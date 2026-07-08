@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use firstpass_proxy::provider::ProviderRegistry;
 use firstpass_proxy::{AppState, ProxyConfig, app, store};
 
 #[tokio::main]
@@ -18,9 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (traces, writer) = store::open(&config.db_path)?;
 
     let bind = config.bind.clone();
+    let providers = ProviderRegistry::new(&config.upstream_anthropic, &config.upstream_openai);
     let state = AppState {
         config: Arc::new(config),
         http: reqwest::Client::builder().build()?,
+        providers,
         traces,
     };
 

@@ -20,20 +20,29 @@ pub enum ProxyError {
     /// The inbound request body could not be read (e.g. the connection dropped mid-body).
     #[error("failed to read request body")]
     BadRequestBody,
+
+    /// The request body was malformed for the target wire API (enforce mode parses it).
+    #[error("{0}")]
+    BadRequest(String),
+
+    /// The escalation engine could not serve any output (every rung errored).
+    #[error("{0}")]
+    Engine(String),
 }
 
 impl ProxyError {
     fn kind(&self) -> &'static str {
         match self {
             ProxyError::Upstream(_) => "upstream_error",
-            ProxyError::BadRequestBody => "bad_request",
+            ProxyError::BadRequestBody | ProxyError::BadRequest(_) => "bad_request",
+            ProxyError::Engine(_) => "engine_error",
         }
     }
 
     fn status(&self) -> StatusCode {
         match self {
-            ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
-            ProxyError::BadRequestBody => StatusCode::BAD_REQUEST,
+            ProxyError::Upstream(_) | ProxyError::Engine(_) => StatusCode::BAD_GATEWAY,
+            ProxyError::BadRequestBody | ProxyError::BadRequest(_) => StatusCode::BAD_REQUEST,
         }
     }
 }

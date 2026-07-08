@@ -47,9 +47,14 @@ async fn spawn_proxy(upstream: &str) -> (String, std::path::PathBuf) {
     .unwrap();
 
     let (traces, _writer) = store::open(&db_path).unwrap();
+    let providers = firstpass_proxy::provider::ProviderRegistry::new(
+        "https://api.anthropic.com",
+        "https://api.openai.com",
+    );
     let state = AppState {
         config: Arc::new(config),
         http: reqwest::Client::new(),
+        providers,
         traces,
     };
 

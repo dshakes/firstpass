@@ -482,20 +482,24 @@ mod tests {
     #[test]
     fn transport_and_5xx_are_failover_eligible() {
         assert!(ProviderError::Transport("boom".into()).is_failover_eligible());
-        assert!(ProviderError::Http {
-            status: 503,
-            body: String::new()
-        }
-        .is_failover_eligible());
+        assert!(
+            ProviderError::Http {
+                status: 503,
+                body: String::new()
+            }
+            .is_failover_eligible()
+        );
     }
 
     #[test]
     fn client_errors_and_decode_failures_are_hard() {
-        assert!(!ProviderError::Http {
-            status: 400,
-            body: String::new()
-        }
-        .is_failover_eligible());
+        assert!(
+            !ProviderError::Http {
+                status: 400,
+                body: String::new()
+            }
+            .is_failover_eligible()
+        );
         assert!(!ProviderError::Decode("bad json".into()).is_failover_eligible());
     }
 
