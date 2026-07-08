@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use firstpass_proxy::gate::GateHealthRegistry;
 use firstpass_proxy::provider::ProviderRegistry;
 use firstpass_proxy::{AppState, ProxyConfig, app, store};
 
@@ -20,10 +21,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind = config.bind.clone();
     let providers = ProviderRegistry::new(&config.upstream_anthropic, &config.upstream_openai);
+
+    // Register a default error budget for every gate named across enforce routes: auto-disable
+    // a gate whose abstain rate exceeds 25% over its last 50 runs (SPEC §7.2).
+    let mut gate_health = GateHealthRegistry::new();
+    if let Some(routing) = config.routing.as_ref() {
+        let mut seen = std::collections::HashSet::new();
+        for route in &routing.routes {
+            for gate in route.gates.iter().chain(&route.deferred_gates) {
+                if seen.insert(gate.clone()) {
+                    gate_health = gate_health.with_budget(gate.clone(), 50, 0.25);
+                }
+            }
+        }
+    }
+
     let state = AppState {
         config: Arc::new(config),
         http: reqwest::Client::builder().build()?,
         providers,
+        gate_health: Arc::new(gate_health),
         traces,
     };
 
