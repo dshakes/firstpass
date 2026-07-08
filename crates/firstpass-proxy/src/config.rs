@@ -3,7 +3,7 @@
 
 use std::env;
 
-use firstpass_core::{Mode, PriceTable};
+use firstpass_core::{Config as RoutingConfig, Mode, PriceTable};
 
 /// The built-in prompt salt used when `FIRSTPASS_PROMPT_SALT` is unset. Fine for local
 /// development; an operator should set their own before handling real traffic, since a
@@ -17,14 +17,19 @@ pub struct ProxyConfig {
     pub bind: String,
     /// Base URL of the upstream Anthropic-compatible API.
     pub upstream_anthropic: String,
+    /// Base URL of the upstream OpenAI-compatible API.
+    pub upstream_openai: String,
     /// Path to the SQLite trace database.
     pub db_path: String,
     /// Tenant identifier stamped on every trace.
     pub tenant_id: String,
     /// Salt mixed into the prompt hash so raw prompt text never touches storage.
     pub prompt_salt: String,
-    /// Routing mode. Only [`Mode::Observe`] is implemented — gating is M2.
+    /// Default mode when no routing config matches (`observe` unless overridden).
     pub mode: Mode,
+    /// Optional declarative routing config (§8.4). When present, its routes decide the mode,
+    /// ladder, and gates per request; enforce routes activate the escalation engine.
+    pub routing: Option<RoutingConfig>,
     /// Model pricing table used to cost each attempt.
     pub prices: PriceTable,
 }
@@ -32,34 +37,53 @@ pub struct ProxyConfig {
 /// Errors that prevent the proxy from starting.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// `FIRSTPASS_MODE` named a mode this build doesn't serve yet.
+    /// `FIRSTPASS_MODE` named an unknown mode (valid: `observe`, `enforce`).
     #[error(
-        "FIRSTPASS_MODE={0:?} is not implemented yet (gating ships in M2); \
-         set FIRSTPASS_MODE=observe or leave it unset"
+        "FIRSTPASS_MODE={0:?} is not a known mode; set `observe` or `enforce`, or leave it unset"
     )]
     UnsupportedMode(String),
+
+    /// The routing config file could not be read or parsed.
+    #[error("routing config error: {0}")]
+    Config(String),
 }
 
 impl ProxyConfig {
     /// Load configuration from environment variables, falling back to local defaults.
     ///
     /// # Errors
-    /// Returns [`ConfigError::UnsupportedMode`] if `FIRSTPASS_MODE` names anything other
-    /// than `observe`.
+    /// [`ConfigError::UnsupportedMode`] for an unknown `FIRSTPASS_MODE`; [`ConfigError::Config`]
+    /// if the `FIRSTPASS_CONFIG` routing file cannot be read or parsed.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_lookup(|key| env::var(key).ok())
+        // Read the routing config file (if any) here, then hand its *content* to the pure
+        // `from_lookup` seam via the synthetic `FIRSTPASS_CONFIG_TOML` key — keeping file I/O
+        // out of the unit-testable path.
+        let routing_toml = match env::var("FIRSTPASS_CONFIG").ok() {
+            Some(path) => Some(
+                std::fs::read_to_string(&path)
+                    .map_err(|e| ConfigError::Config(format!("reading {path}: {e}")))?,
+            ),
+            None => None,
+        };
+        Self::from_lookup(|key| match key {
+            "FIRSTPASS_CONFIG_TOML" => routing_toml.clone(),
+            other => env::var(other).ok(),
+        })
     }
 
     /// Load configuration from an arbitrary key lookup — the seam `from_env` uses, exposed
     /// so tests can exercise defaulting/validation without touching real process env vars.
+    /// The routing config is supplied inline via the `FIRSTPASS_CONFIG_TOML` key.
     ///
     /// # Errors
-    /// Returns [`ConfigError::UnsupportedMode`] if `FIRSTPASS_MODE` names anything other
-    /// than `observe`.
+    /// [`ConfigError::UnsupportedMode`] for an unknown `FIRSTPASS_MODE`; [`ConfigError::Config`]
+    /// if the inline routing TOML fails to parse.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let bind = lookup("FIRSTPASS_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_owned());
         let upstream_anthropic = lookup("FIRSTPASS_UPSTREAM_ANTHROPIC")
             .unwrap_or_else(|| "https://api.anthropic.com".to_owned());
+        let upstream_openai = lookup("FIRSTPASS_UPSTREAM_OPENAI")
+            .unwrap_or_else(|| "https://api.openai.com".to_owned());
         let db_path = lookup("FIRSTPASS_DB").unwrap_or_else(|| "firstpass.db".to_owned());
         let tenant_id = lookup("FIRSTPASS_TENANT").unwrap_or_else(|| "default".to_owned());
         let prompt_salt = lookup("FIRSTPASS_PROMPT_SALT").unwrap_or_else(|| {
@@ -72,16 +96,25 @@ impl ProxyConfig {
         let mode_str = lookup("FIRSTPASS_MODE").unwrap_or_else(|| "observe".to_owned());
         let mode = match mode_str.as_str() {
             "observe" => Mode::Observe,
+            "enforce" => Mode::Enforce,
             other => return Err(ConfigError::UnsupportedMode(other.to_owned())),
+        };
+        let routing = match lookup("FIRSTPASS_CONFIG_TOML") {
+            Some(toml) => {
+                Some(RoutingConfig::parse(&toml).map_err(|e| ConfigError::Config(e.to_string()))?)
+            }
+            None => None,
         };
 
         Ok(Self {
             bind,
             upstream_anthropic,
+            upstream_openai,
             db_path,
             tenant_id,
             prompt_salt,
             mode,
+            routing,
             prices: PriceTable::defaults(),
         })
     }
@@ -115,9 +148,45 @@ mod tests {
     }
 
     #[test]
-    fn enforce_mode_is_rejected() {
+    fn enforce_mode_is_accepted() {
+        let cfg =
+            ProxyConfig::from_lookup(|key| (key == "FIRSTPASS_MODE").then(|| "enforce".to_owned()))
+                .unwrap();
+        assert_eq!(cfg.mode, Mode::Enforce);
+    }
+
+    #[test]
+    fn unknown_mode_is_rejected() {
         let result =
-            ProxyConfig::from_lookup(|key| (key == "FIRSTPASS_MODE").then(|| "enforce".to_owned()));
-        assert!(matches!(result, Err(ConfigError::UnsupportedMode(m)) if m == "enforce"));
+            ProxyConfig::from_lookup(|key| (key == "FIRSTPASS_MODE").then(|| "banana".to_owned()));
+        assert!(matches!(result, Err(ConfigError::UnsupportedMode(m)) if m == "banana"));
+    }
+
+    #[test]
+    fn routing_config_parses_inline() {
+        let toml = r#"
+[[route]]
+match = { task_kind = "code_edit" }
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
+gates = ["non-empty"]
+"#;
+        let cfg = ProxyConfig::from_lookup(|key| match key {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let routing = cfg.routing.expect("routing config present");
+        assert_eq!(routing.routes.len(), 1);
+        assert_eq!(routing.routes[0].mode, Mode::Enforce);
+    }
+
+    #[test]
+    fn bad_routing_config_is_an_error() {
+        let result = ProxyConfig::from_lookup(|key| match key {
+            "FIRSTPASS_CONFIG_TOML" => Some("this is not valid = = toml".to_owned()),
+            _ => None,
+        });
+        assert!(matches!(result, Err(ConfigError::Config(_))));
     }
 }

@@ -22,6 +22,7 @@ hex = "0.4"
 jiff = { version = "0.2", features = ["serde"] }
 # Errors
 thiserror = "2"
+async-trait = "0.1"
 
 # Proxy: HTTP server/client, storage, async runtime, tracing
 axum = "0.8"
