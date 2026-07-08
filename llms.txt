@@ -1,0 +1,23 @@
+# Firstpass
+
+> Firstpass routes every LLM request to the cheapest model that *provably* passes your quality gate — it runs a real check (tests, typecheck, schema, or a fresh-context judge) on the actual output and escalates one ladder rung only on failure, serving the first output that passes. Every decision is a tamper-evident audit trace. Proof over prediction; built agent-first for agent fleets.
+
+Firstpass is **agent-first by construction**: its primary user is an agent. Adoption is a one-env-var `base_url` swap on an OpenAI/Anthropic-wire-compatible proxy; offboarding is unsetting it. Every surface is machine-first — declarative config, structured JSON traces with a re-derivable hash chain, typed verdicts, structured errors, an HTTP feedback API, a `GET /v1/capabilities` discovery endpoint, and an optional MCP server.
+
+What is genuinely new (the cascade mechanism itself is prior art in the model-cascade literature): (1) tamper-evident audit of every routing decision + gate verdict, (2) an outcome-feedback API that calibrates gates from real downstream results, (3) zero-retrain model onboarding (add a rung to the ladder; predictive routers all need retraining).
+
+## Docs
+- [README](README.md): product pitch, the receipt (audit trace), proof-vs-prediction comparison, install, roadmap.
+- [SPEC](SPEC.md): founding spec v0.1 — the source of truth. Positioning (§0), prior art & novelty (§0.1), agent-first tenet (§0.2), architecture (§7), gate framework (§8), trace/feature schema (§9), distribution, milestones (§16).
+- [AGENTS.md](AGENTS.md): agent/contributor onboarding — repo layout, build/test/lint gates, the invariants that must not regress.
+
+## Contract (crates/firstpass-core)
+- Trace schema (SPEC §9.1): structured JSON audit record; serde field names are the wire/audit contract.
+- Feature vector (SPEC §9.2): deterministic, versioned (`features@vN`); privacy-preserving (salted repo fingerprint, no raw prompts).
+- Hash chain: append-only, re-derivable by an external auditor from the stored records alone.
+- Config (SPEC §8.4): declarative routing — routes, ladders, gates, budgets, escalation.
+
+## Distribution
+- Single static binary, no runtime dependencies. Install in seconds: `curl | sh`, Homebrew, `docker run`, or `cargo install`.
+- Multi-provider: Anthropic, OpenAI, Google, and any OpenAI-compatible endpoint (hosted aggregators or local models).
+- BYOK (bring your own keys); zero token markup; no lock-in at the data plane.

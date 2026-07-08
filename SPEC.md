@@ -1,24 +1,88 @@
-# Switchyard — Founding Spec
+# Firstpass — Founding Spec
 
 **Version:** 0.1 (founding draft)
 **Date:** 2026-07-07
 **Status:** Draft for founder review
-**One-liner:** Switchyard routes every LLM request to the cheapest model that **provably** clears your quality gate — verification-gated escalation with a full audit trail, learning your workload from its own verdicts.
+**One-liner:** Firstpass routes every LLM request to the cheapest model that **provably** clears your quality gate — verification-gated escalation with a full audit trail, learning your workload from its own verdicts.
 
-> A switchyard (classification yard) is where railcars are sorted and routed —
-> deterministically, by switches and gravity, one hump at a time. Same idea, for tokens.
+> The cheapest model takes the **first pass** at every request — and either clears your
+> gate (proven, not guessed) or the request escalates to the next tier. You pay up only
+> when the proof says you must.
 
 ---
 
 ## 0. Positioning in one paragraph
 
 Every model router on the market routes by **prediction**: a learned policy guesses which
-model will answer well, sends the request there, and never checks. Switchyard routes by
+model will answer well, sends the request there, and never checks. Firstpass routes by
 **proof**: send the request to the cheapest plausible tier, run a real gate on the output
 (tests, typecheck, schema, fresh-context judge), and escalate one rung only on gate
 failure. Every decision is logged as an auditable trace, and those gate verdicts — ground
 truth, not guesses — become the training signal that makes the routing policy smarter over
 time. Prediction is a black box you have to trust. Proof is a receipt you can read.
+
+---
+
+## 0.1 Prior art & what's actually new (stated honestly)
+
+The escalation *mechanism* is not novel, and the pitch must not pretend it is. The model-cascade
+research literature established cheapest-first querying with a learned scorer that escalates on low
+confidence, and a line of verifier/judge-driven deferral work has refined it since. The mechanism is
+proven — and left un-productized. The standing academic critique of every cascade is that it has *no
+reliability guarantee* and treats the deferral threshold as an unprincipled hyperparameter.
+
+The competing products all route by **prediction**, deciding before generation and never checking the
+output. **Predictive routers** learn a policy — from model internals, from eval data, or from
+preference data — and call the single model it points to; they need retraining or re-evaluation for
+every new model. **Black-box orchestrators** put a predictive head on a hidden state and compose
+frontier models opaquely, with unpredictable per-request cost. **Model gateways** route on price and
+uptime rules, not output quality — they are complements Firstpass sits on top of, not rivals. None of
+them verify the output they actually served.
+
+Firstpass's defensible novelty is **not** the cascade. It is three things no paper and no product
+has put together:
+
+1. **Tamper-evident audit** of every routing decision + gate verdict (§9) — the exact artifact
+   black-box orchestrators cannot give a regulated buyer, and the transparency axis to win on.
+2. **Outcome-feedback calibration** (§8.3, feedback API) — downstream ground truth ("did the tests
+   pass an hour later?") flows back and auto-tunes the gate, answering the "no reliability guarantee"
+   critique that every static cascade carries.
+3. **Zero-retrain onboarding** — add a model as one ladder rung; the gate decides. Predictive routers
+   structurally require retraining/re-eval per new frontier model, in a market shipping them monthly.
+
+The founding bet stands on those three plus the wedge in §2 (agent/coding traffic, where gates are
+cheap and objective). Pitched as a generic cheap-router, Firstpass loses to prior art; pitched as
+the verified, auditable, self-correcting layer for agent fleets, it occupies ground no incumbent holds.
+
+---
+
+## 0.2 Agent-first by construction
+
+Firstpass's primary user is not a human clicking a dashboard — it is an **agent** (a coding agent, a
+CI bot, a subagent in a fleet). That is a design constraint on *every* surface, not a marketing line:
+
+- **Product.** The data plane is a drop-in `base_url`. An agent adopts Firstpass by changing one
+  environment variable and offboards by unsetting it — no SDK, no code change, no rebuild. The proxy
+  is OpenAI/Anthropic wire-compatible so any agent that speaks those APIs already speaks Firstpass.
+- **Components.** Every surface is machine-first and self-describing: config is declarative
+  (TOML/JSON), traces are structured JSON with a re-derivable hash chain, verdicts are typed
+  (`pass`/`fail`/`abstain` + score), errors are structured (never prose an agent must parse), and the
+  feedback channel is a plain HTTP API. A **discovery endpoint** (`GET /v1/capabilities`) lets an agent
+  learn the ladder, gates, modes, and limits at runtime, and an optional **MCP server** exposes traces,
+  verdicts, and feedback as tools so an agent can inspect and correct its own routing.
+- **Comms & docs.** Documentation is agent-consumable by default: [`llms.txt`](llms.txt) at the root,
+  an [`AGENTS.md`](AGENTS.md) contributor/onboarding manifest, machine-readable schemas for the trace
+  and config. A human-readable page is a rendering of the machine-readable source of truth, never the
+  other way round.
+- **Onboarding.** Self-serve and programmatic: point `base_url`, GET `/v1/capabilities`, start in
+  `observe` mode (serve immediately, gate asynchronously) so nothing is at risk while the agent's own
+  traffic teaches the router. No human in the setup loop.
+- **Offboarding.** One env var, instantly reversible, zero lock-in at the data plane (§7.2). BYOK means
+  the agent keeps its own provider relationship; there is nothing to migrate off.
+
+Concretely: `GET /v1/capabilities`, the MCP server, `llms.txt`, and `AGENTS.md` are first-class M1/M2
+deliverables, not afterthoughts. Where a choice is "nice human UI" vs "clean agent contract," the agent
+contract wins and the UI renders it.
 
 ---
 
@@ -47,7 +111,7 @@ time. Prediction is a black box you have to trust. Proof is a receipt you can re
   build, structured-output schemas, and diff review are all machine-checkable.
 - **The trace log is the moat.** Every routed request emits a labeled example
   (*task features → tier tried → verdict → cost*). Competitors with predictive routers
-  must synthesize training data; Switchyard's customers generate it as exhaust. v1's
+  must synthesize training data; Firstpass's customers generate it as exhaust. v1's
   learned policy trains on v0's dogfood traces; v2's learned coordinator trains on v1's.
 - **Deterministic first, learned second.** Anything deterministic logic can decide never
   goes to a model. The ladder, the budget caps, the gate execution — all deterministic.
@@ -67,7 +131,7 @@ time. Prediction is a black box you have to trust. Proof is a receipt you can re
   resources.
 - **Not an eval platform.** Gates plug in; we ship reference gates, but building a
   general evals product is someone else's business.
-- **Not an agent framework.** Switchyard sits *below* the harness (a base_url), never
+- **Not an agent framework.** Firstpass sits *below* the harness (a base_url), never
   replaces it.
 
 ## 4. Who it's for (ICP, in order)
@@ -125,11 +189,11 @@ Feedback API is what no predictive router has.
 ### 6.1 The proxy (data plane)
 
 - **Anthropic-compatible** `/v1/messages` and **OpenAI-compatible** `/v1/chat/completions`
-  endpoints. A harness adopts Switchyard by changing one base URL
+  endpoints. A harness adopts Firstpass by changing one base URL
   (`ANTHROPIC_BASE_URL=https://localhost:4130` or the hosted equivalent) — the same
   insertion pattern proven by compression/caching proxies.
 - Transparent pass-through of everything the policy doesn't touch: tool definitions,
-  system prompts, images, tool results. Switchyard rewrites exactly one thing: the
+  system prompts, images, tool results. Firstpass rewrites exactly one thing: the
   `model` field (plus optional per-rung prompt adaptations in v2).
 - **Streaming semantics:**
   - `observe` mode: stream through untouched; gates run asynchronously on the buffered
@@ -145,7 +209,7 @@ Feedback API is what no predictive router has.
 - `POST /v1/feedback` — `{ trace_id | session_id, gate_id, verdict, score?, evidence?,
   reporter }`. Authenticated per tenant. Idempotent.
 - Reference reporters shipped day one: a **Claude Code hook** (compass), a **CI step**
-  (GitHub Actions), and a **shell one-liner** (`switchyard report --gate tests --verdict
+  (GitHub Actions), and a **shell one-liner** (`firstpass report --gate tests --verdict
   pass`).
 
 ### 6.3 The control plane (paid, later)
@@ -157,10 +221,10 @@ Feedback API is what no predictive router has.
 
 ### 6.4 The CLI
 
-- `switchyard init` — scaffold config, detect harness, print the one env var.
-- `switchyard bench` — the tier-clearance benchmark (§10) against your own repo/tasks.
-- `switchyard traces` / `switchyard why <trace_id>` — local trace inspection.
-- `switchyard gate test <gate_id>` — run a gate against a fixture.
+- `firstpass init` — scaffold config, detect harness, print the one env var.
+- `firstpass bench` — the tier-clearance benchmark (§10) against your own repo/tasks.
+- `firstpass traces` / `firstpass why <trace_id>` — local trace inspection.
+- `firstpass gate test <gate_id>` — run a gate against a fixture.
 
 ---
 
@@ -171,7 +235,7 @@ Feedback API is what no predictive router has.
    │  base_url
    ▼
 ┌─────────────────────────────────────────────┐
-│ switchyard proxy (single Rust binary)       │
+│ firstpass proxy (single Rust binary)        │
 │                                             │
 │  router core ── policy engine (static v0)   │
 │      │              │                       │
@@ -179,7 +243,7 @@ Feedback API is what no predictive router has.
 │  provider clients  gate runner              │
 │  (anthropic,       (inline gates as         │
 │   openai, google,   subprocess plugins)     │
-│   local/ollama)                             │
+│   oai-compatible)                           │
 │      │                                      │
 │      ▼                                      │
 │  trace store (SQLite → Postgres)            │
@@ -217,6 +281,24 @@ Feedback API is what no predictive router has.
    attempt** (default) or return a structured error.
 6. Deferred verdicts attach to the trace whenever they arrive.
 
+### 7.1a Latency model (does Firstpass add latency?)
+
+A common and fair worry. The precise answer:
+
+- **Each rung is exactly one model call.** A rung never calls the LLM twice. The *gate* is a
+  separate step: a **deterministic** gate (tests / typecheck / schema / patch-applies) is **not an
+  LLM call** — and in an agent loop those checks already run, so Firstpass reuses an existing signal
+  and adds no new call. A **judge** gate is one additional LLM call; prefer deterministic gates to
+  avoid it (this is why the agent/coding beachhead is the sweet spot).
+- **Observe mode (default): zero added latency.** The cheap output is served immediately; the gate
+  and any escalation run **asynchronously** off the response path and only feed learning.
+- **Enforce mode: latency is added deliberately** to prove quality before serving — the gate cost
+  always, plus, on the *escalating fraction only*, the earlier attempt's latency. This is why enforce
+  is scoped to subagent/batch/CI traffic, not the interactive hot path. Streaming is preserved; a
+  pre-serve gate buffers only when it genuinely needs the full response.
+- The trace's `total_latency_ms` records the real experienced latency, and the M0 harness reports
+  p50/p95 overhead explicitly (including the worst-case full-escalation path) — no hiding it.
+
 ### 7.2 Failure semantics (prod-grade requirements)
 
 - **Provider outage on rung r** → treat as `abstain` with reason `provider_error`,
@@ -230,6 +312,66 @@ Feedback API is what no predictive router has.
   var. Escape hatch is documented on the front page. No lock-in at the data plane, ever.
 - **Trace store unavailable** → serve traffic, buffer traces to disk, backfill. Losing
   a trace is losing money (training data), but never availability.
+
+---
+
+### 7.3 Distribution & packaging (world-class artifacts)
+
+The product ships as a **single statically-linked binary with zero runtime dependencies** — the natural
+payoff of the Rust choice. Time-to-first-routed-request is measured in seconds, not a setup guide.
+
+- **Install in one line, several ways** (built with [`dist`](https://opensource.axo.dev/cargo-dist/), which
+  produces all of the below from one release):
+  - `curl -LsSf https://firstpass.dev/install.sh | sh` (and a PowerShell equivalent for Windows)
+  - `brew install firstpass/tap/firstpass`
+  - `docker run firstpass/firstpass` (multi-arch image, small distroless base)
+  - `cargo install firstpass` (from crates.io, for the Rust-native)
+- **Prebuilt multi-arch releases** on every tag: macOS (arm64 + x86_64), Linux (arm64 + x86_64,
+  gnu + musl for static), Windows x86_64 — with checksums and cosign signatures. No "compile from source" step required.
+- **Config-optional start.** `firstpass up` with provider keys in the environment routes immediately in
+  `observe` mode with sane defaults; a `firstpass.toml` refines it. `firstpass doctor` validates keys, config,
+  and gate binaries before you rely on it.
+- **Multi-provider / multi-LLM from day one.** First-class clients for **Anthropic, OpenAI, and Google**,
+  plus a generic **OpenAI-compatible** client that covers any compatible endpoint — hosted aggregators,
+  third-party inference providers, and local runtimes alike. A model is a `provider/model` string in the ladder — adding one is a
+  config line, never a rebuild (this is the zero-retrain onboarding of §0.1, at the packaging layer).
+- **Reproducible & verifiable.** Pinned toolchain, locked dependencies, `cargo-deny` in CI (license + advisory
+  gate), SBOM attached to releases. The install script is auditable and versioned.
+
+Distribution quality is a feature, not an afterthought: a router nobody can install in a minute does not get
+adopted by the agent fleets that are the whole market.
+
+---
+
+### 7.4 Integration surface (pluggable into everything that talks to an LLM)
+
+The whole value of a data-plane router is that it disappears into the tools you already run. Firstpass is
+**wire-compatible**: it speaks the provider APIs verbatim, so anything that talks to an LLM plugs in without a
+code change and unplugs the same way.
+
+- **Wire-compatible endpoints.** Firstpass exposes the **Anthropic Messages**, **OpenAI Chat Completions +
+  Responses**, and **Google Gemini `generateContent`** surfaces. A caller points its base URL at Firstpass and
+  everything it already sends — **streaming (SSE), tool/function calling, multimodal inputs, structured
+  outputs** — passes through faithfully. Gates run on the *assembled* output; streaming is preserved to the
+  caller (buffered only when a pre-serve gate in enforce mode requires the full response).
+- **Every way to plug in:**
+  1. **`base_url` env swap** — coding agents, IDE extensions, and SDKs that honour `ANTHROPIC_BASE_URL` /
+     `OPENAI_BASE_URL` / `OPENAI_API_BASE` / `GOOGLE_GEMINI_BASE_URL`. Zero code change; the whole integration
+     is one environment variable.
+  2. **Sidecar / reverse proxy** — headless agents, batch jobs, CI runners, and serverless functions route
+     provider traffic through a Firstpass container in front of them.
+  3. **Embedded library** — the router as a linkable crate (plus a thin HTTP/FFI shim) for teams that want it
+     in-process rather than as a hop.
+  4. **MCP server** — the agent-native surface: an agent calls tools to read its own traces, query
+     `/v1/capabilities`, and submit outcome feedback, so it can inspect and correct its own routing.
+  5. **CLI** — `firstpass up` / `doctor` / `trace` for humans, scripts, and Makefiles.
+- **BYOK passthrough.** Provider keys stay the caller's; Firstpass forwards them and never marks up tokens, so
+  the caller keeps its own provider relationship and ToS.
+- **The invariant:** Firstpass adds a routing + audit + feedback layer *around* the wire contract the agent
+  already uses; it never changes that contract. Pluggable by construction, reversible by construction (§7.2).
+
+M1 ships the Anthropic + OpenAI wire endpoints and the `base_url`/sidecar paths; Gemini, the MCP server, and
+the embedded-library mode follow in M2+.
 
 ---
 
@@ -408,6 +550,35 @@ break-even *and* the audit-trail story alone doesn't justify the proxy, stop —
 the negative result and fold the learnings back into compass instead. Ambition includes
 knowing the exit.
 
+### 10.1 Proof methodology (how the outperformance claim is earned, not asserted)
+
+The claim "cheapest model that provably passes, cheaper than the alternatives" is a set of
+**falsifiable, per-axis hypotheses**, each proven against baselines run on identical traffic —
+not against a marketing table. Firstpass does not claim to beat a frontier model at raw quality
+(it can't, and won't pretend to); it claims parity-at-lower-cost and capabilities incumbents
+structurally lack. The harness (`crates/firstpass-bench`) is the proof machine.
+
+- **Baselines, side by side:** `always-cheap`, `always-top`, `random`, a simulated
+  **predictive router** (picks a rung from a noisy difficulty estimate, never verifies), and
+  **Firstpass** (cheapest-first + gate + escalate). Same tasks, same gate, same price table.
+- **Pre-registered metrics with confidence intervals** (seeded bootstrap, reproducible):
+  success rate, **$/successful-task** (the headline — success held constant), tier-clearance
+  rate, escalation rate, **regret** (served-a-failure + needless-escalation), gate
+  precision/recall vs ground truth, p50/p95 latency overhead.
+- **Conformal risk control (the statistical guarantee):** rather than a hand-tuned deferral
+  threshold — the standing critique of every cascade (§0.1) — calibrate the gate threshold on a
+  held-out set via split-conformal risk control to *guarantee* served-failure rate ≤ α at a
+  chosen confidence. This converts "trust our gate" into a certificate, and is the next-gen edge
+  no competitor ships.
+- **Off-policy evaluation (proving improvement without risk):** every trace logs the
+  counterfactual and the policy's action propensity, enabling inverse-propensity / doubly-robust
+  estimates of a *candidate* policy's value from logged data alone — so "we got better" is proven
+  offline before any live rollout. (Estimators land with the bandit, §11; the logging that makes
+  them unbiased is designed in from M0.)
+- **Honesty controls:** maker ≠ checker judges; held-out tasks; no training on eval traces; the
+  report names the axes Firstpass *loses* on (raw quality vs frontier; enforce-mode latency); and
+  the kill criterion above is honored and published even when it fails.
+
 ---
 
 ## 11. Learning roadmap
@@ -452,7 +623,7 @@ right to compete there.
 
 ## 12. Security & trust model
 
-Switchyard sits in the most sensitive position possible: between customers' prompts and
+Firstpass sits in the most sensitive position possible: between customers' prompts and
 their model providers. Trust is the product; these are requirements, not aspirations.
 
 1. **BYOK, keys never at rest in plaintext.** Self-host: keys stay in the customer's env.
@@ -467,7 +638,7 @@ their model providers. Trust is the product; these are requirements, not aspirat
 5. **Hosted gate execution is sandboxed** (WASI/Firecracker, no network by default) —
    customer gates are untrusted code by definition.
 6. **Supply chain:** signed releases, SBOM, pinned deps, provenance attestation —
-   (the compass `harden` pipeline, applied to Switchyard's own CI).
+   (the compass `harden` pipeline, applied to Firstpass's own CI).
 7. **Compliance path:** SOC 2 Type I within 12 months of hosted GA; zero-retention mode
    is the default posture that makes early enterprise conversations possible before that.
 
@@ -492,16 +663,16 @@ their model providers. Trust is the product; these are requirements, not aspirat
   design partners from the agent-harness ecosystem.
 - **Competitive map (why we win each fight):**
 
-| Competitor class | Examples | Their game | Our counter |
-|---|---|---|---|
-| Plumbing routers | OpenRouter, LiteLLM | Unified API, uptime | We're not plumbing; we compose with them (a rung can *be* an OpenRouter model). |
-| Predictive routers | Martian, NotDiamond | Route by predicted quality | No verification, no receipts, no per-customer learning. Proof beats prediction where gates exist. |
-| Trained coordinators | Sakana Fugu | Learned multi-model orchestration | Black-box, one frozen policy, benchmark-trained. We're auditable, per-tenant, production-trained — and we'll meet them at v2 with data they can't buy. |
-| Academic cascades | FrugalGPT lineage | Cost-quality cascades on benchmarks | No product, no deferred ground truth, no harness integration. |
-| DIY | in-house scripts | A bash ladder | The gate framework, anti-gaming, trace/audit plane, and learning are the 90% under the waterline. |
+| Competitor class | Their game | Our counter |
+|---|---|---|
+| Plumbing routers / gateways | Unified API, uptime, price/uptime routing | We're not plumbing; we compose with them (a rung can *be* one of their models). |
+| Predictive routers | Route by predicted quality, before generation | No verification, no receipts, no per-customer learning. Proof beats prediction where gates exist. |
+| Trained coordinators | Learned multi-model orchestration | Black-box, one frozen policy, benchmark-trained. We're auditable, per-tenant, production-trained — and we'll meet them at v2 with data they can't buy. |
+| Academic cascades | Cost-quality cascades on benchmarks | No product, no deferred ground truth, no harness integration. |
+| DIY / in-house | A bash ladder | The gate framework, anti-gaming, trace/audit plane, and learning are the 90% under the waterline. |
 
 - **The one-sentence answer to "why not X":** *"Everyone else routes by predicting
-  quality; Switchyard routes by verifying it — and hands you the receipt."*
+  quality; Firstpass routes by verifying it — and hands you the receipt."*
 
 ---
 
@@ -512,12 +683,12 @@ plumbing — is the same: **make claims they can't make, backed by artifacts any
 re-run.** Their numbers are self-reported on frozen benchmarks; ours are reproducible on
 the reader's own repo. This is a standing program, not launch content:
 
-1. **Open benchmark, runnable by anyone.** `switchyard bench` (§6.4) *is* the benchmark:
+1. **Open benchmark, runnable by anyone.** `firstpass bench` (§6.4) *is* the benchmark:
    it runs the tier-clearance methodology (§10) against the user's own codebase and
    prints their own break-even table. The strongest possible sales argument is the
    prospect's own data — and it's unfakeable by us, which is the point.
 2. **Head-to-head evals with published methodology.** Reproducible harness comparing
-   Switchyard vs. always-top-model vs. predictive routing (via public APIs where
+   Firstpass vs. always-top-model vs. predictive routing (via public APIs where
    available) on the open task corpus: cost, end-task success (ground-truth gates, never
    judge-only), latency, and — uniquely — **auditability** (can the system produce a
    receipt per decision: yes/no). Methodology, corpus, and raw traces published; every
@@ -563,7 +734,7 @@ Cost of the program: it slows marketing down. That's accepted; the entire brand 
    *Mitigation:* §8.3 in full; gate precision as a first-class alarmed metric.
 3. **Latency overhead unacceptable for interactive use.** *Mitigation:* observe mode as
    default; enforce mode scoped to subagent/batch/CI traffic; inline gates budgeted.
-4. **Fast-follow by a big router** (OpenRouter adds gates). *Mitigation:* the deferred-
+4. **Fast-follow by a big router** (an incumbent gateway bolts on gates). *Mitigation:* the deferred-
    feedback harness integrations + per-tenant learned policies + audit plane are the
    compound moat; move fast on the harness ecosystem where we have home-field advantage.
 5. **Provider ToS friction** (proxying, model-output-judging-model). *Mitigation:* BYOK
@@ -587,10 +758,11 @@ Cost of the program: it slows marketing down. That's accepted; the entire brand 
 
 ## 17. Open questions (founder decisions, not blockers for M0/M1)
 
-1. **Name/trademark:** "Switchyard" — note prior art: JBoss SwitchYard (Red Hat ESB,
-   retired ~2015) and generic uses. Alternates considered: Humpyard, Gantry (prior
-   ML-startup use), Verdict (prior eval-library use), Sluice, Trestle. Working name
-   stands until incorporation forces the check.
+1. **Name/trademark:** "Firstpass" (working name; superseded "Switchyard"). Caveat:
+   common English phrase → hard to trademark/own and weak for SEO. Distinctive coined
+   alternates surfaced in the naming search if a commercial rebrand is wanted later
+   (Greek: Basano, Tekmo; Sanskrit: Viveka, Nikasha). Working name stands until
+   incorporation forces the check.
 2. **License:** Apache-2.0 assumed for OSS core (patent grant matters here); confirm.
 3. **First non-Anthropic rung** for cross-provider data in M0: which provider/model.
 4. **Hosted-first vs self-host-first** for design partners (spec assumes self-host first).

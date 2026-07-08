@@ -3,3 +3,7 @@ target/
 .env
 .DS_Store
 .serena/
+*.db
+*.db-shm
+*.db-wal
+**/*.rs.bk
