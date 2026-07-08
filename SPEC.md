@@ -281,6 +281,24 @@ Feedback API is what no predictive router has.
    attempt** (default) or return a structured error.
 6. Deferred verdicts attach to the trace whenever they arrive.
 
+### 7.1a Latency model (does Firstpass add latency?)
+
+A common and fair worry. The precise answer:
+
+- **Each rung is exactly one model call.** A rung never calls the LLM twice. The *gate* is a
+  separate step: a **deterministic** gate (tests / typecheck / schema / patch-applies) is **not an
+  LLM call** — and in an agent loop those checks already run, so Firstpass reuses an existing signal
+  and adds no new call. A **judge** gate is one additional LLM call; prefer deterministic gates to
+  avoid it (this is why the agent/coding beachhead is the sweet spot).
+- **Observe mode (default): zero added latency.** The cheap output is served immediately; the gate
+  and any escalation run **asynchronously** off the response path and only feed learning.
+- **Enforce mode: latency is added deliberately** to prove quality before serving — the gate cost
+  always, plus, on the *escalating fraction only*, the earlier attempt's latency. This is why enforce
+  is scoped to subagent/batch/CI traffic, not the interactive hot path. Streaming is preserved; a
+  pre-serve gate buffers only when it genuinely needs the full response.
+- The trace's `total_latency_ms` records the real experienced latency, and the M0 harness reports
+  p50/p95 overhead explicitly (including the worst-case full-escalation path) — no hiding it.
+
 ### 7.2 Failure semantics (prod-grade requirements)
 
 - **Provider outage on rung r** → treat as `abstain` with reason `provider_error`,
@@ -531,6 +549,35 @@ numbers per task class, and those numbers become v0's static routing table.
 break-even *and* the audit-trail story alone doesn't justify the proxy, stop — publish
 the negative result and fold the learnings back into compass instead. Ambition includes
 knowing the exit.
+
+### 10.1 Proof methodology (how the outperformance claim is earned, not asserted)
+
+The claim "cheapest model that provably passes, cheaper than the alternatives" is a set of
+**falsifiable, per-axis hypotheses**, each proven against baselines run on identical traffic —
+not against a marketing table. Firstpass does not claim to beat a frontier model at raw quality
+(it can't, and won't pretend to); it claims parity-at-lower-cost and capabilities incumbents
+structurally lack. The harness (`crates/firstpass-bench`) is the proof machine.
+
+- **Baselines, side by side:** `always-cheap`, `always-top`, `random`, a simulated
+  **predictive router** (picks a rung from a noisy difficulty estimate, never verifies), and
+  **Firstpass** (cheapest-first + gate + escalate). Same tasks, same gate, same price table.
+- **Pre-registered metrics with confidence intervals** (seeded bootstrap, reproducible):
+  success rate, **$/successful-task** (the headline — success held constant), tier-clearance
+  rate, escalation rate, **regret** (served-a-failure + needless-escalation), gate
+  precision/recall vs ground truth, p50/p95 latency overhead.
+- **Conformal risk control (the statistical guarantee):** rather than a hand-tuned deferral
+  threshold — the standing critique of every cascade (§0.1) — calibrate the gate threshold on a
+  held-out set via split-conformal risk control to *guarantee* served-failure rate ≤ α at a
+  chosen confidence. This converts "trust our gate" into a certificate, and is the next-gen edge
+  no competitor ships.
+- **Off-policy evaluation (proving improvement without risk):** every trace logs the
+  counterfactual and the policy's action propensity, enabling inverse-propensity / doubly-robust
+  estimates of a *candidate* policy's value from logged data alone — so "we got better" is proven
+  offline before any live rollout. (Estimators land with the bandit, §11; the logging that makes
+  them unbiased is designed in from M0.)
+- **Honesty controls:** maker ≠ checker judges; held-out tasks; no training on eval traces; the
+  report names the axes Firstpass *loses* on (raw quality vs frontier; enforce-mode latency); and
+  the kill criterion above is honored and published even when it fails.
 
 ---
 

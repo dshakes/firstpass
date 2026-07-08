@@ -23,8 +23,18 @@ crates/
     src/config.rs              §8.4 routing/ladder/gate/budget config + route matching
     src/cost.rs                model price table + counterfactual baseline math
     src/error.rs               typed errors (thiserror)
+  firstpass-bench/             (M0) the proof harness — pre-registered benchmark, baselines,
+    src/sim.rs                 deterministic model+gate sim behind ModelBackend/Gate traits (real-backend seam)
+    src/policy.rs              policies under test: always-cheap/top, random, predictive router, Firstpass
+    src/metrics.rs             pre-registered metrics (success, $/success, regret, gate P/R, latency)
+    src/stats.rs               seeded bootstrap confidence intervals (reproducible)
+    src/conformal.rs           split-conformal risk control: a served-failure guarantee
+    src/report.rs              honest report + pre-registered kill criterion
   firstpass-proxy/             (M1) the axum binary: server, provider clients, router, trace store
 ```
+
+Run the proof: `cargo run -p firstpass-bench` (Markdown) or `--json`. Numbers are simulation until the
+real-provider backend lands; the report labels itself so.
 
 ## Build / test / lint (run before handing back — non-negotiable)
 

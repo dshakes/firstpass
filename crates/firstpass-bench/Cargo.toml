@@ -1,0 +1,21 @@
+[package]
+name = "firstpass-bench"
+description = "Firstpass M0 proof harness: a pre-registered, baseline-controlled benchmark with bootstrap CIs, split-conformal risk control, and a published kill criterion. Simulation-first, with a real-provider backend seam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "firstpass-bench"
+path = "src/main.rs"
+
+[dependencies]
+firstpass-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
