@@ -23,6 +23,15 @@ jiff = { version = "0.2", features = ["serde"] }
 # Errors
 thiserror = "2"
 
+# Proxy: HTTP server/client, storage, async runtime, tracing
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+bytes = "1"
+
 # Internal crates
 firstpass-core = { path = "crates/firstpass-core" }
 
