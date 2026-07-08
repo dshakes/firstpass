@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "Apache-2.0"
+repository = "https://github.com/firstpass/firstpass"
+authors = ["Firstpass"]
+
+[workspace.dependencies]
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+# Identity, hashing, time
+uuid = { version = "1", features = ["v7", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+jiff = { version = "0.2", features = ["serde"] }
+# Errors
+thiserror = "2"
+
+# Internal crates
+firstpass-core = { path = "crates/firstpass-core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# Deny footguns across the workspace. Prod-grade: no silent unwrap-in-lib slop.
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+todo = "warn"
+dbg_macro = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
