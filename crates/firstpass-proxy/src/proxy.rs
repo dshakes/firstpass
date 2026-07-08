@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::config::ProxyConfig;
 use crate::error::ProxyError;
-use crate::gate::resolve_gates;
+use crate::gate::{GateHealthRegistry, resolve_gates};
 use crate::provider::{Auth, ChatMessage, ModelRequest, ModelResponse, ProviderRegistry};
 use crate::router::{EnforceCtx, EngineOutcome, route_enforce};
 use crate::upstream::forward_anthropic;
@@ -38,6 +38,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Multi-provider registry used by the enforce-mode escalation engine.
     pub providers: ProviderRegistry,
+    /// Per-gate error budgets (auto-disable), shared across requests.
+    pub gate_health: Arc<GateHealthRegistry>,
     /// Fire-and-forget sender to the background trace writer.
     pub traces: UnboundedSender<Trace>,
 }
@@ -175,6 +177,7 @@ async fn handle_enforce(
     let ctx = EnforceCtx {
         ladder: &route.ladder,
         gates: &gates,
+        health: &state.gate_health,
         base_request: &base_request,
         providers: &state.providers,
         auth: &auth,
@@ -681,6 +684,7 @@ mod tests {
             config: Arc::new(config),
             http: reqwest::Client::new(),
             providers,
+            gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
         };
         (state, rx)
@@ -779,6 +783,7 @@ mod tests {
             config: Arc::new(config),
             http: reqwest::Client::new(),
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
+            gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
         };
         let resp = messages(State(state), HeaderMap::new(), user_body()).await;

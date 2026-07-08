@@ -6,7 +6,7 @@
 //! cross-provider failover falls out of the same loop (§7.2). This is the real-typed, async
 //! version of the `Firstpass` policy proven in `firstpass-bench`; the semantics are identical.
 
-use crate::gate::{Gate, aggregate};
+use crate::gate::{Gate, GateHealthRegistry, aggregate};
 use crate::provider::{Auth, ModelRequest, ModelResponse, ProviderError, ProviderRegistry};
 use firstpass_core::verdict::reason;
 use firstpass_core::{
@@ -35,6 +35,8 @@ pub struct EnforceCtx<'a> {
     pub ladder: &'a [String],
     /// Gates run against each attempt's output (already resolved).
     pub gates: &'a [Box<dyn Gate>],
+    /// Per-gate error budgets: a gate over budget is skipped (auto-disabled) this request.
+    pub health: &'a GateHealthRegistry,
     /// The base request; its `model` is overwritten per rung.
     pub base_request: &'a ModelRequest,
     /// Provider lookup.
@@ -128,8 +130,18 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
                     .unwrap_or(0.0);
                 spent += model_cost;
 
-                let gate_results: Vec<GateResult> =
-                    ctx.gates.iter().map(|g| g.evaluate(&req, &resp)).collect();
+                // Run gates sequentially (they're I/O — subprocess/model), skipping any the
+                // error budget has auto-disabled, and feeding each outcome back to the budget.
+                let mut gate_results: Vec<GateResult> = Vec::with_capacity(ctx.gates.len());
+                for g in ctx.gates {
+                    if !ctx.health.enabled(g.id()) {
+                        tracing::warn!(gate = %g.id(), "skipping auto-disabled gate");
+                        continue;
+                    }
+                    let r = g.evaluate(&req, &resp).await;
+                    ctx.health.record(g.id(), r.verdict == Verdict::Abstain);
+                    gate_results.push(r);
+                }
                 let gc: f64 = gate_results.iter().map(|g| g.cost_usd).sum();
                 gate_cost_total += gc;
                 spent += gc;
@@ -319,6 +331,7 @@ mod tests {
         ProviderRegistry::from_map(map)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ctx<'a>(
         ladder: &'a [String],
         gates: &'a [Box<dyn Gate>],
@@ -327,10 +340,12 @@ mod tests {
         auth: &'a Auth,
         prices: &'a PriceTable,
         budget: Option<f64>,
+        health: &'a GateHealthRegistry,
     ) -> EnforceCtx<'a> {
         EnforceCtx {
             ladder,
             gates,
+            health,
             base_request: req,
             providers,
             auth,
@@ -353,8 +368,11 @@ mod tests {
         let req = base_request();
         let providers = registry(vec![("anthropic", HAIKU, Ok(resp(HAIKU, r#"{"ok":1}"#)))]);
         let (auth, prices) = (Auth::default(), PriceTable::defaults());
-        let (out, trace) =
-            route_enforce(ctx(&ladder, &gates, &req, &providers, &auth, &prices, None)).await;
+        let health = GateHealthRegistry::new();
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
 
         match out {
             EngineOutcome::Served(r) => assert_eq!(r.model, HAIKU),
@@ -381,8 +399,11 @@ mod tests {
             ("anthropic", SONNET, Ok(resp(SONNET, "real answer"))),
         ]);
         let (auth, prices) = (Auth::default(), PriceTable::defaults());
-        let (out, trace) =
-            route_enforce(ctx(&ladder, &gates, &req, &providers, &auth, &prices, None)).await;
+        let health = GateHealthRegistry::new();
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
 
         assert!(matches!(out, EngineOutcome::Served(r) if r.model == SONNET));
         assert_eq!(trace.attempts.len(), 2);
@@ -407,8 +428,11 @@ mod tests {
             ("openai", GPT, Ok(resp(GPT, "answer from openai"))),
         ]);
         let (auth, prices) = (Auth::default(), PriceTable::defaults());
-        let (out, trace) =
-            route_enforce(ctx(&ladder, &gates, &req, &providers, &auth, &prices, None)).await;
+        let health = GateHealthRegistry::new();
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
 
         assert!(matches!(out, EngineOutcome::Served(r) if r.model == GPT));
         assert_eq!(trace.attempts[0].verdict, Verdict::Abstain);
@@ -432,6 +456,7 @@ mod tests {
             ("anthropic", OPUS, Ok(resp(OPUS, ""))),
         ]);
         let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
         let (_out, trace) = route_enforce(ctx(
             &ladder,
             &gates,
@@ -440,6 +465,7 @@ mod tests {
             &auth,
             &prices,
             Some(0.0),
+            &health,
         ))
         .await;
         assert!(
@@ -459,8 +485,11 @@ mod tests {
             ("anthropic", SONNET, Ok(resp(SONNET, "still not json"))),
         ]);
         let (auth, prices) = (Auth::default(), PriceTable::defaults());
-        let (out, trace) =
-            route_enforce(ctx(&ladder, &gates, &req, &providers, &auth, &prices, None)).await;
+        let health = GateHealthRegistry::new();
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
 
         assert!(
             matches!(out, EngineOutcome::Served(r) if r.model == SONNET),
@@ -487,8 +516,11 @@ mod tests {
             ("anthropic", SONNET, Ok(resp(SONNET, "would have worked"))),
         ]);
         let (auth, prices) = (Auth::default(), PriceTable::defaults());
-        let (out, trace) =
-            route_enforce(ctx(&ladder, &gates, &req, &providers, &auth, &prices, None)).await;
+        let health = GateHealthRegistry::new();
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
 
         assert!(
             matches!(out, EngineOutcome::Failed(_)),
@@ -511,8 +543,11 @@ mod tests {
         let (in_t, out_t) = (served.in_tokens, served.out_tokens);
         let providers = registry(vec![("anthropic", HAIKU, Ok(served))]);
         let (auth, prices) = (Auth::default(), PriceTable::defaults());
-        let (_out, trace) =
-            route_enforce(ctx(&ladder, &gates, &req, &providers, &auth, &prices, None)).await;
+        let health = GateHealthRegistry::new();
+        let (_out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
 
         let expected_baseline = prices.cost_usd(OPUS, in_t, out_t).unwrap();
         assert!((trace.final_.counterfactual_baseline_usd - expected_baseline).abs() < 1e-12);
@@ -528,13 +563,48 @@ mod tests {
         let req = base_request();
         let providers = registry(vec![("anthropic", HAIKU, Ok(resp(HAIKU, "ok")))]);
         let (auth, prices) = (Auth::default(), PriceTable::defaults());
-        let (_out, trace) =
-            route_enforce(ctx(&ladder, &gates, &req, &providers, &auth, &prices, None)).await;
+        let health = GateHealthRegistry::new();
+        let (_out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
 
         // A single trace with the genesis prev_hash must form a valid 1-long chain.
         assert!(firstpass_core::verify_chain(std::slice::from_ref(&trace), GENESIS_HASH).is_ok());
         // And it must round-trip through JSON (wire/audit contract).
         let json = serde_json::to_string(&trace).unwrap();
         let _back: Trace = serde_json::from_str(&json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_disabled_gate_is_skipped_by_the_engine() {
+        // An empty candidate would FAIL the non-empty gate — but once that gate is auto-disabled
+        // (over its error budget), the engine skips it, so rung 0 serves with no gate verdict.
+        let ladder = vec![HAIKU.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let providers = registry(vec![("anthropic", HAIKU, Ok(resp(HAIKU, "")))]); // empty text
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+
+        // Drive the "non-empty" budget over threshold so it is disabled before the run.
+        let health = GateHealthRegistry::new().with_budget("non-empty", 4, 0.5);
+        for _ in 0..4 {
+            health.record("non-empty", true);
+        }
+        assert!(
+            !health.enabled("non-empty"),
+            "precondition: gate is auto-disabled"
+        );
+
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+        assert!(matches!(out, EngineOutcome::Served(_)));
+        assert_eq!(trace.final_.served_rung, Some(0));
+        assert!(
+            trace.attempts[0].gates.is_empty(),
+            "disabled gate must be skipped, not run"
+        );
     }
 }

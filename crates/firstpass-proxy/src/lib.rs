@@ -23,6 +23,7 @@ pub mod provider;
 pub mod proxy;
 pub mod router;
 pub mod store;
+pub mod subprocess;
 pub mod upstream;
 
 pub use config::ProxyConfig;
