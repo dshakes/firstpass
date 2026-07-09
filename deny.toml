@@ -17,12 +17,16 @@ allow = [
     "ISC",
     "Zlib",
     "Unicode-3.0",
+    # Permissive data license used by webpki-roots (the Mozilla CA certificate bundle).
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal workspace crates are referenced by path (no version) — don't flag those as wildcards.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

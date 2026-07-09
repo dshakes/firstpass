@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firstpass — Docs & Usage</title>
+<meta name="description" content="How to install, configure, and run Firstpass — the autonomous LLM router. Modes, environment variables, routing config, gates, endpoints, and offboarding.">
+<meta name="theme-color" content="#05070A">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2305070A'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%2319E3B1' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<style>
+  /* docs layout */
+  .doc{display:grid;grid-template-columns:230px 1fr;gap:44px;align-items:start;padding:40px 0 96px}
+  @media(max-width:860px){.doc{grid-template-columns:1fr;gap:20px}}
+  .side-nav{position:sticky;top:84px;font-size:14px}
+  @media(max-width:860px){.side-nav{position:static;border:1px solid var(--line);border-radius:14px;padding:16px;background:var(--glass)}}
+  .side-nav .grp{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--mut2);margin:22px 0 10px}
+  .side-nav a{display:block;color:var(--mut);padding:6px 0;border-left:2px solid transparent;padding-left:14px;margin-left:-2px;transition:.15s}
+  .side-nav a:hover{color:var(--ink)}
+  .side-nav a.on{color:var(--mint);border-left-color:var(--mint)}
+  .doc-main{min-width:0;max-width:760px}
+  .doc-main h1{font-size:clamp(30px,5vw,44px);font-weight:800;letter-spacing:-.03em;margin:0 0 10px}
+  .doc-main h2{font-size:24px;margin:52px 0 14px;scroll-margin-top:80px;font-weight:750}
+  .doc-main h2::before{content:"#";color:var(--mint);margin-right:10px;opacity:.5;font-weight:600}
+  .doc-main h3{font-size:17px;margin:28px 0 10px}
+  .doc-main p,.doc-main li{color:var(--mut);font-size:15.5px}
+  .doc-main a.link{color:var(--mint);border-bottom:1px solid rgba(25,227,177,.3)}
+  .doc-main a.link:hover{border-color:var(--mint)}
+  .doc-main code:not(.code code){font-family:var(--mono);font-size:13px;background:rgba(120,200,190,.1);border:1px solid var(--line);border-radius:6px;padding:1px 6px;color:var(--ink)}
+  .doc-main .code{margin:16px 0}
+  table.t{width:100%;border-collapse:collapse;margin:18px 0;font-size:14px}
+  table.t th,table.t td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  table.t th{color:var(--ink);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut2)}
+  table.t td:first-child{font-family:var(--mono);color:var(--mint);font-size:13px;white-space:nowrap}
+  table.t td code{background:none;border:0;padding:0;color:var(--mut)}
+  .callout{border:1px solid var(--line);border-left:3px solid var(--mint);border-radius:12px;padding:15px 18px;margin:20px 0;background:var(--glass);color:var(--mut);font-size:14.5px}
+  .callout.warn{border-left-color:var(--amber)}
+  .callout b{color:var(--ink)}
+  .pillrow{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}
+  .pillrow .pill{font-family:var(--mono);font-size:12px;color:var(--mut);border:1px solid var(--line2);border-radius:999px;padding:5px 12px}
+  .pillrow .pill b{color:var(--mint)}
+</style>
+</head>
+<body>
+<div class="fx"><div class="blob b1"></div><div class="blob b2"></div></div>
+<div class="grid-bg"></div>
+
+<header><div class="wrap"><nav>
+  <a class="brand" href="index.html"><svg class="dot" width="24" height="24" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0a1512"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#19E3B1" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+  <span class="sp"></span>
+  <a class="nl" href="index.html">Home</a>
+  <a class="nl" href="index.html#vs">Why</a>
+  <a class="nl" href="usage.html">Docs</a>
+  <a class="nl" href="https://github.com/dshakes/firstpass">GitHub ↗</a>
+  <a class="btn primary" href="index.html#install">Run the demo</a>
+</nav></div></header>
+
+<div class="wrap"><div class="doc">
+  <aside class="side-nav" aria-label="Docs navigation">
+    <div class="grp">Get started</div>
+    <a href="#overview">Overview</a>
+    <a href="#install">Install</a>
+    <a href="#quickstart">Quickstart</a>
+    <div class="grp">Configure</div>
+    <a href="#modes">Modes</a>
+    <a href="#env">Environment</a>
+    <a href="#routing">Routing config</a>
+    <a href="#gates">Gates</a>
+    <div class="grp">Operate</div>
+    <a href="#endpoints">Endpoints</a>
+    <a href="#receipts">Receipts &amp; feedback</a>
+    <a href="#offboard">Offboarding</a>
+  </aside>
+
+  <main class="doc-main">
+    <p class="eyebrow">documentation</p>
+    <h1>Using Firstpass</h1>
+    <p>Firstpass is a drop-in, Anthropic-compatible HTTP proxy. Run it, point your agent's <code>base_url</code> at it, and every request is routed to the cheapest model that provably passes your gate — with a signed receipt for each decision. This page covers install, configuration, and operation. For the design rationale, read the <a class="link" href="https://github.com/dshakes/firstpass/blob/main/SPEC.md">SPEC</a>.</p>
+
+    <h2 id="overview">Overview</h2>
+    <p>Every request flows through three moves: <b>route</b> to the cheapest rung of a ladder, <b>gate</b> the real output, and <b>escalate</b> one rung only if the gate fails — across providers, with cross-provider failover on a 5xx. The whole decision is written to a tamper-evident, hash-chained trace.</p>
+    <div class="pillrow"><span class="pill"><b>providers</b> Anthropic · OpenAI</span><span class="pill"><b>store</b> SQLite (WAL)</span><span class="pill"><b>config</b> env + TOML</span><span class="pill"><b>keys</b> BYOK, redacted</span></div>
+
+    <h2 id="install">Install</h2>
+    <table class="t"><thead><tr><th>Method</th><th>Command</th></tr></thead><tbody>
+      <tr><td>Homebrew</td><td><code>brew install dshakes/tap/firstpass-proxy</code></td></tr>
+      <tr><td>curl | sh</td><td><code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh</code></td></tr>
+      <tr><td>Docker</td><td><code>docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest</code></td></tr>
+      <tr><td>Cargo</td><td><code>cargo install --git https://github.com/dshakes/firstpass firstpass-proxy</code></td></tr>
+    </tbody></table>
+    <div class="callout"><b>Availability:</b> <code>cargo install --git</code> and the Docker image work today. Homebrew, the <code>curl | sh</code> installer, and prebuilt binaries publish with the first tagged release.</div>
+
+    <h2 id="quickstart">Quickstart</h2>
+    <p>See the whole loop in ~10 seconds — no API keys. The demo stands up a mock upstream and drives one real decision, escalation and all.</p>
+    <div class="code"><button class="copy" data-copy="git clone https://github.com/dshakes/firstpass && cd firstpass && cargo run -p firstpass-proxy --example demo">copy</button><pre style="margin:0"><span class="c"># clone &amp; watch the receipt print</span>
+git clone https://github.com/dshakes/firstpass <span class="a">&amp;&amp;</span> cd firstpass
+cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</span> demo</pre></div>
+
+    <h2 id="modes">Modes</h2>
+    <p>Firstpass runs in one of two modes, set by <code>FIRSTPASS_MODE</code>:</p>
+    <h3>observe <span style="color:var(--mut2)">(default)</span></h3>
+    <p>Transparent pass-through. Requests are forwarded unchanged and a trace is recorded off the hot path — <b>zero behavior change</b>. Use this to shadow traffic and build an audit trail before enforcing anything.</p>
+    <h3>enforce</h3>
+    <p>Full routing: cheapest-first ladder, gate the output, escalate on failure, cross-provider failover. Requires a routing config (below).</p>
+    <div class="code"><button class="copy" data-copy="FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy">copy</button><pre style="margin:0">FIRSTPASS_MODE=<span class="p">enforce</span> FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy</pre></div>
+
+    <h2 id="env">Environment</h2>
+    <p>Configuration is 12-factor. Run <code>firstpass-proxy --help</code> for the reference:</p>
+    <table class="t"><thead><tr><th>Variable</th><th>Purpose</th><th>Default</th></tr></thead><tbody>
+      <tr><td>FIRSTPASS_MODE</td><td>observe | enforce</td><td><code>observe</code></td></tr>
+      <tr><td>FIRSTPASS_BIND</td><td>listen address</td><td><code>127.0.0.1:8080</code></td></tr>
+      <tr><td>FIRSTPASS_CONFIG</td><td>path to firstpass.toml</td><td><code>—</code></td></tr>
+      <tr><td>FIRSTPASS_DB</td><td>trace store path</td><td><code>firstpass.db</code></td></tr>
+      <tr><td>FIRSTPASS_UPSTREAM_ANTHROPIC</td><td>upstream base URL</td><td><code>api.anthropic.com</code></td></tr>
+      <tr><td>FIRSTPASS_UPSTREAM_OPENAI</td><td>upstream base URL</td><td><code>api.openai.com</code></td></tr>
+      <tr><td>FIRSTPASS_TENANT</td><td>tenant id for the trace</td><td><code>default</code></td></tr>
+      <tr><td>FIRSTPASS_PROMPT_SALT</td><td>salt for prompt hashing</td><td><code>—</code></td></tr>
+      <tr><td>RUST_LOG</td><td>tracing filter</td><td><code>info</code></td></tr>
+    </tbody></table>
+
+    <h2 id="routing">Routing config</h2>
+    <p>Routing is declarative TOML: ordered routes (first match wins), each binding a slice of traffic to a mode, a cheapest-first model ladder, and the gates that must pass. Start from <a class="link" href="https://github.com/dshakes/firstpass/blob/main/firstpass.example.toml">firstpass.example.toml</a>.</p>
+    <div class="code"><button class="copy" data-copy='[[route]]
+match = { agent = "claude-code" }
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
+gates = ["schema", "cargo-test"]'>copy</button><pre style="margin:0"><span class="c">[[route]]</span>
+<span class="cy">match</span>  = { agent = <span class="p">"claude-code"</span> }
+<span class="cy">mode</span>   = <span class="p">"enforce"</span>
+<span class="cy">ladder</span> = [<span class="p">"anthropic/claude-haiku-4-5"</span>, <span class="p">"anthropic/claude-sonnet-5"</span>]
+<span class="cy">gates</span>  = [<span class="p">"schema"</span>, <span class="p">"cargo-test"</span>]
+
+<span class="c"># wildcard fallback — first match wins, top to bottom</span>
+<span class="c">[[route]]</span>
+<span class="cy">match</span> = {}
+<span class="cy">mode</span>  = <span class="p">"observe"</span></pre></div>
+
+    <h2 id="gates">Gates</h2>
+    <p>A gate reads the candidate output and returns a verdict. Two kinds:</p>
+    <ul>
+      <li><b>Inline</b> — <code>non-empty</code>, <code>json-valid</code>, and a minimal JSON-Schema gate (<code>type</code> / <code>required</code> / <code>properties</code>). No process spawn.</li>
+      <li><b>Subprocess plugin</b> — your own command (tests, linter, a judge). The candidate is passed on <b>stdin, never argv</b> (injection-resistant); a JSON verdict comes back on stdout. Non-zero exit or timeout → abstain.</li>
+    </ul>
+    <div class="callout warn"><b>Error budgets.</b> Each gate carries a rolling budget. A gate whose abstain rate exceeds its threshold is auto-disabled for subsequent requests (with an alarm), so one flaky gate can't take down a route.</div>
+
+    <h2 id="endpoints">Endpoints</h2>
+    <table class="t"><thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead><tbody>
+      <tr><td>POST /v1/messages</td><td>Drop-in inference — observe or enforce per route.</td></tr>
+      <tr><td>POST /v1/feedback</td><td>Report a downstream outcome for a prior trace.</td></tr>
+      <tr><td>GET /v1/capabilities</td><td>Machine-readable capability descriptor.</td></tr>
+      <tr><td>GET /healthz</td><td>Liveness.</td></tr>
+    </tbody></table>
+
+    <h2 id="receipts">Receipts &amp; feedback</h2>
+    <p>Every decision is a hash-chained JSON trace an external auditor can re-derive — which model ran, which gates passed, what it cost, and the counterfactual saving. Downstream outcomes (did the tests pass an hour later?) flow back via <code>POST /v1/feedback</code>:</p>
+    <div class="code"><button class="copy" data-copy='curl localhost:8080/v1/feedback -d "{\"trace_id\":\"…\",\"gate_id\":\"cargo-test\",\"verdict\":\"pass\",\"reporter\":\"ci\"}"'>copy</button><pre style="margin:0">curl localhost:8080/v1/feedback -d '<span class="c">{</span>
+  <span class="cy">"trace_id"</span>: <span class="p">"0192f3a1-…"</span>, <span class="cy">"gate_id"</span>: <span class="p">"cargo-test"</span>,
+  <span class="cy">"verdict"</span>:  <span class="p">"pass"</span>, <span class="cy">"reporter"</span>: <span class="p">"ci"</span>
+<span class="c">}</span>'</pre></div>
+    <div class="callout"><b>Chain-preserving.</b> Deferred verdicts live in a separate table keyed by trace id — they are merged on read for display but <b>never</b> folded into the sealed, hashed record. The chain stays re-derivable.</div>
+
+    <h2 id="offboard">Offboarding</h2>
+    <p>Leaving is always one environment variable — an invariant of the design:</p>
+    <div class="code"><button class="copy" data-copy="unset ANTHROPIC_BASE_URL">copy</button><pre style="margin:0"><span class="cy">unset</span> ANTHROPIC_BASE_URL   <span class="c"># your agent talks to the provider directly again</span></pre></div>
+
+    <p style="margin-top:44px"><a class="link" href="index.html">← Back to home</a> &nbsp;·&nbsp; <a class="link" href="https://github.com/dshakes/firstpass/blob/main/SPEC.md">Read the SPEC →</a></p>
+  </main>
+</div></div>
+
+<footer><div class="wrap">
+  <div class="flinks">
+    <a class="brand" href="index.html" style="color:var(--ink)"><svg class="dot" width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0a1512"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#19E3B1" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+    <span class="sp" style="flex:1"></span>
+    <a href="https://github.com/dshakes/firstpass">GitHub</a>
+    <a href="https://github.com/dshakes/firstpass/blob/main/SPEC.md">SPEC</a>
+    <a href="https://github.com/dshakes/firstpass/blob/main/firstpass.example.toml">Config</a>
+  </div>
+  <p class="fnote">Proof over prediction. No competitor products named — Firstpass competes on evidence, not adjectives.</p>
+</div></footer>
+
+<script>
+// active section highlight + copy buttons
+const links=[...document.querySelectorAll('.side-nav a')];
+const map=new Map(links.map(a=>[a.getAttribute('href').slice(1),a]));
+const so=new IntersectionObserver((es)=>es.forEach(e=>{
+  if(e.isIntersecting){links.forEach(l=>l.classList.remove('on'));const a=map.get(e.target.id);if(a)a.classList.add('on');}
+}),{rootMargin:'-70px 0px -70% 0px'});
+document.querySelectorAll('.doc-main h2[id]').forEach(h=>so.observe(h));
+document.querySelectorAll('.copy').forEach(b=>b.onclick=()=>navigator.clipboard.writeText(b.dataset.copy).then(()=>{const o=b.textContent;b.textContent='copied ✓';setTimeout(()=>b.textContent=o,1200);}));
+</script>
+</body>
+</html>

@@ -35,7 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 bytes = "1"
 
 # Internal crates
-firstpass-core = { path = "crates/firstpass-core" }
+firstpass-core = { path = "crates/firstpass-core", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"
