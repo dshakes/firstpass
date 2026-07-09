@@ -12,6 +12,7 @@
 <link rel="stylesheet" href="assets/site.css">
 </head>
 <body>
+<div class="progress" id="prog"></div>
 <div class="fx"><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
 <div class="grid-bg"></div>
 
@@ -28,7 +29,7 @@
 </nav></div></header>
 
 <main id="top">
-<section class="hero"><div class="wrap">
+<section class="hero"><div class="hero-glow" id="heroGlow"></div><div class="wrap">
   <div class="tagpill"><b>◆ autonomous llm routing</b> · proof over prediction</div>
   <h1><span class="grad-text">Cheap first.</span><span class="l2">Proven, not guessed.</span></h1>
   <p class="sub">Firstpass sends every request to the <b>cheapest model</b>, proves the output clears your gate, and escalates <b>only on failure</b> — with a signed, tamper-evident receipt for every call.</p>
@@ -70,6 +71,16 @@
         <li><span class="m">✓</span> To improve, edit a gate. Zero retrain.</li>
       </ul>
     </div>
+  </div>
+</div></section>
+
+<section id="built-for"><div class="wrap reveal stagger">
+  <p class="eyebrow">built for</p>
+  <h2>Where proof-over-prediction pays.</h2>
+  <div class="uses">
+    <div class="use"><span class="ic">🤖</span><h3>Coding agents</h3><p>Gate on your real test suite. The cheap model writes the patch; it ships only if the tests actually pass — otherwise it escalates.</p><span class="tag">gate: cargo-test · pytest · tsc</span></div>
+    <div class="use"><span class="ic">🛰️</span><h3>Agent fleets</h3><p>Per-tenant policies, ladders, and budgets. Route across providers with failover across boundaries — one drop-in hop for the whole fleet.</p><span class="tag">multi-tenant · multi-provider</span></div>
+    <div class="use"><span class="ic">📉</span><h3>Cost-sensitive production</h3><p>Serve the cheapest model that clears the bar; pay for the expensive one only when the gate demands it. Every dollar has a receipt.</p><span class="tag">~65% cheaper (sim)</span></div>
   </div>
 </div></section>
 
@@ -173,14 +184,14 @@
   <p class="eyebrow">the receipt</p>
   <h2>Not a dashboard number.<br>A decision you can <span class="grad-text">audit</span>.</h2>
   <p class="lead">Every call becomes a hash-chained JSON trace an external auditor can re-derive. Point at any request and answer <i>why did this go to that model, and what did it cost.</i></p>
-  <div class="code" style="margin-top:28px"><button class="copy" data-copy='{ "trace_id": "0192f3a1", "prev_hash": "9f2c…a1b7", "mode": "enforce" }'>copy</button><pre style="margin:0"><span class="c">{</span>
+  <div style="position:relative;margin-top:28px"><div class="seal" id="seal">SEALED ✓</div><div class="code"><button class="copy" data-copy='{ "trace_id": "0192f3a1", "prev_hash": "9f2c…a1b7", "mode": "enforce" }'>copy</button><pre style="margin:0"><span class="c">{</span>
   <span class="cy">"trace_id"</span>: <span class="p">"0192f3a1-7c4e-7abc"</span>, <span class="cy">"prev_hash"</span>: <span class="p">"9f2c…a1b7"</span>,   <span class="c">// chains to the prior decision — tamper-evident</span>
   <span class="cy">"attempts"</span>: [
     { <span class="cy">"rung"</span>:0, <span class="cy">"model"</span>:<span class="p">"…/haiku-4-5"</span>,  <span class="cy">"gate"</span>:<span class="c" style="color:#FF5A6A">"fail"</span>, <span class="cy">"cost"</span>:0.0007 },  <span class="c">// cheap first — gate caught it</span>
     { <span class="cy">"rung"</span>:1, <span class="cy">"model"</span>:<span class="p">"…/sonnet-5"</span>,  <span class="cy">"gate"</span>:<span class="p">"pass"</span>, <span class="cy">"cost"</span>:0.0121 }   <span class="c">// escalated, proven, served</span>
   ],
   <span class="cy">"final"</span>: { <span class="cy">"served_rung"</span>:1, <span class="cy">"savings_usd"</span>:<span class="p">0.0502</span> }   <span class="c">// vs always-top-tier</span>
-<span class="c">}</span></pre></div>
+<span class="c">}</span></pre></div></div>
 </div></section>
 
 <section id="proof"><div class="wrap reveal">
@@ -323,6 +334,23 @@ if(arch){
   }));
   arch.addEventListener('pointerleave',()=>{arch.classList.remove('dim');archCap.innerHTML=archIdle;});
 }
+
+// ── scroll progress bar ──
+const prog=document.getElementById('prog');
+addEventListener('scroll',()=>{const h=document.documentElement;prog.style.width=(h.scrollTop/(h.scrollHeight-h.clientHeight)*100)+'%';},{passive:true});
+
+// ── hero cursor glow ──
+const hero=document.querySelector('.hero'), heroGlow=document.getElementById('heroGlow');
+if(hero&&heroGlow)hero.addEventListener('pointermove',e=>{const r=hero.getBoundingClientRect();
+  heroGlow.style.setProperty('--hx',(e.clientX-r.left)+'px');heroGlow.style.setProperty('--hy',(e.clientY-r.top)+'px');});
+
+// ── use-case card spotlight ──
+document.querySelectorAll('.use').forEach(c=>c.addEventListener('pointermove',e=>{const r=c.getBoundingClientRect();
+  c.style.setProperty('--mx',((e.clientX-r.left)/r.width*100)+'%');c.style.setProperty('--my',((e.clientY-r.top)/r.height*100)+'%');}));
+
+// ── animated "sealed" stamp on the receipt ──
+const seal=document.getElementById('seal');
+if(seal){const so2=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){seal.classList.add('in');so2.unobserve(seal);}}),{threshold:.6});so2.observe(seal);}
 </script>
 </body>
 </html>

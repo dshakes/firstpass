@@ -228,3 +228,33 @@
   .arch-cap b{color:#fff;font-weight:550;font-size:15px}
   .arch-cap span{color:var(--mut);font-size:14px}
   .arch-cap .hint{color:var(--mut2);font-family:var(--mono);font-size:12.5px}
+
+  /* ══ polish pass: progress · hero glow · stagger · use-cases · seal ══ */
+  .progress{position:fixed;top:0;left:0;height:2px;width:0;z-index:70;background:linear-gradient(90deg,var(--mint),#38E8FF);box-shadow:0 0 8px rgba(25,227,177,.5)}
+  .hero{position:relative}
+  .hero>.wrap{position:relative;z-index:1}
+  .hero-glow{position:absolute;inset:0;pointer-events:none;z-index:0;opacity:0;transition:opacity .5s;
+    background:radial-gradient(340px circle at var(--hx,50%) var(--hy,30%),rgba(25,227,177,.09),transparent 62%)}
+  .hero:hover .hero-glow{opacity:1}
+  .reveal.stagger>*{opacity:0;transform:translateY(12px);transition:opacity .5s cubic-bezier(.2,.7,.2,1),transform .5s cubic-bezier(.2,.7,.2,1)}
+  .reveal.stagger.in>*{opacity:1;transform:none}
+  .reveal.stagger.in>*:nth-child(2){transition-delay:.07s}
+  .reveal.stagger.in>*:nth-child(3){transition-delay:.14s}
+  .reveal.stagger.in>*:nth-child(n+4){transition-delay:.2s}
+  .uses{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:36px}
+  @media(max-width:840px){.uses{grid-template-columns:1fr}}
+  .use{position:relative;border:1px solid var(--line);border-radius:14px;padding:22px;background:var(--surface);overflow:hidden;transition:border-color .2s,transform .2s}
+  .use:hover{border-color:var(--line2);transform:translateY(-2px)}
+  .use::after{content:"";position:absolute;inset:0;opacity:0;transition:opacity .35s;pointer-events:none;
+    background:radial-gradient(300px circle at var(--mx,50%) var(--my,-20%),rgba(25,227,177,.12),transparent 62%)}
+  .use:hover::after{opacity:1}
+  .use .ic{font-size:20px;margin-bottom:12px;display:inline-grid;place-items:center;width:38px;height:38px;border-radius:9px;background:rgba(25,227,177,.08);border:1px solid var(--line2)}
+  .use h3{margin:0 0 7px;font-size:16px;font-weight:600;color:#fff}
+  .use p{margin:0;color:var(--mut);font-size:14px;line-height:1.55}
+  .use .tag{position:relative;z-index:1;font-family:var(--mono);font-size:11px;color:var(--mint);margin-top:12px;display:block}
+  .seal{position:absolute;top:-13px;right:16px;transform:rotate(-7deg) scale(.85);opacity:0;z-index:3;
+    font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:1px;color:var(--mint);
+    border:1.5px solid var(--mint);border-radius:8px;padding:5px 11px;background:#0a0a0a;box-shadow:0 0 22px -6px rgba(25,227,177,.55)}
+  .seal.in{animation:stamp .55s cubic-bezier(.2,1.5,.4,1) forwards}
+  @keyframes stamp{to{opacity:1;transform:rotate(-7deg) scale(1)}}
+  @media (prefers-reduced-motion:reduce){.seal{opacity:1;transform:rotate(-7deg)}}
