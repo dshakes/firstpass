@@ -4,246 +4,135 @@
 
 # Firstpass
 
-### The cheapest model takes the first pass. It clears your gate — proven, not guessed — or the request escalates.
-
-**Firstpass routes every LLM request to the cheapest model that _provably_ passes your quality gate, and hands you a signed receipt for the decision.**
+**Route every LLM request to the cheapest model that _provably_ passes your quality gate — and get a signed receipt for the decision.**
 
 Proof over prediction. Built for agent fleets.
 
-[![status](https://img.shields.io/badge/status-M0–M2%20shipped-19E3B1)](SPEC.md)
-[![tests](https://img.shields.io/badge/tests-98%20passing-19E3B1)](crates)
+[![CI](https://github.com/dshakes/firstpass/actions/workflows/ci.yml/badge.svg)](https://github.com/dshakes/firstpass/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![rust](https://img.shields.io/badge/rust-1.93%2B-orange)](rust-toolchain.toml)
 [![spec](https://img.shields.io/badge/spec-v0.1-informational)](SPEC.md)
+[![site](https://img.shields.io/badge/site-live-19E3B1)](https://dshakes.github.io/firstpass)
 
-**[Landing site →](https://dshakes.github.io/firstpass/)**  ·  [SPEC](SPEC.md)  ·  [example config](firstpass.example.toml)
+**[Website](https://dshakes.github.io/firstpass)** · [Quickstart](#quickstart) · [Install](#install) · [How it works](#how-it-works) · [Configure](#configuration) · [SPEC](SPEC.md)
 
 </div>
 
 ---
 
-> **Status — the core routes, gates, audits, and learns end-to-end.** The proxy (`firstpass-proxy`) does
-> observe pass-through *and* enforce-mode escalation — cheapest model first, gate the real output, escalate on
-> failure, cross-provider failover — writing a tamper-evident audit trace and closing the outcome-feedback loop
-> (`POST /v1/feedback`). The gate framework ships subprocess plugins + error-budget auto-disable. The whole
-> path is verified **over real HTTP with no test doubles in the plane** ([`tests/end_to_end.rs`](crates/firstpass-proxy/tests/end_to_end.rs)).
-> **See it in ~10 seconds, no API keys:** `cargo run -p firstpass-proxy --example demo`.
->
-> Honestly scoped: the proof-harness numbers below are a labeled *simulation* until wired to live providers (needs keys);
-> judge/self-consistency gates and published binaries are next. Nothing here is claimed as measured that isn't.
+Firstpass is a **drop-in, Anthropic-compatible proxy**. Point your agent's `base_url` at it and every request is routed to the cheapest model first, its **real output** is checked by a gate you define (tests, typecheck, schema, a judge), and it escalates one rung only when the gate fails — writing a tamper-evident audit trace for every decision.
 
-## The one-paragraph pitch
+> **Honestly scoped.** The proxy routes, gates, escalates, fails over, audits, and learns end-to-end over real HTTP — no test doubles in the plane. The [proof-harness](#proof-not-adjectives) numbers are a labeled **simulation** until wired to live providers; prebuilt binaries, `cargo install`, and judge gates are on the [roadmap](#roadmap). Nothing here is claimed as measured that isn't.
 
-Every model router on the market routes by **prediction** — a learned policy guesses which model will answer
-well, sends the request there, and never checks. They all decide _before_ generation and ask you to trust the
-guess. Firstpass routes by **proof**: it sends each
-request to the cheapest plausible model, runs a real gate on the actual output — tests, typecheck, schema,
-a fresh-context judge — and escalates one rung only when the gate fails. Every decision becomes a
-tamper-evident trace you can audit, and every downstream outcome (did the tests pass an hour later?) flows
-back to sharpen the gate. Prediction is a black box you have to trust. **Proof is a receipt you can read.**
+## Quickstart
 
-## Why now
+See the whole loop in ~10 seconds — **no API keys**:
 
-Agent fleets — coding agents, CI bots, review agents — send **everything** to a top-tier model because
-nobody can tell, per request, when a cheaper one would have done the job. The price gap between tiers is
-**10–30×**. The fraction of requests that actually _need_ the top tier is unknown — which is precisely the
-problem. Meanwhile those same agents already run tests, typechecks, and lint on every step: a free,
-ground-truth signal for "was this model good enough" that today just evaporates.
+```bash
+git clone https://github.com/dshakes/firstpass && cd firstpass
+cargo run -p firstpass-proxy --example demo
+```
 
-Firstpass turns that thrown-away signal into a routing decision. In agent and coding workloads, "correct" is
-**checkable for free and objectively** — does it compile, do the tests pass, is the diff applicable, is the
-tool-call schema-valid. That's the one place a verifier beats a predictor outright, because the predictor
-can't see whether the code runs, and you can.
+It stands up a mock upstream and the proxy, drives one real decision (cheap model fails the gate → escalates → passes), prints the [receipt](#the-receipt), submits feedback, and re-verifies the sealed chain.
+
+**Then use it in front of your own agent:**
+
+```bash
+firstpass-proxy                                    # 1. run it (observe mode: logs, changes nothing)
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"  # 2. point your agent at it — same wire format
+#   … use your agent normally; Firstpass records a receipt per call …
+unset ANTHROPIC_BASE_URL                            # 3. offboard anytime — one env var
+```
+
+To turn on cheapest-first routing + gating, copy [`firstpass.example.toml`](firstpass.example.toml) and run in enforce mode — see [Configuration](#configuration).
+
+## Install
+
+| Method | Command |
+| --- | --- |
+| **Homebrew** | `brew install dshakes/tap/firstpass-proxy` |
+| **curl \| sh** | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh \| sh` |
+| **Docker** | `docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest` |
+| **From source** | `cargo install --git https://github.com/dshakes/firstpass firstpass-proxy` |
+
+> Homebrew, the `curl \| sh` installer, and prebuilt binaries (macOS · Linux · Windows, all checksummed) are produced by [cargo-dist](https://opensource.axo.dev/cargo-dist/) and attach to each [GitHub Release](https://github.com/dshakes/firstpass/releases). The container image is published to [GHCR](https://github.com/dshakes/firstpass/pkgs/container/firstpass) on every push to `main`. `cargo install --git` and the Docker image work today; the release-gated channels light up with the first tagged release.
+
+## Prediction vs. proof
+
+<div align="center"><img src="assets/compare.svg" alt="Prediction guesses a model up front and never checks; Firstpass sends cheap, gates the real output, escalates only on failure, and emits a receipt" width="880"></div>
+
+Model routers on the market route by **prediction** — a learned policy guesses which model will answer well, sends the request there, and never checks. Firstpass routes by **proof**: it runs a real gate on the real output, and the decision is a record you can audit — not a guess you hope was right.
+
+## How it works
+
+<div align="center"><img src="assets/flow.svg" alt="A request hits the cheapest rung, fails the gate, escalates one rung, passes, and is served — every decision logged to the audit trace" width="840"></div>
+
+1. **Route** to the cheapest rung of a declarative ladder. BYOK — your keys pass through, redacted from every log.
+2. **Gate** the real output: inline (non-empty, JSON, [JSON-Schema](SPEC.md)) or subprocess plugins (your tests/linter/judge) that read the candidate on **stdin, never argv** — injection-resistant. Per-gate error budgets auto-disable a flaky gate.
+3. **Escalate** exactly one rung on gate failure — budget-capped; a provider 5xx fails over cross-provider. Serve the first output that passes, and record everything.
 
 ## The receipt
 
-Every routed request emits an append-only, hash-chained trace. This is the artifact no predictive router
-produces — the thing your security team, your finance team, and your incident review all actually want:
+Not a dashboard number — a decision you can audit. Every call becomes a hash-chained JSON trace an external auditor can re-derive.
 
-<div align="center">
-<img src="assets/receipt.svg" alt="Firstpass audit receipt: haiku failed the test gate, sonnet passed, served at 80% savings versus always-top-tier" width="620">
-</div>
-
-And the same trace as JSON your tools can parse and re-derive:
+<div align="center"><img src="assets/receipt.svg" alt="Firstpass audit receipt: the cheap model failed the test gate, the next rung passed, served at a real saving versus always-top-tier" width="620"></div>
 
 ```jsonc
 {
   "trace_id": "0192f3a1-7c4e-7abc-9d21-4e8b1f0a2c33",
-  "prev_hash": "9f2c…a1b7",                      // chains to the previous decision — tamper-evident
-  "session_id": "agent-run-4417",
+  "prev_hash": "9f2c…a1b7",                         // chains to the previous decision — tamper-evident
   "mode": "enforce",
-  "request": { "task_kind": "code_edit", "language": "rust", "features": "features@v1" },
   "attempts": [
     { "rung": 0, "model": "anthropic/claude-haiku-4-5", "cost_usd": 0.0007,
-      "gates": [ { "gate_id": "cargo-test", "verdict": "fail", "score": 0.0, "ms": 3100 } ],
-      "verdict": "fail" },                        // cheap model tried first — the test gate caught it
+      "gates": [{ "gate_id": "cargo-test", "verdict": "fail", "score": 0.0 }],
+      "verdict": "fail" },                           // cheap model tried first — the test gate caught it
     { "rung": 1, "model": "anthropic/claude-sonnet-5", "cost_usd": 0.0121,
-      "gates": [ { "gate_id": "cargo-test", "verdict": "pass", "score": 1.0, "ms": 2950 } ],
-      "verdict": "pass" }                         // escalated one rung, proven to pass, served
+      "gates": [{ "gate_id": "cargo-test", "verdict": "pass", "score": 1.0 }],
+      "verdict": "pass" }                            // escalated one rung, proven to pass, served
   ],
-  "final": {
-    "served_rung": 1, "served_from": "attempt",
-    "total_cost_usd": 0.0128,
-    "counterfactual_baseline_usd": 0.0630,        // what always-top-tier would have cost
-    "savings_usd": 0.0502                         // 80% cheaper, at proven quality parity
-  }
+  "final": { "served_rung": 1, "total_cost_usd": 0.0128,
+             "counterfactual_baseline_usd": 0.0630, "savings_usd": 0.0502 }
 }
 ```
 
-You can re-derive the hash chain yourself. You can point at any request and answer *why did this go to that
-model, and what did it cost.* No router on the market can.
+Point at any request and answer *why did this go to that model, and what did it cost* — and re-derive the hash chain yourself. Downstream outcomes flow back via [`POST /v1/feedback`](SPEC.md) onto a deferred-verdict side table that never alters the sealed record.
 
-## How it works
+## Configuration
 
-<div align="center">
-<img src="assets/flow.svg" alt="Routing flow: a request hits the cheapest rung, fails the gate, escalates one rung, passes, and is served — every decision logged to the audit trace" width="840">
-</div>
+Firstpass is configured through the environment (12-factor) — run `firstpass-proxy --help` for the full reference:
 
-1. **Send** the request to the cheapest plausible model tier.
-2. **Gate** the output with a real check — tests, typecheck, schema, or a fresh-context judge (maker ≠ checker).
-3. **Escalate** exactly one rung on gate failure; serve the first output that passes, budget-capped.
-4. **Log** every decision as a tamper-evident trace; downstream outcomes feed back and sharpen the gate.
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `FIRSTPASS_MODE` | `observe` \| `enforce` | `observe` |
+| `FIRSTPASS_BIND` | listen address | `127.0.0.1:8080` |
+| `FIRSTPASS_CONFIG` | path to `firstpass.toml` (routes, ladders, gates) | — |
+| `FIRSTPASS_DB` | trace store path | `firstpass.db` |
+| `FIRSTPASS_UPSTREAM_ANTHROPIC` | upstream base URL | `https://api.anthropic.com` |
+| `FIRSTPASS_UPSTREAM_OPENAI` | upstream base URL | `https://api.openai.com` |
 
-## Run it now — real routing, no API keys (≈10s)
-
-The demo stands up a local server that speaks the Anthropic wire protocol, runs one **real** enforce-mode
-decision through the proxy (cheap model fails the gate → escalates → passes), prints the audit receipt, then
-reports a downstream outcome through the feedback API and shows it attach without breaking the chain:
+Routing itself is declarative TOML — routes → mode, a cheapest-first model ladder, and the gates that must pass. Start from [`firstpass.example.toml`](firstpass.example.toml):
 
 ```bash
-cargo run -p firstpass-proxy --example demo
+cp firstpass.example.toml firstpass.toml
+FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy
 ```
 
-```text
-served output : fn main() { println!("hello world"); }
-served model  : anthropic/claude-sonnet-5
-
-── audit receipt ──────────────────────────────────
-  rung 0 · anthropic/claude-haiku-4-5   · FAIL · $0.0023
-  rung 1 · anthropic/claude-sonnet-5    · PASS · $0.0063
-  ─────────────────────────────────────────────────
-  total     $0.0086
-  baseline  $0.0330   (always top-tier)
-  SAVED     $0.0244   (73% cheaper at proven quality)
-  chain     verified ✓
-feedback POST /v1/feedback → 202 (downstream outcome recorded)
-audit chain after feedback : still verified ✓ — the sealed record never changed
-```
-
-Everything there is real code over real HTTP; only the upstream is local, so no keys are needed. Point the
-same proxy at real providers and it behaves identically.
-
-**Run the proxy for real** (BYOK — your keys, zero markup):
-
-```bash
-cp firstpass.example.toml firstpass.toml            # declarative routes: ladder + gates per traffic slice
-FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml \
-  cargo run -p firstpass-proxy                      # or: docker build -t firstpass . && docker run -p 8080:8080 firstpass
-export ANTHROPIC_BASE_URL="http://localhost:8080"   # your agent already speaks this wire format
-# ...run your agent exactly as before. Offboard anytime: unset ANTHROPIC_BASE_URL
-```
-
-**Target install** (published artifacts — in progress): a single static binary in seconds via
-`curl … | sh`, `brew install`, `docker run firstpass/firstpass`, or `cargo install firstpass`.
-
-**Multi-provider:** first-class Anthropic and OpenAI clients today (Google + generic OpenAI-compatible next); a
-model is just a `provider/model` line in your ladder — adding one never means a rebuild or a retrain.
-
-## Plugs into anything that talks to an LLM
-
-Firstpass is **wire-compatible** — it speaks the provider APIs verbatim, so whatever you already run plugs in
-without a code change and unplugs the same way:
-
-- **Coding agents & IDE extensions** — one `base_url` env var (`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` / `GOOGLE_GEMINI_BASE_URL`).
-- **Headless & CI agents, serverless** — drop a Firstpass sidecar in front of provider traffic.
-- **In-process** — link the router as an embedded library instead of a network hop.
-- **Agent-native** — an MCP server exposes traces, capabilities, and the feedback API as tools.
-- **Humans & scripts** — a CLI (`firstpass up` / `doctor` / `trace`).
-
-It exposes the **Anthropic Messages**, **OpenAI Chat + Responses**, and **Google Gemini** surfaces, and passes
-through everything you send — **streaming (SSE), tool/function calling, multimodal, structured outputs** —
-faithfully. Gates run on the assembled output; the wire contract your agent uses never changes. BYOK, zero markup.
-
-## Proof over prediction — how Firstpass differs
-
-| | Decides… | Checks the actual output? | Audit receipt | New model onboarding |
-|---|---|---|---|---|
-| **Predictive routers** | before generation (predict) | ❌ never | ❌ | retrain / re-eval per model |
-| **Black-box orchestrators** | before generation (predict) | ❌ opaque | ❌ | proprietary |
-| **Model gateways** | by price/uptime rules | ❌ | partial logs | n/a (passthrough) |
-| **Firstpass** | **after** generation (verify) | ✅ **every request** | ✅ **tamper-evident** | **one line in the ladder, no retrain** |
-
-## What's actually new — stated honestly
-
-The cascade mechanism itself is **not** novel — "cheapest-first, verify, escalate" is well-established in the
-model-cascade research literature. We won't pretend otherwise. What no paper and no product has put together,
-and what Firstpass is built around, is three things:
-
-1. **Tamper-evident audit** of every routing decision and gate verdict — the exact thing black-box
-   orchestrators structurally cannot give a regulated buyer.
-2. **Outcome-feedback calibration** — the downstream truth (did the tests pass later?) flows back through a
-   feedback API and auto-tunes the gates. A static cascade becomes a self-improving one.
-3. **Zero-retrain onboarding** — a new frontier model ships monthly; predictive routers all need retraining.
-   Firstpass adds it as one line in the ladder and lets the gate decide.
-
-Lead with those, or a reviewer who knows the literature rightly calls it a cascade with a nicer UI. We lead with those.
+**Endpoints:** `POST /v1/messages` (drop-in) · `POST /v1/feedback` · `GET /v1/capabilities` · `GET /healthz`.
 
 ## Proof, not adjectives
 
-"Best" is a claim; we ship the machine that checks it. **`cargo run -p firstpass-bench`** is a
-pre-registered, baseline-controlled benchmark: every routing policy — always-cheap, always-top,
-random, a simulated predictive router, and Firstpass — runs on identical traffic through the same
-gate, with **bootstrap confidence intervals**, a **split-conformal serving guarantee**, and a
-**published kill criterion** that says *stop* if the thesis fails.
+<div align="center"><img src="assets/proof.svg" alt="Proof-harness simulation: ~65% cheaper at equal-or-higher success, 0.16 vs 0.46 served-failure versus a predictive router, ≤10% conformal served-failure at 95% confidence, kill criterion reads PROCEED" width="880"></div>
 
-On the current run (clearly-labeled **simulation** — real-provider numbers land in M0):
+The harness (`cargo run -p firstpass-bench`) runs against a **simulated** backend behind real-backend trait seams, and ships a **pre-registered kill criterion** that says *stop* if the thesis fails — bootstrap confidence intervals and a split-conformal served-failure guarantee, not a benchmark screenshot. Live-provider numbers are pending API keys.
 
-- **~65% cheaper per successful task** than always-top-tier, at *higher* success (multiple gated shots beat one blind shot)
-- **served-failure 0.16 vs 0.46** for a predictive router — verification catches what prediction serves blind
-- **conformal guarantee:** serve iff gate-score ≥ λ ⇒ **≤10% served-failure at 95% confidence** — a certificate, not a hope
-- **honest about the loss:** enforce-mode latency (observe mode adds **zero**; a deterministic gate in an agent loop adds no new call)
+## Roadmap
 
-These validate the *method*; swap the sim backend for real providers and the same harness produces
-real proof — a reproducible report with error bars and a kill switch, not a benchmark screenshot.
+- **M0 ✓** — proof harness: baselines, bootstrap CIs, conformal guarantee, pre-registered kill criterion.
+- **M1 ✓** — Rust proxy: Anthropic + OpenAI clients, observe **and** enforce, escalation, cross-provider failover, SQLite trace store — over real HTTP.
+- **M2 ✓** — gate framework: subprocess plugins, inline + schema gates, error-budget auto-disable, feedback API + deferred verdicts.
+- **M3 →** — live-provider proof, judge / self-consistency gates, published binaries + Homebrew tap, SSE streaming passthrough.
 
-## Built agent-first
+## Links
 
-Firstpass's primary user is an agent, and every surface is designed for one — not a human clicking a dashboard.
-Adoption is a one-env-var `base_url` swap on an OpenAI/Anthropic-wire-compatible proxy; config is declarative;
-traces are structured JSON with a re-derivable hash chain; verdicts are typed; errors are structured, never prose.
-A `GET /v1/capabilities` endpoint lets an agent learn the ladder, gates, and limits at runtime, and an optional
-MCP server exposes traces, verdicts, and the feedback API as tools so an agent can inspect and correct its own
-routing. Docs are agent-consumable by default ([`llms.txt`](llms.txt), [`AGENTS.md`](AGENTS.md)). Onboarding is
-self-serve and programmatic; offboarding is one reversible env var. See [SPEC.md §0.2](SPEC.md).
+[Website](https://dshakes.github.io/firstpass) · [SPEC](SPEC.md) · [Example config](firstpass.example.toml) · [Agent guide](AGENTS.md) · [llms.txt](llms.txt) · [License](LICENSE)
 
-## No lock-in, ever
-
-Firstpass sits *below* your harness as a `base_url` — it never replaces your agent framework. If the proxy
-is down or you don't like it, **unset one environment variable** and your harness talks to the providers
-directly again. BYOK (bring your own keys); we never mark up tokens. The escape hatch is a front-page promise,
-not fine print.
-
-## Roadmap (see [SPEC.md §16](SPEC.md))
-
-- **M0 ✓** — tier-clearance benchmark: baselines, bootstrap CIs, split-conformal serving guarantee, published kill criterion (simulation until wired to live providers).
-- **M1 ✓** — Rust proxy: Anthropic + OpenAI clients, static ladder, observe **and** enforce mode, escalation, cross-provider failover, SQLite trace store — verified over real HTTP.
-- **M2 ✓** — gate framework: subprocess plugin contract, inline + schema gates, error-budget auto-disable, feedback API + deferred verdicts (chain-preserving).
-- **M3** — live-provider proof numbers, judge/self-consistency gates, published binaries; dogfood on real agent traffic.
-- **M4 / M5** — learned routing (contextual bandit): shadow-eval → live, promotion gated on logged traces and the feedback signal.
-- **M6** — OSS launch.
-
-## Non-goals (what we deliberately don't do)
-
-Not a universal router (v0–v1 target workloads *where gates exist*). Not an inference provider or reseller
-(BYOK, zero token markup). Not an eval platform, not an agent framework, not a day-one trained coordinator.
-Firstpass does one thing: route to the cheapest model that provably passes, and prove it.
-
----
-
-<div align="center">
-
-**[Read the full spec →](SPEC.md)**
-
-*Proof over prediction.*
-
-</div>
+<div align="center"><sub>Proof over prediction. No competitor products named — Firstpass competes on evidence, not adjectives.</sub></div>

@@ -7,7 +7,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
 license = "Apache-2.0"
-repository = "https://github.com/firstpass/firstpass"
+repository = "https://github.com/dshakes/firstpass"
+homepage = "https://dshakes.github.io/firstpass"
 authors = ["Firstpass"]
 
 [workspace.dependencies]
@@ -40,6 +41,11 @@ firstpass-core = { path = "crates/firstpass-core" }
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 # Deny footguns across the workspace. Prod-grade: no silent unwrap-in-lib slop.
 [workspace.lints.clippy]

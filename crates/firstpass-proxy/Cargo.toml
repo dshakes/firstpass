@@ -1,11 +1,12 @@
 [package]
 name = "firstpass-proxy"
-description = "Firstpass observe-mode HTTP proxy: a drop-in base_url in front of Anthropic that forwards requests unchanged and records a tamper-evident audit trace."
+description = "Drop-in, Anthropic-compatible LLM proxy that routes each request to the cheapest model that provably passes a quality gate, escalates on failure, and records a tamper-evident audit trace."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage = "https://dshakes.github.io/firstpass"
 authors.workspace = true
 
 [[bin]]

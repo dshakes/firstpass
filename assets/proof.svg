@@ -1,0 +1,51 @@
+<svg viewBox="0 0 1000 340" xmlns="http://www.w3.org/2000/svg" role="img" preserveAspectRatio="xMidYMid meet" font-family="ui-sans-serif, -apple-system, Segoe UI, Roboto, sans-serif">
+  <title>Proof-harness results (simulation): about 65% cheaper at equal-or-higher success, 0.16 vs 0.46 served-failure rate versus a predictive router, and a conformal guarantee of at most 10% served-failure at 95% confidence — with a pre-registered kill criterion currently reading PROCEED</title>
+  <defs>
+    <filter id="pg" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect x="1.5" y="1.5" width="997" height="337" rx="16" fill="#0B0E14" stroke="#263449"/>
+
+  <!-- header -->
+  <text x="34" y="46" font-size="13" letter-spacing="2" fill="#19E3B1" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">PROOF, NOT ADJECTIVES</text>
+  <text x="34" y="72" font-size="19" font-weight="700" fill="#E6EDF3">A reproducible report with error bars and a kill switch.</text>
+  <!-- SIMULATION ribbon -->
+  <g>
+    <rect x="792" y="28" width="176" height="30" rx="8" fill="#2a2410" stroke="#7a6320"/>
+    <circle cx="812" cy="43" r="4" fill="#F5A623"/>
+    <text x="826" y="47" font-size="12" font-weight="700" fill="#F5A623" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">SIMULATION</text>
+  </g>
+
+  <!-- three stat panels -->
+  <g>
+    <!-- 1 -->
+    <rect x="34" y="98" width="296" height="150" rx="12" fill="#0c1614" stroke="#1c4b40"/>
+    <text x="52" y="164" font-size="52" font-weight="800" fill="#19E3B1" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">~65%</text>
+    <text x="52" y="196" font-size="13.5" font-weight="600" fill="#E6EDF3">cheaper at equal-or-higher success</text>
+    <text x="52" y="218" font-size="12.5" fill="#8A97A6">vs a predictive router, same task set</text>
+
+    <!-- 2 -->
+    <rect x="352" y="98" width="296" height="150" rx="12" fill="#0c1614" stroke="#1c4b40"/>
+    <text x="370" y="164" font-size="52" font-weight="800" fill="#19E3B1" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">0.16</text>
+    <text x="512" y="150" font-size="20" font-weight="700" fill="#FF5C5C" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">vs 0.46</text>
+    <text x="370" y="196" font-size="13.5" font-weight="600" fill="#E6EDF3">served-failure rate vs prediction</text>
+    <text x="370" y="218" font-size="12.5" fill="#8A97A6">verification catches what guessing serves</text>
+
+    <!-- 3 -->
+    <rect x="670" y="98" width="296" height="150" rx="12" fill="#0c1614" stroke="#1c4b40"/>
+    <text x="688" y="164" font-size="52" font-weight="800" fill="#19E3B1" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">≤10%</text>
+    <text x="688" y="196" font-size="13.5" font-weight="600" fill="#E6EDF3">conformal served-failure @ 95%</text>
+    <text x="688" y="218" font-size="12.5" fill="#8A97A6">a certificate, not a hope</text>
+  </g>
+
+  <!-- kill criterion bar -->
+  <g>
+    <rect x="34" y="266" width="932" height="46" rx="10" fill="#0F151C" stroke="#263449"/>
+    <rect x="34" y="266" width="4" height="46" rx="2" fill="#19E3B1"/>
+    <text x="54" y="294" font-size="13.5" fill="#8A97A6">Pre-registered <tspan fill="#E6EDF3" font-weight="600">kill criterion</tspan> — bootstrap CIs + split-conformal guarantee + a published go/no-go gate.</text>
+    <g>
+      <rect x="820" y="277" width="128" height="24" rx="12" fill="#0e211d" stroke="#1c4b40"/>
+      <circle cx="840" cy="289" r="4" fill="#19E3B1" filter="url(#pg)"/>
+      <text x="854" y="293" font-size="12" font-weight="700" fill="#19E3B1" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">verdict: PROCEED</text>
+    </g>
+  </g>
+</svg>
