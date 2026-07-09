@@ -178,14 +178,19 @@
         <rect x="812" y="184" width="152" height="52" rx="10" fill="#0b0b0c" stroke="#41505f"/>
         <text class="nt" x="888" y="215" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">OpenAI</text>
       </g>
-      <!-- escalate <-> providers -->
-      <path d="M728 150 C770 150 772 146 810 146" fill="none" stroke="#19E3B1" stroke-width="2" marker-end="url(#mkm)"/>
-      <text x="762" y="138" font-size="9.5" fill="#19E3B1">BYOK</text>
-      <path d="M810 210 C700 210 640 176 566 168" fill="none" stroke="#F5B544" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#mka)"/>
-      <text x="690" y="200" font-size="9.5" fill="#F5B544">output → re-gate</text>
+      <!-- provider bus: both providers share the call/return interface -->
+      <line x1="806" y1="146" x2="806" y2="210" stroke="#41505f" stroke-width="1.5"/>
+      <line x1="806" y1="146" x2="812" y2="146" stroke="#41505f" stroke-width="1.5"/>
+      <line x1="806" y1="210" x2="812" y2="210" stroke="#41505f" stroke-width="1.5"/>
+      <!-- escalate -> providers (call) -->
+      <path d="M728 150 L802 150" fill="none" stroke="#19E3B1" stroke-width="2" marker-end="url(#mkm)"/>
+      <text x="765" y="140" text-anchor="middle" font-size="9.5" fill="#19E3B1">call · BYOK</text>
+      <!-- providers -> gate: output returns to be gated, routed cleanly below the pipeline -->
+      <path d="M806 206 L576 206 C562 206 562 194 562 178" fill="none" stroke="#F5B544" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#mka)"/>
+      <text x="700" y="199" text-anchor="middle" font-size="9.5" fill="#F5B544">output → re-gate</text>
 
-      <!-- animated request packet -->
-      <circle r="5" fill="#38E8FF"><animateMotion dur="4.5s" repeatCount="indefinite" path="M184 214 C214 214 220 150 268 150 L398 150 L432 150 L562 150 L596 150 L728 150 C770 150 772 146 810 146"/></circle>
+      <!-- animated request packet: agent → router → gate → escalate → provider -->
+      <circle r="5" fill="#38E8FF"><animateMotion dur="4.5s" repeatCount="indefinite" path="M184 214 C214 214 220 150 268 150 L398 150 L432 150 L562 150 L596 150 L728 150 L802 150"/></circle>
     </svg>
     <div class="arch-cap" id="archCap"><span class="dot"></span><span class="hint">Hover a component to inspect it — router, gate, escalation, trace store, feedback, or a provider.</span></div>
   </div>
