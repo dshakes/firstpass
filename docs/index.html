@@ -19,7 +19,8 @@
   <a class="brand" href="#top"><svg class="dot" width="24" height="24" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0a1512"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#19E3B1" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
   <span class="sp"></span>
   <a class="nl" href="#decide">Watch it decide</a>
-  <a class="nl" href="#vs">Prediction vs proof</a>
+  <a class="nl" href="#vs">Why</a>
+  <a class="nl" href="#architecture">Architecture</a>
   <a class="nl" href="#install">Install</a>
   <a class="nl" href="usage.html">Docs</a>
   <a class="nl" href="https://github.com/dshakes/firstpass">GitHub ↗</a>
@@ -92,6 +93,91 @@
       <path d="M390 55 C390 25 660 25 660 55" fill="none" stroke="#FFB020" stroke-width="1.6" stroke-dasharray="4 3" opacity=".7"/>
       <text x="525" y="28" fill="#FFB020" font-size="11" text-anchor="middle">escalate on fail</text>
     </svg>
+  </div>
+</div></section>
+
+<section id="architecture"><div class="wrap reveal">
+  <p class="eyebrow">system architecture</p>
+  <h2>One hop between your agent<br>and every provider.</h2>
+  <p class="lead">Firstpass sits inline as a drop-in proxy. Hover any component to see what it does.</p>
+  <div class="arch" id="arch">
+    <svg viewBox="0 0 1000 430" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" aria-label="Firstpass system architecture: agents connect through the Firstpass proxy — router, gate engine, escalation and failover, trace store, and feedback API — to multiple providers.">
+      <defs>
+        <marker id="mk" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#5a6b78"/></marker>
+        <marker id="mkm" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#19E3B1"/></marker>
+        <marker id="mka" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#F5B544"/></marker>
+      </defs>
+
+      <!-- zone labels -->
+      <text x="112" y="34" text-anchor="middle" font-size="11" letter-spacing="1.5" fill="#6a6a6f">AGENTS</text>
+      <text x="500" y="34" text-anchor="middle" font-size="11" letter-spacing="1.5" fill="#19E3B1">FIRSTPASS PROXY</text>
+      <text x="888" y="34" text-anchor="middle" font-size="11" letter-spacing="1.5" fill="#6a6a6f">PROVIDERS</text>
+
+      <!-- proxy container -->
+      <rect x="246" y="52" width="508" height="346" rx="16" fill="rgba(25,227,177,.03)" stroke="#1c4b40"/>
+
+      <!-- Agent -->
+      <g class="node" data-t="Your agent" data-d="Any client that already speaks the Anthropic Messages API — Claude Code, an SDK, or your own app. You just point ANTHROPIC_BASE_URL at Firstpass.">
+        <rect x="34" y="176" width="150" height="88" rx="12" fill="#0b0b0c" stroke="#2b2b30"/>
+        <text class="nt" x="109" y="212" text-anchor="middle" font-size="14" font-weight="700" fill="#EDEDED">Your agent</text>
+        <text x="109" y="232" text-anchor="middle" font-size="10.5" fill="#9a9a9e">Anthropic wire</text>
+      </g>
+      <path d="M184 214 C214 214 220 150 268 150" fill="none" stroke="#5a6b78" stroke-width="2" marker-end="url(#mk)"/>
+      <text x="214" y="140" font-size="9.5" fill="#6a6a6f">base_url</text>
+
+      <!-- pipeline: Router -> Gate -> Escalate -->
+      <g class="node" data-t="Router" data-d="Picks the cheapest rung of a declarative model ladder for this route (matched by agent, task, or language). First match wins.">
+        <rect x="270" y="124" width="128" height="52" rx="10" fill="#101011" stroke="#2b2b30"/>
+        <text class="nt" x="334" y="147" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Router</text>
+        <text x="334" y="163" text-anchor="middle" font-size="9.5" fill="#9a9a9e">cheapest first</text>
+      </g>
+      <path d="M398 150 L432 150" fill="none" stroke="#5a6b78" stroke-width="2" marker-end="url(#mk)"/>
+      <g class="node" data-t="Gate engine" data-d="Runs a real gate on the real output — inline (non-empty, JSON, JSON-Schema) or your own subprocess plugin (tests, linter, judge) fed on stdin. Flaky gates auto-disable on an error budget.">
+        <rect x="434" y="124" width="128" height="52" rx="10" fill="#101011" stroke="#3a4a61"/>
+        <text class="nt" x="498" y="147" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Gate engine</text>
+        <text x="498" y="163" text-anchor="middle" font-size="9.5" fill="#9a9a9e">test the output</text>
+      </g>
+      <path d="M562 150 L596 150" fill="none" stroke="#5a6b78" stroke-width="2" marker-end="url(#mk)"/>
+      <g class="node" data-t="Escalate + failover" data-d="On a gate fail, escalate exactly one rung — budget-capped. A provider 5xx abstains and fails over to the next rung, which can be a different provider.">
+        <rect x="598" y="124" width="130" height="52" rx="10" fill="#101011" stroke="#2b2b30"/>
+        <text class="nt" x="663" y="145" text-anchor="middle" font-size="12.5" font-weight="600" fill="#EDEDED">Escalate</text>
+        <text x="663" y="162" text-anchor="middle" font-size="9.5" fill="#F5B544">+ failover</text>
+      </g>
+
+      <!-- record layer: Trace store + Feedback -->
+      <g class="node" data-t="Trace store" data-d="Every decision is written off the hot path to a SQLite store as a hash-chained JSON trace — re-derivable by an external auditor. Zero added latency on the request path.">
+        <rect x="270" y="256" width="196" height="60" rx="10" fill="#0d141b" stroke="#2b2b30"/>
+        <text class="nt" x="368" y="281" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Trace store</text>
+        <text x="368" y="299" text-anchor="middle" font-size="9.5" fill="#19E3B1">SQLite · hash-chain</text>
+      </g>
+      <g class="node" data-t="Feedback API" data-d="POST /v1/feedback folds downstream outcomes (did the tests pass an hour later?) back onto a trace via a deferred-verdict side table — never altering the sealed record.">
+        <rect x="490" y="256" width="160" height="60" rx="10" fill="#0d141b" stroke="#2b2b30"/>
+        <text class="nt" x="570" y="281" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Feedback API</text>
+        <text x="570" y="299" text-anchor="middle" font-size="9.5" fill="#9a9a9e">/v1/feedback</text>
+      </g>
+      <!-- pipeline -> record -->
+      <path d="M334 176 L360 250" fill="none" stroke="#2b3f52" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#mk)"/>
+      <path d="M498 176 L520 250" fill="none" stroke="#2b3f52" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#mk)"/>
+
+      <!-- providers -->
+      <g class="node" data-t="Anthropic" data-d="Upstream provider adapter for the Anthropic Messages API. BYOK — your key passes through, redacted from every log.">
+        <rect x="812" y="120" width="152" height="52" rx="10" fill="#0b0b0c" stroke="#2b2b30"/>
+        <text class="nt" x="888" y="151" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Anthropic</text>
+      </g>
+      <g class="node" data-t="OpenAI" data-d="Upstream provider adapter for the OpenAI Chat Completions API. Ladders can mix providers; failover crosses provider boundaries.">
+        <rect x="812" y="184" width="152" height="52" rx="10" fill="#0b0b0c" stroke="#2b2b30"/>
+        <text class="nt" x="888" y="215" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">OpenAI</text>
+      </g>
+      <!-- escalate <-> providers -->
+      <path d="M728 150 C770 150 772 146 810 146" fill="none" stroke="#19E3B1" stroke-width="2" marker-end="url(#mkm)"/>
+      <text x="762" y="138" font-size="9.5" fill="#19E3B1">BYOK</text>
+      <path d="M810 210 C700 210 640 176 566 168" fill="none" stroke="#F5B544" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#mka)"/>
+      <text x="690" y="200" font-size="9.5" fill="#F5B544">output → re-gate</text>
+
+      <!-- animated request packet -->
+      <circle r="5" fill="#38E8FF"><animateMotion dur="4.5s" repeatCount="indefinite" path="M184 214 C214 214 220 150 268 150 L398 150 L432 150 L562 150 L596 150 L728 150 C770 150 772 146 810 146"/></circle>
+    </svg>
+    <div class="arch-cap" id="archCap"><span class="dot"></span><span class="hint">Hover a component to inspect it — router, gate, escalation, trace store, feedback, or a provider.</span></div>
   </div>
 </div></section>
 
@@ -231,6 +317,24 @@ document.querySelectorAll('#inst .tab').forEach(tab=>tab.onclick=()=>{
 
 // ── copy buttons ──
 document.querySelectorAll('.copy').forEach(b=>b.onclick=()=>navigator.clipboard.writeText(b.dataset.copy).then(()=>{const o=b.textContent;b.textContent='copied ✓';setTimeout(()=>b.textContent=o,1200);}));
+
+// ── cursor-tracked spotlight on cards ──
+document.querySelectorAll('.card').forEach(c=>c.addEventListener('pointermove',e=>{
+  const r=c.getBoundingClientRect();
+  c.style.setProperty('--mx',((e.clientX-r.left)/r.width*100)+'%');
+  c.style.setProperty('--my',((e.clientY-r.top)/r.height*100)+'%');
+}));
+
+// ── interactive architecture diagram ──
+const arch=document.getElementById('arch'), archCap=document.getElementById('archCap');
+const archIdle='<span class="dot"></span><span class="hint">Hover a component to inspect it — router, gate, escalation, trace store, feedback, or a provider.</span>';
+if(arch){
+  arch.querySelectorAll('.node').forEach(n=>n.addEventListener('pointerenter',()=>{
+    arch.classList.add('dim');
+    archCap.innerHTML='<span class="dot"></span><span><b>'+n.dataset.t+'</b> &nbsp;'+n.dataset.d+'</span>';
+  }));
+  arch.addEventListener('pointerleave',()=>{arch.classList.remove('dim');archCap.innerHTML=archIdle;});
+}
 </script>
 </body>
 </html>
