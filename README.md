@@ -49,12 +49,11 @@ To turn on cheapest-first routing + gating, copy [`firstpass.example.toml`](firs
 
 | Method | Command |
 | --- | --- |
-| **Homebrew** | `brew install dshakes/tap/firstpass-proxy` |
 | **curl \| sh** | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh \| sh` |
 | **Docker** | `docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest` |
 | **From source** | `cargo install --git https://github.com/dshakes/firstpass firstpass-proxy` |
 
-> Homebrew, the `curl \| sh` installer, and prebuilt binaries (macOS · Linux · Windows, all checksummed) are produced by [cargo-dist](https://opensource.axo.dev/cargo-dist/) and attach to each [GitHub Release](https://github.com/dshakes/firstpass/releases). The container image is published to [GHCR](https://github.com/dshakes/firstpass/pkgs/container/firstpass) on every push to `main`. `cargo install --git` and the Docker image work today; the release-gated channels light up with the first tagged release.
+> The `curl \| sh` installer and prebuilt binaries (macOS · Linux · Windows, all checksummed) are produced by [cargo-dist](https://opensource.axo.dev/cargo-dist/) and attach to each [GitHub Release](https://github.com/dshakes/firstpass/releases). The container image is published to [GHCR](https://github.com/dshakes/firstpass/pkgs/container/firstpass) on every push to `main`. Homebrew is planned (needs a formula tap). `cargo install --git` and Docker work today.
 
 ## Prediction vs. proof
 
@@ -64,7 +63,7 @@ Model routers on the market route by **prediction** — a learned policy guesses
 
 ## How it works
 
-<div align="center"><img src="assets/flow.svg" alt="A request hits the cheapest rung, fails the gate, escalates one rung, passes, and is served — every decision logged to the audit trace" width="840"></div>
+<div align="center"><img src="assets/how.svg" alt="A request hits the cheapest rung, fails the gate, escalates one rung, passes, and is served — every decision logged to the audit trace" width="840"></div>
 
 1. **Route** to the cheapest rung of a declarative ladder. BYOK — your keys pass through, redacted from every log.
 2. **Gate** the real output: inline (non-empty, JSON, [JSON-Schema](SPEC.md)) or subprocess plugins (your tests/linter/judge) that read the candidate on **stdin, never argv** — injection-resistant. Per-gate error budgets auto-disable a flaky gate.

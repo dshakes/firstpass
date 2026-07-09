@@ -7,10 +7,8 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
-# Homebrew formula is published to this tap repo (requires a HOMEBREW_TAP_TOKEN secret).
-tap = "dshakes/homebrew-tap"
-publish-jobs = ["homebrew"]
+# The installers to generate for each app. Homebrew is deferred until a tap repo +
+# HOMEBREW_TAP_TOKEN secret exist — re-add "homebrew" + `tap`/`publish-jobs` then.
+installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
