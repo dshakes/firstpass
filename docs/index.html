@@ -81,19 +81,7 @@
     <div class="card"><div class="kicker">◈</div><h3>Gate</h3><p>Run a real gate on the real output — inline or your own subprocess plugin, fed on <b>stdin not argv</b> (injection-resistant). Flaky gates auto-disable on an error budget.</p></div>
     <div class="card"><div class="kicker">↑</div><h3>Escalate &amp; seal</h3><p>One rung up on failure, budget-capped; a provider 5xx fails over. The decision becomes a <b>tamper-evident hash-chain trace</b> anyone can re-derive.</p></div>
   </div>
-  <div class="pipe" aria-hidden="true">
-    <svg viewBox="0 0 1000 150" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,Menlo,monospace">
-      <defs>
-        <linearGradient id="wire" x1="0" x2="1"><stop offset="0" stop-color="#19E3B1"/><stop offset="1" stop-color="#38E8FF"/></linearGradient>
-      </defs>
-      <line x1="120" y1="75" x2="880" y2="75" stroke="url(#wire)" stroke-width="2" opacity=".4"/>
-      <circle r="6" fill="#19E3B1"><animateMotion dur="4s" repeatCount="indefinite" path="M120,75 L880,75" keyPoints="0;0.28;0.28;0.62;0.62;1" keyTimes="0;0.2;0.4;0.55;0.72;1" calcMode="linear"/><animate attributeName="fill" values="#19E3B1;#19E3B1;#FF5A6A;#FFB020;#19E3B1;#19E3B1" keyTimes="0;0.2;0.4;0.55;0.72;1" dur="4s" repeatCount="indefinite"/></circle>
-      <g fill="#0a1512" stroke="#2a4a44"><rect x="60" y="55" width="120" height="40" rx="9"/><rect x="330" y="55" width="120" height="40" rx="9"/><rect x="600" y="55" width="120" height="40" rx="9"/><rect x="820" y="55" width="150" height="40" rx="9"/></g>
-      <g fill="#EAF6F3" font-size="13" text-anchor="middle"><text x="120" y="80">request</text><text x="390" y="80" fill="#19E3B1">rung 0</text><text x="660" y="80" fill="#38E8FF">gate</text><text x="895" y="80" fill="#19E3B1">served ✓</text></g>
-      <path d="M390 55 C390 25 660 25 660 55" fill="none" stroke="#FFB020" stroke-width="1.6" stroke-dasharray="4 3" opacity=".7"/>
-      <text x="525" y="28" fill="#FFB020" font-size="11" text-anchor="middle">escalate on fail</text>
-    </svg>
-  </div>
+  <div class="pipe"><img src="assets/how.svg" alt="Route to the cheapest model, gate its real output, escalate one rung only on failure, serve, and log every decision to a hash-chained audit trace." loading="lazy"></div>
 </div></section>
 
 <section id="architecture"><div class="wrap reveal">
