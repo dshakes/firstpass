@@ -26,7 +26,18 @@
   <a class="nl" href="usage.html">Docs</a>
   <a class="nl" href="https://github.com/dshakes/firstpass">GitHub ↗</a>
   <a class="btn primary" href="#install">Run the demo</a>
-</nav></div></header>
+  <button class="menu-btn" id="menuBtn" aria-label="Open menu" aria-expanded="false">☰</button>
+</nav></div>
+  <div class="mobile-menu" id="mobileMenu">
+    <a class="demo" href="#install">⚡ Run the demo — no keys</a>
+    <a href="#decide">Watch it decide</a>
+    <a href="#vs">Why</a>
+    <a href="#architecture">Architecture</a>
+    <a href="#install">Install</a>
+    <a href="usage.html">Docs</a>
+    <a href="https://github.com/dshakes/firstpass">GitHub ↗</a>
+  </div>
+</header>
 
 <main id="top">
 <section class="hero"><div class="hero-glow" id="heroGlow"></div><div class="wrap">
@@ -351,6 +362,14 @@ document.querySelectorAll('.use').forEach(c=>c.addEventListener('pointermove',e=
 // ── animated "sealed" stamp on the receipt ──
 const seal=document.getElementById('seal');
 if(seal){const so2=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){seal.classList.add('in');so2.unobserve(seal);}}),{threshold:.6});so2.observe(seal);}
+
+// ── mobile menu ──
+const menuBtn=document.getElementById('menuBtn'), mobileMenu=document.getElementById('mobileMenu');
+if(menuBtn&&mobileMenu){
+  const toggle=(open)=>{mobileMenu.classList.toggle('open',open);menuBtn.textContent=open?'✕':'☰';menuBtn.setAttribute('aria-expanded',open);};
+  menuBtn.addEventListener('click',()=>toggle(!mobileMenu.classList.contains('open')));
+  mobileMenu.querySelectorAll('a').forEach(a=>a.addEventListener('click',()=>toggle(false)));
+}
 </script>
 </body>
 </html>
