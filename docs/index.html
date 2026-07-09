@@ -128,7 +128,7 @@
 
       <!-- Agent -->
       <g class="node" data-t="Your agent" data-d="Any client that already speaks the Anthropic Messages API — Claude Code, an SDK, or your own app. You just point ANTHROPIC_BASE_URL at Firstpass.">
-        <rect x="34" y="176" width="150" height="88" rx="12" fill="#0b0b0c" stroke="#2b2b30"/>
+        <rect x="34" y="176" width="150" height="88" rx="12" fill="#0b0b0c" stroke="#41505f"/>
         <text class="nt" x="109" y="212" text-anchor="middle" font-size="14" font-weight="700" fill="#EDEDED">Your agent</text>
         <text x="109" y="232" text-anchor="middle" font-size="10.5" fill="#9a9a9e">Anthropic wire</text>
       </g>
@@ -137,31 +137,31 @@
 
       <!-- pipeline: Router -> Gate -> Escalate -->
       <g class="node" data-t="Router" data-d="Picks the cheapest rung of a declarative model ladder for this route (matched by agent, task, or language). First match wins.">
-        <rect x="270" y="124" width="128" height="52" rx="10" fill="#101011" stroke="#2b2b30"/>
+        <rect x="270" y="124" width="128" height="52" rx="10" fill="#101011" stroke="#41505f"/>
         <text class="nt" x="334" y="147" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Router</text>
         <text x="334" y="163" text-anchor="middle" font-size="9.5" fill="#9a9a9e">cheapest first</text>
       </g>
       <path d="M398 150 L432 150" fill="none" stroke="#5a6b78" stroke-width="2" marker-end="url(#mk)"/>
       <g class="node" data-t="Gate engine" data-d="Runs a real gate on the real output — inline (non-empty, JSON, JSON-Schema) or your own subprocess plugin (tests, linter, judge) fed on stdin. Flaky gates auto-disable on an error budget.">
-        <rect x="434" y="124" width="128" height="52" rx="10" fill="#101011" stroke="#3a4a61"/>
+        <rect x="434" y="124" width="128" height="52" rx="10" fill="#101011" stroke="#51637d"/>
         <text class="nt" x="498" y="147" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Gate engine</text>
         <text x="498" y="163" text-anchor="middle" font-size="9.5" fill="#9a9a9e">test the output</text>
       </g>
       <path d="M562 150 L596 150" fill="none" stroke="#5a6b78" stroke-width="2" marker-end="url(#mk)"/>
       <g class="node" data-t="Escalate + failover" data-d="On a gate fail, escalate exactly one rung — budget-capped. A provider 5xx abstains and fails over to the next rung, which can be a different provider.">
-        <rect x="598" y="124" width="130" height="52" rx="10" fill="#101011" stroke="#2b2b30"/>
+        <rect x="598" y="124" width="130" height="52" rx="10" fill="#101011" stroke="#41505f"/>
         <text class="nt" x="663" y="145" text-anchor="middle" font-size="12.5" font-weight="600" fill="#EDEDED">Escalate</text>
         <text x="663" y="162" text-anchor="middle" font-size="9.5" fill="#F5B544">+ failover</text>
       </g>
 
       <!-- record layer: Trace store + Feedback -->
       <g class="node" data-t="Trace store" data-d="Every decision is written off the hot path to a SQLite store as a hash-chained JSON trace — re-derivable by an external auditor. Zero added latency on the request path.">
-        <rect x="270" y="256" width="196" height="60" rx="10" fill="#0d141b" stroke="#2b2b30"/>
+        <rect x="270" y="256" width="196" height="60" rx="10" fill="#0d141b" stroke="#41505f"/>
         <text class="nt" x="368" y="281" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Trace store</text>
         <text x="368" y="299" text-anchor="middle" font-size="9.5" fill="#19E3B1">SQLite · hash-chain</text>
       </g>
       <g class="node" data-t="Feedback API" data-d="POST /v1/feedback folds downstream outcomes (did the tests pass an hour later?) back onto a trace via a deferred-verdict side table — never altering the sealed record.">
-        <rect x="490" y="256" width="160" height="60" rx="10" fill="#0d141b" stroke="#2b2b30"/>
+        <rect x="490" y="256" width="160" height="60" rx="10" fill="#0d141b" stroke="#41505f"/>
         <text class="nt" x="570" y="281" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Feedback API</text>
         <text x="570" y="299" text-anchor="middle" font-size="9.5" fill="#9a9a9e">/v1/feedback</text>
       </g>
@@ -171,11 +171,11 @@
 
       <!-- providers -->
       <g class="node" data-t="Anthropic" data-d="Upstream provider adapter for the Anthropic Messages API. BYOK — your key passes through, redacted from every log.">
-        <rect x="812" y="120" width="152" height="52" rx="10" fill="#0b0b0c" stroke="#2b2b30"/>
+        <rect x="812" y="120" width="152" height="52" rx="10" fill="#0b0b0c" stroke="#41505f"/>
         <text class="nt" x="888" y="151" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Anthropic</text>
       </g>
       <g class="node" data-t="OpenAI" data-d="Upstream provider adapter for the OpenAI Chat Completions API. Ladders can mix providers; failover crosses provider boundaries.">
-        <rect x="812" y="184" width="152" height="52" rx="10" fill="#0b0b0c" stroke="#2b2b30"/>
+        <rect x="812" y="184" width="152" height="52" rx="10" fill="#0b0b0c" stroke="#41505f"/>
         <text class="nt" x="888" y="215" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">OpenAI</text>
       </g>
       <!-- escalate <-> providers -->
