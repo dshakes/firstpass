@@ -1,0 +1,35 @@
+# Firstpass routing config — copy to `firstpass.toml`, point FIRSTPASS_CONFIG at it.
+#
+#   FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml \
+#   cargo run -p firstpass-proxy
+#
+# Routes are matched top-to-bottom; the first match wins. Each route binds a slice
+# of traffic to a mode, a model ladder (cheapest first), and the gates that must pass.
+
+[[route]]
+match = { agent = "claude-code", subagent = ["test-runner", "explore"] }
+mode  = "enforce"
+ladder = ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
+gates  = ["schema", "judge-diff"]
+
+[[route]]
+match = { task_kind = "code_edit" }
+mode  = "enforce"
+ladder = ["anthropic/claude-sonnet-5", "anthropic/claude-opus-4-8"]
+gates  = ["patch-applies", "lint-diff", "judge-diff"]
+deferred_gates = ["compiles", "tests"]
+
+[[route]]
+match = {}
+mode  = "observe"
+ladder = ["anthropic/claude-opus-4-8"]
+
+[budget]
+per_request_usd = 0.50
+per_session_usd = 10.00
+per_day_usd     = 250.00
+on_exhausted    = "serve_best_attempt"
+
+[escalation]
+max_rungs_per_request = 3
+session_promotion = { after_failures = 3, window = "30m" }

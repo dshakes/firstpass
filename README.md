@@ -16,6 +16,8 @@ Proof over prediction. Built for agent fleets.
 [![rust](https://img.shields.io/badge/rust-1.93%2B-orange)](rust-toolchain.toml)
 [![spec](https://img.shields.io/badge/spec-v0.1-informational)](SPEC.md)
 
+**[Landing site →](https://dshakes.github.io/firstpass/)**  ·  [SPEC](SPEC.md)  ·  [example config](firstpass.example.toml)
+
 </div>
 
 ---
@@ -134,7 +136,9 @@ same proxy at real providers and it behaves identically.
 **Run the proxy for real** (BYOK — your keys, zero markup):
 
 ```bash
-cargo run -p firstpass-proxy                        # or: docker build -t firstpass . && docker run -p 8080:8080 firstpass
+cp firstpass.example.toml firstpass.toml            # declarative routes: ladder + gates per traffic slice
+FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml \
+  cargo run -p firstpass-proxy                      # or: docker build -t firstpass . && docker run -p 8080:8080 firstpass
 export ANTHROPIC_BASE_URL="http://localhost:8080"   # your agent already speaks this wire format
 # ...run your agent exactly as before. Offboard anytime: unset ANTHROPIC_BASE_URL
 ```

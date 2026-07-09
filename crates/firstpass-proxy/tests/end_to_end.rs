@@ -18,11 +18,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use bytes::Bytes;
-use firstpass_core::{verify_chain, ServedFrom, Verdict, GENESIS_HASH};
+use firstpass_core::{GENESIS_HASH, ServedFrom, Verdict, verify_chain};
 use firstpass_proxy::provider::ProviderRegistry;
 use firstpass_proxy::proxy::AppState;
-use firstpass_proxy::{app, store, ProxyConfig};
-use serde_json::{json, Value};
+use firstpass_proxy::{ProxyConfig, app, store};
+use serde_json::{Value, json};
 
 /// A faithful local stand-in for the frontier providers. Behaviour is keyed on the requested
 /// model so a single server can drive escalation and failover scenarios:

@@ -18,11 +18,11 @@ use std::time::Duration;
 use axum::routing::post;
 use axum::{Json, Router};
 use bytes::Bytes;
-use firstpass_core::{verify_chain, GENESIS_HASH};
+use firstpass_core::{GENESIS_HASH, verify_chain};
 use firstpass_proxy::provider::ProviderRegistry;
 use firstpass_proxy::proxy::AppState;
-use firstpass_proxy::{app, store, ProxyConfig};
-use serde_json::{json, Value};
+use firstpass_proxy::{ProxyConfig, app, store};
+use serde_json::{Value, json};
 
 #[tokio::main]
 async fn main() {
