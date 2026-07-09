@@ -53,7 +53,16 @@
   <a class="nl" href="usage.html">Docs</a>
   <a class="nl" href="https://github.com/dshakes/firstpass">GitHub ↗</a>
   <a class="btn primary" href="index.html#install">Run the demo</a>
-</nav></div></header>
+  <button class="menu-btn" id="menuBtn" aria-label="Open menu" aria-expanded="false">☰</button>
+</nav></div>
+  <div class="mobile-menu" id="mobileMenu">
+    <a class="demo" href="index.html#install">⚡ Run the demo</a>
+    <a href="index.html">Home</a>
+    <a href="index.html#vs">Why</a>
+    <a href="usage.html">Docs</a>
+    <a href="https://github.com/dshakes/firstpass">GitHub ↗</a>
+  </div>
+</header>
 
 <div class="wrap"><div class="doc">
   <aside class="side-nav" aria-label="Docs navigation">
@@ -186,6 +195,14 @@ const so=new IntersectionObserver((es)=>es.forEach(e=>{
 }),{rootMargin:'-70px 0px -70% 0px'});
 document.querySelectorAll('.doc-main h2[id]').forEach(h=>so.observe(h));
 document.querySelectorAll('.copy').forEach(b=>b.onclick=()=>navigator.clipboard.writeText(b.dataset.copy).then(()=>{const o=b.textContent;b.textContent='copied ✓';setTimeout(()=>b.textContent=o,1200);}));
+
+// mobile menu
+const menuBtn=document.getElementById('menuBtn'), mobileMenu=document.getElementById('mobileMenu');
+if(menuBtn&&mobileMenu){
+  const toggle=(open)=>{mobileMenu.classList.toggle('open',open);menuBtn.textContent=open?'✕':'☰';menuBtn.setAttribute('aria-expanded',open);};
+  menuBtn.addEventListener('click',()=>toggle(!mobileMenu.classList.contains('open')));
+  mobileMenu.querySelectorAll('a').forEach(a=>a.addEventListener('click',()=>toggle(false)));
+}
 </script>
 </body>
 </html>
