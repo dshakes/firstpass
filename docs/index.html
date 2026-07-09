@@ -136,12 +136,10 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
 
   <h3 style="margin:40px 0 0;font-size:16px;font-weight:600;color:var(--mut)">Or install the proxy</h3>
   <div class="inst" id="inst">
-    <div class="tab on" data-t="brew"><span class="i">🍺</span> Homebrew</div>
-    <div class="tab" data-t="curl"><span class="i">⬇</span> curl | sh</div>
+    <div class="tab on" data-t="curl"><span class="i">⬇</span> curl | sh</div>
     <div class="tab" data-t="docker"><span class="i">🐳</span> Docker</div>
     <div class="tab" data-t="cargo"><span class="i">🦀</span> Cargo</div>
-    <div class="panel on" data-p="brew"><div class="code"><button class="copy" data-copy="brew install dshakes/tap/firstpass-proxy">copy</button><pre style="margin:0">brew install dshakes/tap/firstpass-proxy</pre></div><p style="color:var(--mut2);font-size:12.5px;margin:12px 0 0">Formula publishes with the first tagged release.</p></div>
-    <div class="panel" data-p="curl"><div class="code"><button class="copy" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh">copy</button><pre style="margin:0"><span class="cy">curl</span> --proto '=https' --tlsv1.2 -LsSf \
+    <div class="panel on" data-p="curl"><div class="code"><button class="copy" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh">copy</button><pre style="margin:0"><span class="cy">curl</span> --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh <span class="a">|</span> sh</pre></div></div>
     <div class="panel" data-p="docker"><div class="code"><button class="copy" data-copy="docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest">copy</button><pre style="margin:0"><span class="cy">docker</span> run -p 8080:8080 <span class="a">-e</span> FIRSTPASS_BIND=0.0.0.0:8080 \
   ghcr.io/dshakes/firstpass:latest</pre></div></div>
