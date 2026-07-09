@@ -1,326 +1,238 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Firstpass — proof over prediction for LLM routing</title>
-<meta name="description" content="Firstpass routes every LLM request to the cheapest model that provably passes your quality gate, and hands you a signed receipt for the decision. Proof over prediction. Built for agent fleets.">
+<title>Firstpass — the autonomous LLM router that proves it before it serves it</title>
+<meta name="description" content="Firstpass sends every request to the cheapest model, proves the output passes your gate, and escalates only on failure — with a signed receipt for every decision. Proof over prediction.">
 <meta property="og:title" content="Firstpass — proof over prediction">
-<meta property="og:description" content="The cheapest model takes the first pass. It clears your gate — proven, not guessed — or the request escalates.">
-<meta property="og:type" content="website">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230B0F14'/><path d='M8 20 L14 12 L19 17 L24 10' fill='none' stroke='%2319E3B1' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<style>
-  /* Switchyard theme — ink + signal-mint. */
-  :root{
-    --mint:#19E3B1; --mint-ink:#0a3d30;
-    --amber:#F5A623; --red:#FF5C5C;
-    --bg:#0B0F14; --bg-2:#0F151C; --card:#121a22; --card-2:#0d141b;
-    --line:#20303c; --line-2:#2b3f4e;
-    --ink:#E8F1F0; --ink-2:#9fb2b3; --ink-3:#6f8385;
-    --radius:14px; --maxw:1080px;
-    --shadow:0 1px 0 rgba(255,255,255,.02) inset, 0 18px 50px -24px rgba(0,0,0,.7);
-    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
-    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
-  }
-  :root[data-theme="light"]{
-    --bg:#F7FAF9; --bg-2:#eef4f2; --card:#ffffff; --card-2:#f3f7f6;
-    --line:#dbe6e3; --line-2:#c6d6d2;
-    --ink:#0c1a17; --ink-2:#3f5651; --ink-3:#6b827c; --mint-ink:#0a3d30;
-    --shadow:0 1px 0 rgba(255,255,255,.6) inset, 0 18px 40px -26px rgba(16,40,34,.35);
-  }
-  *{box-sizing:border-box}
-  html{scroll-behavior:smooth}
-  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
-  body{margin:0;background:radial-gradient(1200px 600px at 78% -8%,rgba(25,227,177,.10),transparent 60%),var(--bg);
-    color:var(--ink);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-  a{color:inherit;text-decoration:none}
-  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 22px}
-  .mint{color:var(--mint)}
-  .mono{font-family:var(--mono)}
-  h1,h2,h3{line-height:1.14;letter-spacing:-.02em;margin:0}
-  section{padding:72px 0;border-top:1px solid var(--line)}
-  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--mint);margin:0 0 14px}
-  .sub{color:var(--ink-2);font-size:18px;max-width:62ch}
-
-  /* nav */
-  header{position:sticky;top:0;z-index:50;backdrop-filter:blur(10px);
-    background:color-mix(in srgb,var(--bg) 82%,transparent);border-bottom:1px solid var(--line)}
-  nav{display:flex;align-items:center;gap:18px;height:60px}
-  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.02em}
-  .brand svg{display:block}
-  nav .spacer{flex:1}
-  nav a.navlink{color:var(--ink-2);font-size:14px;padding:6px 2px;border-bottom:2px solid transparent}
-  nav a.navlink:hover{color:var(--ink)}
-  @media (max-width:720px){nav a.navlink:not(.cta){display:none}}
-  .iconbtn{cursor:pointer;background:var(--card);border:1px solid var(--line);color:var(--ink-2);
-    width:34px;height:34px;border-radius:9px;display:grid;place-items:center;font-size:15px}
-  .iconbtn:hover{color:var(--ink);border-color:var(--line-2)}
-
-  /* buttons */
-  .btn{display:inline-flex;align-items:center;gap:9px;font-weight:600;font-size:15px;
-    padding:11px 18px;border-radius:11px;border:1px solid var(--line-2);background:var(--card);transition:.15s}
-  .btn:hover{border-color:var(--mint);transform:translateY(-1px)}
-  .btn.primary{background:var(--mint);color:#04120d;border-color:var(--mint)}
-  .btn.primary:hover{box-shadow:0 10px 30px -10px rgba(25,227,177,.6)}
-  .btn:focus-visible,a:focus-visible,.iconbtn:focus-visible{outline:2px solid var(--mint);outline-offset:2px}
-
-  /* hero */
-  .hero{padding:64px 0 36px;border-top:0}
-  .badges{display:flex;flex-wrap:wrap;gap:8px;margin:22px 0 0}
-  .pill{font-family:var(--mono);font-size:12px;color:var(--ink-2);background:var(--card);
-    border:1px solid var(--line);border-radius:999px;padding:5px 11px}
-  .pill b{color:var(--mint);font-weight:600}
-  h1.title{font-size:clamp(34px,5.4vw,58px);font-weight:800;margin:10px 0 0}
-  .lede{font-size:clamp(18px,2.2vw,22px);color:var(--ink);max-width:40ch;margin:20px 0 0;font-weight:500}
-  .lede .q{color:var(--ink-2);font-weight:400}
-  .cta{display:flex;flex-wrap:wrap;gap:12px;margin:26px 0 0}
-  .heroart{margin:34px 0 0;border:1px solid var(--line);border-radius:var(--radius);background:var(--card-2);
-    padding:18px;box-shadow:var(--shadow)}
-  .heroart img{width:100%;height:auto;display:block}
-
-  /* honest banner */
-  .honest{display:flex;gap:12px;align-items:flex-start;margin:22px 0 0;padding:14px 16px;
-    border:1px solid var(--line);border-left:3px solid var(--amber);border-radius:10px;background:var(--card-2);
-    color:var(--ink-2);font-size:14.5px;max-width:70ch}
-  .honest b{color:var(--ink)}
-
-  /* generic grid cards */
-  .grid{display:grid;gap:18px;margin-top:34px}
-  .g2{grid-template-columns:1fr 1fr}
-  .g3{grid-template-columns:repeat(3,1fr)}
-  @media (max-width:820px){.g2,.g3{grid-template-columns:1fr}}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:22px;box-shadow:var(--shadow)}
-  .card h3{font-size:19px;margin-bottom:8px}
-  .card p{color:var(--ink-2);margin:0;font-size:15px}
-  .tag{display:inline-block;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;
-    padding:3px 8px;border-radius:6px;margin-bottom:12px}
-  .tag.predict{color:var(--red);background:color-mix(in srgb,var(--red) 15%,transparent)}
-  .tag.proof{color:var(--mint);background:color-mix(in srgb,var(--mint) 15%,transparent)}
-  .num{font-family:var(--mono);font-size:30px;font-weight:700;color:var(--mint)}
-  .card.stat p.k{color:var(--ink-3);font-size:13px;margin-top:6px}
-
-  /* steps */
-  .steps{counter-reset:s}
-  .step{display:flex;gap:16px;padding:18px 0;border-bottom:1px solid var(--line)}
-  .step:last-child{border-bottom:0}
-  .step .n{counter-increment:s;flex:0 0 38px;height:38px;border-radius:10px;display:grid;place-items:center;
-    font-family:var(--mono);font-weight:700;color:var(--mint);background:color-mix(in srgb,var(--mint) 12%,transparent);
-    border:1px solid color-mix(in srgb,var(--mint) 40%,transparent)}
-  .step .n::before{content:counter(s)}
-  .step h3{font-size:17px}
-  .step p{color:var(--ink-2);margin:4px 0 0;font-size:15px}
-
-  /* code */
-  .code{position:relative;background:var(--card-2);border:1px solid var(--line);border-radius:12px;
-    padding:16px 16px;overflow-x:auto;box-shadow:var(--shadow)}
-  .code pre{margin:0;font-family:var(--mono);font-size:13.5px;line-height:1.65;color:var(--ink)}
-  .code .c{color:var(--ink-3)}
-  .code .p{color:var(--mint)}
-  .code .a{color:var(--amber)}
-  .copy{position:absolute;top:10px;right:10px;cursor:pointer;font-family:var(--mono);font-size:11px;
-    color:var(--ink-2);background:var(--card);border:1px solid var(--line);border-radius:7px;padding:5px 9px}
-  .copy:hover{color:var(--mint);border-color:var(--mint)}
-
-  /* receipt row */
-  .receipt-row{display:grid;grid-template-columns:1.05fr .95fr;gap:26px;align-items:center}
-  @media (max-width:900px){.receipt-row{grid-template-columns:1fr}}
-  .receipt-art{border:1px solid var(--line);border-radius:var(--radius);background:var(--card-2);padding:14px;box-shadow:var(--shadow)}
-  .receipt-art img{width:100%;height:auto;display:block}
-
-  /* milestones */
-  .ms{display:flex;flex-wrap:wrap;gap:10px;margin-top:24px}
-  .ms .m{font-family:var(--mono);font-size:13px;padding:9px 13px;border-radius:10px;border:1px solid var(--line);background:var(--card)}
-  .ms .done{border-color:color-mix(in srgb,var(--mint) 45%,transparent)}
-  .ms .done b{color:var(--mint)}
-  .ms .next{color:var(--ink-2)}
-  .ms .next b{color:var(--amber)}
-
-  footer{border-top:1px solid var(--line);padding:40px 0 60px;color:var(--ink-3);font-size:14px}
-  footer a{color:var(--ink-2)} footer a:hover{color:var(--mint)}
-  .fnote{margin-top:10px;font-size:12.5px}
-</style>
+<meta property="og:description" content="The cheapest model takes the first pass. It clears your gate — proven, not guessed — or it escalates. Signed receipt every time.">
+<meta name="theme-color" content="#05070A">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2305070A'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%2319E3B1' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="assets/site.css">
 </head>
 <body>
-<header>
-  <div class="wrap"><nav>
-    <a class="brand" href="#top" aria-label="Firstpass home">
-      <svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0B0F14"/><path d="M8 20 L14 12 L19 17 L24 10" fill="none" stroke="#19E3B1" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      Firstpass
-    </a>
-    <span class="spacer"></span>
-    <a class="navlink" href="#wedge">Why</a>
-    <a class="navlink" href="#how">How it works</a>
-    <a class="navlink" href="#proof">Proof</a>
-    <a class="navlink" href="#start">Quickstart</a>
-    <a class="navlink cta" href="https://github.com/dshakes/firstpass">GitHub ↗</a>
-    <button class="iconbtn" id="theme" aria-label="Toggle light and dark theme" title="Toggle theme">◐</button>
-  </nav></div>
-</header>
+<div class="fx"><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
+<div class="grid-bg"></div>
+
+<header><div class="wrap"><nav>
+  <a class="brand" href="#top"><svg class="dot" width="24" height="24" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0a1512"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#19E3B1" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+  <span class="sp"></span>
+  <a class="nl" href="#decide">Watch it decide</a>
+  <a class="nl" href="#vs">Prediction vs proof</a>
+  <a class="nl" href="#install">Install</a>
+  <a class="nl" href="usage.html">Docs</a>
+  <a class="nl" href="https://github.com/dshakes/firstpass">GitHub ↗</a>
+  <a class="btn primary" href="#install">Run the demo</a>
+</nav></div></header>
 
 <main id="top">
 <section class="hero"><div class="wrap">
-  <div class="badges">
-    <span class="pill"><b>M0–M2</b> shipped</span>
-    <span class="pill"><b>98</b> tests passing</span>
-    <span class="pill">Rust · Apache-2.0</span>
-    <span class="pill">verified over <b>real HTTP</b></span>
-  </div>
-  <p class="eyebrow" style="margin-top:22px">Proof over prediction · built for agent fleets</p>
-  <h1 class="title">The cheapest model takes<br>the first pass.</h1>
-  <p class="lede">It clears your gate — <span class="mint">proven, not guessed</span> — <span class="q">or the request escalates.</span></p>
-  <p class="sub" style="margin-top:16px">Firstpass routes every LLM request to the cheapest model that <b class="mint">provably</b> passes your quality gate, and hands you a <b>signed receipt</b> for the decision.</p>
+  <div class="tagpill"><b>◆ autonomous llm routing</b> · proof over prediction</div>
+  <h1><span class="grad-text">Cheap first.</span><span class="l2">Proven, not guessed.</span></h1>
+  <p class="sub">Firstpass sends every request to the <b>cheapest model</b>, proves the output clears your gate, and escalates <b>only on failure</b> — with a signed, tamper-evident receipt for every call.</p>
   <div class="cta">
-    <a class="btn primary" href="#start">Run the demo — no API keys →</a>
-    <a class="btn" href="https://github.com/dshakes/firstpass/blob/main/SPEC.md">Read the SPEC</a>
-    <a class="btn" href="https://github.com/dshakes/firstpass">Star on GitHub ★</a>
+    <a class="btn primary" href="#install">⚡ Run the demo — no keys</a>
+    <a class="btn" href="https://github.com/dshakes/firstpass">★ Star on GitHub</a>
   </div>
-  <div class="heroart"><img src="assets/hero.svg" width="1000" height="240"
-    alt="Firstpass — the cheapest model takes the first pass, proven not guessed"></div>
-  <div class="honest">
-    <span aria-hidden="true">⚠</span>
-    <span><b>Honestly scoped.</b> The core routes, gates, audits, and learns end-to-end over real HTTP with no test doubles in the plane. The proof-harness numbers below are a labeled <b>simulation</b> until wired to live providers; judge/self-consistency gates and published binaries are next. Nothing here is claimed as measured that isn't.</span>
+  <div class="trust"><span><b>M0–M2</b> shipped</span><span><b>99</b> tests green</span><span><b>Rust</b> · real HTTP</span><span><b>Apache-2.0</b></span></div>
+
+  <!-- live agent decision stream -->
+  <div class="term" id="decide" aria-label="Live agent routing decision">
+    <div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span class="mono">firstpass · enforce · POST /v1/messages</span></div>
+    <div class="body" id="stream"></div>
   </div>
 </div></section>
 
-<section id="wedge"><div class="wrap">
-  <p class="eyebrow">The wedge</p>
-  <h2 style="font-size:clamp(26px,3.4vw,38px)">Every other router decides <span style="color:var(--red)">before</span> generation.<br>Firstpass decides on the <span class="mint">actual output</span>.</h2>
-  <p class="sub" style="margin-top:16px">Model routers on the market route by <b>prediction</b> — a learned policy guesses which model will answer well, sends the request there, and never checks. Firstpass routes by <b>proof</b>.</p>
-  <div class="grid g2">
-    <div class="card">
-      <span class="tag predict">Prediction — the status quo</span>
-      <h3>Guess, send, hope</h3>
-      <p>A classifier picks a model up front from the prompt alone. If the guess is wrong, the bad answer ships anyway — you find out downstream, if ever. No record of why. Retrain the policy to improve.</p>
+<section id="vs"><div class="wrap reveal">
+  <p class="eyebrow">the wedge</p>
+  <h2>Every other router <span style="color:var(--red)">guesses</span>.<br>Firstpass <span class="grad-text">proves</span>.</h2>
+  <div class="vs">
+    <div class="side predict">
+      <span class="badge">✕ Prediction — the status quo</span>
+      <h3>Guess a model, send, hope</h3>
+      <ul>
+        <li><span class="m">→</span> A classifier picks a model from the prompt alone</li>
+        <li><span class="m">→</span> No check on the real output — a wrong guess ships anyway</li>
+        <li><span class="m">→</span> You find out downstream, if ever. No record of why.</li>
+        <li><span class="m">→</span> To improve, retrain the policy model</li>
+      </ul>
     </div>
-    <div class="card">
-      <span class="tag proof">Proof — Firstpass</span>
+    <div class="divider"><span>VS</span></div>
+    <div class="side proof">
+      <span class="badge">✓ Proof — Firstpass</span>
       <h3>Send cheap, gate the output, escalate on fail</h3>
-      <p>Run the cheapest plausible model, then run a <b>real gate on the real output</b> — tests, typecheck, schema, a fresh-context judge. Escalate exactly one rung only when the gate fails. Serve the first output that passes. Every decision is a signed, re-derivable trace.</p>
+      <ul>
+        <li><span class="m">✓</span> Run the cheapest model, gate its <b>real output</b></li>
+        <li><span class="m">✓</span> Tests · typecheck · schema · a fresh-context judge</li>
+        <li><span class="m">✓</span> Escalate one rung only on failure — signed receipt every time</li>
+        <li><span class="m">✓</span> To improve, edit a gate. Zero retrain.</li>
+      </ul>
     </div>
   </div>
 </div></section>
 
-<section id="how"><div class="wrap">
-  <p class="eyebrow">How it works</p>
-  <h2 style="font-size:clamp(26px,3.4vw,38px)">Three moves, one signed receipt.</h2>
-  <div class="grid" style="grid-template-columns:1fr;margin-top:26px">
-    <div class="steps card">
-      <div class="step"><div class="n"></div><div>
-        <h3>Route to the cheapest rung first</h3>
-        <p>A declarative ladder (cheapest → most capable) per traffic slice. Drop-in Anthropic-compatible proxy — point <span class="mono">/v1/messages</span> at it. BYOK: your keys pass through, redacted from every log.</p></div></div>
-      <div class="step"><div class="n"></div><div>
-        <h3>Gate the real output</h3>
-        <p>Inline gates (non-empty, JSON-valid, JSON-Schema) or subprocess plugins (your tests, linter, judge) that read the candidate on <b>stdin, never argv</b> — injection-resistant. Per-gate error budgets auto-disable a flaky gate before it takes down the route.</p></div></div>
-      <div class="step"><div class="n"></div><div>
-        <h3>Escalate one rung — or serve, and record everything</h3>
-        <p>On a gate fail, escalate a single rung, budget-capped; a provider 5xx fails over cross-provider. The chosen output is served in the provider's native shape, and the whole decision becomes a <b>tamper-evident hash-chain trace</b> an external auditor can re-derive.</p></div></div>
-    </div>
+<section id="how"><div class="wrap reveal">
+  <p class="eyebrow">how it works</p>
+  <h2>Three moves. One receipt.</h2>
+  <div class="cards g3">
+    <div class="card"><div class="kicker">▸</div><h3>Route</h3><p>Cheapest rung of a declarative ladder first — <b>across providers</b> (Anthropic, OpenAI). Drop-in: your agent speaks the Anthropic wire format, so just point <span class="mono c-mint">base_url</span> at it. BYOK, keys redacted from every log.</p></div>
+    <div class="card"><div class="kicker">◈</div><h3>Gate</h3><p>Run a real gate on the real output — inline or your own subprocess plugin, fed on <b>stdin not argv</b> (injection-resistant). Flaky gates auto-disable on an error budget.</p></div>
+    <div class="card"><div class="kicker">↑</div><h3>Escalate &amp; seal</h3><p>One rung up on failure, budget-capped; a provider 5xx fails over. The decision becomes a <b>tamper-evident hash-chain trace</b> anyone can re-derive.</p></div>
   </div>
-  <div class="heroart" style="margin-top:22px"><img src="assets/flow.svg" width="1000" height="460"
-    alt="Routing flow: a request hits the cheapest rung, fails the gate, escalates one rung, passes, and is served — every decision logged to the audit trace"></div>
-</div></section>
-
-<section id="receipt"><div class="wrap">
-  <p class="eyebrow">The receipt</p>
-  <h2 style="font-size:clamp(26px,3.4vw,38px)">Not a dashboard number. A decision you can audit.</h2>
-  <div class="receipt-row" style="margin-top:30px">
-    <div class="receipt-art"><img src="assets/receipt.svg" width="720" height="560"
-      alt="Firstpass audit receipt: the cheap model failed the test gate, the next rung passed, served at a real saving versus always-top-tier"></div>
-    <div>
-      <p class="sub" style="margin:0 0 18px">The <span class="mono">demo</span> stands up a mock upstream and the proxy, drives one real decision end-to-end, and prints the receipt — no keys, ~10 seconds:</p>
-      <div class="code" style="border-left:3px solid var(--line-2)"><pre>rung 0 · anthropic/claude-haiku-4-5   · <span style="color:var(--red)">FAIL</span> · $0.0023
-rung 1 · anthropic/claude-sonnet-5    · <span class="p">PASS</span> · $0.0110
-served rung 1 · saved <span class="p">73%</span> vs always-top-tier
-audit chain          · <span class="p">verified ✓</span>
-feedback logged      · chain <span class="p">still verified ✓</span></pre></div>
-      <p style="color:var(--ink-3);font-size:13px;margin-top:12px">Illustrative output from the bundled no-keys demo. The cheap model tried first, the test gate caught it, one rung of escalation fixed it, and the sealed record survived a later outcome-feedback write unchanged.</p>
-    </div>
+  <div class="pipe" aria-hidden="true">
+    <svg viewBox="0 0 1000 150" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,Menlo,monospace">
+      <defs>
+        <linearGradient id="wire" x1="0" x2="1"><stop offset="0" stop-color="#19E3B1"/><stop offset="1" stop-color="#38E8FF"/></linearGradient>
+      </defs>
+      <line x1="120" y1="75" x2="880" y2="75" stroke="url(#wire)" stroke-width="2" opacity=".4"/>
+      <circle r="6" fill="#19E3B1"><animateMotion dur="4s" repeatCount="indefinite" path="M120,75 L880,75" keyPoints="0;0.28;0.28;0.62;0.62;1" keyTimes="0;0.2;0.4;0.55;0.72;1" calcMode="linear"/><animate attributeName="fill" values="#19E3B1;#19E3B1;#FF5A6A;#FFB020;#19E3B1;#19E3B1" keyTimes="0;0.2;0.4;0.55;0.72;1" dur="4s" repeatCount="indefinite"/></circle>
+      <g fill="#0a1512" stroke="#2a4a44"><rect x="60" y="55" width="120" height="40" rx="9"/><rect x="330" y="55" width="120" height="40" rx="9"/><rect x="600" y="55" width="120" height="40" rx="9"/><rect x="820" y="55" width="150" height="40" rx="9"/></g>
+      <g fill="#EAF6F3" font-size="13" text-anchor="middle"><text x="120" y="80">request</text><text x="390" y="80" fill="#19E3B1">rung 0</text><text x="660" y="80" fill="#38E8FF">gate</text><text x="895" y="80" fill="#19E3B1">served ✓</text></g>
+      <path d="M390 55 C390 25 660 25 660 55" fill="none" stroke="#FFB020" stroke-width="1.6" stroke-dasharray="4 3" opacity=".7"/>
+      <text x="525" y="28" fill="#FFB020" font-size="11" text-anchor="middle">escalate on fail</text>
+    </svg>
   </div>
 </div></section>
 
-<section id="new"><div class="wrap">
-  <p class="eyebrow">What's actually new</p>
-  <h2 style="font-size:clamp(26px,3.4vw,38px)">Cascading is prior art. The honesty is the product.</h2>
-  <p class="sub" style="margin-top:16px">Cheap-first cascades exist and we don't claim to have invented them. What Firstpass adds is the machinery that makes the decision <b>trustworthy and self-improving</b>:</p>
-  <div class="grid g3">
-    <div class="card"><h3 class="mint">Tamper-evident audit</h3><p>Every decision is a hash-chained JSON trace with a re-derivable digest. An external auditor verifies the chain without trusting us — the invariant that must never regress.</p></div>
-    <div class="card"><h3 class="mint">Outcome-feedback loop</h3><p><span class="mono">POST /v1/feedback</span> folds downstream reality — did the tests pass an hour later? — back onto the trace via a deferred-verdict side table that <b>never</b> alters the sealed record.</p></div>
-    <div class="card"><h3 class="mint">Zero-retrain</h3><p>Improve routing by tuning gates and ladders in declarative config, not by retraining a policy model. The gate is the knob; the config is the source of truth.</p></div>
+<section id="receipt"><div class="wrap reveal">
+  <p class="eyebrow">the receipt</p>
+  <h2>Not a dashboard number.<br>A decision you can <span class="grad-text">audit</span>.</h2>
+  <p class="lead">Every call becomes a hash-chained JSON trace an external auditor can re-derive. Point at any request and answer <i>why did this go to that model, and what did it cost.</i></p>
+  <div class="code" style="margin-top:28px"><button class="copy" data-copy='{ "trace_id": "0192f3a1", "prev_hash": "9f2c…a1b7", "mode": "enforce" }'>copy</button><pre style="margin:0"><span class="c">{</span>
+  <span class="cy">"trace_id"</span>: <span class="p">"0192f3a1-7c4e-7abc"</span>, <span class="cy">"prev_hash"</span>: <span class="p">"9f2c…a1b7"</span>,   <span class="c">// chains to the prior decision — tamper-evident</span>
+  <span class="cy">"attempts"</span>: [
+    { <span class="cy">"rung"</span>:0, <span class="cy">"model"</span>:<span class="p">"…/haiku-4-5"</span>,  <span class="cy">"gate"</span>:<span class="c" style="color:#FF5A6A">"fail"</span>, <span class="cy">"cost"</span>:0.0007 },  <span class="c">// cheap first — gate caught it</span>
+    { <span class="cy">"rung"</span>:1, <span class="cy">"model"</span>:<span class="p">"…/sonnet-5"</span>,  <span class="cy">"gate"</span>:<span class="p">"pass"</span>, <span class="cy">"cost"</span>:0.0121 }   <span class="c">// escalated, proven, served</span>
+  ],
+  <span class="cy">"final"</span>: { <span class="cy">"served_rung"</span>:1, <span class="cy">"savings_usd"</span>:<span class="p">0.0502</span> }   <span class="c">// vs always-top-tier</span>
+<span class="c">}</span></pre></div>
+</div></section>
+
+<section id="proof"><div class="wrap reveal">
+  <p class="eyebrow">proof, not adjectives</p>
+  <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between">
+    <h2>Error bars and a kill switch.</h2>
+    <span class="simchip">◆ SIMULATION — live numbers pending keys</span>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="n grad-text" data-to="65" data-suffix="%" data-prefix="~">~0%</div><div class="k">cheaper at equal-or-higher success vs a predictive router</div></div>
+    <div class="stat"><div class="n grad-text" data-to="0.16" data-dec="2">0.00</div><div class="k">served-failure rate <span class="vs-tag">vs 0.46</span> for prediction — verification catches what guessing serves</div></div>
+    <div class="stat"><div class="n grad-text" data-to="10" data-prefix="≤" data-suffix="%">≤0%</div><div class="k">conformal served-failure @ 95% confidence — a certificate, not a hope</div></div>
+  </div>
+  <div class="killbar">
+    <span style="color:var(--mut);font-size:14.5px"><b style="color:var(--ink)">Pre-registered kill criterion</b> — bootstrap CIs + split-conformal guarantee + a published go/no-go gate.</span>
+    <span class="verdict">verdict: PROCEED</span>
   </div>
 </div></section>
 
-<section id="proof"><div class="wrap">
-  <p class="eyebrow">Proof, not adjectives</p>
-  <h2 style="font-size:clamp(26px,3.4vw,38px)">A reproducible report with error bars and a kill switch.</h2>
-  <p class="honest" style="max-width:74ch"><span aria-hidden="true">⚠</span><span>The numbers below come from the <b>proof harness</b> (<span class="mono">cargo run -p firstpass-bench</span>) running against a <b>simulated</b> backend and gate behind real-backend trait seams. They are clearly labeled <b>SIMULATION</b>; live-provider numbers are pending API keys. This is the pre-registered result, not a cherry-picked screenshot.</span></p>
-  <div class="grid g3" style="margin-top:26px">
-    <div class="card stat"><div class="num">~65%</div><p class="k">cheaper at equal-or-higher success vs a predictive router <span style="color:var(--ink-3)">(sim)</span></p></div>
-    <div class="card stat"><div class="num">0.16</div><p class="k">served-failure rate vs <b style="color:var(--red)">0.46</b> for prediction — verification catches what prediction serves blind <span style="color:var(--ink-3)">(sim)</span></p></div>
-    <div class="card stat"><div class="num">≤10%</div><p class="k">conformal guarantee: serve iff gate-score ≥ λ ⇒ ≤10% served-failure at 95% confidence — a certificate, not a hope</p></div>
+<section id="install"><div class="wrap reveal">
+  <p class="eyebrow">get started</p>
+  <h2>See the whole loop in <span class="grad-text">~10 seconds</span>.</h2>
+  <p class="lead">No API keys — the demo stands up a mock upstream and drives one real decision, escalation and all.</p>
+  <div class="code" style="margin-top:26px;border-color:var(--mint)"><button class="copy" data-copy="git clone https://github.com/dshakes/firstpass && cd firstpass && cargo run -p firstpass-proxy --example demo">copy</button><pre style="margin:0"><span class="c"># clone &amp; watch the receipt print</span>
+git clone https://github.com/dshakes/firstpass <span class="a">&amp;&amp;</span> cd firstpass
+cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</span> demo</pre></div>
+
+  <h3 style="margin:40px 0 0;font-size:16px;font-weight:600;color:var(--mut)">Or install the proxy</h3>
+  <div class="inst" id="inst">
+    <div class="tab on" data-t="brew"><span class="i">🍺</span> Homebrew</div>
+    <div class="tab" data-t="curl"><span class="i">⬇</span> curl | sh</div>
+    <div class="tab" data-t="docker"><span class="i">🐳</span> Docker</div>
+    <div class="tab" data-t="cargo"><span class="i">🦀</span> Cargo</div>
+    <div class="panel on" data-p="brew"><div class="code"><button class="copy" data-copy="brew install dshakes/tap/firstpass-proxy">copy</button><pre style="margin:0">brew install dshakes/tap/firstpass-proxy</pre></div><p style="color:var(--mut2);font-size:12.5px;margin:12px 0 0">Formula publishes with the first tagged release.</p></div>
+    <div class="panel" data-p="curl"><div class="code"><button class="copy" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh">copy</button><pre style="margin:0"><span class="cy">curl</span> --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh <span class="a">|</span> sh</pre></div></div>
+    <div class="panel" data-p="docker"><div class="code"><button class="copy" data-copy="docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest">copy</button><pre style="margin:0"><span class="cy">docker</span> run -p 8080:8080 <span class="a">-e</span> FIRSTPASS_BIND=0.0.0.0:8080 \
+  ghcr.io/dshakes/firstpass:latest</pre></div></div>
+    <div class="panel" data-p="cargo"><div class="code"><button class="copy" data-copy="cargo install --git https://github.com/dshakes/firstpass firstpass-proxy">copy</button><pre style="margin:0"><span class="cy">cargo</span> install --git https://github.com/dshakes/firstpass firstpass-proxy</pre></div><p style="color:var(--mut2);font-size:12.5px;margin:12px 0 0">Works today — builds from source.</p></div>
   </div>
-  <div class="card" style="margin-top:18px;border-left:3px solid var(--mint)">
-    <h3>Pre-registered kill criterion</h3>
-    <p>The harness ships a published rule that says <b>stop</b> if the thesis fails — bootstrap confidence intervals, a split-conformal served-failure guarantee, and a go/no-go gate on the whole bet. Current verdict on the simulation: <b class="mint">PROCEED</b> — to be re-run against live providers.</p>
-  </div>
+
+  <h3 style="margin:40px 0 14px;font-size:16px;font-weight:600;color:var(--mut)">Then point your agent at it</h3>
+  <div class="code"><button class="copy" data-copy="export ANTHROPIC_BASE_URL=http://127.0.0.1:8080">copy</button><pre style="margin:0">firstpass-proxy                                    <span class="c"># observe mode — logs, changes nothing</span>
+<span class="cy">export</span> ANTHROPIC_BASE_URL=http://127.0.0.1:8080   <span class="c"># same wire format your agent speaks</span>
+<span class="cy">unset</span> ANTHROPIC_BASE_URL                            <span class="c"># offboard anytime — one env var</span></pre></div>
 </div></section>
 
-<section id="start"><div class="wrap">
-  <p class="eyebrow">Quickstart</p>
-  <h2 style="font-size:clamp(26px,3.4vw,38px)">See the whole loop in ~10 seconds.</h2>
-  <div class="grid g2" style="margin-top:26px">
-    <div>
-      <h3 style="font-size:16px;margin-bottom:10px">1 · Run the no-keys demo</h3>
-      <div class="code"><button class="copy" data-copy="cargo run -p firstpass-proxy --example demo">copy</button><pre><span class="c"># real HTTP, no API keys, prints the receipt</span>
-cargo run -p firstpass-proxy <span class="a">--example</span> demo</pre></div>
-      <h3 style="font-size:16px;margin:22px 0 10px">2 · Or serve it (Docker)</h3>
-      <div class="code"><button class="copy" data-copy="docker build -t firstpass . && docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 firstpass">copy</button><pre>docker build -t firstpass .
-docker run -p 8080:8080 <span class="a">-e</span> FIRSTPASS_BIND=0.0.0.0:8080 firstpass</pre></div>
-    </div>
-    <div>
-      <h3 style="font-size:16px;margin-bottom:10px">3 · Point your agent at it &amp; enforce</h3>
-      <div class="code"><button class="copy" data-copy="FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml cargo run -p firstpass-proxy">copy</button><pre><span class="c"># copy firstpass.example.toml -> firstpass.toml</span>
-FIRSTPASS_MODE=<span class="p">enforce</span> \
-FIRSTPASS_CONFIG=./firstpass.toml \
-  cargo run <span class="a">-p</span> firstpass-proxy
-
-<span class="c"># drop-in Anthropic-compatible endpoint</span>
-curl localhost:8080/v1/messages <span class="a">-d</span> @req.json</pre></div>
-      <p style="color:var(--ink-3);font-size:13px;margin-top:12px">Config is declarative TOML: routes → mode, a cheapest-first model ladder, and the gates that must pass. See <a class="mint" href="https://github.com/dshakes/firstpass/blob/main/firstpass.example.toml">firstpass.example.toml</a>.</p>
-    </div>
-  </div>
-  <div class="ms">
-    <span class="m done"><b>M0 ✓</b> proof harness + kill criterion</span>
-    <span class="m done"><b>M1 ✓</b> proxy · observe + enforce · escalation · failover · SQLite trace</span>
-    <span class="m done"><b>M2 ✓</b> gate framework · subprocess plugins · budgets · feedback API</span>
-    <span class="m next"><b>M3 →</b> live-provider proof · judge gates · published binaries</span>
+<section id="roadmap"><div class="wrap reveal">
+  <p class="eyebrow">roadmap</p>
+  <h2>Shipped in the open.</h2>
+  <div class="road">
+    <div class="step done"><div class="dot"></div><h4><span>M0 ✓</span> Proof harness</h4><p>Baselines, bootstrap CIs, conformal guarantee, kill criterion.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>M1 ✓</span> The proxy</h4><p>Observe + enforce, escalation, cross-provider failover, trace store — real HTTP.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>M2 ✓</span> Gate framework</h4><p>Subprocess plugins, schema gates, budgets, feedback API.</p></div>
+    <div class="step next"><div class="dot"></div><h4><span>M3 →</span> Live proof</h4><p>Real-provider numbers, judge gates, published binaries + Homebrew tap.</p></div>
   </div>
 </div></section>
 </main>
 
 <footer><div class="wrap">
-  <div style="display:flex;flex-wrap:wrap;gap:18px;align-items:center">
-    <a class="brand" href="#top" style="color:var(--ink)">
-      <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0B0F14"/><path d="M8 20 L14 12 L19 17 L24 10" fill="none" stroke="#19E3B1" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      Firstpass</a>
-    <span class="spacer" style="flex:1"></span>
+  <div class="foot-cta reveal">
+    <h2>The cheapest model takes the first pass.<br><span class="grad-text">Prove it.</span></h2>
+    <div class="cta"><a class="btn primary" href="#install">⚡ Run the demo</a><a class="btn" href="https://github.com/dshakes/firstpass/blob/main/SPEC.md">Read the SPEC</a></div>
+  </div>
+  <div class="flinks">
+    <a class="brand" href="#top" style="color:var(--ink)"><svg class="dot" width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0a1512"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#19E3B1" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+    <span class="sp" style="flex:1"></span>
     <a href="https://github.com/dshakes/firstpass">GitHub</a>
     <a href="https://github.com/dshakes/firstpass/blob/main/SPEC.md">SPEC</a>
+    <a href="https://github.com/dshakes/firstpass/blob/main/firstpass.example.toml">Config</a>
     <a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">Apache-2.0</a>
   </div>
-  <p class="fnote">Proof over prediction. Built for agent fleets. · No competitor products named — Firstpass competes on evidence, not adjectives.</p>
+  <p class="fnote">Proof over prediction. No competitor products named — Firstpass competes on evidence, not adjectives.</p>
 </div></footer>
 
 <script>
-  // Theme toggle — respects OS default, remembers choice for the session.
-  var root=document.documentElement, t=document.getElementById('theme');
-  try{var saved=localStorage.getItem('fp-theme'); if(saved)root.setAttribute('data-theme',saved);
-      else if(matchMedia('(prefers-color-scheme:light)').matches)root.setAttribute('data-theme','light');}catch(e){}
-  t.onclick=function(){var n=root.getAttribute('data-theme')==='dark'?'light':'dark';
-    root.setAttribute('data-theme',n); try{localStorage.setItem('fp-theme',n)}catch(e){}};
-  // Copy buttons.
-  document.querySelectorAll('.copy').forEach(function(b){b.onclick=function(){
-    navigator.clipboard.writeText(b.getAttribute('data-copy')).then(function(){
-      var o=b.textContent;b.textContent='copied ✓';setTimeout(function(){b.textContent=o},1200);});};});
+// ── live agent decision stream (loops) ──
+const stream = document.getElementById('stream');
+const script = [
+  ['pre','▸','c-mut',' incoming request  ','c-ink','agent=claude-code  task=code_edit'],
+  ['pre','·','c-mut',' rung 0  ','c-mint','anthropic/claude-haiku-4-5','c-mut','  — generating…'],
+  ['pre','⏵','c-mut',' gate  ','c-cyan','cargo-test','c-mut','  running on real output…'],
+  ['pre','✕','c-red',' rung 0 FAILED  ','c-mut','gate cargo-test · 2 tests red · $0.0007'],
+  ['pre','↑','c-amber',' escalate → rung 1  ','c-mint','anthropic/claude-sonnet-5'],
+  ['pre','⏵','c-mut',' gate  ','c-cyan','cargo-test','c-mut','  running…'],
+  ['pre','✓','c-mint',' rung 1 PASSED  ','c-mut','served · $0.0121 · saved 73% vs top-tier'],
+  ['pre','⛭','c-cyan',' receipt sealed  ','c-mut','hash-chain verified ✓  ·  trace 0192f3a1'],
+];
+let i=0;
+function push(){
+  if(i>=script.length){ setTimeout(()=>{stream.innerHTML='';i=0;push();},2600); return; }
+  const s=script[i++]; const ln=document.createElement('div'); ln.className='ln';
+  let html='';
+  for(let k=0;k<s.length;k+=2){ const cls=s[k]==='pre'?'pre':s[k]; html+=`<span class="${cls}">${s[k+1]}</span>`; }
+  ln.innerHTML=html;
+  if(i===script.length){ ln.innerHTML+='<span class="cursor"></span>'; }
+  stream.appendChild(ln);
+  setTimeout(push, 520 + Math.min(i*40,240));
+}
+push();
+
+// ── count-up stats on scroll ──
+const io=new IntersectionObserver((es)=>es.forEach(e=>{
+  if(!e.isIntersecting) return;
+  const el=e.target; io.unobserve(el);
+  const to=parseFloat(el.dataset.to), dec=+(el.dataset.dec||0), pre=el.dataset.prefix||'', suf=el.dataset.suffix||'';
+  let t0=null, dur=1100;
+  const tick=(ts)=>{ t0=t0||ts; const p=Math.min((ts-t0)/dur,1); const v=(to*(1-Math.pow(1-p,3)));
+    el.textContent=pre+v.toFixed(dec)+suf; if(p<1) requestAnimationFrame(tick); else el.textContent=pre+to.toFixed(dec)+suf; };
+  requestAnimationFrame(tick);
+}),{threshold:.6});
+document.querySelectorAll('.stat .n').forEach(n=>io.observe(n));
+
+// ── reveal on scroll ──
+const ro=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');ro.unobserve(e.target);}}),{threshold:.12});
+document.querySelectorAll('.reveal').forEach(el=>ro.observe(el));
+
+// ── install tabs ──
+document.querySelectorAll('#inst .tab').forEach(tab=>tab.onclick=()=>{
+  document.querySelectorAll('#inst .tab').forEach(t=>t.classList.remove('on'));
+  document.querySelectorAll('#inst .panel').forEach(p=>p.classList.remove('on'));
+  tab.classList.add('on'); document.querySelector(`#inst .panel[data-p="${tab.dataset.t}"]`).classList.add('on');
+});
+
+// ── copy buttons ──
+document.querySelectorAll('.copy').forEach(b=>b.onclick=()=>navigator.clipboard.writeText(b.dataset.copy).then(()=>{const o=b.textContent;b.textContent='copied ✓';setTimeout(()=>b.textContent=o,1200);}));
 </script>
 </body>
 </html>
