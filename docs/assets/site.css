@@ -175,3 +175,56 @@
   .fnote{margin-top:16px;color:var(--mut2);font-size:12.5px}
   .reveal{opacity:0;transform:translateY(14px);transition:opacity .6s cubic-bezier(.2,.7,.2,1),transform .6s cubic-bezier(.2,.7,.2,1)}
   .reveal.in{opacity:1;transform:none}
+
+  /* offset in-page anchor jumps so they clear the sticky header */
+  section,.term{scroll-margin-top:80px}
+
+  /* ══ engagement layer: depth · motion · interactivity ══ */
+  @property --a{syntax:'<angle>';inherits:false;initial-value:0deg}
+
+  /* living ambient — a slow conic aurora behind the hero (low opacity, not glary) */
+  .fx::after{content:"";position:absolute;top:-24%;left:50%;width:940px;height:940px;transform:translateX(-50%);
+    background:conic-gradient(from 0deg,transparent 0%,rgba(25,227,177,.11),transparent 26%,rgba(56,189,248,.09),transparent 55%,rgba(139,124,255,.07),transparent 80%);
+    border-radius:50%;filter:blur(70px);opacity:.6;animation:aurora 44s linear infinite}
+  @keyframes aurora{to{transform:translateX(-50%) rotate(360deg)}}
+
+  /* hero terminal — rotating gradient glow border + soft halo (premium centerpiece) */
+  .term{box-shadow:0 30px 90px -50px rgba(0,0,0,.9),0 0 70px -30px rgba(25,227,177,.28)}
+  .term::before{content:"";position:absolute;inset:-1px;border-radius:15px;padding:1px;pointer-events:none;z-index:2;
+    background:conic-gradient(from var(--a),transparent 15%,var(--mint) 30%,#38E8FF 42%,transparent 58%);
+    -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;
+    animation:spinborder 7s linear infinite}
+  @keyframes spinborder{to{--a:360deg}}
+
+  /* interactive spotlight cards (cursor-tracked) */
+  .card{overflow:hidden}
+  .card::after{content:"";position:absolute;inset:0;border-radius:inherit;opacity:0;transition:opacity .35s;pointer-events:none;
+    background:radial-gradient(340px circle at var(--mx,50%) var(--my,-20%),rgba(25,227,177,.14),transparent 62%)}
+  .card:hover::after{opacity:1}
+  .card{background-image:linear-gradient(180deg,rgba(255,255,255,.022),transparent 40%)}
+
+  /* subtle animated shimmer on gradient headlines/numbers */
+  .grad-text{background-size:220% auto;animation:shimmer 9s ease-in-out infinite}
+  @keyframes shimmer{0%,100%{background-position:0% center}50%{background-position:130% center}}
+
+  /* bigger, bolder stats + primary CTA lift */
+  .stat .n{font-size:clamp(42px,4.4vw,54px)}
+  .stat{background-image:linear-gradient(180deg,rgba(255,255,255,.02),transparent 45%)}
+  .btn.primary:hover{box-shadow:0 0 34px -10px rgba(255,255,255,.35)}
+  .kicker{box-shadow:0 0 24px -12px rgba(25,227,177,.6)}
+  @media (prefers-reduced-motion:reduce){.fx::after,.term::before,.grad-text{animation:none}}
+
+  /* ══ interactive architecture diagram ══ */
+  .arch{margin-top:36px;border:1px solid var(--line);border-radius:18px;background:var(--surface);padding:24px 20px 18px;position:relative;overflow:hidden}
+  .arch svg{width:100%;height:auto;display:block}
+  .arch .node{cursor:pointer;transition:opacity .2s}
+  .arch .node rect{transition:stroke .2s,fill .2s,filter .2s}
+  .arch .node:hover rect{stroke:var(--mint);fill:#0e211d}
+  .arch .node .nt{transition:fill .2s}
+  .arch .node:hover .nt{fill:#fff}
+  .arch.dim .node:not(:hover){opacity:.4}
+  .arch-cap{margin-top:14px;min-height:48px;border-top:1px solid var(--line);padding-top:14px;display:flex;gap:12px;align-items:flex-start}
+  .arch-cap .dot{flex:0 0 auto;width:9px;height:9px;border-radius:50%;background:var(--mint);margin-top:6px;box-shadow:0 0 8px var(--mint)}
+  .arch-cap b{color:#fff;font-weight:550;font-size:15px}
+  .arch-cap span{color:var(--mut);font-size:14px}
+  .arch-cap .hint{color:var(--mut2);font-family:var(--mono);font-size:12.5px}
