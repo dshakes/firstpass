@@ -9,10 +9,18 @@
 use std::path::Path;
 use std::time::Duration;
 
-use firstpass_core::{GENESIS_HASH, Trace};
+use firstpass_core::{DeferredVerdict, GENESIS_HASH, Score, Trace, Verdict};
 use rusqlite::Connection;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// Open a connection with WAL + a busy timeout, so the background writer and short-lived
+/// feedback/read connections can share the file without "database is locked" errors.
+fn connect(db_path: impl AsRef<Path>) -> Result<Connection, StoreError> {
+    let conn = Connection::open(db_path.as_ref())?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(conn)
+}
 
 /// Errors from the trace store.
 #[derive(Debug, thiserror::Error)]
@@ -41,8 +49,7 @@ pub type TraceSender = mpsc::UnboundedSender<Trace>;
 /// # Errors
 /// Returns [`StoreError::Sqlite`] if the database cannot be opened or migrated.
 pub fn open(db_path: impl AsRef<Path>) -> Result<(TraceSender, JoinHandle<()>), StoreError> {
-    let conn = Connection::open(db_path.as_ref())?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    let conn = connect(db_path.as_ref())?;
     migrate(&conn)?;
 
     let (tx, rx) = mpsc::unbounded_channel::<Trace>();
@@ -51,6 +58,9 @@ pub fn open(db_path: impl AsRef<Path>) -> Result<(TraceSender, JoinHandle<()>), 
 }
 
 fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    // WAL: lets the background writer and short-lived feedback/read connections share the file
+    // concurrently. `journal_mode` is persisted in the file header once set by any connection.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS traces (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +72,20 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             session TEXT NOT NULL,
             body TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS traces_session_idx ON traces(session);",
+        CREATE INDEX IF NOT EXISTS traces_session_idx ON traces(session);
+        -- Deferred verdicts live in their OWN table, keyed by trace_id. They are NEVER folded
+        -- into the sealed, hashed `traces.body`, so a late outcome can't alter a past record and
+        -- the tamper-evident chain stays valid. They are merged onto a trace only on read.
+        CREATE TABLE IF NOT EXISTS deferred_verdicts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT NOT NULL,
+            gate_id TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            score REAL,
+            reported_at TEXT NOT NULL,
+            reporter TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS deferred_trace_idx ON deferred_verdicts(trace_id);",
     )?;
     Ok(())
 }
@@ -130,8 +153,7 @@ fn insert(conn: &Connection, trace: &Trace, hash: &str) -> Result<(), StoreError
 /// Returns [`StoreError::Sqlite`] on a database error, or [`StoreError::Json`] if a stored
 /// row is not valid trace JSON.
 pub fn load_all_traces(db_path: impl AsRef<Path>) -> Result<Vec<Trace>, StoreError> {
-    let conn = Connection::open(db_path.as_ref())?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    let conn = connect(db_path.as_ref())?;
     let mut stmt = conn.prepare("SELECT body FROM traces ORDER BY seq ASC")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut traces = Vec::new();
@@ -139,6 +161,123 @@ pub fn load_all_traces(db_path: impl AsRef<Path>) -> Result<Vec<Trace>, StoreErr
         traces.push(serde_json::from_str(&row?)?);
     }
     Ok(traces)
+}
+
+/// Whether a trace with `trace_id` exists — used to reject feedback for unknown traces.
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] on a database error.
+pub fn trace_exists(db_path: impl AsRef<Path>, trace_id: &str) -> Result<bool, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM traces WHERE trace_id = ?1",
+        [trace_id],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Append a deferred verdict for `trace_id` (a downstream outcome or async gate result). This
+/// writes ONLY to the `deferred_verdicts` table; the sealed trace and its hash are untouched, so
+/// the audit chain remains verifiable (SPEC §8.3.4 — the outcome-feedback loop).
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] on a database error.
+pub fn append_deferred(
+    db_path: impl AsRef<Path>,
+    trace_id: &str,
+    v: &DeferredVerdict,
+) -> Result<(), StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    conn.execute(
+        "INSERT INTO deferred_verdicts (trace_id, gate_id, verdict, score, reported_at, reporter)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            trace_id,
+            v.gate_id,
+            v.verdict.as_str(),
+            v.score.map(Score::value),
+            v.reported_at.to_string(),
+            v.reporter,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load the deferred verdicts recorded for `trace_id`, oldest first. Malformed stored rows are
+/// skipped (logged), never fatal — a corrupt late outcome must not break reading the trace.
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] on a database error.
+pub fn load_deferred(
+    db_path: impl AsRef<Path>,
+    trace_id: &str,
+) -> Result<Vec<DeferredVerdict>, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let mut stmt = conn.prepare(
+        "SELECT gate_id, verdict, score, reported_at, reporter
+         FROM deferred_verdicts WHERE trace_id = ?1 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([trace_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<f64>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (gate_id, verdict_s, score, reported_s, reporter) = row?;
+        let verdict = match verdict_s.as_str() {
+            "pass" => Verdict::Pass,
+            "fail" => Verdict::Fail,
+            "abstain" => Verdict::Abstain,
+            other => {
+                tracing::warn!(verdict = %other, %trace_id, "skipping deferred row with bad verdict");
+                continue;
+            }
+        };
+        let Ok(reported_at) = reported_s.parse::<jiff::Timestamp>() else {
+            tracing::warn!(%trace_id, "skipping deferred row with bad timestamp");
+            continue;
+        };
+        out.push(DeferredVerdict {
+            gate_id,
+            verdict,
+            score: score.and_then(|s| Score::new(s).ok()),
+            reported_at,
+            reporter,
+        });
+    }
+    Ok(out)
+}
+
+/// Load a single trace by id with its deferred verdicts merged into `deferred` — the **view**
+/// for display/inspection. This is deliberately separate from [`load_all_traces`]: merging
+/// deferred verdicts changes the record, so a merged trace must NOT be fed to `verify_chain`
+/// (chain verification always runs on the sealed bodies from [`load_all_traces`]).
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] / [`StoreError::Json`] on database or decode errors.
+pub fn load_trace_view(
+    db_path: impl AsRef<Path>,
+    trace_id: &str,
+) -> Result<Option<Trace>, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let body: Option<String> = conn
+        .query_row(
+            "SELECT body FROM traces WHERE trace_id = ?1",
+            [trace_id],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(body) = body else { return Ok(None) };
+    let mut trace: Trace = serde_json::from_str(&body)?;
+    trace.deferred = load_deferred(db_path, trace_id)?;
+    Ok(Some(trace))
 }
 
 #[cfg(test)]
@@ -210,6 +349,59 @@ mod tests {
         assert_eq!(traces.len(), 2);
         assert_eq!(traces[0].prev_hash, GENESIS_HASH);
         assert_eq!(traces[1].prev_hash, traces[0].hash().unwrap());
+        verify_chain(&traces, GENESIS_HASH).unwrap();
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn deferred_verdicts_attach_on_read_without_breaking_the_chain() {
+        let db_path = std::env::temp_dir().join(format!(
+            "firstpass-deferred-test-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        let (tx, handle) = open(&db_path).unwrap();
+        let t0 = sample_trace("acme", "run-1");
+        let t1 = sample_trace("acme", "run-1");
+        let (id0, id1) = (t0.trace_id.to_string(), t1.trace_id.to_string());
+        tx.send(t0).unwrap();
+        tx.send(t1).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        // A downstream outcome arrives for the first trace (e.g. "tests passed an hour later").
+        let dv = DeferredVerdict {
+            gate_id: "tests".to_owned(),
+            verdict: Verdict::Pass,
+            score: Some(Score::new(1.0).unwrap()),
+            reported_at: jiff::Timestamp::now(),
+            reporter: "ci".to_owned(),
+        };
+        append_deferred(&db_path, &id0, &dv).unwrap();
+        assert!(trace_exists(&db_path, &id0).unwrap());
+        assert!(!trace_exists(&db_path, "no-such-trace").unwrap());
+
+        // The view surfaces the deferred verdict...
+        let view = load_trace_view(&db_path, &id0).unwrap().unwrap();
+        assert_eq!(view.deferred.len(), 1);
+        assert_eq!(view.deferred[0].gate_id, "tests");
+        assert_eq!(view.deferred[0].verdict, Verdict::Pass);
+        // ...the second trace has none.
+        assert!(
+            load_trace_view(&db_path, &id1)
+                .unwrap()
+                .unwrap()
+                .deferred
+                .is_empty()
+        );
+
+        // THE INVARIANT: the sealed bodies are untouched, so the chain still verifies. A late
+        // outcome can never alter a past decision's hash.
+        let traces = load_all_traces(&db_path).unwrap();
+        assert!(
+            traces.iter().all(|t| t.deferred.is_empty()),
+            "sealed records stay deferred-free"
+        );
         verify_chain(&traces, GENESIS_HASH).unwrap();
 
         let _ = std::fs::remove_file(&db_path);

@@ -13,9 +13,10 @@ use bytes::Bytes;
 use firstpass_core::features::{hour_bucket, token_bucket};
 use firstpass_core::hashchain::sha256_hex;
 use firstpass_core::{
-    Attempt, FEATURE_VERSION, Features, FinalOutcome, GENESIS_HASH, Mode, PolicyRef, RequestInfo,
-    ServedFrom, TaskKind, Trace, Verdict,
+    Attempt, DeferredVerdict, FEATURE_VERSION, Features, FinalOutcome, GENESIS_HASH, Mode,
+    PolicyRef, RequestInfo, Score, ServedFrom, TaskKind, Trace, Verdict,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
@@ -25,6 +26,7 @@ use crate::error::ProxyError;
 use crate::gate::{GateHealthRegistry, resolve_gates};
 use crate::provider::{Auth, ChatMessage, ModelRequest, ModelResponse, ProviderRegistry};
 use crate::router::{EnforceCtx, EngineOutcome, route_enforce};
+use crate::store;
 use crate::upstream::forward_anthropic;
 use firstpass_core::Route;
 
@@ -56,6 +58,7 @@ impl std::fmt::Debug for AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/v1/messages", post(messages))
+        .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
         .route("/healthz", get(healthz))
         .with_state(state)
@@ -86,8 +89,101 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
         "wire_apis": ["anthropic.messages"],
         "ladder": ladder,
         "gates": gates,
+        "feedback_api": "POST /v1/feedback",
         "offboarding": "unset ANTHROPIC_BASE_URL",
     }))
+}
+
+/// Body of `POST /v1/feedback`: a downstream outcome reported for a past decision.
+#[derive(Debug, Deserialize)]
+struct FeedbackRequest {
+    /// The `trace_id` of the decision this outcome is about.
+    trace_id: String,
+    /// The gate/source id, e.g. `"tests"` or `"feedback:ci"`.
+    gate_id: String,
+    /// `"pass"` | `"fail"` | `"abstain"`.
+    verdict: String,
+    /// Optional confidence in `[0, 1]`.
+    #[serde(default)]
+    score: Option<f64>,
+    /// Who reported it (a CI system, a human reviewer, a deferred gate).
+    reporter: String,
+}
+
+/// `POST /v1/feedback` — attach a downstream outcome (deferred verdict) to a past trace, closing
+/// the outcome-feedback loop (SPEC §8.3.4). The verdict is stored in a **separate** table keyed
+/// by `trace_id`; the sealed, hashed trace is never mutated, so the audit chain stays verifiable.
+/// Returns `202 Accepted`. This is the signal that later calibrates the gates.
+async fn feedback(State(state): State<AppState>, body: Bytes) -> Response {
+    let req: FeedbackRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return ProxyError::BadRequest(format!("invalid feedback body: {e}")).into_response();
+        }
+    };
+    let verdict = match req.verdict.as_str() {
+        "pass" => Verdict::Pass,
+        "fail" => Verdict::Fail,
+        "abstain" => Verdict::Abstain,
+        other => {
+            return ProxyError::BadRequest(format!("unknown verdict {other:?}")).into_response();
+        }
+    };
+    let score = match req.score {
+        Some(s) => match Score::new(s) {
+            Ok(sc) => Some(sc),
+            Err(_) => {
+                return ProxyError::BadRequest(format!("score {s} out of range [0,1]"))
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    let db = state.config.db_path.clone();
+
+    // Reject feedback for an unknown trace, so orphan outcomes can't accumulate.
+    let (db_check, tid_check) = (db.clone(), req.trace_id.clone());
+    match tokio::task::spawn_blocking(move || store::trace_exists(&db_check, &tid_check)).await {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            return ProxyError::NotFound(format!("unknown trace_id {:?}", req.trace_id))
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            tracing::error!(%e, "feedback: trace_exists check failed");
+            return ProxyError::Internal(e.to_string()).into_response();
+        }
+        Err(e) => {
+            tracing::error!(%e, "feedback: trace_exists task panicked");
+            return ProxyError::Internal(e.to_string()).into_response();
+        }
+    }
+
+    let dv = DeferredVerdict {
+        gate_id: req.gate_id,
+        verdict,
+        score,
+        reported_at: jiff::Timestamp::now(),
+        reporter: req.reporter,
+    };
+    let trace_id = req.trace_id.clone();
+    match tokio::task::spawn_blocking(move || store::append_deferred(&db, &req.trace_id, &dv)).await
+    {
+        Ok(Ok(())) => (
+            axum::http::StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "recorded", "trace_id": trace_id })),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(%e, "feedback: append_deferred failed");
+            ProxyError::Internal(e.to_string()).into_response()
+        }
+        Err(e) => {
+            tracing::error!(%e, "feedback: append_deferred task panicked");
+            ProxyError::Internal(e.to_string()).into_response()
+        }
+    }
 }
 
 /// The header a caller may set to group requests into a session for the audit trail. When
@@ -789,5 +885,119 @@ mod tests {
         let resp = messages(State(state), HeaderMap::new(), user_body()).await;
         // Observe path forwards upstream; the bogus host yields a gateway error, not our 200.
         assert_ne!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    // --- Feedback API tests (drive `feedback` against a real temp trace store) ---
+
+    /// Persist one trace to a fresh temp DB and return (state, db_path, trace_id).
+    async fn feedback_state() -> (AppState, std::path::PathBuf, String) {
+        let db = std::env::temp_dir().join(format!("firstpass-feedback-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+
+        let mut trace = build_error_trace(
+            &ProxyConfig::from_lookup(|_| None).unwrap(),
+            &Bytes::from_static(b"{}"),
+            5,
+            Some("sess-fb"),
+        );
+        trace.attempts.push(Attempt {
+            rung: 0,
+            model: "anthropic/claude-haiku-4-5".into(),
+            provider: "anthropic".into(),
+            in_tokens: 10,
+            out_tokens: 5,
+            cost_usd: 0.001,
+            latency_ms: 5,
+            gates: vec![],
+            verdict: Verdict::Pass,
+        });
+        let trace_id = trace.trace_id.to_string();
+        tx.send(trace).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let db_str = db.to_string_lossy().into_owned();
+        let config = ProxyConfig::from_lookup(move |k| match k {
+            "FIRSTPASS_DB" => Some(db_str.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let (traces, _rx) = mpsc::unbounded_channel();
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            traces,
+        };
+        (state, db, trace_id)
+    }
+
+    #[tokio::test]
+    async fn feedback_records_a_deferred_verdict_without_breaking_the_chain() {
+        let (state, db, trace_id) = feedback_state().await;
+        let body = Bytes::from(
+            serde_json::json!({
+                "trace_id": trace_id,
+                "gate_id": "tests",
+                "verdict": "pass",
+                "score": 1.0,
+                "reporter": "ci",
+            })
+            .to_string(),
+        );
+        let resp = feedback(State(state), body).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
+
+        // The deferred verdict is visible on the trace view...
+        let view = crate::store::load_trace_view(&db, &trace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.deferred.len(), 1);
+        assert_eq!(view.deferred[0].gate_id, "tests");
+        // ...and the sealed chain still verifies (the outcome didn't mutate the trace).
+        let traces = crate::store::load_all_traces(&db).unwrap();
+        firstpass_core::verify_chain(&traces, GENESIS_HASH).unwrap();
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn feedback_for_unknown_trace_is_404() {
+        let (state, db, _trace_id) = feedback_state().await;
+        let body = Bytes::from(
+            serde_json::json!({
+                "trace_id": "does-not-exist",
+                "gate_id": "tests",
+                "verdict": "pass",
+                "reporter": "ci",
+            })
+            .to_string(),
+        );
+        let resp = feedback(State(state), body).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn feedback_rejects_bad_verdict_and_score() {
+        let (state, db, trace_id) = feedback_state().await;
+        let bad_verdict = Bytes::from(
+            serde_json::json!({ "trace_id": trace_id, "gate_id": "g", "verdict": "maybe", "reporter": "x" })
+                .to_string(),
+        );
+        assert_eq!(
+            feedback(State(state.clone()), bad_verdict).await.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let bad_score = Bytes::from(
+            serde_json::json!({ "trace_id": trace_id, "gate_id": "g", "verdict": "pass", "score": 9.0, "reporter": "x" })
+                .to_string(),
+        );
+        assert_eq!(
+            feedback(State(state), bad_score).await.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let _ = std::fs::remove_file(&db);
     }
 }

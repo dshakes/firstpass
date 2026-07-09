@@ -28,6 +28,14 @@ pub enum ProxyError {
     /// The escalation engine could not serve any output (every rung errored).
     #[error("{0}")]
     Engine(String),
+
+    /// A referenced resource does not exist (e.g. feedback for an unknown trace id).
+    #[error("{0}")]
+    NotFound(String),
+
+    /// An internal failure (e.g. the trace store errored). Never leaks internals to the caller.
+    #[error("internal error")]
+    Internal(String),
 }
 
 impl ProxyError {
@@ -36,6 +44,8 @@ impl ProxyError {
             ProxyError::Upstream(_) => "upstream_error",
             ProxyError::BadRequestBody | ProxyError::BadRequest(_) => "bad_request",
             ProxyError::Engine(_) => "engine_error",
+            ProxyError::NotFound(_) => "not_found",
+            ProxyError::Internal(_) => "internal_error",
         }
     }
 
@@ -43,6 +53,8 @@ impl ProxyError {
         match self {
             ProxyError::Upstream(_) | ProxyError::Engine(_) => StatusCode::BAD_GATEWAY,
             ProxyError::BadRequestBody | ProxyError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ProxyError::NotFound(_) => StatusCode::NOT_FOUND,
+            ProxyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
