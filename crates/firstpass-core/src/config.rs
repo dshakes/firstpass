@@ -339,6 +339,16 @@ session_promotion = { after_failures = 3, window = "30m" }
     }
 
     #[test]
+    fn shipped_example_config_parses() {
+        // The repo ships `firstpass.example.toml` for users to copy. If it drifts
+        // from the schema, this fails in CI rather than at a user's first run.
+        let toml = include_str!("../../../firstpass.example.toml");
+        let c = Config::parse(toml).expect("firstpass.example.toml must parse");
+        assert_eq!(c.routes.len(), 3);
+        assert_eq!(c.routes[0].mode, Mode::Enforce);
+    }
+
+    #[test]
     fn empty_match_is_wildcard() {
         let m = Match::default();
         assert!(m.matches(&Features::new(TaskKind::Other)));

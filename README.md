@@ -10,19 +10,27 @@
 
 Proof over prediction. Built for agent fleets.
 
-[![status](https://img.shields.io/badge/status-building%20M1-f5a623)](SPEC.md)
+[![status](https://img.shields.io/badge/status-M0–M2%20shipped-19E3B1)](SPEC.md)
+[![tests](https://img.shields.io/badge/tests-98%20passing-19E3B1)](crates)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.93%2B-orange)](rust-toolchain.toml)
 [![spec](https://img.shields.io/badge/spec-v0.1-informational)](SPEC.md)
+
+**[Landing site →](https://dshakes.github.io/firstpass/)**  ·  [SPEC](SPEC.md)  ·  [example config](firstpass.example.toml)
 
 </div>
 
 ---
 
-> **Status — founding stage, actively building.** The founding spec ([SPEC.md](SPEC.md)) is done and the
-> domain contract (`firstpass-core`: trace schema, verdicts, tamper-evident hash chain, routing config,
-> cost model) is landing now. The M1 proxy is next. This README describes the product being built and the
-> DX we're building toward; nothing here claims measured results yet — that's what M0's benchmark proves.
+> **Status — the core routes, gates, audits, and learns end-to-end.** The proxy (`firstpass-proxy`) does
+> observe pass-through *and* enforce-mode escalation — cheapest model first, gate the real output, escalate on
+> failure, cross-provider failover — writing a tamper-evident audit trace and closing the outcome-feedback loop
+> (`POST /v1/feedback`). The gate framework ships subprocess plugins + error-budget auto-disable. The whole
+> path is verified **over real HTTP with no test doubles in the plane** ([`tests/end_to_end.rs`](crates/firstpass-proxy/tests/end_to_end.rs)).
+> **See it in ~10 seconds, no API keys:** `cargo run -p firstpass-proxy --example demo`.
+>
+> Honestly scoped: the proof-harness numbers below are a labeled *simulation* until wired to live providers (needs keys);
+> judge/self-consistency gates and published binaries are next. Nothing here is claimed as measured that isn't.
 
 ## The one-paragraph pitch
 
@@ -96,29 +104,50 @@ model, and what did it cost.* No router on the market can.
 3. **Escalate** exactly one rung on gate failure; serve the first output that passes, budget-capped.
 4. **Log** every decision as a tamper-evident trace; downstream outcomes feed back and sharpen the gate.
 
-## Install & integrate — the target experience (M1)
+## Run it now — real routing, no API keys (≈10s)
 
-> These are the one-liners we're building toward, shown so the DX is unambiguous. The proxy binary lands in M1;
-> follow [SPEC.md §16](SPEC.md) for status.
-
-A single static binary, no runtime dependencies, running in seconds — any of:
+The demo stands up a local server that speaks the Anthropic wire protocol, runs one **real** enforce-mode
+decision through the proxy (cheap model fails the gate → escalates → passes), prints the audit receipt, then
+reports a downstream outcome through the feedback API and shows it attach without breaking the chain:
 
 ```bash
-curl -LsSf https://firstpass.dev/install.sh | sh   # or: brew install firstpass/tap/firstpass
-docker run -p 8080:8080 firstpass/firstpass         # or: cargo install firstpass
+cargo run -p firstpass-proxy --example demo
 ```
 
-Then adopt it with **one environment variable** — no SDK, no code change:
+```text
+served output : fn main() { println!("hello world"); }
+served model  : anthropic/claude-sonnet-5
+
+── audit receipt ──────────────────────────────────
+  rung 0 · anthropic/claude-haiku-4-5   · FAIL · $0.0023
+  rung 1 · anthropic/claude-sonnet-5    · PASS · $0.0063
+  ─────────────────────────────────────────────────
+  total     $0.0086
+  baseline  $0.0330   (always top-tier)
+  SAVED     $0.0244   (73% cheaper at proven quality)
+  chain     verified ✓
+feedback POST /v1/feedback → 202 (downstream outcome recorded)
+audit chain after feedback : still verified ✓ — the sealed record never changed
+```
+
+Everything there is real code over real HTTP; only the upstream is local, so no keys are needed. Point the
+same proxy at real providers and it behaves identically.
+
+**Run the proxy for real** (BYOK — your keys, zero markup):
 
 ```bash
-firstpass up                                        # starts in observe mode with sane defaults
+cp firstpass.example.toml firstpass.toml            # declarative routes: ladder + gates per traffic slice
+FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml \
+  cargo run -p firstpass-proxy                      # or: docker build -t firstpass . && docker run -p 8080:8080 firstpass
 export ANTHROPIC_BASE_URL="http://localhost:8080"   # your agent already speaks this wire format
 # ...run your agent exactly as before. Offboard anytime: unset ANTHROPIC_BASE_URL
 ```
 
-**Multi-provider from day one:** first-class Anthropic, OpenAI, and Google clients, plus a generic
-OpenAI-compatible client that covers any compatible endpoint — hosted aggregators, third-party inference
-providers, and local runtimes alike. A model is just a `provider/model` line in your ladder — adding one never means a rebuild or a retrain.
+**Target install** (published artifacts — in progress): a single static binary in seconds via
+`curl … | sh`, `brew install`, `docker run firstpass/firstpass`, or `cargo install firstpass`.
+
+**Multi-provider:** first-class Anthropic and OpenAI clients today (Google + generic OpenAI-compatible next); a
+model is just a `provider/model` line in your ladder — adding one never means a rebuild or a retrain.
 
 ## Plugs into anything that talks to an LLM
 
@@ -196,11 +225,11 @@ not fine print.
 
 ## Roadmap (see [SPEC.md §16](SPEC.md))
 
-- **M0** — tier-clearance benchmark on real agentic coding tasks — the go/no-go gate on the whole bet.
-- **M1** — Rust proxy MVP: Anthropic + OpenAI endpoints, static ladder, observe mode, SQLite trace store.
-- **M2** — gate framework: plugin contract, reference gates, enforce mode, feedback API, error-budget auto-disable.
-- **M3** — dogfood GA on real agent traffic (compass subagent fleet is customer #1).
-- **M4 / M5** — learned routing (contextual bandit): shadow-eval → live, promotion gated on logged traces.
+- **M0 ✓** — tier-clearance benchmark: baselines, bootstrap CIs, split-conformal serving guarantee, published kill criterion (simulation until wired to live providers).
+- **M1 ✓** — Rust proxy: Anthropic + OpenAI clients, static ladder, observe **and** enforce mode, escalation, cross-provider failover, SQLite trace store — verified over real HTTP.
+- **M2 ✓** — gate framework: subprocess plugin contract, inline + schema gates, error-budget auto-disable, feedback API + deferred verdicts (chain-preserving).
+- **M3** — live-provider proof numbers, judge/self-consistency gates, published binaries; dogfood on real agent traffic.
+- **M4 / M5** — learned routing (contextual bandit): shadow-eval → live, promotion gated on logged traces and the feedback signal.
 - **M6** — OSS launch.
 
 ## Non-goals (what we deliberately don't do)
