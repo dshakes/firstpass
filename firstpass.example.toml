@@ -10,19 +10,33 @@
 match = { agent = "claude-code", subagent = ["test-runner", "explore"] }
 mode  = "enforce"
 ladder = ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
-gates  = ["schema", "judge-diff"]
+gates  = ["non-empty", "judge"]
 
 [[route]]
 match = { task_kind = "code_edit" }
 mode  = "enforce"
 ladder = ["anthropic/claude-sonnet-5", "anthropic/claude-opus-4-8"]
-gates  = ["patch-applies", "lint-diff", "judge-diff"]
-deferred_gates = ["compiles", "tests"]
+gates  = ["json-valid", "unit-tests"]
 
 [[route]]
 match = {}
 mode  = "observe"
 ladder = ["anthropic/claude-opus-4-8"]
+
+# Gates. Built-ins: `non-empty`, `json-valid`. Every other gate id is a `[[gate]]` below — any
+# executable that receives the candidate as JSON on **stdin** (never argv) and prints
+#   {"verdict":"pass|fail|abstain", "score"?: 0.0-1.0, "reason"?: "..."}
+# on stdout (SPEC §8.1). This is how you bring your own test runner, linter, or LLM judge — no
+# rebuild, just a command. Exit ≠ 0 or a timeout is treated as `abstain`.
+
+[[gate]]
+id  = "unit-tests"
+cmd = ["your-test-runner", "--from-stdin"]
+
+[[gate]]
+id         = "judge"          # e.g. a script that asks an LLM to grade the candidate
+cmd        = ["python3", "judge.py"]
+timeout_ms = 60000
 
 [budget]
 per_request_usd = 0.50

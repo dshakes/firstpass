@@ -317,7 +317,12 @@ async fn handle_enforce(
         .into_response();
     };
     let auth = Auth::from_headers(headers);
-    let gates = resolve_gates(&route.gates);
+    let gate_defs = state
+        .config
+        .routing
+        .as_ref()
+        .map_or(&[][..], |cfg| &cfg.gate_defs);
+    let gates = resolve_gates(&route.gates, gate_defs);
     let session_id = session_header.unwrap_or_else(|| Uuid::now_v7().to_string());
     let (budget, max_rungs) = match state.config.routing.as_ref() {
         Some(cfg) => (

@@ -8,10 +8,12 @@
 //! fail open (burns trust) (§7.2).
 
 use crate::provider::{ModelRequest, ModelResponse};
+use crate::subprocess::SubprocessGate;
 use async_trait::async_trait;
-use firstpass_core::{GateResult, Verdict};
+use firstpass_core::{GateDef, GateResult, Verdict};
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// A verification gate. Object-safe + async so subprocess/model gates fit the same contract.
 #[async_trait]
@@ -235,22 +237,41 @@ impl GateHealthRegistry {
     }
 }
 
-/// Resolve config gate names into runnable gates. Unknown names are skipped with a warning.
+/// Resolve a route's gate ids into runnable gates. Built-in ids (`non-empty`, `json-valid`) map to
+/// inline gates; any other id is looked up among the config's `[[gate]]` definitions and built as a
+/// [`SubprocessGate`] (SPEC §8.1 — bring your own test / linter / judge, invoked as a command that
+/// reads the candidate on stdin). An id that is neither built-in nor defined is skipped with a
+/// warning rather than failing the request.
 ///
-// ponytail: model gates (`judge-diff`, `self-consistency`) and deferred gates (`compiles`,
-// `tests`) need a live LLM / harness hook + the red-team fixture suite; they resolve to nothing
-// here (skipped with a warn) until Batch 5. `patch-applies`/`lint-diff` ship as subprocess gates
-// via config, not hard-coded names.
+// ponytail: a native in-proxy LLM-judge gate (`judge-diff`, `self-consistency`) is the follow-on —
+// it needs a live judge model to verify quality + the red-team injection fixtures. Until then a
+// judge IS reachable today: point a `[[gate]]` cmd at a script that calls a model.
 #[must_use]
-pub fn resolve_gates(names: &[String]) -> Vec<Box<dyn Gate>> {
+pub fn resolve_gates(names: &[String], defs: &[GateDef]) -> Vec<Box<dyn Gate>> {
     let mut gates: Vec<Box<dyn Gate>> = Vec::new();
     for name in names {
         match name.as_str() {
             "non-empty" => gates.push(Box::new(NonEmptyGate)),
             "json-valid" => gates.push(Box::new(JsonValidGate)),
-            other => {
-                tracing::warn!(gate = %other, "unknown gate id — skipped (implemented in M2+)")
-            }
+            other => match defs.iter().find(|d| d.id == other) {
+                Some(def) => {
+                    // `Config::parse` guarantees a non-empty cmd; stay defensive on the request path.
+                    let Some((program, args)) = def.cmd.split_first() else {
+                        tracing::warn!(gate = %other, "configured gate has empty cmd — skipped");
+                        continue;
+                    };
+                    gates.push(Box::new(SubprocessGate::new(
+                        def.id.clone(),
+                        program.clone(),
+                        args.to_vec(),
+                        Duration::from_millis(def.timeout_ms),
+                    )));
+                }
+                None => tracing::warn!(
+                    gate = %other,
+                    "unknown gate id — not a built-in and not defined in [[gate]]; skipped"
+                ),
+            },
         }
     }
     gates
@@ -359,13 +380,51 @@ mod tests {
 
     #[test]
     fn resolve_skips_unknown_and_keeps_known() {
-        let gates = resolve_gates(&[
-            "non-empty".to_owned(),
-            "judge-diff".to_owned(),
-            "json-valid".to_owned(),
-        ]);
+        let gates = resolve_gates(
+            &[
+                "non-empty".to_owned(),
+                "judge-diff".to_owned(),
+                "json-valid".to_owned(),
+            ],
+            &[],
+        );
         let ids: Vec<_> = gates.iter().map(|g| g.id()).collect();
         assert_eq!(ids, ["non-empty", "json-valid"]);
+    }
+
+    #[test]
+    fn resolve_builds_configured_subprocess_gate() {
+        // A gate id that isn't built-in resolves to a SubprocessGate when defined in `[[gate]]`.
+        let defs = vec![GateDef {
+            id: "my-tests".to_owned(),
+            cmd: vec!["true".to_owned()],
+            timeout_ms: 1000,
+        }];
+        let gates = resolve_gates(&["my-tests".to_owned(), "undefined".to_owned()], &defs);
+        let ids: Vec<_> = gates.iter().map(|g| g.id()).collect();
+        assert_eq!(
+            ids,
+            ["my-tests"],
+            "configured id resolves; unknown id skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_subprocess_gate_runs_end_to_end() {
+        // A user-defined gate that fails iff the candidate text contains "BAD" — proving the config
+        // → SubprocessGate → verdict path works over stdin, no hard-coded gate name.
+        let script = r#"c=$(cat); case "$c" in *BAD*) echo '{"verdict":"fail"}';; *) echo '{"verdict":"pass"}';; esac"#;
+        let defs = vec![GateDef {
+            id: "no-bad".to_owned(),
+            cmd: vec!["bash".to_owned(), "-c".to_owned(), script.to_owned()],
+            timeout_ms: 5000,
+        }];
+        let gates = resolve_gates(&["no-bad".to_owned()], &defs);
+        assert_eq!(gates.len(), 1);
+        let good = gates[0].evaluate(&req(), &resp("all good")).await;
+        assert_eq!(good.verdict, Verdict::Pass);
+        let bad = gates[0].evaluate(&req(), &resp("this is BAD")).await;
+        assert_eq!(bad.verdict, Verdict::Fail);
     }
 
     #[test]

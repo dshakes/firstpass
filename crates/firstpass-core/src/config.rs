@@ -34,6 +34,33 @@ pub struct Config {
     /// Escalation limits and promotion rules.
     #[serde(default)]
     pub escalation: Escalation,
+    /// User-defined subprocess gates (SPEC §8.1), referenced by `id` from a route's `gates` /
+    /// `deferred_gates`. Declared as `[[gate]]` sections in TOML.
+    #[serde(rename = "gate", default)]
+    pub gate_defs: Vec<GateDef>,
+}
+
+/// A user-defined subprocess gate (SPEC §8.1): any executable that reads the candidate as JSON on
+/// **stdin** (never argv — injection-resistant) and emits `{"verdict":"pass|fail|abstain", ...}`
+/// on stdout. This is the language-agnostic plugin mechanism — a test runner, a linter, or an LLM
+/// judge invoked by a script are all just commands here.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateDef {
+    /// The id a route references this gate by (must be unique and not shadow a built-in gate id).
+    pub id: String,
+    /// The command to run: program first, then its args — e.g. `["pytest", "-q"]` or
+    /// `["bash", "-c", "…"]`. Must be non-empty.
+    pub cmd: Vec<String>,
+    /// Hard timeout in milliseconds; the gate abstains (`timeout`) if the process runs longer.
+    #[serde(default = "default_gate_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// Default subprocess-gate timeout: 30s. Long enough for a test suite, short enough to bound the
+/// enforce-path tail.
+fn default_gate_timeout_ms() -> u64 {
+    30_000
 }
 
 /// One routing rule.
@@ -251,9 +278,29 @@ impl Config {
     /// Parse a TOML configuration document.
     ///
     /// # Errors
-    /// Returns [`Error::Config`] on invalid TOML or unknown fields.
+    /// Returns [`Error::Config`] on invalid TOML, unknown fields, or an invalid gate definition
+    /// (empty `cmd`, or a duplicate/blank `id`).
     pub fn parse(toml_str: &str) -> Result<Self> {
-        Ok(toml::from_str(toml_str)?)
+        let config: Self = toml::from_str(toml_str)?;
+        let mut seen = std::collections::HashSet::new();
+        for def in &config.gate_defs {
+            if def.id.trim().is_empty() {
+                return Err(Error::InvalidConfig("gate id must not be empty".to_owned()));
+            }
+            if def.cmd.is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "gate {:?} has an empty cmd",
+                    def.id
+                )));
+            }
+            if !seen.insert(def.id.as_str()) {
+                return Err(Error::InvalidConfig(format!(
+                    "duplicate gate id {:?}",
+                    def.id
+                )));
+            }
+        }
+        Ok(config)
     }
 
     /// The first route whose match claims `f`, or `None` if no route matches.
@@ -346,6 +393,44 @@ session_promotion = { after_failures = 3, window = "30m" }
         let c = Config::parse(toml).expect("firstpass.example.toml must parse");
         assert_eq!(c.routes.len(), 3);
         assert_eq!(c.routes[0].mode, Mode::Enforce);
+    }
+
+    #[test]
+    fn parses_gate_definitions() {
+        let toml = r#"
+[[route]]
+match = {}
+mode  = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+gates  = ["my-tests"]
+
+[[gate]]
+id  = "my-tests"
+cmd = ["pytest", "-q"]
+
+[[gate]]
+id         = "judge"
+cmd        = ["bash", "-c", "./judge.sh"]
+timeout_ms = 60000
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert_eq!(c.gate_defs.len(), 2);
+        assert_eq!(c.gate_defs[0].id, "my-tests");
+        assert_eq!(c.gate_defs[0].cmd, ["pytest", "-q"]);
+        assert_eq!(c.gate_defs[0].timeout_ms, 30_000, "default timeout applies");
+        assert_eq!(c.gate_defs[1].timeout_ms, 60_000);
+    }
+
+    #[test]
+    fn rejects_invalid_gate_definitions() {
+        let empty_cmd = "[[gate]]\nid = \"g\"\ncmd = []\n";
+        assert!(matches!(
+            Config::parse(empty_cmd),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        let dup = "[[gate]]\nid = \"g\"\ncmd = [\"a\"]\n[[gate]]\nid = \"g\"\ncmd = [\"b\"]\n";
+        assert!(matches!(Config::parse(dup), Err(Error::InvalidConfig(_))));
     }
 
     #[test]
