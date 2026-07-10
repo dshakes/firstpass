@@ -21,7 +21,7 @@ Proof over prediction. Built for agent fleets.
 
 Firstpass is a **drop-in, Anthropic-compatible proxy**. Point your agent's `base_url` at it and every request is routed to the cheapest model first, its **real output** is checked by a gate you define (tests, typecheck, schema, a judge), and it escalates one rung only when the gate fails — writing a tamper-evident audit trace for every decision.
 
-> **Honestly scoped.** The proxy routes, gates, escalates, fails over, audits, and learns end-to-end over real HTTP — no test doubles in the plane. The [proof-harness](#proof-not-adjectives) numbers are a labeled **simulation** until wired to live providers; prebuilt binaries, `cargo install`, and judge gates are on the [roadmap](#roadmap). Nothing here is claimed as measured that isn't.
+> **Honestly scoped.** The proxy routes, gates, escalates, fails over, audits, and learns end-to-end over real HTTP — no test doubles in the plane. The [proof harness](#proof-not-adjectives) now has a **live-provider mode** (`--live`) with a small real result below; the larger ≥200-task benchmark and a 30-day dogfood are the [roadmap](#roadmap). Prebuilt binaries and Homebrew are still pending. Nothing here is claimed as measured that isn't.
 
 ## Quickstart
 
@@ -121,14 +121,18 @@ FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy
 
 <div align="center"><img src="assets/proof.svg" alt="Proof-harness simulation: ~65% cheaper at equal-or-higher success, 0.16 vs 0.46 served-failure versus a predictive router, ≤10% conformal served-failure at 95% confidence, kill criterion reads PROCEED" width="880"></div>
 
-The harness (`cargo run -p firstpass-bench`) runs against a **simulated** backend behind real-backend trait seams, and ships a **pre-registered kill criterion** that says *stop* if the thesis fails — bootstrap confidence intervals and a split-conformal served-failure guarantee, not a benchmark screenshot. Live-provider numbers are pending API keys.
+The harness (`cargo run -p firstpass-bench`) runs the full methodology — baselines, bootstrap confidence intervals, a split-conformal served-failure guarantee, and a **pre-registered kill criterion** that says *stop* if the thesis fails — behind real-backend trait seams. `--live` swaps the simulated backend for real providers (BYOK).
+
+**Live preliminary — real Anthropic, 15 verifiable tasks:** Firstpass served at **~87% lower $/success than always-top at equal success** (0.933), beat a predictive router on served-failure (**0.067 vs 0.133**), and the cheap tier cleared **93%** of tasks against a 30% break-even — **kill criterion: PROCEED**. Caveat, stated plainly: this is a small proof-of-*pipeline* run with a *perfect deterministic* gate (so gate precision/recall is 1.00 and the conformal guarantee is degenerate). It is **not** the publishable benchmark — that needs ≥200 curated tasks and a real, imperfect gate, which is the next milestone.
 
 ## Roadmap
 
 - **M0 ✓** — proof harness: baselines, bootstrap CIs, conformal guarantee, pre-registered kill criterion.
 - **M1 ✓** — Rust proxy: Anthropic + OpenAI clients, observe **and** enforce, escalation, cross-provider failover, SQLite trace store — over real HTTP.
-- **M2 ✓** — gate framework: subprocess plugins, inline + schema gates, error-budget auto-disable, feedback API + deferred verdicts.
-- **M3 →** — live-provider proof, judge / self-consistency gates, published binaries + Homebrew tap, SSE streaming passthrough.
+- **M2 ✓** — gate framework: subprocess plugins, inline + schema gates, **native LLM-judge gate** (maker≠checker, candidate-as-data), error-budget auto-disable, feedback API + deferred verdicts.
+- **M2.5 ✓** — real-traffic proxy: **SSE streaming passthrough**, tool/multimodal-safe enforce; **`firstpass` CLI** (`up` / `doctor` / `trace`) + **MCP server**; live-provider proof harness (`--live`).
+- **M3 →** — larger live benchmark (≥200 tasks + a real imperfect gate), 30-day self-host dogfood GA, published binaries + Homebrew tap.
+- **Hosted GA →** — multi-tenant control plane, BYOK KMS envelope encryption, sandboxed gate execution — designed in [ADR 0001](docs/adr/0001-hosted-ga-architecture.md), gated behind dogfood GA.
 
 ## Links
 
