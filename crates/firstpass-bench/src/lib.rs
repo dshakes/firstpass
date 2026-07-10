@@ -12,6 +12,7 @@
 
 pub mod coding;
 pub mod conformal;
+pub mod dataset;
 pub mod live;
 pub mod metrics;
 pub mod policy;

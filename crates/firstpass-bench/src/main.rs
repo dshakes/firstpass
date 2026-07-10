@@ -12,6 +12,7 @@ use firstpass_bench::coding::{
     CandidateSolver, CodingReport, GeneratedSolver, LiveSolver, coding_suite,
     generated_coding_suite, mock_solutions, run_coding_benchmark,
 };
+use firstpass_bench::dataset::load_mbpp_jsonl;
 use firstpass_bench::sandbox::establish_sandbox;
 use firstpass_bench::{BenchConfig, run_benchmark, run_benchmark_live};
 
@@ -48,6 +49,13 @@ fn main() {
     // (needed for a feasible conformal bound).
     if args.iter().any(|a| a == "--coding" || a == "--coding-live") {
         let live_coding = args.iter().any(|a| a == "--coding-live");
+        let dataset_path = std::env::var("FIRSTPASS_CODING_DATASET").ok();
+        if dataset_path.is_some() && !live_coding {
+            eprintln!(
+                "FIRSTPASS_CODING_DATASET needs --coding-live (plain --coding has no live solver to grade a real dataset)"
+            );
+            std::process::exit(2);
+        }
         let sb = match establish_sandbox(SANDBOX_IMAGE) {
             Ok(sb) => sb,
             Err(e) => {
@@ -59,9 +67,18 @@ fn main() {
         let n_gen = std::env::var("FIRSTPASS_CODING_N")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
-        let tasks = match n_gen {
-            Some(n) => generated_coding_suite(n),
-            None => coding_suite(),
+        let tasks = match &dataset_path {
+            Some(path) => match load_mbpp_jsonl(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("failed to load coding dataset {path}: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => match n_gen {
+                Some(n) => generated_coding_suite(n),
+                None => coding_suite(),
+            },
         };
         // Offline solver must match the suite: GeneratedSolver for the generated suite, mock for demo.
         let solver: Box<dyn CandidateSolver> = if live_coding {
