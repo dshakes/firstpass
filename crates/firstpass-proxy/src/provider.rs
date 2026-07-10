@@ -434,6 +434,9 @@ impl ProviderRegistry {
 pub struct MockProvider {
     id: String,
     outcomes: HashMap<String, Result<ModelResponse, ProviderError>>,
+    /// Every model string `complete()` was called with — lets speculation tests assert which rungs
+    /// were actually fired. Shared (`Arc`) so a clone taken before boxing still observes the calls.
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[cfg(test)]
@@ -447,7 +450,15 @@ impl MockProvider {
         Self {
             id: id.into(),
             outcomes,
+            calls: Arc::default(),
         }
+    }
+
+    /// A handle to the shared call log; clone it before boxing the provider into a registry, then
+    /// inspect the models `complete()` saw after the engine runs.
+    #[must_use]
+    pub fn call_log(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+        Arc::clone(&self.calls)
     }
 }
 
@@ -463,6 +474,7 @@ impl Provider for MockProvider {
         req: &ModelRequest,
         _auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
+        self.calls.lock().unwrap().push(req.model.clone());
         self.outcomes.get(&req.model).cloned().unwrap_or_else(|| {
             Err(ProviderError::Decode(format!(
                 "no mock outcome configured for {}",

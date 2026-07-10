@@ -324,12 +324,13 @@ async fn handle_enforce(
         .map_or(&[][..], |cfg| &cfg.gate_defs);
     let gates = resolve_gates(&route.gates, gate_defs, &state.providers, &auth);
     let session_id = session_header.unwrap_or_else(|| Uuid::now_v7().to_string());
-    let (budget, max_rungs) = match state.config.routing.as_ref() {
+    let (budget, max_rungs, speculation) = match state.config.routing.as_ref() {
         Some(cfg) => (
             cfg.budget.per_request_usd,
             cfg.escalation.max_rungs_per_request,
+            cfg.escalation.speculation,
         ),
-        None => (None, 3),
+        None => (None, 3, 0),
     };
 
     let ctx = EnforceCtx {
@@ -342,6 +343,7 @@ async fn handle_enforce(
         prices: &state.config.prices,
         budget_per_request_usd: budget,
         max_rungs,
+        speculation,
         features,
         tenant_id: state.config.tenant_id.clone(),
         session_id,

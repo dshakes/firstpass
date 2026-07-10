@@ -219,6 +219,10 @@ pub struct Escalation {
     /// Optionally start higher for the rest of a session that keeps failing.
     #[serde(default)]
     pub session_promotion: Option<SessionPromotion>,
+    /// Prefetch depth: fire this many rungs ahead concurrently to trade wasted spend for latency.
+    /// `0` (default) is serial — one call at a time. The served result is identical either way.
+    #[serde(default)]
+    pub speculation: u32,
 }
 
 const fn default_max_rungs() -> u32 {
@@ -230,6 +234,7 @@ impl Default for Escalation {
         Self {
             max_rungs_per_request: default_max_rungs(),
             session_promotion: None,
+            speculation: 0,
         }
     }
 }
