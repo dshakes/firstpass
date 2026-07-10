@@ -993,4 +993,50 @@ mod tests {
             EngineOutcome::Failed(e) => panic!("expected best-attempt served, got {e}"),
         }
     }
+
+    #[tokio::test]
+    async fn speculation_cuts_wall_clock_vs_serial() {
+        // The latency payoff, verified offline: rung 0 fails the gate, so serial pays rung 0 + rung
+        // 1 latency *sequentially*; speculation fires both concurrently and finishes in ~one rung's
+        // time. Timing-based, but the margin (a full 80ms rung) dwarfs scheduler jitter. This proves
+        // the overlap mechanism — absolute live p95 still needs a real-provider run.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+
+        let build = || {
+            let mut outs = HashMap::new();
+            outs.insert(HAIKU.to_owned(), Ok(resp(HAIKU, ""))); // fails non-empty
+            outs.insert(SONNET.to_owned(), Ok(resp(SONNET, "real answer"))); // passes
+            let mock = MockProvider::new("anthropic", outs).with_delay(80);
+            let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+            map.insert("anthropic".to_owned(), Arc::new(mock));
+            ProviderRegistry::from_map(map)
+        };
+
+        let providers = build();
+        let health = GateHealthRegistry::new();
+        let t = std::time::Instant::now();
+        let _ = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+        let serial = t.elapsed();
+
+        let providers = build();
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.speculation = 1;
+        let t = std::time::Instant::now();
+        let _ = route_enforce(c).await;
+        let spec = t.elapsed();
+
+        assert!(
+            spec < serial * 3 / 4,
+            "speculation must overlap rung latencies: serial={serial:?} spec={spec:?}"
+        );
+    }
 }

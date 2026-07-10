@@ -437,6 +437,9 @@ pub struct MockProvider {
     /// Every model string `complete()` was called with — lets speculation tests assert which rungs
     /// were actually fired. Shared (`Arc`) so a clone taken before boxing still observes the calls.
     calls: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Simulated per-call latency (0 = respond instantly). Lets a test measure the wall-clock win
+    /// speculation buys by overlapping rung calls that would otherwise run serially.
+    delay_ms: u64,
 }
 
 #[cfg(test)]
@@ -451,7 +454,15 @@ impl MockProvider {
             id: id.into(),
             outcomes,
             calls: Arc::default(),
+            delay_ms: 0,
         }
+    }
+
+    /// Make `complete()` sleep `ms` before responding, to simulate real per-call latency.
+    #[must_use]
+    pub fn with_delay(mut self, ms: u64) -> Self {
+        self.delay_ms = ms;
+        self
     }
 
     /// A handle to the shared call log; clone it before boxing the provider into a registry, then
@@ -475,6 +486,9 @@ impl Provider for MockProvider {
         _auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
         self.calls.lock().unwrap().push(req.model.clone());
+        if self.delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        }
         self.outcomes.get(&req.model).cloned().unwrap_or_else(|| {
             Err(ProviderError::Decode(format!(
                 "no mock outcome configured for {}",
