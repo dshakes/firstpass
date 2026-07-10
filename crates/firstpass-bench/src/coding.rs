@@ -1,28 +1,27 @@
-//! Coding-with-tests benchmark (Batch 3b) — the domain where the best practical gate is STILL
+//! Coding-with-tests benchmark (Batch 3b/3c) — the domain where the best practical gate is STILL
 //! imperfect, so the conformal served-failure bound is *meaningful* (unlike self-checking
 //! arithmetic, which has a zero-error gate and degenerate conformal — proven in Batch 1).
 //!
-//! A candidate model writes code for a task. The **visible** tests are the gate (real coverage gaps
-//! → genuine false-accept / false-reject); the **hidden** oracle tests are ground truth. Every
-//! candidate runs in the fail-closed sandbox (ADR 0002 — untrusted, model-generated code). Conformal
-//! calibrates on `(gate_pass, oracle_correct)` pairs, where the gate's error is now real.
+//! A candidate model writes code for a task. The **visible** cases are the gate; the **hidden**
+//! oracle cases are ground truth. Every candidate runs in the fail-closed sandbox (ADR 0002 —
+//! untrusted, model-generated code).
 //!
-//! Cost note: unlike the arithmetic harness, this measures each task **once** (one candidate call,
-//! two sandbox runs) rather than re-running per policy — candidate calls and sandbox execs are
-//! expensive, so we record the (gate, oracle) pair directly and derive the numbers from it.
+//! **Continuous gate score (3c):** the gate score is the *fraction of visible cases passed*, in
+//! `[0, 1]`, not a bare pass/fail. Conformal calibrates on `(gate_score, oracle_correct)` and can
+//! now pick a real threshold `λ` — serving only candidates scoring `≥ λ`. This refines the *reject*
+//! side: a candidate that passes only some visible cases (score `< 1`) can be held back. It does NOT
+//! magically fix false-accepts: a candidate that passes **all** visible cases scores `1.0`, so a bug
+//! that only the hidden oracle catches is still served — the residual lever there is broader visible
+//! coverage or a reasoning (judge) gate, not test-fraction alone. We report both honestly.
 //!
-//! Gate-score note: this first cut uses a **binary** gate (visible suite passes or not), so its
-//! conformal score is `{0, 1}`. Conformal can then only choose "serve every gate-pass" or "serve
-//! none" — it cannot exclude individual false-accepts, so it needs enough samples for the Hoeffding
-//! bound to absorb the empirical failure rate. A **continuous** gate score (fraction of visible
-//! test cases passed, or a judge score) would let conformal actually tune the threshold; that is the
-//! natural next refinement.
+//! Cost note: each task is measured **once** (one candidate call, two sandbox runs) rather than
+//! re-running per policy — candidate calls and sandbox execs are expensive.
 
 use crate::conformal::{self, ConformalResult};
-use crate::sandbox::{ExecUnit, Limits, Sandbox};
+use crate::sandbox::{ExecOutcome, ExecUnit, Limits, Sandbox};
 use std::collections::HashMap;
 
-/// A coding task: prompt, the file the candidate writes, and two test suites.
+/// A coding task: prompt, the file the candidate writes, and two lists of boolean-expression cases.
 #[derive(Debug, Clone)]
 pub struct CodingTask {
     /// Stable id, e.g. `"is_prime"`.
@@ -31,11 +30,11 @@ pub struct CodingTask {
     pub prompt: String,
     /// File the candidate's code is written to, e.g. `"solution.py"`.
     pub entrypoint: String,
-    /// The **gate**: a Python script that imports the solution and asserts (exit 0 = pass). Has
-    /// deliberate coverage gaps, so passing it does not guarantee correctness.
-    pub visible_tests: String,
-    /// The **oracle** (ground truth): a thorough Python script; exit 0 = actually correct.
-    pub hidden_tests: String,
+    /// The **gate**: Python boolean expressions (each must eval truthy). Deliberate coverage gaps —
+    /// passing all of them does not guarantee correctness.
+    pub visible_cases: Vec<String>,
+    /// The **oracle** (ground truth): thorough Python boolean expressions; all-pass = correct.
+    pub hidden_cases: Vec<String>,
 }
 
 /// Candidate code plus its token cost.
@@ -43,31 +42,32 @@ pub struct CodingTask {
 pub struct Solution {
     /// The candidate's code for [`CodingTask::entrypoint`].
     pub code: String,
-    /// Input tokens billed (0 for the mock solver).
+    /// Input tokens billed (0 for offline solvers).
     pub in_tokens: u64,
-    /// Output tokens billed (0 for the mock solver).
+    /// Output tokens billed (0 for offline solvers).
     pub out_tokens: u64,
 }
 
-/// Produces candidate code for a task. [`MockSolver`] (offline, deterministic) or [`LiveSolver`]
+/// Produces candidate code for a task. Offline ([`MockSolver`]/[`GeneratedSolver`]) or [`LiveSolver`]
 /// (Anthropic, opt-in, costs tokens).
 pub trait CandidateSolver {
     /// Solve one task.
     ///
     /// # Errors
-    /// A solver failure aborts the whole run — we refuse to publish partial numbers (mirrors the
-    /// arithmetic live path).
+    /// A solver failure aborts the whole run — we refuse to publish partial numbers.
     fn solve(&self, task: &CodingTask) -> Result<Solution, String>;
 }
 
-/// One task's measured pair: did the gate pass, and was it actually correct?
+/// One task's measured result.
 #[derive(Debug, Clone)]
 pub struct TaskOutcome {
     /// Task id.
     pub id: String,
-    /// Visible (gate) tests passed.
-    pub gate_pass: bool,
-    /// Hidden (oracle) tests passed — ground truth.
+    /// Fraction of visible cases passed, in `[0, 1]` — the continuous gate score.
+    pub gate_score: f64,
+    /// All visible cases passed (`gate_score == 1.0`) — the "serve on full pass" condition.
+    pub gate_full_pass: bool,
+    /// All hidden oracle cases passed — ground truth.
     pub oracle_correct: bool,
     /// Input tokens billed.
     pub in_tokens: u64,
@@ -84,17 +84,18 @@ pub struct CodingReport {
     pub n: usize,
     /// Fraction of tasks the candidate got actually correct (per the oracle).
     pub oracle_pass_rate: f64,
-    /// Gate **false-accept** rate: `P(gate passes | oracle incorrect)` — the coverage-gap leakage
-    /// that makes conformal meaningful. Zero for a perfect gate (arithmetic); non-zero here.
+    /// Gate **false-accept** rate at full-pass: `P(all visible pass | oracle incorrect)` — the
+    /// coverage-gap leakage that makes conformal meaningful. Zero for a perfect gate (arithmetic).
     pub gate_false_accept_rate: f64,
-    /// Gate **false-reject** rate: `P(gate fails | oracle correct)`.
+    /// Gate **false-reject** rate at full-pass: `P(not all visible pass | oracle correct)`.
     pub gate_false_reject_rate: f64,
-    /// Served-failure if you serve whenever the gate passes, with no conformal threshold:
-    /// `P(incorrect | gate passes)`. What conformal is there to bound.
-    pub served_failure_rate: f64,
-    /// Conformal threshold + its calibrated served-failure bound (needs `n >= min_n` to be
-    /// `feasible`; a small demo suite will be infeasible — that's honest, size up for a real run).
+    /// Served-failure if you serve every full-visible-pass, no conformal: `P(incorrect | full pass)`.
+    pub served_failure_full_pass: f64,
+    /// Conformal threshold on the continuous score + its calibrated bound (needs enough served
+    /// samples to be `feasible`; a tiny suite is honestly infeasible).
     pub conformal: ConformalResult,
+    /// Empirical served-failure at the conformal threshold on this same set (validation).
+    pub served_failure_at_threshold: f64,
     /// Per-task detail.
     pub outcomes: Vec<TaskOutcome>,
 }
@@ -107,28 +108,54 @@ fn ratio(num: usize, den: usize) -> f64 {
     }
 }
 
-/// Run one test suite against candidate code in the sandbox; `true` iff it exits 0. A sandbox error
-/// (or non-zero exit) is a fail — never a panic, never a host fallback.
-fn suite_passes(
+/// Build the Python runner that imports the solution, evals each case, and prints `FP_SCORE p n`.
+/// Cases are passed as JSON (stdlib) so arbitrary expression text needs no shell/Python escaping.
+fn build_runner(cases: &[String]) -> String {
+    let json = serde_json::to_string(cases).unwrap_or_else(|_| "[]".to_owned());
+    format!(
+        "import json\nfrom solution import *\nCASES = json.loads(r'''{json}''')\np = 0\nfor c in CASES:\n    try:\n        if eval(c):\n            p += 1\n    except Exception:\n        pass\nprint('FP_SCORE %d %d' % (p, len(CASES)))\n"
+    )
+}
+
+/// Parse `FP_SCORE p n` out of runner stdout.
+fn parse_score(stdout: &str) -> Option<(usize, usize)> {
+    let line = stdout.lines().find(|l| l.starts_with("FP_SCORE "))?;
+    let mut it = line.split_whitespace().skip(1);
+    let p = it.next()?.parse().ok()?;
+    let n = it.next()?.parse().ok()?;
+    Some((p, n))
+}
+
+/// Run one case list against candidate code in the sandbox; returns `(passed, total)`. A sandbox
+/// error, crash, or timeout counts as zero passed — never a panic, never a host fallback.
+fn suite_score(
     sb: &dyn Sandbox,
     task: &CodingTask,
     code: &str,
-    tests: &str,
+    cases: &[String],
     limits: &Limits,
-) -> bool {
+) -> (usize, usize) {
+    if cases.is_empty() {
+        return (0, 0);
+    }
     let unit = ExecUnit {
         files: vec![
             (task.entrypoint.clone(), code.to_owned()),
-            ("fp_tests.py".to_owned(), tests.to_owned()),
+            ("fp_runner.py".to_owned(), build_runner(cases)),
         ],
-        command: "python3 fp_tests.py".to_owned(),
+        command: "python3 fp_runner.py".to_owned(),
     };
-    sb.run(&unit, limits)
-        .map(|o| o.is_success())
-        .unwrap_or(false)
+    match sb.run(&unit, limits) {
+        Ok(ExecOutcome::Completed {
+            exit_code: 0,
+            stdout,
+            ..
+        }) => parse_score(&stdout).unwrap_or((0, cases.len())),
+        _ => (0, cases.len()),
+    }
 }
 
-/// Evaluate one task: solve, then run the visible (gate) and hidden (oracle) suites in the sandbox.
+/// Evaluate one task: solve, then score the visible (gate) and hidden (oracle) case lists.
 ///
 /// # Errors
 /// Propagates a solver failure so the caller can refuse to publish.
@@ -139,12 +166,14 @@ pub fn evaluate_task(
     limits: &Limits,
 ) -> Result<TaskOutcome, String> {
     let sol = solver.solve(task)?;
-    let gate_pass = suite_passes(sb, task, &sol.code, &task.visible_tests, limits);
-    let oracle_correct = suite_passes(sb, task, &sol.code, &task.hidden_tests, limits);
+    let (vp, vt) = suite_score(sb, task, &sol.code, &task.visible_cases, limits);
+    let (hp, ht) = suite_score(sb, task, &sol.code, &task.hidden_cases, limits);
+    let gate_score = ratio(vp, vt);
     Ok(TaskOutcome {
         id: task.id.clone(),
-        gate_pass,
-        oracle_correct,
+        gate_score,
+        gate_full_pass: vt > 0 && vp == vt,
+        oracle_correct: ht > 0 && hp == ht,
         in_tokens: sol.in_tokens,
         out_tokens: sol.out_tokens,
     })
@@ -177,8 +206,8 @@ pub fn run_coding_benchmark(
     ))
 }
 
-/// Derive the gate error, served-failure, and conformal bound from measured `(gate, oracle)` pairs.
-/// Pure — no sandbox, no model — so the metric math is unit-testable without Docker.
+/// Derive gate error, served-failure, and the conformal bound from measured outcomes. Pure — no
+/// sandbox, no model — so the metric math is unit-testable without Docker.
 #[must_use]
 pub fn summarize(
     runtime_tier: String,
@@ -192,20 +221,22 @@ pub fn summarize(
     let correct = n - incorrect;
     let false_accept = outcomes
         .iter()
-        .filter(|o| o.gate_pass && !o.oracle_correct)
+        .filter(|o| o.gate_full_pass && !o.oracle_correct)
         .count();
     let false_reject = outcomes
         .iter()
-        .filter(|o| !o.gate_pass && o.oracle_correct)
+        .filter(|o| !o.gate_full_pass && o.oracle_correct)
         .count();
-    let served = outcomes.iter().filter(|o| o.gate_pass).count();
+    let full_pass = outcomes.iter().filter(|o| o.gate_full_pass).count();
 
-    // Conformal on binary gate scores: serving-when-gate-passes; the bound is on P(incorrect|served).
+    // Conformal on the CONTINUOUS gate score: serve when score >= threshold.
     let pairs: Vec<(f64, bool)> = outcomes
         .iter()
-        .map(|o| (f64::from(u8::from(o.gate_pass)), o.oracle_correct))
+        .map(|o| (o.gate_score, o.oracle_correct))
         .collect();
     let conformal = conformal::calibrate(&pairs, alpha, delta, min_n);
+    let (served_failure_at_threshold, _) =
+        conformal::served_failure_rate(&pairs, conformal.threshold);
 
     CodingReport {
         runtime_tier,
@@ -213,8 +244,9 @@ pub fn summarize(
         oracle_pass_rate: ratio(correct, n),
         gate_false_accept_rate: ratio(false_accept, incorrect),
         gate_false_reject_rate: ratio(false_reject, correct),
-        served_failure_rate: ratio(false_accept, served),
+        served_failure_full_pass: ratio(false_accept, full_pass),
         conformal,
+        served_failure_at_threshold,
         outcomes,
     }
 }
@@ -302,7 +334,6 @@ fn strip_fences(s: &str) -> String {
     let Some(rest) = t.strip_prefix("```") else {
         return t.to_owned();
     };
-    // Drop the rest of the opening fence line (an optional language tag), then a trailing fence.
     let body = rest.split_once('\n').map_or("", |(_, b)| b);
     body.trim_end()
         .strip_suffix("```")
@@ -311,121 +342,211 @@ fn strip_fences(s: &str) -> String {
         .to_owned()
 }
 
-// ---- embedded demo suite ----------------------------------------------------------------------
+// ---- suites -----------------------------------------------------------------------------------
 
-/// A small coding suite with **deliberate visible-test coverage gaps**, so a real candidate can pass
-/// the gate while failing the oracle (a genuine false-accept). Enough to exercise and verify the
-/// pipeline end-to-end; a real conformal bound needs a much larger live run (size `n` accordingly).
+fn task(id: &str, prompt: &str, visible: &[&str], hidden: &[&str]) -> CodingTask {
+    CodingTask {
+        id: id.to_owned(),
+        prompt: prompt.to_owned(),
+        entrypoint: "solution.py".to_owned(),
+        visible_cases: visible.iter().map(|s| (*s).to_owned()).collect(),
+        hidden_cases: hidden.iter().map(|s| (*s).to_owned()).collect(),
+    }
+}
+
+/// A small hand-authored suite with deliberate visible-case gaps — enough to exercise the pipeline
+/// end-to-end. A real conformal bound needs the larger [`generated_coding_suite`] via a live run.
 #[must_use]
 pub fn coding_suite() -> Vec<CodingTask> {
-    fn task(id: &str, prompt: &str, visible: &str, hidden: &str) -> CodingTask {
-        CodingTask {
-            id: id.to_owned(),
-            prompt: prompt.to_owned(),
-            entrypoint: "solution.py".to_owned(),
-            visible_tests: visible.to_owned(),
-            hidden_tests: hidden.to_owned(),
-        }
-    }
     vec![
         task(
             "is_prime",
             "Write solution.py defining `is_prime(n: int) -> bool` returning True iff n is prime.",
-            "from solution import is_prime\nassert is_prime(2) and is_prime(3) and is_prime(13)\nassert not is_prime(4) and not is_prime(9)\nprint('ok')\n",
-            // gap in visible: n < 2 is never tested.
-            "from solution import is_prime\nassert not is_prime(0) and not is_prime(1) and not is_prime(-7)\nassert is_prime(2) and is_prime(7919)\nprint('ok')\n",
+            &[
+                "is_prime(2)",
+                "is_prime(13)",
+                "not is_prime(4)",
+                "not is_prime(9)",
+            ],
+            &[
+                "not is_prime(0)",
+                "not is_prime(1)",
+                "not is_prime(-7)",
+                "is_prime(7919)",
+            ], // gap: n<2
         ),
         task(
             "count_vowels",
-            "Write solution.py defining `count_vowels(s: str) -> int` counting vowels (a,e,i,o,u), case-insensitive.",
-            "from solution import count_vowels\nassert count_vowels('hello') == 2\nassert count_vowels('xyz') == 0\nprint('ok')\n",
-            // gap in visible: uppercase vowels never tested.
-            "from solution import count_vowels\nassert count_vowels('AEIOU') == 5\nassert count_vowels('Hello World') == 3\nprint('ok')\n",
+            "Write solution.py defining `count_vowels(s: str) -> int` counting vowels a,e,i,o,u, case-insensitive.",
+            &["count_vowels('hello') == 2", "count_vowels('xyz') == 0"],
+            &[
+                "count_vowels('AEIOU') == 5",
+                "count_vowels('Hello World') == 3",
+            ], // gap: uppercase
         ),
         task(
             "reverse_string",
             "Write solution.py defining `reverse_string(s: str) -> str` returning s reversed.",
-            "from solution import reverse_string\nassert reverse_string('abc') == 'cba'\nassert reverse_string('') == ''\nprint('ok')\n",
-            "from solution import reverse_string\nassert reverse_string('racecar') == 'racecar'\nassert reverse_string('ab cd') == 'dc ba'\nprint('ok')\n",
-        ),
-        task(
-            "list_sum",
-            "Write solution.py defining `list_sum(xs: list[int]) -> int` returning the sum of xs.",
-            "from solution import list_sum\nassert list_sum([1,2,3]) == 6\nassert list_sum([]) == 0\nprint('ok')\n",
-            "from solution import list_sum\nassert list_sum([-1,-2,-3]) == -6\nassert list_sum([100]) == 100\nprint('ok')\n",
-        ),
-        task(
-            "gcd",
-            "Write solution.py defining `gcd(a: int, b: int) -> int` returning the greatest common divisor.",
-            "from solution import gcd\nassert gcd(12, 8) == 4\nassert gcd(7, 1) == 1\nprint('ok')\n",
-            "from solution import gcd\nassert gcd(0, 5) == 5\nassert gcd(270, 192) == 6\nprint('ok')\n",
-        ),
-        task(
-            "factorial",
-            "Write solution.py defining `factorial(n: int) -> int` returning n! (with factorial(0)==1).",
-            "from solution import factorial\nassert factorial(0) == 1\nassert factorial(5) == 120\nprint('ok')\n",
-            "from solution import factorial\nassert factorial(1) == 1\nassert factorial(6) == 720\nprint('ok')\n",
+            &["reverse_string('abc') == 'cba'", "reverse_string('') == ''"],
+            &[
+                "reverse_string('racecar') == 'racecar'",
+                "reverse_string('ab cd') == 'dc ba'",
+            ],
         ),
     ]
 }
 
-/// Canned solutions matching [`coding_suite`], with a **known** mix: two false-accepts (pass the
-/// gappy gate, fail the oracle), one true-reject (fails both), three correct. Used by the mock run
-/// and the real-sandbox pipeline test.
+/// Canned solutions for [`coding_suite`] with a known mix: one false-accept (`is_prime`, passes the
+/// gappy gate, fails the oracle), one true-reject (`count_vowels` here is correct — kept simple),
+/// one correct. Used by the real-sandbox pipeline test.
 #[must_use]
 pub fn mock_solutions() -> MockSolver {
     MockSolver::new(vec![
-        // FALSE ACCEPT: is_prime that returns True for n < 2 (untested by the visible gate).
+        // FALSE ACCEPT: is_prime returns True for n < 2 (untested by the visible gate).
         (
             "is_prime",
             "def is_prime(n):\n    d = 2\n    while d * d <= n:\n        if n % d == 0:\n            return False\n        d += 1\n    return True\n",
         ),
-        // FALSE ACCEPT: count_vowels that ignores uppercase (untested by the visible gate).
+        // CORRECT.
         (
             "count_vowels",
-            "def count_vowels(s):\n    return sum(1 for c in s if c in 'aeiou')\n",
+            "def count_vowels(s):\n    return sum(1 for c in s.lower() if c in 'aeiou')\n",
         ),
         // CORRECT.
         (
             "reverse_string",
             "def reverse_string(s):\n    return s[::-1]\n",
         ),
-        // CORRECT.
-        ("list_sum", "def list_sum(xs):\n    return sum(xs)\n"),
-        // CORRECT.
-        (
-            "gcd",
-            "def gcd(a, b):\n    while b:\n        a, b = b, a % b\n    return a\n",
-        ),
-        // TRUE REJECT: broken factorial — the gate correctly catches it (fails visible too).
-        ("factorial", "def factorial(n):\n    return 0\n"),
     ])
+}
+
+/// Deterministic 64-bit FNV-1a with a seed — for reproducible variant selection without a rand dep.
+fn fnv(s: &str, seed: u64) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325 ^ seed;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// A scalable, deterministic coding suite: `n` "bucket" classifier tasks with per-task thresholds
+/// `(lo, hi)`, each with visible cases that avoid the `hi` boundary (the coverage gap) and hidden
+/// cases that hit it. Big enough (`n ≥ ~200`) to make a conformal bound feasible on a live run.
+/// The thresholds are encoded in the id (`bucket-{i}-{lo}-{hi}`) so [`GeneratedSolver`] can produce
+/// a matching solution without a shared side-table.
+#[must_use]
+pub fn generated_coding_suite(n: usize) -> Vec<CodingTask> {
+    (0..n)
+        .map(|i| {
+            let lo = 10 + (i as i64 % 40);
+            let hi = lo + 20 + (i as i64 % 15);
+            let id = format!("bucket-{i}-{lo}-{hi}");
+            let prompt = format!(
+                "Write solution.py defining `bucket(n: int) -> int` that returns 0 when n < {lo}, \
+                 1 when {lo} <= n < {hi}, and 2 when n >= {hi}."
+            );
+            // Visible: avoids n == hi (the gap). Hidden: hits the hi boundary.
+            let visible = vec![
+                format!("bucket({}) == 0", lo - 3),
+                format!("bucket({}) == 1", lo + 1),
+                format!("bucket({}) == 2", hi + 2),
+                format!("bucket({}) == 1", (lo + hi) / 2),
+            ];
+            let hidden = vec![
+                format!("bucket({hi}) == 2"),
+                format!("bucket({}) == 1", hi - 1),
+                format!("bucket({lo}) == 1"),
+                format!("bucket({}) == 0", lo - 1),
+            ];
+            CodingTask {
+                id,
+                prompt,
+                entrypoint: "solution.py".to_owned(),
+                visible_cases: visible,
+                hidden_cases: hidden,
+            }
+        })
+        .collect()
+}
+
+/// Deterministic solver for [`generated_coding_suite`]: reproduces a `bucket` implementation per
+/// task with a seeded mix of correct / false-accept-buggy (wrong only at `n == hi`, so it passes the
+/// gappy gate) / clearly-broken (fails some visible cases → low gate score → gate rejects it).
+#[derive(Debug, Clone)]
+pub struct GeneratedSolver {
+    seed: u64,
+}
+
+impl GeneratedSolver {
+    /// New solver with the given variant seed.
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        Self { seed }
+    }
+}
+
+impl CandidateSolver for GeneratedSolver {
+    fn solve(&self, task: &CodingTask) -> Result<Solution, String> {
+        // id = "bucket-{i}-{lo}-{hi}"
+        let parts: Vec<&str> = task.id.split('-').collect();
+        let (lo, hi) = match parts.as_slice() {
+            [_, _, lo, hi] => (
+                lo.parse::<i64>().map_err(|e| e.to_string())?,
+                hi.parse::<i64>().map_err(|e| e.to_string())?,
+            ),
+            _ => return Err(format!("not a generated task id: {:?}", task.id)),
+        };
+        // Mix: ~90% correct, ~3% false-accept, ~7% clearly-broken.
+        let code = match fnv(&task.id, self.seed) % 100 {
+            0..=2 => {
+                // FALSE ACCEPT: `<= hi` is wrong exactly at n == hi (only the hidden oracle tests it).
+                format!(
+                    "def bucket(n):\n    if n < {lo}: return 0\n    elif n <= {hi}: return 1\n    else: return 2\n"
+                )
+            }
+            3..=9 => {
+                // CLEARLY BROKEN: swaps the low bucket, so a visible case fails → low gate score.
+                format!(
+                    "def bucket(n):\n    if n < {lo}: return 2\n    elif n < {hi}: return 1\n    else: return 0\n"
+                )
+            }
+            _ => format!(
+                "def bucket(n):\n    if n < {lo}: return 0\n    elif n < {hi}: return 1\n    else: return 2\n"
+            ),
+        };
+        Ok(Solution {
+            code,
+            in_tokens: 0,
+            out_tokens: 0,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn outcome(id: &str, gate: bool, oracle: bool) -> TaskOutcome {
+    fn outcome(id: &str, score: f64, oracle: bool) -> TaskOutcome {
         TaskOutcome {
             id: id.to_owned(),
-            gate_pass: gate,
+            gate_score: score,
+            gate_full_pass: (score - 1.0).abs() < 1e-9,
             oracle_correct: oracle,
             in_tokens: 0,
             out_tokens: 0,
         }
     }
 
-    /// The known mix from `mock_solutions`: 3 correct, 2 false-accept, 1 true-reject.
     #[test]
     fn summarize_computes_gate_error_and_served_failure() {
         let outs = vec![
-            outcome("is_prime", true, false),      // false accept
-            outcome("count_vowels", true, false),  // false accept
-            outcome("factorial", false, false),    // true reject
-            outcome("reverse_string", true, true), // correct
-            outcome("list_sum", true, true),       // correct
-            outcome("gcd", true, true),            // correct
+            outcome("fa1", 1.0, false), // false accept (full pass, wrong)
+            outcome("fa2", 1.0, false), // false accept
+            outcome("bad", 0.5, false), // gate rejects (partial), wrong
+            outcome("ok1", 1.0, true),  // correct
+            outcome("ok2", 1.0, true),  // correct
+            outcome("ok3", 1.0, true),  // correct
         ];
         let r = summarize("fake".to_owned(), outs, 0.1, 0.05, 50);
         assert_eq!(r.n, 6);
@@ -433,45 +554,91 @@ mod tests {
         // false accepts among the 3 incorrect = 2/3.
         assert!((r.gate_false_accept_rate - 2.0 / 3.0).abs() < 1e-9);
         assert!((r.gate_false_reject_rate - 0.0).abs() < 1e-9);
-        // served = 5 (all gate-passes); 2 of them are wrong → 0.4.
-        assert!((r.served_failure_rate - 0.4).abs() < 1e-9);
+        // full-pass = 5 (fa1,fa2,ok1,ok2,ok3); 2 wrong → 0.4.
+        assert!((r.served_failure_full_pass - 0.4).abs() < 1e-9);
     }
 
     /// The whole point of coding-with-tests: a gate with REAL false-accepts, unlike arithmetic.
     #[test]
     fn gate_has_nonzero_false_accept_unlike_arithmetic() {
-        let outs = vec![outcome("a", true, false), outcome("b", true, true)];
-        let r = summarize("fake".to_owned(), outs, 0.1, 0.05, 1);
-        assert!(
-            r.gate_false_accept_rate > 0.0,
-            "coding gate must have genuine error to make conformal meaningful"
+        let r = summarize(
+            "fake".to_owned(),
+            vec![outcome("a", 1.0, false), outcome("b", 1.0, true)],
+            0.1,
+            0.05,
+            1,
         );
+        assert!(r.gate_false_accept_rate > 0.0);
     }
 
-    /// With enough clean samples, conformal earns a bounded served-failure — the guarantee
-    /// arithmetic could not (its gate had zero error, nothing to bound). NOTE: a binary tests-pass
-    /// gate gives conformal only two thresholds (serve-all vs serve-none), so it cannot *exclude*
-    /// individual false-accepts — it needs enough `n` for the Hoeffding bound to absorb the
-    /// empirical rate under `alpha`. A continuous gate score (fraction of visible tests passed, or a
-    /// judge score) would let conformal actually tune — the natural upgrade (see module docs).
+    /// The continuous score gives conformal a real threshold to choose, and the empirical served-
+    /// failure at that threshold must respect α — the conformal guarantee, now on a gate whose error
+    /// is genuine. Wrong items sit at DISTINCT low scores (no ties): a spread score is exactly what
+    /// lets the threshold cleanly separate them.
     #[test]
-    fn conformal_bounds_served_failure_on_coding_pairs() {
-        let mut outs = vec![outcome("bad1", true, false), outcome("bad2", true, false)];
-        for i in 0..400 {
-            outs.push(outcome(&format!("ok{i}"), true, true)); // 402 served, 2 wrong ≈ 0.5%
+    fn conformal_bound_holds_on_spread_continuous_scores() {
+        let mut outs = Vec::new();
+        for i in 0..30 {
+            outs.push(outcome(
+                &format!("bad{i}"),
+                0.30 + f64::from(i) * 0.001,
+                false,
+            )); // distinct low
         }
-        for i in 0..20 {
-            outs.push(outcome(&format!("rej{i}"), false, false)); // gate-rejects, score 0
+        for i in 0..200 {
+            outs.push(outcome(&format!("ok{i}"), 1.0, true)); // correct
         }
         let r = summarize("fake".to_owned(), outs, 0.1, 0.05, 50);
-        assert!(r.served_failure_rate < 0.1);
         assert!(
             r.conformal.feasible,
-            "402 served with 2 fails should clear the Hoeffding bound at alpha=0.10"
+            "clean high-score mass makes a bound feasible"
+        );
+        assert!(
+            r.served_failure_at_threshold <= 0.1 + 1e-9,
+            "conformal bound must hold: served-failure {:.4} > alpha 0.10",
+            r.served_failure_at_threshold
         );
     }
 
-    /// A missing solution aborts the run — we never publish partial numbers.
+    /// Honest caveat, verified: when many items TIE at one score (a binary or coarse gate), the
+    /// threshold cannot split a safe prefix from the rest, so the true served-failure at that
+    /// threshold can exceed the calibrated risk. `served_failure_at_threshold` re-checks over all
+    /// pairs and exposes it — which is why a well-spread continuous score matters.
+    #[test]
+    fn tied_scores_can_break_the_calibrated_risk() {
+        let mut outs = Vec::new();
+        for i in 0..30 {
+            outs.push(outcome(&format!("bad{i}"), 0.5, false)); // ALL tied at 0.5
+        }
+        for i in 0..200 {
+            outs.push(outcome(&format!("ok{i}"), 1.0, true));
+        }
+        let r = summarize("fake".to_owned(), outs, 0.1, 0.05, 50);
+        assert!(
+            r.served_failure_at_threshold > r.conformal.calib_risk,
+            "the 0.5 tie should make the honest re-check exceed the optimistic calib risk"
+        );
+    }
+
+    /// Honest limitation: a full-pass false-accept scores 1.0, so conformal CANNOT exclude it —
+    /// with false-accepts among the served, feasibility needs enough n for the Hoeffding bound.
+    #[test]
+    fn full_pass_false_accepts_need_volume_not_just_a_threshold() {
+        let mut outs = vec![outcome("fa1", 1.0, false), outcome("fa2", 1.0, false)];
+        for i in 0..400 {
+            outs.push(outcome(&format!("ok{i}"), 1.0, true)); // 402 served, 2 wrong ≈ 0.5%
+        }
+        let r = summarize("fake".to_owned(), outs, 0.1, 0.05, 50);
+        assert!(
+            r.conformal.feasible,
+            "402 served with 2 fails clears Hoeffding at alpha=0.10"
+        );
+        assert!(
+            (r.conformal.threshold - 1.0).abs() < 1e-9,
+            "can only serve full-pass here"
+        );
+    }
+
     #[test]
     fn run_aborts_on_solver_error() {
         struct NeverSandbox;
@@ -483,45 +650,65 @@ mod tests {
                 &self,
                 _: &ExecUnit,
                 _: &Limits,
-            ) -> Result<crate::sandbox::ExecOutcome, crate::sandbox::SandboxError> {
-                panic!("must not run: solver error should short-circuit before the sandbox");
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                panic!("solver error must short-circuit before the sandbox");
             }
         }
         let tasks = vec![coding_suite().remove(0)];
-        let solver = MockSolver::new(vec![]); // no solution for the task
-        let err = run_coding_benchmark(&tasks, &solver, &NeverSandbox, 0.1, 0.05, 50).unwrap_err();
+        let err = run_coding_benchmark(
+            &tasks,
+            &MockSolver::new(vec![]),
+            &NeverSandbox,
+            0.1,
+            0.05,
+            50,
+        )
+        .unwrap_err();
         assert!(err.contains("no mock solution"), "{err}");
     }
 
-    /// The wiring end-to-end with a fake sandbox: gate/oracle verdicts flow into the report.
+    /// Wiring end-to-end with a fake sandbox that reports partial visible scores via `FP_SCORE`.
     #[test]
-    fn run_wires_sandbox_verdicts_into_report() {
-        // Fake: visible suite passes, hidden suite fails → a false accept.
-        struct GapSandbox;
-        impl Sandbox for GapSandbox {
+    fn run_wires_continuous_scores_into_report() {
+        struct ScoreSandbox;
+        impl Sandbox for ScoreSandbox {
             fn runtime(&self) -> &str {
-                "gap"
+                "score"
             }
             fn run(
                 &self,
                 u: &ExecUnit,
                 _: &Limits,
-            ) -> Result<crate::sandbox::ExecOutcome, crate::sandbox::SandboxError> {
-                let tests = &u.files.iter().find(|(p, _)| p == "fp_tests.py").unwrap().1;
-                let code = if tests.contains("7919") { 1 } else { 0 }; // hidden suite (has 7919) fails
-                Ok(crate::sandbox::ExecOutcome::Completed {
-                    exit_code: code,
-                    stdout: String::new(),
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                let runner = &u.files.iter().find(|(p, _)| p == "fp_runner.py").unwrap().1;
+                // hidden runner contains the 7919 primality check; visible does not.
+                let (p, n) = if runner.contains("7919") {
+                    (0, 4) // oracle: fails
+                } else {
+                    (4, 4) // visible: full pass
+                };
+                Ok(ExecOutcome::Completed {
+                    exit_code: 0,
+                    stdout: format!("FP_SCORE {p} {n}\n"),
                     stderr: String::new(),
                 })
             }
         }
         let tasks = vec![coding_suite().remove(0)]; // is_prime
-        let solver = mock_solutions();
-        let r = run_coding_benchmark(&tasks, &solver, &GapSandbox, 0.1, 0.05, 1).unwrap();
-        assert_eq!(r.runtime_tier, "gap");
-        assert_eq!(r.outcomes.len(), 1);
-        assert!(r.outcomes[0].gate_pass && !r.outcomes[0].oracle_correct);
+        let r =
+            run_coding_benchmark(&tasks, &mock_solutions(), &ScoreSandbox, 0.1, 0.05, 1).unwrap();
+        assert_eq!(r.runtime_tier, "score");
+        assert!((r.outcomes[0].gate_score - 1.0).abs() < 1e-9 && r.outcomes[0].gate_full_pass);
+        assert!(!r.outcomes[0].oracle_correct); // false accept
+    }
+
+    #[test]
+    fn build_runner_and_parse_roundtrip() {
+        let runner = build_runner(&["is_prime(2)".to_owned(), "not is_prime(1)".to_owned()]);
+        assert!(runner.contains("from solution import *"));
+        assert!(runner.contains("FP_SCORE"));
+        assert_eq!(parse_score("noise\nFP_SCORE 3 4\nmore"), Some((3, 4)));
+        assert_eq!(parse_score("no score here"), None);
     }
 
     #[test]
@@ -535,14 +722,23 @@ mod tests {
     }
 
     #[test]
-    fn mock_solutions_cover_the_suite() {
-        let solver = mock_solutions();
-        for t in coding_suite() {
-            assert!(solver.solve(&t).is_ok(), "missing mock for {}", t.id);
+    fn generated_suite_is_deterministic_and_solvable() {
+        let suite = generated_coding_suite(50);
+        assert_eq!(suite.len(), 50);
+        let solver = GeneratedSolver::new(7);
+        // Every generated task has a matching solution, and ids round-trip lo/hi.
+        for t in &suite {
+            let sol = solver
+                .solve(t)
+                .expect("generated solver solves its own tasks");
+            assert!(sol.code.contains("def bucket(n):"));
         }
+        // Deterministic: same seed → same code.
+        let again = GeneratedSolver::new(7).solve(&suite[0]).unwrap();
+        assert_eq!(solver.solve(&suite[0]).unwrap().code, again.code);
     }
 
-    // ---- real Docker pipeline (opt-in; needs a daemon; NO model spend — uses MockSolver) --------
+    // ---- real Docker pipeline (opt-in; needs a daemon; NO model spend — uses offline solvers) ----
     //   cargo test -p firstpass-bench --lib coding::tests::real_ -- --ignored --nocapture
 
     #[test]
@@ -554,22 +750,43 @@ mod tests {
         let solver = mock_solutions();
         let limits = Limits::default();
 
-        // is_prime: buggy mock passes the gappy visible gate but fails the oracle — a REAL false
-        // accept, proven by running real Python in the sandbox.
+        // is_prime: buggy mock passes the gappy visible gate (score 1.0) but fails the oracle.
         let is_prime = suite.iter().find(|t| t.id == "is_prime").unwrap();
         let o = evaluate_task(sb.as_ref(), &solver, is_prime, &limits).expect("eval");
         assert!(
-            o.gate_pass,
-            "buggy is_prime should pass the gappy visible gate"
+            (o.gate_score - 1.0).abs() < 1e-9 && o.gate_full_pass,
+            "buggy is_prime passes gappy gate"
         );
-        assert!(!o.oracle_correct, "buggy is_prime should fail the oracle");
+        assert!(
+            !o.oracle_correct,
+            "buggy is_prime fails the oracle — a real false accept"
+        );
 
         // reverse_string: correct mock passes both.
         let rev = suite.iter().find(|t| t.id == "reverse_string").unwrap();
         let o = evaluate_task(sb.as_ref(), &solver, rev, &limits).expect("eval");
+        assert!(o.gate_full_pass && o.oracle_correct);
+    }
+
+    #[test]
+    #[ignore = "requires a running container daemon"]
+    fn real_generated_run_produces_a_partial_score() {
+        use crate::sandbox::establish_sandbox;
+        let sb = establish_sandbox("python:3.12-alpine").expect("sandbox");
+        // Find a clearly-broken generated task (variant 3..=9) and confirm the sandbox reports a
+        // partial visible score (< 1.0) — the continuous signal from real Python.
+        let suite = generated_coding_suite(60);
+        let solver = GeneratedSolver::new(1);
+        let limits = Limits::default();
+        let broken = suite.iter().find(|t| {
+            solver.solve(t).unwrap().code.contains("if n < ") && {
+                let o = evaluate_task(sb.as_ref(), &solver, t, &limits).unwrap();
+                o.gate_score < 1.0
+            }
+        });
         assert!(
-            o.gate_pass && o.oracle_correct,
-            "correct solution should pass both"
+            broken.is_some(),
+            "expected at least one broken generated task with a partial score"
         );
     }
 }
