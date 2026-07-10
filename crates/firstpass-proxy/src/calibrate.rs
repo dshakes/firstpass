@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use firstpass_core::conformal::{self, ConformalResult};
-use firstpass_core::{Attempt, DeferredVerdict, Score, Trace, Verdict};
+use firstpass_core::{Attempt, DeferredVerdict, GateResult, Score, Trace, Verdict};
 
 use crate::store::{self, StoreError};
 
@@ -74,22 +74,29 @@ pub fn calibrate_pairs(
     }
 }
 
-/// The aggregate score for a served attempt: the mean of its gates' numeric scores, or — for an
-/// attempt with no numeric gate score at all — `1.0` if it passed and `0.0` if it didn't. A bare
-/// pass/fail with no score still needs to sit somewhere on the `[0, 1]` axis conformal thresholds
-/// against; treating a scoreless pass as maximally confident and a scoreless fail as minimally
-/// confident keeps "higher score = more servable" true either way.
-fn attempt_score(attempt: &Attempt) -> f64 {
-    let numeric: Vec<f64> = attempt
-        .gates
+/// The aggregate score for a set of gate results at a given verdict: the mean of the numeric gate
+/// scores, or — when no gate reported a numeric score at all — `1.0` if it passed and `0.0` if it
+/// didn't. A bare pass/fail with no score still needs to sit somewhere on the `[0, 1]` axis
+/// conformal thresholds against; treating a scoreless pass as maximally confident and a scoreless
+/// fail as minimally confident keeps "higher score = more servable" true either way.
+///
+/// Shared by [`attempt_score`] (calibration, offline) and the router's `serve_threshold` decision
+/// (serving, online) so the two agree on what "the score" means.
+pub(crate) fn gate_score(gates: &[GateResult], verdict: Verdict) -> f64 {
+    let numeric: Vec<f64> = gates
         .iter()
         .filter_map(|g| g.score.map(Score::value))
         .collect();
     if numeric.is_empty() {
-        f64::from(attempt.verdict == Verdict::Pass)
+        f64::from(verdict == Verdict::Pass)
     } else {
         numeric.iter().sum::<f64>() / numeric.len() as f64
     }
+}
+
+/// The aggregate score for a served attempt (see [`gate_score`]).
+fn attempt_score(attempt: &Attempt) -> f64 {
+    gate_score(&attempt.gates, attempt.verdict)
 }
 
 /// Build a `(score, correct)` pair for one trace, if it has deferred feedback and a served

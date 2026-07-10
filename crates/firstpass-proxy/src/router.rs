@@ -6,6 +6,7 @@
 //! cross-provider failover falls out of the same loop (§7.2). This is the real-typed, async
 //! version of the `Firstpass` policy proven in `firstpass-bench`; the semantics are identical.
 
+use crate::calibrate::gate_score;
 use crate::gate::{Gate, GateHealthRegistry, aggregate};
 use crate::provider::{Auth, ModelRequest, ModelResponse, ProviderError, ProviderRegistry};
 use firstpass_core::verdict::reason;
@@ -54,6 +55,10 @@ pub struct EnforceCtx<'a> {
     /// Prefetch depth: fire this many rungs ahead concurrently while gating in ladder order.
     /// `0` = serial (the default): one call at a time, byte-identical to the original engine.
     pub speculation: u32,
+    /// Calibrated conformal serve threshold (SPEC §10.1): a rung serves iff its aggregate gate
+    /// score is `>=` this value. `None` (the default) keeps the original rule — serve iff the
+    /// aggregate gate verdict is `Pass` — byte-identical to the original engine.
+    pub serve_threshold: Option<f64>,
     /// Feature vector routed on (recorded in the trace).
     pub features: Features,
     /// Tenant id.
@@ -165,6 +170,26 @@ struct LadderRun {
     hard_error: Option<String>,
 }
 
+/// The shared serve decision (SPEC §10.1), used by both [`run_serial`] and [`run_speculative`] so
+/// they can never disagree.
+///
+/// - `serve_threshold == None` (the default): serve iff the aggregate gate verdict is `Pass` —
+///   byte-identical to the original engine.
+/// - `serve_threshold == Some(t)`: serve iff the rung's aggregate gate score is `>= t`, regardless
+///   of verdict — a calibrated conformal threshold overrides the pass/fail cutoff. The score is
+///   computed by [`gate_score`], the same mean-of-numeric-gate-scores rule `calibrate` uses so
+///   calibration and serving agree.
+fn should_serve(
+    serve_threshold: Option<f64>,
+    gate_results: &[GateResult],
+    verdict: Verdict,
+) -> bool {
+    match serve_threshold {
+        None => verdict == Verdict::Pass,
+        Some(t) => gate_score(gate_results, verdict) >= t,
+    }
+}
+
 /// Serial engine: one rung at a time — call, gate, serve the first pass, escalate on fail. This is
 /// the original, proven loop; `speculation == 0` routes here unchanged.
 async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
@@ -247,6 +272,7 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                 spent += gc;
 
                 let verdict = aggregate(&gate_results);
+                let serve = should_serve(ctx.serve_threshold, &gate_results, verdict);
                 attempts.push(Attempt {
                     rung: idx,
                     model: model_str.clone(),
@@ -260,7 +286,7 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                 });
                 best = Some((idx, resp));
 
-                if verdict == Verdict::Pass {
+                if serve {
                     served_rung = Some(idx);
                     break;
                 }
@@ -410,6 +436,7 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                 spent += gc;
 
                 let verdict = aggregate(&gate_results);
+                let serve = should_serve(ctx.serve_threshold, &gate_results, verdict);
                 attempts.push(Attempt {
                     rung: idx as u32,
                     model: model_str.clone(),
@@ -423,7 +450,7 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                 });
                 best = Some((idx as u32, resp));
 
-                if verdict == Verdict::Pass {
+                if serve {
                     served_rung = Some(idx as u32);
                     done = true;
                 } else if let Some(cap) = ctx.budget_per_request_usd
@@ -596,6 +623,7 @@ mod tests {
             budget_per_request_usd: budget,
             max_rungs: 3,
             speculation: 0,
+            serve_threshold: None,
             features: Features::new(firstpass_core::TaskKind::CodeEdit),
             tenant_id: "acme".into(),
             session_id: "sess-1".into(),
@@ -1038,5 +1066,109 @@ mod tests {
             spec < serial * 3 / 4,
             "speculation must overlap rung latencies: serial={serial:?} spec={spec:?}"
         );
+    }
+
+    /// A gate that always passes but scores by parsing the candidate text as `f64` — lets a test
+    /// drive an exact aggregate score without depending on a real gate's scoring internals.
+    #[derive(Debug)]
+    struct ScoreGate;
+
+    #[async_trait::async_trait]
+    impl Gate for ScoreGate {
+        fn id(&self) -> &str {
+            "score"
+        }
+
+        async fn evaluate(&self, _req: &ModelRequest, resp: &ModelResponse) -> GateResult {
+            let score = resp.text.trim().parse::<f64>().unwrap_or(0.0);
+            GateResult {
+                gate_id: self.id().to_owned(),
+                verdict: Verdict::Pass,
+                score: Some(firstpass_core::Score::clamped(score)),
+                cost_usd: 0.0,
+                ms: 0,
+                reason: None,
+                evidence_ref: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_threshold_escalates_past_low_scoring_rung() {
+        // Both rungs pass ScoreGate's verdict; only score decides. Haiku scores 0.5 (< 0.8, must
+        // escalate even though it "passed"); Sonnet scores 0.9 (>= 0.8, serves).
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(ScoreGate)];
+        let req = base_request();
+        let providers = registry(vec![
+            ("anthropic", HAIKU, Ok(resp(HAIKU, "0.5"))),
+            ("anthropic", SONNET, Ok(resp(SONNET, "0.9"))),
+        ]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.serve_threshold = Some(0.8);
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == SONNET));
+        assert_eq!(trace.attempts.len(), 2);
+        // Both rungs actually passed the gate's verdict — proving escalation was score-driven.
+        assert_eq!(trace.attempts[0].verdict, Verdict::Pass);
+        assert_eq!(trace.attempts[1].verdict, Verdict::Pass);
+        assert_eq!(trace.final_.escalations, 1);
+        assert_eq!(trace.final_.served_rung, Some(1));
+        assert_eq!(trace.final_.served_from, ServedFrom::Attempt);
+    }
+
+    #[tokio::test]
+    async fn serve_threshold_does_not_serve_a_pass_below_threshold() {
+        // A single-rung ladder: the gate passes it, but its score (0.3) is below the 0.8
+        // threshold, so it must NOT serve as a normal pass — it can only be reached via the
+        // best-attempt fallback once the ladder is exhausted.
+        let ladder = vec![HAIKU.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(ScoreGate)];
+        let req = base_request();
+        let providers = registry(vec![("anthropic", HAIKU, Ok(resp(HAIKU, "0.3")))]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.serve_threshold = Some(0.8);
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == HAIKU));
+        assert_eq!(
+            trace.attempts[0].verdict,
+            Verdict::Pass,
+            "gate verdict was Pass"
+        );
+        assert_eq!(
+            trace.final_.served_from,
+            ServedFrom::BestAttempt,
+            "score below threshold must fall back, not serve as a normal pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_threshold_none_serves_on_verdict_regardless_of_score() {
+        // Same low-scoring rung as above, but with no threshold configured: today's rule (verdict
+        // alone) must serve it as a normal pass.
+        let ladder = vec![HAIKU.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(ScoreGate)];
+        let req = base_request();
+        let providers = registry(vec![("anthropic", HAIKU, Ok(resp(HAIKU, "0.1")))]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        assert_eq!(c.serve_threshold, None);
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == HAIKU));
+        assert_eq!(trace.final_.served_from, ServedFrom::Attempt);
     }
 }

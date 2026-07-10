@@ -223,6 +223,11 @@ pub struct Escalation {
     /// `0` (default) is serial — one call at a time. The served result is identical either way.
     #[serde(default)]
     pub speculation: u32,
+    /// Calibrated conformal serve threshold: a rung is served iff its aggregate gate score is
+    /// `>=` this value (SPEC §10.1). `None` (default) keeps the original rule — serve iff the
+    /// aggregate gate verdict is `Pass` — byte-identical to today.
+    #[serde(default)]
+    pub serve_threshold: Option<f64>,
 }
 
 const fn default_max_rungs() -> u32 {
@@ -235,6 +240,7 @@ impl Default for Escalation {
             max_rungs_per_request: default_max_rungs(),
             session_promotion: None,
             speculation: 0,
+            serve_threshold: None,
         }
     }
 }
