@@ -32,6 +32,10 @@ pub enum Error {
     #[error("config parse error: {0}")]
     Config(#[from] toml::de::Error),
 
+    /// Config parsed but failed a semantic validation check (e.g. an invalid gate definition).
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
+
     /// JSON (de)serialization failed — e.g. during canonicalization.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),

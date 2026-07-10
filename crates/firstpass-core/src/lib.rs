@@ -29,7 +29,8 @@ pub mod trace;
 pub mod verdict;
 
 pub use config::{
-    Budget, Config, Escalation, Mode, ModelRef, OnExhausted, Route, SessionPromotion,
+    Budget, Config, Escalation, GateDef, JudgeDef, Mode, ModelRef, OnExhausted, Route,
+    SessionPromotion,
 };
 pub use cost::{ModelPrice, PriceTable};
 pub use error::{Error, Result};

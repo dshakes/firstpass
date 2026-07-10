@@ -87,6 +87,29 @@ pub struct Task {
     pub difficulty: f64,
     /// Approximate prompt size, drives input-token cost.
     pub prompt_tokens: u64,
+    /// Real prompt text for a live run (`None` in simulation).
+    pub prompt: Option<String>,
+    /// Ground-truth expected answer for a live run, checked by the live gate (`None` in simulation).
+    pub expected: Option<String>,
+}
+
+impl Task {
+    /// A verifiable live task: a real prompt with a known expected answer. `difficulty` is set to a
+    /// neutral 0.5 — a live task has no simulator-known difficulty to leak to the predictive baseline.
+    #[must_use]
+    pub fn verifiable(id: u64, prompt: impl Into<String>, expected: impl Into<String>) -> Self {
+        let prompt = prompt.into();
+        // Rough input estimate (~4 chars/token) for accounting before the API returns real usage;
+        // the live backend overwrites in/out tokens with the provider's actual counts.
+        let prompt_tokens = (prompt.len() / 4).max(1) as u64;
+        Self {
+            id,
+            difficulty: 0.5,
+            prompt_tokens,
+            prompt: Some(prompt),
+            expected: Some(expected.into()),
+        }
+    }
 }
 
 /// Generate a reproducible suite of `n` tasks with difficulty ~ U(0,1).
@@ -97,6 +120,8 @@ pub fn task_suite(n: usize, seed: u64) -> Vec<Task> {
             id,
             difficulty: hash01(seed, id, 1),
             prompt_tokens: 800 + (hash01(seed, id, 2) * 3200.0) as u64,
+            prompt: None,
+            expected: None,
         })
         .collect()
 }

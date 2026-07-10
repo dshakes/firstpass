@@ -34,6 +34,59 @@ pub struct Config {
     /// Escalation limits and promotion rules.
     #[serde(default)]
     pub escalation: Escalation,
+    /// User-defined subprocess gates (SPEC §8.1), referenced by `id` from a route's `gates` /
+    /// `deferred_gates`. Declared as `[[gate]]` sections in TOML.
+    #[serde(rename = "gate", default)]
+    pub gate_defs: Vec<GateDef>,
+}
+
+/// A user-defined gate (SPEC §8.1). Exactly one kind per definition:
+/// - **subprocess** (`cmd`): any executable that reads the candidate as JSON on **stdin** (never
+///   argv — injection-resistant) and emits `{"verdict":"pass|fail|abstain", ...}` on stdout.
+/// - **judge** (`judge`): a native LLM-judge gate that grades the candidate against a rubric.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateDef {
+    /// The id a route references this gate by (must be unique and not shadow a built-in gate id).
+    pub id: String,
+    /// Subprocess command: program first, then its args — e.g. `["pytest", "-q"]`. Set this **or**
+    /// `judge`, not both.
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    /// Hard timeout in milliseconds for a subprocess gate; it abstains (`timeout`) if the process
+    /// runs longer.
+    #[serde(default = "default_gate_timeout_ms")]
+    pub timeout_ms: u64,
+    /// LLM-judge configuration. Set this **or** `cmd`, not both.
+    #[serde(default)]
+    pub judge: Option<JudgeDef>,
+}
+
+/// Configuration for a native LLM-judge gate (SPEC §8.3): a separate model grades the candidate
+/// against a rubric. The runner enforces maker ≠ checker (a model never grades its own output) and
+/// treats the candidate as data, not instructions.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeDef {
+    /// The judge model, as `provider/model` (must differ from the candidate's model at runtime).
+    pub model: String,
+    /// Pass iff the judge's score ≥ this threshold, in `[0, 1]`.
+    #[serde(default = "default_judge_threshold")]
+    pub threshold: f64,
+    /// What "good" means for this route — handed to the judge as the grading rubric.
+    #[serde(default)]
+    pub rubric: Option<String>,
+}
+
+/// Default subprocess-gate timeout: 30s. Long enough for a test suite, short enough to bound the
+/// enforce-path tail.
+fn default_gate_timeout_ms() -> u64 {
+    30_000
+}
+
+/// Default judge pass threshold.
+fn default_judge_threshold() -> f64 {
+    0.7
 }
 
 /// One routing rule.
@@ -251,9 +304,39 @@ impl Config {
     /// Parse a TOML configuration document.
     ///
     /// # Errors
-    /// Returns [`Error::Config`] on invalid TOML or unknown fields.
+    /// Returns [`Error::Config`] on invalid TOML or unknown fields, or [`Error::InvalidConfig`] on
+    /// an invalid gate definition (not exactly one of `cmd`/`judge`, a judge threshold outside
+    /// `[0,1]`, or a duplicate/blank `id`).
     pub fn parse(toml_str: &str) -> Result<Self> {
-        Ok(toml::from_str(toml_str)?)
+        let config: Self = toml::from_str(toml_str)?;
+        let mut seen = std::collections::HashSet::new();
+        for def in &config.gate_defs {
+            if def.id.trim().is_empty() {
+                return Err(Error::InvalidConfig("gate id must not be empty".to_owned()));
+            }
+            // Exactly one kind: a subprocess `cmd` or a `judge`, never both, never neither.
+            if def.cmd.is_empty() == def.judge.is_none() {
+                return Err(Error::InvalidConfig(format!(
+                    "gate {:?} must set exactly one of `cmd` or `judge`",
+                    def.id
+                )));
+            }
+            if let Some(judge) = &def.judge
+                && !(0.0..=1.0).contains(&judge.threshold)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "gate {:?} judge threshold {} is outside [0, 1]",
+                    def.id, judge.threshold
+                )));
+            }
+            if !seen.insert(def.id.as_str()) {
+                return Err(Error::InvalidConfig(format!(
+                    "duplicate gate id {:?}",
+                    def.id
+                )));
+            }
+        }
+        Ok(config)
     }
 
     /// The first route whose match claims `f`, or `None` if no route matches.
@@ -346,6 +429,44 @@ session_promotion = { after_failures = 3, window = "30m" }
         let c = Config::parse(toml).expect("firstpass.example.toml must parse");
         assert_eq!(c.routes.len(), 3);
         assert_eq!(c.routes[0].mode, Mode::Enforce);
+    }
+
+    #[test]
+    fn parses_gate_definitions() {
+        let toml = r#"
+[[route]]
+match = {}
+mode  = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+gates  = ["my-tests"]
+
+[[gate]]
+id  = "my-tests"
+cmd = ["pytest", "-q"]
+
+[[gate]]
+id         = "judge"
+cmd        = ["bash", "-c", "./judge.sh"]
+timeout_ms = 60000
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert_eq!(c.gate_defs.len(), 2);
+        assert_eq!(c.gate_defs[0].id, "my-tests");
+        assert_eq!(c.gate_defs[0].cmd, ["pytest", "-q"]);
+        assert_eq!(c.gate_defs[0].timeout_ms, 30_000, "default timeout applies");
+        assert_eq!(c.gate_defs[1].timeout_ms, 60_000);
+    }
+
+    #[test]
+    fn rejects_invalid_gate_definitions() {
+        let empty_cmd = "[[gate]]\nid = \"g\"\ncmd = []\n";
+        assert!(matches!(
+            Config::parse(empty_cmd),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        let dup = "[[gate]]\nid = \"g\"\ncmd = [\"a\"]\n[[gate]]\nid = \"g\"\ncmd = [\"b\"]\n";
+        assert!(matches!(Config::parse(dup), Err(Error::InvalidConfig(_))));
     }
 
     #[test]

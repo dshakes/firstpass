@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -27,7 +28,7 @@ use crate::gate::{GateHealthRegistry, resolve_gates};
 use crate::provider::{Auth, ChatMessage, ModelRequest, ModelResponse, ProviderRegistry};
 use crate::router::{EnforceCtx, EngineOutcome, route_enforce};
 use crate::store;
-use crate::upstream::forward_anthropic;
+use crate::upstream::{forward_anthropic, forward_anthropic_streaming};
 use firstpass_core::Route;
 
 /// Shared state handed to every request handler. Cheap to clone: an `Arc`ed config, a
@@ -213,10 +214,66 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             // Clone the matched route so no borrow of `state.config` is held across the await;
             // routes are tiny (a handful of strings).
             let route = route.clone();
-            return handle_enforce(&state, &headers, &body, features, &route, session_header).await;
+            if enforce_can_handle(&features, &body) {
+                return handle_enforce(&state, &headers, &body, features, &route, session_header)
+                    .await;
+            }
+            // The request carries tools / images / tool-result blocks the text-only enforce path
+            // can't round-trip faithfully yet. Rather than drop them and serve corrupted output,
+            // fall through to transparent observe passthrough (correct, un-gated) for this request.
+            tracing::info!(
+                "enforce route matched but request has tool/image content; serving via observe passthrough"
+            );
         }
     }
     observe_passthrough(state, headers, body, session_header).await
+}
+
+/// Whether the enforce path can faithfully handle this request. Enforce normalizes content to
+/// text and re-synthesizes a text response, so it cannot round-trip tool calls or images — a
+/// request that declares tools, carries images, or contains tool_use/tool_result blocks is served
+/// via transparent observe passthrough instead of being silently corrupted.
+///
+// ponytail: full tool/multimodal round-tripping through the ladder is the follow-on (needs
+// provider-adapter work + live verification); this guard just refuses to corrupt in the meantime.
+fn enforce_can_handle(features: &Features, body: &[u8]) -> bool {
+    features.tool_count == 0 && !features.has_images && !messages_have_tool_blocks(body)
+}
+
+/// Whether any message carries a `tool_use` or `tool_result` content block (a multi-turn tool
+/// conversation), which the text-only enforce normalization would drop.
+fn messages_have_tool_blocks(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("messages")
+                .and_then(Value::as_array)
+                .map(|messages| messages.iter().any(message_has_tool_block))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a single message's content contains a `tool_use` or `tool_result` block.
+fn message_has_tool_block(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("tool_use" | "tool_result")
+                )
+            })
+        })
+}
+
+/// Whether the request opts into server-sent-events streaming (`"stream": true`).
+fn is_stream_request(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|json| json.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// Read a header as an owned `String`, if present and valid UTF-8.
@@ -260,7 +317,12 @@ async fn handle_enforce(
         .into_response();
     };
     let auth = Auth::from_headers(headers);
-    let gates = resolve_gates(&route.gates);
+    let gate_defs = state
+        .config
+        .routing
+        .as_ref()
+        .map_or(&[][..], |cfg| &cfg.gate_defs);
+    let gates = resolve_gates(&route.gates, gate_defs, &state.providers, &auth);
     let session_id = session_header.unwrap_or_else(|| Uuid::now_v7().to_string());
     let (budget, max_rungs) = match state.config.routing.as_ref() {
         Some(cfg) => (
@@ -308,9 +370,10 @@ async fn handle_enforce(
 /// Parse an Anthropic Messages request body into the normalized [`ModelRequest`]. Returns
 /// `None` if the body isn't valid JSON or lacks a `messages` array.
 ///
-// ponytail: content blocks are collapsed to their concatenated text; tool_use/tool_result and
-// image blocks are dropped from the normalized form (kept opaque in `tools`). Full multimodal
-// round-tripping is a follow-up — the enforce beachhead is text/code.
+// Content blocks are collapsed to their concatenated text. Requests carrying tool_use/tool_result
+// or image blocks never reach this function — `enforce_can_handle` routes them to transparent
+// observe passthrough instead, so nothing is silently dropped here. Full multimodal round-tripping
+// through the ladder is the follow-up; the enforce beachhead is text/code.
 fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
     let json: Value = serde_json::from_slice(body).ok()?;
     let messages_json = json.get("messages")?.as_array()?;
@@ -381,6 +444,10 @@ async fn observe_passthrough(
     body: Bytes,
     session_header: Option<String>,
 ) -> Response {
+    // Streaming requests are relayed chunk-by-chunk rather than buffered (SPEC §7.4).
+    if is_stream_request(&body) {
+        return observe_stream(state, headers, body, session_header).await;
+    }
     let start = Instant::now();
     let result = forward_anthropic(
         &state.http,
@@ -410,6 +477,60 @@ async fn observe_passthrough(
             err.into_response()
         }
     }
+}
+
+/// Observe mode for a streaming request (`stream: true`): relay the upstream SSE response
+/// chunk-by-chunk instead of buffering, so streaming is preserved to the caller and
+/// time-to-first-byte stays low. `latency_ms` is time-to-response-headers (the added-latency
+/// figure that matters), recorded off the response path.
+///
+// ponytail: streamed-response token usage lives in the SSE `message_start`/`message_delta` events
+// we don't buffer, so the trace records request-side features + latency now; parsing usage from a
+// teed SSE stream is the follow-on.
+async fn observe_stream(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    session_header: Option<String>,
+) -> Response {
+    let start = Instant::now();
+    let result = forward_anthropic_streaming(
+        &state.http,
+        &state.config.upstream_anthropic,
+        &headers,
+        body.clone(),
+    )
+    .await;
+    let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    match result {
+        Ok((status, resp_headers, response)) => {
+            spawn_stream_trace(&state, body, latency_ms, session_header);
+            let stream_body = Body::from_stream(response.bytes_stream());
+            (status, resp_headers, stream_body).into_response()
+        }
+        Err(err) => {
+            spawn_trace(&state, body, None, latency_ms, session_header);
+            err.into_response()
+        }
+    }
+}
+
+/// Enqueue a request-side trace for a streamed observe response, off the response path.
+fn spawn_stream_trace(
+    state: &AppState,
+    req_body: Bytes,
+    latency_ms: u64,
+    session_header: Option<String>,
+) {
+    let config = state.config.clone();
+    let traces = state.traces.clone();
+    tokio::spawn(async move {
+        let trace = build_stream_trace(&config, &req_body, latency_ms, session_header.as_deref());
+        if traces.send(trace).is_err() {
+            tracing::warn!("trace writer is gone; dropping stream trace");
+        }
+    });
 }
 
 /// Construct the trace and enqueue it for the background writer, entirely off the response
@@ -551,6 +672,48 @@ fn build_trace(
         total_latency_ms: latency_ms,
         escalations: 0,
         counterfactual_baseline_usd: cost_usd,
+        savings_usd: 0.0,
+    };
+    trace.recompute_savings();
+    trace
+}
+
+/// Build the observe-mode trace for a **streamed** response: we relayed real bytes to the caller,
+/// but the token usage lives in the SSE events we didn't buffer, so it's recorded as served with
+/// unknown (zero) usage — honest about what we served without inventing token counts.
+fn build_stream_trace(
+    config: &ProxyConfig,
+    req_body: &Bytes,
+    latency_ms: u64,
+    session_header: Option<&str>,
+) -> Trace {
+    let (req_model, tool_count, has_images) = request_features(req_body);
+    let model = req_model.unwrap_or_else(|| "unknown".to_owned());
+
+    let attempt = Attempt {
+        rung: 0,
+        model,
+        provider: "anthropic".to_owned(),
+        in_tokens: 0,
+        out_tokens: 0,
+        cost_usd: 0.0,
+        latency_ms,
+        gates: Vec::new(),
+        verdict: Verdict::Pass,
+    };
+
+    let mut trace = base_trace(config, req_body, latency_ms, session_header);
+    trace.request.features.tool_count = tool_count;
+    trace.request.features.has_images = has_images;
+    trace.attempts.push(attempt);
+    trace.final_ = FinalOutcome {
+        served_rung: Some(0),
+        served_from: ServedFrom::Attempt,
+        total_cost_usd: 0.0,
+        gate_cost_usd: 0.0,
+        total_latency_ms: latency_ms,
+        escalations: 0,
+        counterfactual_baseline_usd: 0.0,
         savings_usd: 0.0,
     };
     trace.recompute_savings();
@@ -885,6 +1048,101 @@ mod tests {
         let resp = messages(State(state), HeaderMap::new(), user_body()).await;
         // Observe path forwards upstream; the bogus host yields a gateway error, not our 200.
         assert_ne!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn detects_stream_requests() {
+        assert!(is_stream_request(br#"{"stream": true}"#));
+        assert!(!is_stream_request(br#"{"stream": false}"#));
+        assert!(!is_stream_request(br#"{"model":"m"}"#));
+        assert!(!is_stream_request(b"not json"));
+    }
+
+    #[test]
+    fn detects_tool_blocks_in_messages() {
+        let with =
+            br#"{"messages":[{"role":"user","content":[{"type":"tool_result","content":"42"}]}]}"#;
+        let without = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        assert!(messages_have_tool_blocks(with));
+        assert!(!messages_have_tool_blocks(without));
+    }
+
+    #[test]
+    fn enforce_only_handles_plain_text() {
+        let plain =
+            Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        let tools = Bytes::from_static(
+            br#"{"model":"m","tools":[{"name":"t"}],"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let f_plain = extract_features(&HeaderMap::new(), &plain);
+        let f_tools = extract_features(&HeaderMap::new(), &tools);
+        assert!(enforce_can_handle(&f_plain, &plain));
+        assert!(!enforce_can_handle(&f_tools, &tools));
+    }
+
+    /// B2: an enforce route serves plain text (200 from the mock) but falls back to transparent
+    /// observe passthrough for tool/image requests rather than dropping blocks — proven by the
+    /// tool request hitting the (bogus) upstream instead of the enforcing mock.
+    #[tokio::test]
+    async fn enforce_falls_back_to_observe_for_tool_requests() {
+        let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n";
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.to_owned()),
+            "FIRSTPASS_MODE" => Some("enforce".to_owned()),
+            "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some("http://127.0.0.1:1".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let mut outs = HashMap::new();
+        outs.insert(
+            "anthropic/m".to_owned(),
+            Ok(model_resp("anthropic/m", "hello")),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        let (traces, _rx) = mpsc::unbounded_channel();
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(map),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            traces,
+        };
+
+        // Plain text enforces: the mock serves 200.
+        let plain =
+            Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        let resp = messages(State(state.clone()), HeaderMap::new(), plain).await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "plain text should enforce"
+        );
+
+        // Declares tools => cannot enforce faithfully => observe fallback => bogus upstream => not 200.
+        let tools = Bytes::from_static(
+            br#"{"model":"m","tools":[{"name":"get_weather"}],"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let resp = messages(State(state.clone()), HeaderMap::new(), tools).await;
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "tool request must fall back to observe, not enforce"
+        );
+
+        // tool_result block in a message => same fallback.
+        let toolres = Bytes::from_static(
+            br#"{"model":"m","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"42"}]}]}"#,
+        );
+        let resp = messages(State(state), HeaderMap::new(), toolres).await;
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "tool_result request must fall back to observe, not enforce"
+        );
     }
 
     // --- Feedback API tests (drive `feedback` against a real temp trace store) ---

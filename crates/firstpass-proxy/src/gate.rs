@@ -7,11 +7,14 @@
 //! with an alarm, so a broken gate can neither silently fail closed (burns money) nor silently
 //! fail open (burns trust) (§7.2).
 
-use crate::provider::{ModelRequest, ModelResponse};
+use crate::judge::JudgeGate;
+use crate::provider::{Auth, ModelRequest, ModelResponse, ProviderRegistry};
+use crate::subprocess::SubprocessGate;
 use async_trait::async_trait;
-use firstpass_core::{GateResult, Verdict};
+use firstpass_core::{GateDef, GateResult, Verdict};
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// A verification gate. Object-safe + async so subprocess/model gates fit the same contract.
 #[async_trait]
@@ -235,22 +238,62 @@ impl GateHealthRegistry {
     }
 }
 
-/// Resolve config gate names into runnable gates. Unknown names are skipped with a warning.
-///
-// ponytail: model gates (`judge-diff`, `self-consistency`) and deferred gates (`compiles`,
-// `tests`) need a live LLM / harness hook + the red-team fixture suite; they resolve to nothing
-// here (skipped with a warn) until Batch 5. `patch-applies`/`lint-diff` ship as subprocess gates
-// via config, not hard-coded names.
+/// Resolve a route's gate ids into runnable gates. Built-in ids (`non-empty`, `json-valid`) map to
+/// inline gates; any other id is looked up among the config's `[[gate]]` definitions and built as
+/// either a [`SubprocessGate`] (a `cmd` gate, SPEC §8.1) or a [`JudgeGate`] (a `judge` gate, §8.3).
+/// The judge needs a provider (from `registry`) and the caller's credentials (`auth`, BYOK). An id
+/// that is neither built-in nor defined — or a judge whose provider isn't registered — is skipped
+/// with a warning rather than failing the request.
 #[must_use]
-pub fn resolve_gates(names: &[String]) -> Vec<Box<dyn Gate>> {
+pub fn resolve_gates(
+    names: &[String],
+    defs: &[GateDef],
+    registry: &ProviderRegistry,
+    auth: &Auth,
+) -> Vec<Box<dyn Gate>> {
     let mut gates: Vec<Box<dyn Gate>> = Vec::new();
     for name in names {
         match name.as_str() {
             "non-empty" => gates.push(Box::new(NonEmptyGate)),
             "json-valid" => gates.push(Box::new(JsonValidGate)),
-            other => {
-                tracing::warn!(gate = %other, "unknown gate id — skipped (implemented in M2+)")
-            }
+            other => match defs.iter().find(|d| d.id == other) {
+                Some(def) if def.judge.is_some() => {
+                    // `Config::parse` guarantees exactly one kind, so this `if let` always binds.
+                    if let Some(judge) = def.judge.as_ref() {
+                        let provider_id = judge.model.split('/').next().unwrap_or_default();
+                        match registry.get(provider_id) {
+                            Some(provider) => gates.push(Box::new(JudgeGate::new(
+                                def.id.clone(),
+                                provider,
+                                judge.model.clone(),
+                                auth.clone(),
+                                judge.threshold,
+                                judge.rubric.clone().unwrap_or_default(),
+                            ))),
+                            None => tracing::warn!(
+                                gate = %other, provider = %provider_id,
+                                "judge gate provider not registered — skipped"
+                            ),
+                        }
+                    }
+                }
+                Some(def) => {
+                    let Some((program, args)) = def.cmd.split_first() else {
+                        tracing::warn!(gate = %other, "configured gate has empty cmd — skipped");
+                        continue;
+                    };
+                    gates.push(Box::new(SubprocessGate::new(
+                        def.id.clone(),
+                        program.clone(),
+                        args.to_vec(),
+                        Duration::from_millis(def.timeout_ms),
+                    )));
+                }
+                None => tracing::warn!(
+                    gate = %other,
+                    "unknown gate id — not a built-in and not defined in [[gate]]; skipped"
+                ),
+            },
         }
     }
     gates
@@ -357,15 +400,118 @@ mod tests {
         );
     }
 
+    fn empty_registry() -> ProviderRegistry {
+        ProviderRegistry::new("http://localhost", "http://localhost")
+    }
+
     #[test]
     fn resolve_skips_unknown_and_keeps_known() {
-        let gates = resolve_gates(&[
-            "non-empty".to_owned(),
-            "judge-diff".to_owned(),
-            "json-valid".to_owned(),
-        ]);
+        let gates = resolve_gates(
+            &[
+                "non-empty".to_owned(),
+                "judge-diff".to_owned(),
+                "json-valid".to_owned(),
+            ],
+            &[],
+            &empty_registry(),
+            &Auth::default(),
+        );
         let ids: Vec<_> = gates.iter().map(|g| g.id()).collect();
         assert_eq!(ids, ["non-empty", "json-valid"]);
+    }
+
+    #[test]
+    fn resolve_builds_configured_subprocess_gate() {
+        // A gate id that isn't built-in resolves to a SubprocessGate when defined in `[[gate]]`.
+        let defs = vec![GateDef {
+            id: "my-tests".to_owned(),
+            cmd: vec!["true".to_owned()],
+            timeout_ms: 1000,
+            judge: None,
+        }];
+        let gates = resolve_gates(
+            &["my-tests".to_owned(), "undefined".to_owned()],
+            &defs,
+            &empty_registry(),
+            &Auth::default(),
+        );
+        let ids: Vec<_> = gates.iter().map(|g| g.id()).collect();
+        assert_eq!(
+            ids,
+            ["my-tests"],
+            "configured id resolves; unknown id skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_subprocess_gate_runs_end_to_end() {
+        // A user-defined gate that fails iff the candidate text contains "BAD" — proving the config
+        // → SubprocessGate → verdict path works over stdin, no hard-coded gate name.
+        let script = r#"c=$(cat); case "$c" in *BAD*) echo '{"verdict":"fail"}';; *) echo '{"verdict":"pass"}';; esac"#;
+        let defs = vec![GateDef {
+            id: "no-bad".to_owned(),
+            cmd: vec!["bash".to_owned(), "-c".to_owned(), script.to_owned()],
+            timeout_ms: 5000,
+            judge: None,
+        }];
+        let gates = resolve_gates(
+            &["no-bad".to_owned()],
+            &defs,
+            &empty_registry(),
+            &Auth::default(),
+        );
+        assert_eq!(gates.len(), 1);
+        let good = gates[0].evaluate(&req(), &resp("all good")).await;
+        assert_eq!(good.verdict, Verdict::Pass);
+        let bad = gates[0].evaluate(&req(), &resp("this is BAD")).await;
+        assert_eq!(bad.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn resolve_builds_configured_judge_gate() {
+        use crate::provider::{MockProvider, Provider};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let defs = vec![GateDef {
+            id: "quality".to_owned(),
+            cmd: vec![],
+            timeout_ms: 30_000,
+            judge: Some(firstpass_core::JudgeDef {
+                model: "anthropic/judge".to_owned(),
+                threshold: 0.7,
+                rubric: None,
+            }),
+        }];
+
+        // Registry that serves `anthropic` → the judge gate is built.
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", HashMap::new())),
+        );
+        let gates = resolve_gates(
+            &["quality".to_owned()],
+            &defs,
+            &ProviderRegistry::from_map(map),
+            &Auth::default(),
+        );
+        assert_eq!(
+            gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
+            ["quality"]
+        );
+
+        // Registry without that provider → skipped, not a hard failure.
+        let skipped = resolve_gates(
+            &["quality".to_owned()],
+            &defs,
+            &ProviderRegistry::from_map(HashMap::new()),
+            &Auth::default(),
+        );
+        assert!(
+            skipped.is_empty(),
+            "judge with no registered provider is skipped"
+        );
     }
 
     #[test]
