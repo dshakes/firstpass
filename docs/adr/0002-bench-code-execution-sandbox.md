@@ -42,24 +42,37 @@ trust boundary and gets designed before it is built. This ADR is that design.
 
 ## Decisions
 
-### D1 — Mechanism: an ephemeral container, `--network none`, no host mounts
+### D1 — Mechanism: strongest-available OCI runtime (microVM / gVisor ideal), auto-selected, never `runc`-by-default-silently
 
-Options considered:
-- **(a) Bare subprocess + `ulimit`/`setrlimit`** — no FS or network isolation. Rejected: a candidate
-  can still `rm`, read secrets, and open sockets. Resource caps alone are not a sandbox.
-- **(b) WASI / wasmtime** — strong deterministic isolation, no syscalls/network by default. But the
-  benchmark runs **Python** test suites (HumanEval/MBPP are Python); running CPython + arbitrary
-  packages under WASI is painful-to-infeasible today. Rejected **for this benchmark** (kept as the
-  right tier for *pure-compute* gates in D3).
-- **(c) Ephemeral OCI container (Docker/Podman)** — `--network none`, no bind mounts of host paths,
-  read-only rootfs + a `tmpfs` workdir, `--cpus`/`--memory`/`--pids-limit`, `--rm`, run as a
-  non-root uid. Covers every in-scope threat with tooling that already exists. **Chosen.**
-- **(d) microVM (Firecracker) / gVisor** — stronger (kernel isolation), but heavier ops and infra-
-  dependent. Overkill for a dev-time, single-operator benchmark. Deferred to D3's hosted tier.
+The bar is *running untrusted, model-generated code* — the same problem E2B, Modal, Fly, and Daytona
+solve for AI code execution, and they all converge on **microVM-class isolation**, not shared-kernel
+containers. So the ideal is not "a Docker container"; it is **hardware-virtualized or
+kernel-intercepting isolation**, with plain containers as an explicitly-weaker fallback.
 
-**Decision: (c).** Container runtime is pluggable (Docker or Podman — same CLI surface for our needs);
-the harness detects which is present. WASI stays the future path for pure-compute gates, not for this
-Python benchmark.
+Tiers, strongest first (all behind the D4 `Sandbox` seam, so the runtime is a swap, not a rewrite):
+- **(ideal) microVM — Firecracker / Cloud Hypervisor.** Hardware-virtualized, separate guest kernel;
+  the industry standard for untrusted AI-generated code (Lambda, E2B, Modal). Strongest isolation.
+  Heavier ops (KVM, a guest rootfs/kernel image, vsock I/O) — a dedicated `Sandbox` impl, built when
+  the benchmark runs on Linux+KVM infra. **The target ceiling.**
+- **(strong, drop-in) gVisor — `runsc`.** A userspace guest kernel that intercepts syscalls; near-
+  microVM isolation with **zero** image changes (it's just an OCI `--runtime`), and it runs CPython +
+  arbitrary pip packages. **The tier we implement and ship first** — ideal-grade isolation that is
+  actually buildable and verifiable today.
+- **(fallback, loud) plain OCI `runc` (Docker/Podman)** — namespace isolation, shared host kernel.
+  Used **only** when no stronger runtime is present, and then **only with a printed warning** naming
+  the weaker boundary. Never the silent default.
+- **(rejected) bare subprocess + `ulimit`** — resource caps are not a sandbox (still `rm`s, reads
+  secrets, opens sockets). **(rejected for this benchmark) WASI/wasmtime** — great for *pure-compute*
+  gates, but CPython + arbitrary test-suite packages under WASI is infeasible today; kept as the D3
+  path for pure-compute gates.
+
+**Decision: implement one OCI runner that auto-selects the strongest available runtime** — probe for
+`runsc` (gVisor) first and use it; else fall back to `runc` **with a warning**; and leave the
+`Sandbox` trait ready for a Firecracker microVM impl as the ideal tier. Same flags across runtimes
+(`--network none`, no host mounts, ro rootfs + tmpfs workdir, cpu/mem/pids caps, non-root, cap-drop).
+The chosen runtime is recorded in the trace/report, so a published number always states its isolation
+tier. This delivers ideal-grade isolation where the infra supports it, degrades **visibly** (never
+silently) where it doesn't, and makes the microVM upgrade a new impl behind an unchanged seam.
 
 ### D2 — Non-negotiable isolation invariants (never simplified away)
 
