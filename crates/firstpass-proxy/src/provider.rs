@@ -156,6 +156,13 @@ struct AnthropicWireMessage<'a> {
     content: &'a str,
 }
 
+/// Strip the `provider/` prefix from a ladder model id for the provider's wire API — Anthropic and
+/// OpenAI expect the bare model (`claude-haiku-4-5`), not `anthropic/claude-haiku-4-5`. The full
+/// prefixed id is still what the ladder/trace use; only the wire call is stripped.
+fn wire_model(model: &str) -> &str {
+    model.split_once('/').map_or(model, |(_, m)| m)
+}
+
 #[derive(Serialize)]
 struct AnthropicWireRequest<'a> {
     model: &'a str,
@@ -167,9 +174,9 @@ struct AnthropicWireRequest<'a> {
 
 /// Speaks `POST {base}/v1/messages` (Anthropic Messages API).
 ///
-// LIVE-UNVERIFIED: compiled against the documented wire shape but never exercised against a
-// live endpoint — this sandbox has no network access. Exercise against a real key before
-// relying on it in production.
+// LIVE-VERIFIED (2026-07-10): exercised against real Anthropic through the running proxy's enforce
+// path — a haiku completion served end-to-end. The `anthropic/` prefix must be stripped for the
+// wire call (see `wire_model`); sending it verbatim 404s.
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     /// Base URL, e.g. `https://api.anthropic.com`.
@@ -191,7 +198,7 @@ impl Provider for AnthropicProvider {
     ) -> Result<ModelResponse, ProviderError> {
         let key = auth.anthropic_key.as_deref().unwrap_or_default();
         let body = AnthropicWireRequest {
-            model: &req.model,
+            model: wire_model(&req.model),
             system: req.system.as_deref(),
             max_tokens: req.max_tokens,
             messages: req
@@ -277,9 +284,9 @@ struct OpenAiWireRequest<'a> {
 
 /// Speaks `POST {base}/v1/chat/completions` (OpenAI Chat Completions API).
 ///
-// LIVE-UNVERIFIED: compiled against the documented wire shape but never exercised against a
-// live endpoint — this sandbox has no network access. Exercise against a real key before
-// relying on it in production.
+// LIVE-UNVERIFIED: the `wire_model` prefix-strip fix is applied here too, but the OpenAI path has
+// not yet been exercised against a real endpoint (only Anthropic has). Verify against a real key
+// before relying on it in production.
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
     /// Base URL, e.g. `https://api.openai.com`.
@@ -312,7 +319,7 @@ impl Provider for OpenAiProvider {
             content: &m.content,
         }));
         let body = OpenAiWireRequest {
-            model: &req.model,
+            model: wire_model(&req.model),
             max_tokens: req.max_tokens,
             messages,
         };
@@ -468,6 +475,14 @@ impl Provider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_model_strips_the_provider_prefix() {
+        // Regression: sending "anthropic/claude-haiku-4-5" verbatim 404s at the provider.
+        assert_eq!(wire_model("anthropic/claude-haiku-4-5"), "claude-haiku-4-5");
+        assert_eq!(wire_model("openai/gpt-5.5"), "gpt-5.5");
+        assert_eq!(wire_model("claude-opus-4-8"), "claude-opus-4-8"); // no prefix → unchanged
+    }
 
     fn resp(model: &str, text: &str) -> ModelResponse {
         ModelResponse {
