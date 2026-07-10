@@ -15,6 +15,7 @@
 //! - [`router`] — the enforce-mode escalation engine.
 //! - [`proxy`] — axum routing, observe passthrough, and enforce dispatch.
 //! - [`error`] — structured, no-leak error responses.
+//! - [`metrics`] — Prometheus recorder install + `GET /metrics`.
 //! - [`cli`] — `firstpass doctor` / `trace` logic (validate a setup, read the store).
 //! - [`mcp`] — minimal MCP stdio server so an agent can read its traces and submit feedback.
 //! - [`run`] — shared server bootstrap for the `firstpass` and `firstpass-proxy` binaries.
@@ -27,6 +28,7 @@ pub mod error;
 pub mod gate;
 pub mod judge;
 pub mod mcp;
+pub mod metrics;
 pub mod provider;
 pub mod proxy;
 pub mod router;

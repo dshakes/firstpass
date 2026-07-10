@@ -65,7 +65,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
     tracing::info!(%bind, "firstpass listening");
     tracing::info!("offboard: unset ANTHROPIC_BASE_URL");
 
-    axum::serve(listener, app(state))
+    axum::serve(listener, app(state)?)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

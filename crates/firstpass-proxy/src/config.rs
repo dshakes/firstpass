@@ -32,7 +32,14 @@ pub struct ProxyConfig {
     pub routing: Option<RoutingConfig>,
     /// Model pricing table used to cost each attempt.
     pub prices: PriceTable,
+    /// Max in-flight requests before new ones queue behind the concurrency limiter
+    /// (`FIRSTPASS_MAX_CONCURRENCY`, default 512). A load-shed valve, not a timeout — it never
+    /// severs an in-flight SSE stream.
+    pub max_concurrency: usize,
 }
+
+/// Default for [`ProxyConfig::max_concurrency`] when `FIRSTPASS_MAX_CONCURRENCY` is unset.
+const DEFAULT_MAX_CONCURRENCY: usize = 512;
 
 /// Errors that prevent the proxy from starting.
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +112,12 @@ impl ProxyConfig {
             }
             None => None,
         };
+        let max_concurrency = match lookup("FIRSTPASS_MAX_CONCURRENCY") {
+            Some(s) => s.parse().map_err(|e| {
+                ConfigError::Config(format!("FIRSTPASS_MAX_CONCURRENCY={s:?}: {e}"))
+            })?,
+            None => DEFAULT_MAX_CONCURRENCY,
+        };
 
         Ok(Self {
             bind,
@@ -116,6 +129,7 @@ impl ProxyConfig {
             mode,
             routing,
             prices: PriceTable::defaults(),
+            max_concurrency,
         })
     }
 }
@@ -133,6 +147,24 @@ mod tests {
         assert_eq!(cfg.tenant_id, "default");
         assert_eq!(cfg.prompt_salt, DEFAULT_PROMPT_SALT);
         assert_eq!(cfg.mode, Mode::Observe);
+        assert_eq!(cfg.max_concurrency, DEFAULT_MAX_CONCURRENCY);
+    }
+
+    #[test]
+    fn max_concurrency_is_parsed_from_env() {
+        let cfg = ProxyConfig::from_lookup(|key| {
+            (key == "FIRSTPASS_MAX_CONCURRENCY").then(|| "64".to_owned())
+        })
+        .unwrap();
+        assert_eq!(cfg.max_concurrency, 64);
+    }
+
+    #[test]
+    fn bad_max_concurrency_is_an_error() {
+        let result = ProxyConfig::from_lookup(|key| {
+            (key == "FIRSTPASS_MAX_CONCURRENCY").then(|| "not-a-number".to_owned())
+        });
+        assert!(matches!(result, Err(ConfigError::Config(_))));
     }
 
     #[test]
