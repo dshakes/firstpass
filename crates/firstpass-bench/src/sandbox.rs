@@ -233,8 +233,11 @@ impl ContainerSandbox {
         let mut s = String::from("set -e\n");
         for (path, contents) in &unit.files {
             let b64 = b64encode(contents.as_bytes());
+            // Shell-quote the path so a task path containing a quote can't break the setup script's
+            // quoting (blast radius is container-confined, but keep it robust — matches `command`).
+            let dst = shell_quote(&format!("/work/{path}"));
             s.push_str(&format!(
-                "mkdir -p \"$(dirname '/work/{path}')\"\nprintf %s '{b64}' | base64 -d > '/work/{path}'\n"
+                "mkdir -p \"$(dirname {dst})\"\nprintf %s '{b64}' | base64 -d > {dst}\n"
             ));
         }
         s.push_str("cd /work\n");

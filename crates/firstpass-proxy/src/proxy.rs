@@ -19,7 +19,7 @@ use firstpass_core::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
 use crate::config::ProxyConfig;
@@ -32,7 +32,7 @@ use crate::upstream::{forward_anthropic, forward_anthropic_streaming};
 use firstpass_core::Route;
 
 /// Shared state handed to every request handler. Cheap to clone: an `Arc`ed config, a
-/// pooled HTTP client, and an unbounded channel sender.
+/// pooled HTTP client, and a bounded channel sender.
 #[derive(Clone)]
 pub struct AppState {
     /// Static proxy configuration.
@@ -44,7 +44,7 @@ pub struct AppState {
     /// Per-gate error budgets (auto-disable), shared across requests.
     pub gate_health: Arc<GateHealthRegistry>,
     /// Fire-and-forget sender to the background trace writer.
-    pub traces: UnboundedSender<Trace>,
+    pub traces: store::TraceSender,
 }
 
 impl std::fmt::Debug for AppState {
@@ -55,6 +55,27 @@ impl std::fmt::Debug for AppState {
     }
 }
 
+/// Fire-and-forget a trace at the background writer: non-blocking, and bounded. If the writer has
+/// fallen behind enough to fill the buffer, or is gone, the trace is dropped with a warning rather
+/// than blocking the hot path or growing memory without limit (the audit chain over persisted
+/// traces stays valid; a dropped trace is simply absent).
+fn offer_trace(traces: &store::TraceSender, trace: Trace) {
+    match traces.try_send(trace) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            tracing::warn!("trace channel full; dropping trace (writer behind under load)");
+        }
+        Err(TrySendError::Closed(_)) => {
+            tracing::warn!("trace writer is gone; dropping trace");
+        }
+    }
+}
+
+/// Max accepted request body. Explicit (not axum's ~2 MB default) so it's an intentional ceiling:
+/// generous enough to pass through large multimodal/long-context requests, bounded so a single
+/// oversized body can't exhaust memory.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Build the axum router: `POST /v1/messages`, `GET /v1/capabilities`, `GET /healthz`.
 pub fn app(state: AppState) -> Router {
     Router::new()
@@ -62,6 +83,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
         .route("/healthz", get(healthz))
+        // Explicit body-size ceiling (DoS/OOM guard) across every route.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -353,11 +376,8 @@ async fn handle_enforce(
     };
 
     let (outcome, trace) = route_enforce(ctx).await;
-    // The trace is already built; enqueue it off-path (send is non-blocking on an unbounded
-    // channel, so no spawn needed).
-    if state.traces.send(trace).is_err() {
-        tracing::warn!("trace writer is gone; dropping enforce trace");
-    }
+    // The trace is already built; enqueue it off-path (non-blocking `try_send`, so no spawn needed).
+    offer_trace(&state.traces, trace);
 
     match outcome {
         EngineOutcome::Served(resp) => (
@@ -529,9 +549,7 @@ fn spawn_stream_trace(
     let traces = state.traces.clone();
     tokio::spawn(async move {
         let trace = build_stream_trace(&config, &req_body, latency_ms, session_header.as_deref());
-        if traces.send(trace).is_err() {
-            tracing::warn!("trace writer is gone; dropping stream trace");
-        }
+        offer_trace(&traces, trace);
     });
 }
 
@@ -559,9 +577,7 @@ fn spawn_trace(
             ),
             None => build_error_trace(&config, &req_body, latency_ms, session_header.as_deref()),
         };
-        if traces.send(trace).is_err() {
-            tracing::warn!("trace writer is gone; dropping trace");
-        }
+        offer_trace(&traces, trace);
     });
 }
 
@@ -908,7 +924,7 @@ mod tests {
         ladder: &[&str],
         gates: &[&str],
         outcomes: Vec<(&str, Result<ModelResponse, ProviderError>)>,
-    ) -> (AppState, mpsc::UnboundedReceiver<Trace>) {
+    ) -> (AppState, mpsc::Receiver<Trace>) {
         let toml = format!(
             "[[route]]\nmatch = {{}}\nmode = \"enforce\"\nladder = [{}]\ngates = [{}]\n",
             ladder
@@ -940,7 +956,7 @@ mod tests {
         );
         let providers = ProviderRegistry::from_map(map);
 
-        let (traces, rx) = mpsc::unbounded_channel();
+        let (traces, rx) = mpsc::channel(64);
         let state = AppState {
             config: Arc::new(config),
             http: reqwest::Client::new(),
@@ -1039,7 +1055,7 @@ mod tests {
             _ => None,
         })
         .unwrap();
-        let (traces, _rx) = mpsc::unbounded_channel();
+        let (traces, _rx) = mpsc::channel(64);
         let state = AppState {
             config: Arc::new(config),
             http: reqwest::Client::new(),
@@ -1105,7 +1121,7 @@ mod tests {
             "anthropic".to_owned(),
             Arc::new(MockProvider::new("anthropic", outs)),
         );
-        let (traces, _rx) = mpsc::unbounded_channel();
+        let (traces, _rx) = mpsc::channel(64);
         let state = AppState {
             config: Arc::new(config),
             http: reqwest::Client::new(),
@@ -1172,7 +1188,7 @@ mod tests {
             verdict: Verdict::Pass,
         });
         let trace_id = trace.trace_id.to_string();
-        tx.send(trace).unwrap();
+        tx.try_send(trace).unwrap();
         drop(tx);
         handle.await.unwrap();
 
@@ -1182,7 +1198,7 @@ mod tests {
             _ => None,
         })
         .unwrap();
-        let (traces, _rx) = mpsc::unbounded_channel();
+        let (traces, _rx) = mpsc::channel(64);
         let state = AppState {
             config: Arc::new(config),
             http: reqwest::Client::new(),

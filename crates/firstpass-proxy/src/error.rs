@@ -57,6 +57,28 @@ impl ProxyError {
             ProxyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+
+    /// The message returned to the caller. Client-actionable errors (validation, not-found) return
+    /// their real message; upstream / engine / internal detail is generalized so the response never
+    /// leaks the upstream's identity, an internal error string, or server state (the full detail is
+    /// logged server-side instead — see [`IntoResponse`]).
+    fn client_message(&self) -> String {
+        match self {
+            ProxyError::BadRequest(m) | ProxyError::NotFound(m) => m.clone(),
+            ProxyError::BadRequestBody => "failed to read request body".to_owned(),
+            ProxyError::Upstream(_) => "upstream request failed".to_owned(),
+            ProxyError::Engine(_) => "no rung could serve a valid response".to_owned(),
+            ProxyError::Internal(_) => "internal error".to_owned(),
+        }
+    }
+
+    /// Whether the full detail must be kept server-side (logged, not returned).
+    fn detail_is_internal(&self) -> bool {
+        matches!(
+            self,
+            ProxyError::Upstream(_) | ProxyError::Engine(_) | ProxyError::Internal(_)
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -74,10 +96,16 @@ struct ErrorDetail<'a> {
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let message = self.to_string();
+        let kind = self.kind();
+        // Log the full detail server-side for the variants whose detail must not reach the caller,
+        // so operators keep the diagnostic while clients get an opaque message.
+        if self.detail_is_internal() {
+            tracing::warn!(kind, detail = %self, "request error");
+        }
+        let message = self.client_message();
         let body = ErrorBody {
             error: ErrorDetail {
-                kind: self.kind(),
+                kind,
                 message: &message,
             },
         };
@@ -98,5 +126,36 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"]["type"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn engine_error_does_not_leak_internal_detail_to_caller() {
+        // The engine detail names a specific upstream host — it must not reach the client body.
+        let leaky = "connection refused to https://internal-upstream.acme:8443/v1/messages";
+        let response = ProxyError::Engine(leaky.to_owned()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "engine_error");
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(
+            !msg.contains("internal-upstream"),
+            "leaked upstream host: {msg}"
+        );
+        assert!(!msg.contains("acme"), "leaked internal detail: {msg}");
+    }
+
+    #[tokio::test]
+    async fn bad_request_keeps_its_client_actionable_message() {
+        // Validation messages ARE client-actionable and should be preserved.
+        let response =
+            ProxyError::BadRequest("field `model` is required".to_owned()).into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]["message"].as_str().unwrap().contains("model"));
     }
 }

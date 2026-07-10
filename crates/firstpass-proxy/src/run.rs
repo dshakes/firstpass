@@ -50,7 +50,12 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
 
     let state = AppState {
         config: Arc::new(config),
-        http: reqwest::Client::builder().build()?,
+        // Observe passthrough may stream SSE, so only bound the CONNECT phase here — a total or
+        // read timeout would sever a long-lived stream. (The enforce providers, which never stream
+        // through the adapter, carry a full request timeout — see `ProviderRegistry::new`.)
+        http: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()?,
         providers,
         gate_health: Arc::new(gate_health),
         traces,

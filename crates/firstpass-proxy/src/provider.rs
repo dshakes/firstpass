@@ -394,9 +394,18 @@ impl std::fmt::Debug for ProviderRegistry {
 
 impl ProviderRegistry {
     /// Build the standard registry: Anthropic + OpenAI, sharing one HTTP client.
+    ///
+    /// The enforce path is request/response (never streamed through the adapter), so the client
+    /// carries a total request timeout as well as a connect timeout — a hung or slow upstream can't
+    /// pin a routing decision indefinitely. Falls back to a default client if the builder fails
+    /// (only on TLS backend init, which is fatal anyway).
     #[must_use]
     pub fn new(anthropic_base: impl Into<String>, openai_base: impl Into<String>) -> Self {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
         providers.insert(
             "anthropic".to_owned(),
