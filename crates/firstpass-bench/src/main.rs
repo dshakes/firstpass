@@ -9,7 +9,8 @@
 //!   firstpass-bench --coding-live  # coding-with-tests with a LIVE candidate model (needs ANTHROPIC_API_KEY)
 
 use firstpass_bench::coding::{
-    CandidateSolver, CodingReport, LiveSolver, coding_suite, mock_solutions, run_coding_benchmark,
+    CandidateSolver, CodingReport, GeneratedSolver, LiveSolver, coding_suite,
+    generated_coding_suite, mock_solutions, run_coding_benchmark,
 };
 use firstpass_bench::sandbox::establish_sandbox;
 use firstpass_bench::{BenchConfig, run_benchmark, run_benchmark_live};
@@ -40,9 +41,11 @@ fn main() {
         return;
     }
 
-    // Coding-with-tests benchmark (Batch 3b): candidate writes code → run visible (gate) + hidden
-    // (oracle) in the fail-closed sandbox → real gate error + conformal. `--coding` uses the mock
-    // solver (no model spend); `--coding-live` uses a live candidate model.
+    // Coding-with-tests benchmark (Batch 3b/3c): candidate writes code → run visible (gate) + hidden
+    // (oracle) in the fail-closed sandbox → real gate error + conformal on the continuous score.
+    // `--coding` = offline solver (no model spend); `--coding-live` = live candidate model.
+    // FIRSTPASS_CODING_N=<n> swaps the 3-task demo suite for the scalable generated suite of n tasks
+    // (needed for a feasible conformal bound).
     if args.iter().any(|a| a == "--coding" || a == "--coding-live") {
         let live_coding = args.iter().any(|a| a == "--coding-live");
         let sb = match establish_sandbox(SANDBOX_IMAGE) {
@@ -53,6 +56,14 @@ fn main() {
             }
         };
         let cfg = BenchConfig::default();
+        let n_gen = std::env::var("FIRSTPASS_CODING_N")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        let tasks = match n_gen {
+            Some(n) => generated_coding_suite(n),
+            None => coding_suite(),
+        };
+        // Offline solver must match the suite: GeneratedSolver for the generated suite, mock for demo.
         let solver: Box<dyn CandidateSolver> = if live_coding {
             let key = match std::env::var("ANTHROPIC_API_KEY") {
                 Ok(k) if !k.is_empty() => k,
@@ -62,11 +73,13 @@ fn main() {
                 }
             };
             Box::new(LiveSolver::new(key, "claude-haiku-4-5".to_owned()))
+        } else if n_gen.is_some() {
+            Box::new(GeneratedSolver::new(cfg.backend_seed))
         } else {
             Box::new(mock_solutions())
         };
         match run_coding_benchmark(
-            &coding_suite(),
+            &tasks,
             solver.as_ref(),
             sb.as_ref(),
             cfg.conformal_alpha,
@@ -119,9 +132,9 @@ fn main() {
 }
 
 /// Print a coding-with-tests report: the gate's real error, the served-failure it induces, and the
-/// conformal bound (with an honest note when the demo suite is too small to be feasible).
+/// conformal bound on the continuous score (with an honest note when the suite is too small).
 fn print_coding(r: &CodingReport) {
-    println!("# Coding-with-tests benchmark (Batch 3b)\n");
+    println!("# Coding-with-tests benchmark (Batch 3b/3c)\n");
     println!("- sandbox runtime tier: {}", r.runtime_tier);
     println!("- tasks: {}", r.n);
     println!(
@@ -129,34 +142,39 @@ fn print_coding(r: &CodingReport) {
         r.oracle_pass_rate * 100.0
     );
     println!(
-        "- gate false-accept rate (P(gate pass | incorrect)): {:.1}%  <- real gate error (arithmetic had 0)",
+        "- gate false-accept rate (P(full visible pass | incorrect)): {:.1}%  <- real gate error (arithmetic had 0)",
         r.gate_false_accept_rate * 100.0
     );
     println!(
-        "- gate false-reject rate (P(gate fail | correct)):  {:.1}%",
+        "- gate false-reject rate (P(not full pass | correct)):       {:.1}%",
         r.gate_false_reject_rate * 100.0
     );
     println!(
-        "- served-failure if you serve every gate-pass:      {:.1}%",
-        r.served_failure_rate * 100.0
+        "- served-failure if you serve every full-visible-pass:       {:.1}%",
+        r.served_failure_full_pass * 100.0
     );
     println!(
-        "- conformal: threshold {:.3}, served {:.0}%, calib-risk {:.1}%, feasible={}",
+        "- conformal (continuous score): threshold {:.3}, served {:.0}%, calib-risk {:.1}%, feasible={}",
         r.conformal.threshold,
         r.conformal.served_frac * 100.0,
         r.conformal.calib_risk * 100.0,
         r.conformal.feasible
     );
+    println!(
+        "- served-failure at the conformal threshold:                 {:.1}%",
+        r.served_failure_at_threshold * 100.0
+    );
     if !r.conformal.feasible {
         println!(
-            "  (infeasible: this demo suite is tiny — a real conformal bound needs a much larger live run)"
+            "  (infeasible on this run — a real bound needs more served samples: FIRSTPASS_CODING_N=200 --coding-live)"
         );
     }
-    println!("\nper-task (gate_pass / oracle_correct):");
-    for o in &r.outcomes {
+    let shown = r.outcomes.len().min(12);
+    println!("\nper-task (gate_score / oracle_correct), first {shown}:");
+    for o in r.outcomes.iter().take(shown) {
         println!(
-            "  {:<16} gate={:<5} oracle={}",
-            o.id, o.gate_pass, o.oracle_correct
+            "  {:<22} score={:.2} oracle={}",
+            o.id, o.gate_score, o.oracle_correct
         );
     }
 }
