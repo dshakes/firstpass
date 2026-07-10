@@ -13,6 +13,11 @@ authors.workspace = true
 name = "firstpass-proxy"
 path = "src/main.rs"
 
+# The unified CLI: `firstpass up | doctor | trace`.
+[[bin]]
+name = "firstpass"
+path = "src/bin/firstpass.rs"
+
 [dependencies]
 firstpass-core.workspace = true
 serde.workspace = true
