@@ -8,6 +8,7 @@
 //!
 //! - [`config`] — [`ProxyConfig`], loaded from the environment.
 //! - [`store`] — the background SQLite trace writer.
+//! - [`calibrate`] — recalibrate the conformal serving threshold from deferred feedback.
 //! - [`upstream`] — BYOK passthrough to the upstream provider (observe mode).
 //! - [`provider`] — normalized multi-provider model access (Anthropic, OpenAI).
 //! - [`gate`] — runtime verification gates (Batch 3 inline set).
@@ -19,6 +20,7 @@
 //! - [`run`] — shared server bootstrap for the `firstpass` and `firstpass-proxy` binaries.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod calibrate;
 pub mod cli;
 pub mod config;
 pub mod error;

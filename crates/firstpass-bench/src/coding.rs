@@ -17,8 +17,8 @@
 //! Cost note: each task is measured **once** (one candidate call, two sandbox runs) rather than
 //! re-running per policy — candidate calls and sandbox execs are expensive.
 
-use crate::conformal::{self, ConformalResult};
 use crate::sandbox::{ExecOutcome, ExecUnit, Limits, Sandbox};
+use firstpass_core::conformal::{self, ConformalResult};
 use std::collections::HashMap;
 
 /// A coding task: prompt, the file the candidate writes, and two lists of boolean-expression cases.

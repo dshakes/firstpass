@@ -1,9 +1,9 @@
 //! Assembling and rendering the proof report — honestly, including where Firstpass loses and a
 //! pre-registered kill criterion (SPEC §10).
 
-use crate::conformal::ConformalResult;
 use crate::metrics::PolicyMetrics;
 use crate::stats::Ci;
+use firstpass_core::conformal::ConformalResult;
 use serde::Serialize;
 use std::fmt::Write as _;
 

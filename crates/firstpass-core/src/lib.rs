@@ -15,12 +15,14 @@
 //! - [`hashchain`] — tamper-evident, auditor-re-derivable hashing.
 //! - [`config`] — declarative routing [`Config`] (SPEC §8.4).
 //! - [`cost`] — model pricing and the counterfactual baseline.
+//! - [`conformal`] — split-conformal risk control on the gate threshold (SPEC §10.1).
 //! - [`error`] — the crate [`Error`] type.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![doc(html_root_url = "https://docs.rs/firstpass-core")]
 
 pub mod config;
+pub mod conformal;
 pub mod cost;
 pub mod error;
 pub mod features;
@@ -32,6 +34,7 @@ pub use config::{
     Budget, Config, Escalation, GateDef, JudgeDef, Mode, ModelRef, OnExhausted, Route,
     SessionPromotion,
 };
+pub use conformal::{ConformalResult, calibrate, served_failure_rate};
 pub use cost::{ModelPrice, PriceTable};
 pub use error::{Error, Result};
 pub use features::{FEATURE_VERSION, Features, TaskKind};
