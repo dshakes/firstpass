@@ -108,7 +108,12 @@ pub fn run_benchmark(cfg: &BenchConfig) -> Report {
 pub fn run_benchmark_live(cfg: &BenchConfig, api_key: String) -> Result<Report, String> {
     let backend = live::LiveBackend::new(api_key);
     let gate = live::LiveGate;
-    let suite = live::live_suite();
+    // Graded verifiable suite; size via FIRSTPASS_BENCH_N (default 200 — the SPEC §10 target).
+    let n = std::env::var("FIRSTPASS_BENCH_N")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(200);
+    let suite = live::graded_suite(n);
     backend.preflight(&cfg.ladder[0]).map_err(|e| {
         format!("preflight failed (check ANTHROPIC_API_KEY and ladder model ids): {e}")
     })?;

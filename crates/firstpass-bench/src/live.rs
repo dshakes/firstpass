@@ -174,13 +174,14 @@ pub fn parse_anthropic(v: &serde_json::Value) -> Result<(String, u64, u64), Stri
     Ok((text, in_tokens, out_tokens))
 }
 
-/// Ground-truth check: does the model's output contain the expected answer (normalized)?
-///
-/// ponytail: substring match on lowercased alphanumeric text — fine for the curated, unambiguous
-/// suite below; a per-task checker (numeric tolerance, regex, or a real unit test) is the upgrade
-/// when the suite scales toward the SPEC §10 target of ≥200 tasks.
+/// Ground-truth check. For an integer answer (the arithmetic suite) it compares the **last integer**
+/// in the output exactly, so `"12"` never spuriously matches inside `"1234"`. For a short factual
+/// answer it falls back to a normalized substring match.
 #[must_use]
 pub fn check_answer(output: &str, expected: &str) -> bool {
+    if let Ok(exp) = expected.trim().parse::<i64>() {
+        return last_integer(output) == Some(exp);
+    }
     fn norm(s: &str) -> String {
         s.to_lowercase()
             .chars()
@@ -192,6 +193,96 @@ pub fn check_answer(output: &str, expected: &str) -> bool {
     }
     let (out, exp) = (norm(output), norm(expected));
     !exp.is_empty() && out.contains(&exp)
+}
+
+/// The last integer appearing in `s` (commas stripped, leading `-` honored) — the model's final
+/// answer when it's told to "reply with only the final integer".
+fn last_integer(s: &str) -> Option<i64> {
+    let cleaned = s.replace(',', "");
+    let mut last = None;
+    let mut cur = String::new();
+    for c in cleaned.chars() {
+        if c.is_ascii_digit() || (c == '-' && cur.is_empty()) {
+            cur.push(c);
+        } else {
+            if let Ok(n) = cur.parse::<i64>() {
+                last = Some(n);
+            }
+            cur.clear();
+        }
+    }
+    if let Ok(n) = cur.parse::<i64>() {
+        last = Some(n);
+    }
+    last
+}
+
+/// A ≥200-scale suite of **verifiable, graded** arithmetic tasks with a real difficulty gradient
+/// (fully-parenthesized left-to-right expressions of escalating length/magnitude). Deterministic:
+/// task `i` is a pure function of `i`, so a run is reproducible without a stored dataset.
+///
+/// This scales the **cost / success / escalation** proof to statistical power. It does *not*
+/// exercise an imperfect gate — arithmetic is self-checking, so a judge can just recompute it; a
+/// meaningful conformal guarantee needs a coding-with-tests benchmark, which is a separate effort.
+#[must_use]
+pub fn graded_suite(n: usize) -> Vec<Task> {
+    (0..n)
+        .map(|i| {
+            let (prompt, answer) = arithmetic_task(i as u64);
+            Task::verifiable(i as u64, prompt, answer.to_string())
+        })
+        .collect()
+}
+
+/// Build one deterministic arithmetic task from `seed`: `(prompt, exact_answer)`. Difficulty tiers
+/// by `seed % 3` (2/3/4 steps, growing operands) create the gradient that makes routing matter.
+fn arithmetic_task(seed: u64) -> (String, i64) {
+    // A small deterministic LCG so operands are a pure function of the seed (no RNG state, no dates).
+    let mut state = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    let mut next = |m: u64| -> u64 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % m
+    };
+
+    let (steps, max) = match seed % 3 {
+        0 => (2u32, 20i64), // easy
+        1 => (3, 99),       // medium
+        _ => (4, 999),      // hard
+    };
+
+    #[allow(clippy::cast_possible_wrap)]
+    let mut val = (next(max as u64) as i64) + 1;
+    let mut expr = format!("{val}");
+    for _ in 0..steps {
+        #[allow(clippy::cast_possible_wrap)]
+        match next(3) {
+            0 => {
+                let o = (next(max as u64) as i64) + 1;
+                expr = format!("({expr} + {o})");
+                val += o;
+            }
+            1 => {
+                let o = (next(max as u64) as i64) + 1;
+                expr = format!("({expr} - {o})");
+                val -= o;
+            }
+            // Keep × operands small so magnitudes stay in a range that differentiates models
+            // (rather than exploding past what any model can do).
+            _ => {
+                let o = (next(9) as i64) + 2;
+                expr = format!("({expr} × {o})");
+                val *= o;
+            }
+        }
+    }
+    (
+        format!("Compute the exact value of {expr}. Reply with only the final integer."),
+        val,
+    )
 }
 
 /// A small embedded suite of verifiable tasks (unambiguous known answers) to prove the live pipeline
@@ -301,6 +392,80 @@ mod tests {
         assert!(check_answer("It is Canberra.", "canberra"));
         assert!(!check_answer("The capital is Sydney.", "Canberra"));
         assert!(!check_answer("anything", "")); // empty expected never matches
+    }
+
+    #[test]
+    fn checks_numeric_answers_exactly() {
+        assert!(check_answer("The final answer is 391.", "391"));
+        assert!(!check_answer("3910", "391")); // no spurious substring match
+        assert!(check_answer("result: -6", "-6"));
+        assert!(check_answer("1,274", "1274")); // commas stripped
+        assert!(!check_answer("12", "1234"));
+    }
+
+    /// Re-evaluate a fully-left-nested expression by folding its numbers/ops left-to-right.
+    fn eval_left(expr: &str) -> i64 {
+        let mut nums = Vec::new();
+        let mut ops = Vec::new();
+        let mut cur = String::new();
+        for c in expr.chars() {
+            if c.is_ascii_digit() {
+                cur.push(c);
+            } else {
+                if !cur.is_empty() {
+                    nums.push(cur.parse::<i64>().unwrap());
+                    cur.clear();
+                }
+                if c == '+' || c == '-' || c == '×' {
+                    ops.push(c);
+                    // Stop once we leave the expression (the trailing "Reply..." has no ops).
+                }
+            }
+        }
+        if !cur.is_empty() {
+            nums.push(cur.parse::<i64>().unwrap());
+        }
+        // Only fold the operands the ops actually pair with (ignore any trailing prose numbers).
+        let mut acc = nums[0];
+        for (i, op) in ops.iter().enumerate() {
+            let n = nums[i + 1];
+            acc = match op {
+                '+' => acc + n,
+                '-' => acc - n,
+                _ => acc * n,
+            };
+        }
+        acc
+    }
+
+    #[test]
+    fn graded_tasks_are_deterministic_and_correct() {
+        for seed in 0..60u64 {
+            let (p1, a1) = arithmetic_task(seed);
+            let (p2, a2) = arithmetic_task(seed);
+            assert_eq!((p1.clone(), a1), (p2, a2), "deterministic for seed {seed}");
+            let expr = p1
+                .trim_start_matches("Compute the exact value of ")
+                .split(". Reply")
+                .next()
+                .unwrap();
+            assert_eq!(
+                eval_left(expr),
+                a1,
+                "answer matches expression for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn graded_suite_scales_and_is_verifiable() {
+        let suite = graded_suite(200);
+        assert_eq!(suite.len(), 200);
+        assert!(
+            suite
+                .iter()
+                .all(|t| t.prompt.is_some() && t.expected.is_some())
+        );
     }
 
     #[test]

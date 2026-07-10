@@ -21,7 +21,7 @@ Proof over prediction. Built for agent fleets.
 
 Firstpass is a **drop-in, Anthropic-compatible proxy**. Point your agent's `base_url` at it and every request is routed to the cheapest model first, its **real output** is checked by a gate you define (tests, typecheck, schema, a judge), and it escalates one rung only when the gate fails — writing a tamper-evident audit trace for every decision.
 
-> **Honestly scoped.** The proxy routes, gates, escalates, fails over, audits, and learns end-to-end over real HTTP — no test doubles in the plane. The [proof harness](#proof-not-adjectives) now has a **live-provider mode** (`--live`) with a small real result below; the larger ≥200-task benchmark and a 30-day dogfood are the [roadmap](#roadmap). Prebuilt binaries and Homebrew are still pending. Nothing here is claimed as measured that isn't.
+> **Honestly scoped.** The proxy routes, gates, escalates, fails over, audits, and learns end-to-end over real HTTP — no test doubles in the plane, and the enforce path is [live-verified](#proof-not-adjectives) against real Anthropic. The [proof harness](#proof-not-adjectives) has a **200-task live result** below; still ahead: a coding-with-tests benchmark (to earn the conformal guarantee), a 30-day dogfood, and prebuilt binaries. See the [roadmap](#roadmap). Nothing here is claimed as measured that isn't.
 
 ## Quickstart
 
@@ -123,7 +123,18 @@ FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy
 
 The harness (`cargo run -p firstpass-bench`) runs the full methodology — baselines, bootstrap confidence intervals, a split-conformal served-failure guarantee, and a **pre-registered kill criterion** that says *stop* if the thesis fails — behind real-backend trait seams. `--live` swaps the simulated backend for real providers (BYOK).
 
-**Live preliminary — real Anthropic, 15 verifiable tasks:** Firstpass served at **~87% lower $/success than always-top at equal success** (0.933), beat a predictive router on served-failure (**0.067 vs 0.133**), and the cheap tier cleared **93%** of tasks against a 30% break-even — **kill criterion: PROCEED**. Caveat, stated plainly: this is a small proof-of-*pipeline* run with a *perfect deterministic* gate (so gate precision/recall is 1.00 and the conformal guarantee is degenerate). It is **not** the publishable benchmark — that needs ≥200 curated tasks and a real, imperfect gate, which is the next milestone.
+**Live — real Anthropic, 200 graded verifiable tasks** (`--live`, difficulty-graded arithmetic; reproducible, deterministic):
+
+| policy | success | $/success | served-failure |
+|---|---|---|---|
+| always-cheap (Haiku) | 0.62 `[0.55, 0.69]` | $0.0001 | 0.38 |
+| always-top (Opus) | 0.98 `[0.96, 0.99]` | $0.0023 | 0.02 |
+| predictive router | 0.88 | $0.0007 | 0.12 |
+| **firstpass** | **1.00** `[1.00, 1.00]` | **$0.0003** | **0.00** |
+
+Firstpass served at **~85% lower $/success than always-top, at parity-or-better quality**, with **served-failure 0.00 vs the predictive router's 0.12** — verification catches what prediction serves blind. The cheap tier cleared 62% of tasks against a 13% break-even, so **the pre-registered kill criterion reads PROCEED**.
+
+Stated plainly: these tasks are *self-checking* (a deterministic gate → gate precision/recall 1.00), so this proves the **cost / success / escalation** thesis at scale but the **conformal served-failure guarantee is degenerate here** — earning it needs a genuinely *imperfect* gate, which means a **coding-with-tests benchmark**. That's the next milestone, not a claim made today.
 
 ## Roadmap
 
@@ -131,7 +142,7 @@ The harness (`cargo run -p firstpass-bench`) runs the full methodology — basel
 - **M1 ✓** — Rust proxy: Anthropic + OpenAI clients, observe **and** enforce, escalation, cross-provider failover, SQLite trace store — over real HTTP.
 - **M2 ✓** — gate framework: subprocess plugins, inline + schema gates, **native LLM-judge gate** (maker≠checker, candidate-as-data), error-budget auto-disable, feedback API + deferred verdicts.
 - **M2.5 ✓** — real-traffic proxy: **SSE streaming passthrough**, tool/multimodal-safe enforce; **`firstpass` CLI** (`up` / `doctor` / `trace`) + **MCP server**; live-provider proof harness (`--live`).
-- **M3 →** — larger live benchmark (≥200 tasks + a real imperfect gate), 30-day self-host dogfood GA, published binaries + Homebrew tap.
+- **M3 →** — 200-task live benchmark ✓ (cost/success proof at scale); still ahead: a **coding-with-tests benchmark** (a real *imperfect* gate, to earn the conformal guarantee), a 30-day self-host dogfood GA, and published binaries + Homebrew tap.
 - **Hosted GA →** — multi-tenant control plane, BYOK KMS envelope encryption, sandboxed gate execution — designed in [ADR 0001](docs/adr/0001-hosted-ga-architecture.md), gated behind dogfood GA.
 
 ## Links
