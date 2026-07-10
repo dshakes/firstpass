@@ -16,6 +16,8 @@ path = "src/main.rs"
 firstpass-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Live-provider backend (`--live`): blocking HTTP so the sequential harness needs no async runtime.
+reqwest = { workspace = true, features = ["blocking"] }
 
 [lints]
 workspace = true

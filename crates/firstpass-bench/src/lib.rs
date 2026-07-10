@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod conformal;
+pub mod live;
 pub mod metrics;
 pub mod policy;
 pub mod report;
@@ -21,7 +22,7 @@ use firstpass_core::PriceTable;
 use metrics::evaluate;
 use policy::{AlwaysCheap, AlwaysTop, Decision, Firstpass, Policy, PredictiveRouter, RandomRung};
 use report::{KillDecision, Report};
-use sim::{Gate, ModelBackend, Rung, SimBackend, SimGate, task_suite};
+use sim::{Gate, ModelBackend, Rung, SimBackend, SimGate, Task, task_suite};
 use stats::mean;
 
 /// Knobs for a benchmark run. Defaults model the agent/coding beachhead: a fast cheap tier, a
@@ -77,7 +78,7 @@ impl Default for BenchConfig {
     }
 }
 
-/// Run the full benchmark and produce a [`Report`].
+/// Run the full benchmark against the **simulated** backend and produce a [`Report`].
 #[must_use]
 pub fn run_benchmark(cfg: &BenchConfig) -> Report {
     let suite = task_suite(cfg.n_tasks, cfg.seed);
@@ -88,6 +89,53 @@ pub fn run_benchmark(cfg: &BenchConfig) -> Report {
         cfg.gate_fnr,
         cfg.gate_cost_usd,
     );
+    // Disjoint calibration suite for conformal (sim only — free to draw more tasks).
+    let calib = task_suite(cfg.n_tasks.max(2000), cfg.seed.wrapping_add(1));
+    run_core(cfg, &suite, &calib, &backend, &gate, true)
+}
+
+/// Run the full benchmark against **live providers** (Anthropic Messages) over a verifiable task
+/// suite, producing the real (non-simulated) [`Report`]. BYOK: `api_key` is used only to call the
+/// provider and is never stored or traced.
+///
+/// A preflight call validates the key/model before the full run so a bad key fails fast instead of
+/// burning a whole run. Any hard provider error during the run aborts with `Err` rather than
+/// publishing misleading all-fail numbers. Live runs make real API calls (~150 at the default
+/// suite size) and cost real tokens.
+///
+/// # Errors
+/// Returns a message if the preflight fails or any live call errors during the run.
+pub fn run_benchmark_live(cfg: &BenchConfig, api_key: String) -> Result<Report, String> {
+    let backend = live::LiveBackend::new(api_key);
+    let gate = live::LiveGate;
+    let suite = live::live_suite();
+    backend.preflight(&cfg.ladder[0]).map_err(|e| {
+        format!("preflight failed (check ANTHROPIC_API_KEY and ladder model ids): {e}")
+    })?;
+    let report = run_core(cfg, &suite, &suite, &backend, &gate, false);
+    let errs = backend.take_errors();
+    if errs.is_empty() {
+        Ok(report)
+    } else {
+        Err(format!(
+            "{} live call(s) failed — refusing to publish numbers:\n  {}",
+            errs.len(),
+            errs.join("\n  ")
+        ))
+    }
+}
+
+/// The shared benchmark core: same policies, metrics, conformal calibration, and kill criterion,
+/// run against whatever backend/gate/suite it is handed. `simulated` records whether these are
+/// simulated or real-provider numbers so the report can label itself honestly.
+fn run_core(
+    cfg: &BenchConfig,
+    suite: &[Task],
+    calib: &[Task],
+    backend: &dyn ModelBackend,
+    gate: &dyn Gate,
+    simulated: bool,
+) -> Report {
     let prices = PriceTable::defaults();
 
     let policies: Vec<Box<dyn Policy>> = vec![
@@ -107,13 +155,12 @@ pub fn run_benchmark(cfg: &BenchConfig) -> Report {
     for pol in &policies {
         let decisions: Vec<Decision> = suite
             .iter()
-            .map(|t| pol.decide(t, &cfg.ladder, &backend, &gate, &prices))
+            .map(|t| pol.decide(t, &cfg.ladder, backend, gate, &prices))
             .collect();
         policy_metrics.push(evaluate(pol.name(), &decisions, cfg.seed, cfg.alpha));
     }
 
-    // Conformal calibration on rung-0 (score, correct) pairs from a disjoint calibration suite.
-    let calib = task_suite(cfg.n_tasks.max(2000), cfg.seed.wrapping_add(1));
+    // Conformal calibration on rung-0 (score, correct) pairs from the calibration suite.
     let rung0 = &cfg.ladder[0];
     let pairs: Vec<(f64, bool)> = calib
         .iter()
@@ -172,7 +219,7 @@ pub fn run_benchmark(cfg: &BenchConfig) -> Report {
     };
 
     Report {
-        simulated: true,
+        simulated,
         policies: policy_metrics,
         conformal,
         kill: KillDecision {
