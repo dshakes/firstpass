@@ -254,15 +254,15 @@ mod tests {
         for i in 0..40u32 {
             let t = trace_with_score(0.7 + f64::from(i % 10) * 0.01);
             correct_ids.push(t.trace_id.to_string());
-            tx.send(t).unwrap();
+            tx.try_send(t).unwrap();
         }
         for i in 0..40u32 {
             let t = trace_with_score(0.2 + f64::from(i % 10) * 0.01);
             incorrect_ids.push(t.trace_id.to_string());
-            tx.send(t).unwrap();
+            tx.try_send(t).unwrap();
         }
         for i in 0..5u32 {
-            tx.send(trace_with_score(0.5 + f64::from(i) * 0.01))
+            tx.try_send(trace_with_score(0.5 + f64::from(i) * 0.01))
                 .unwrap();
         }
         drop(tx);

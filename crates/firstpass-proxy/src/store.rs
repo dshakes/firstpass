@@ -1,7 +1,9 @@
-//! Tamper-evident trace storage: a background SQLite writer fed by an unbounded channel.
+//! Tamper-evident trace storage: a background SQLite writer fed by a bounded channel.
 //!
-//! The hot request path never blocks on disk: it sends a [`Trace`] down an unbounded channel
-//! and returns immediately. A single background task owns the SQLite connection, assigns
+//! The hot request path never blocks on disk: it `try_send`s a [`Trace`] down a bounded channel
+//! and returns immediately (dropping the trace if the writer has fallen far enough behind to fill
+//! the buffer — bounded memory over a guaranteed write). A single background task owns the SQLite
+//! connection, assigns
 //! each trace's `prev_hash` from the current chain head, computes its `hash`, and appends it
 //! (SPEC §9: the hash chain is only meaningful if every writer agrees on chain order, which a
 //! single writer task guarantees for free).
@@ -37,8 +39,13 @@ pub enum StoreError {
 }
 
 /// Sending half of the trace channel; cheap to clone, safe to share across request handlers.
-/// Sending is fire-and-forget — the hot path never awaits the writer.
-pub type TraceSender = mpsc::UnboundedSender<Trace>;
+/// Sending is fire-and-forget via `try_send` — the hot path never awaits the writer, and a bounded
+/// buffer means a stalled writer sheds load (drops traces) instead of growing memory without limit.
+pub type TraceSender = mpsc::Sender<Trace>;
+
+/// Trace buffer depth. Deep enough to absorb normal write bursts; bounded so a wedged writer (disk
+/// stall) can't OOM the process — excess traces are dropped with a warning, not queued forever.
+pub const TRACE_CHANNEL_CAP: usize = 8192;
 
 /// Open (creating if needed) the SQLite trace database, migrate its schema, and spawn the
 /// background writer task.
@@ -52,7 +59,7 @@ pub fn open(db_path: impl AsRef<Path>) -> Result<(TraceSender, JoinHandle<()>), 
     let conn = connect(db_path.as_ref())?;
     migrate(&conn)?;
 
-    let (tx, rx) = mpsc::unbounded_channel::<Trace>();
+    let (tx, rx) = mpsc::channel::<Trace>(TRACE_CHANNEL_CAP);
     let handle = tokio::task::spawn_blocking(move || writer_loop(conn, rx));
     Ok((tx, handle))
 }
@@ -93,7 +100,7 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
 /// The writer's main loop: runs on a blocking-pool thread for the lifetime of the store.
 /// Never panics on a bad trace — logs and drops it, so one malformed record can't wedge the
 /// whole audit pipeline.
-fn writer_loop(conn: Connection, mut rx: mpsc::UnboundedReceiver<Trace>) {
+fn writer_loop(conn: Connection, mut rx: mpsc::Receiver<Trace>) {
     let mut head = match current_head(&conn) {
         Ok(head) => head,
         Err(err) => {
@@ -340,8 +347,8 @@ mod tests {
             std::env::temp_dir().join(format!("firstpass-store-test-{}.db", uuid::Uuid::now_v7()));
         let (tx, handle) = open(&db_path).unwrap();
 
-        tx.send(sample_trace("tenant-a", "session-1")).unwrap();
-        tx.send(sample_trace("tenant-a", "session-1")).unwrap();
+        tx.try_send(sample_trace("tenant-a", "session-1")).unwrap();
+        tx.try_send(sample_trace("tenant-a", "session-1")).unwrap();
         drop(tx);
         handle.await.unwrap();
 
@@ -364,8 +371,8 @@ mod tests {
         let t0 = sample_trace("acme", "run-1");
         let t1 = sample_trace("acme", "run-1");
         let (id0, id1) = (t0.trace_id.to_string(), t1.trace_id.to_string());
-        tx.send(t0).unwrap();
-        tx.send(t1).unwrap();
+        tx.try_send(t0).unwrap();
+        tx.try_send(t1).unwrap();
         drop(tx);
         handle.await.unwrap();
 
