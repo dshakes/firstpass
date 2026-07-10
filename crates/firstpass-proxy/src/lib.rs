@@ -15,6 +15,7 @@
 //! - [`proxy`] — axum routing, observe passthrough, and enforce dispatch.
 //! - [`error`] — structured, no-leak error responses.
 //! - [`cli`] — `firstpass doctor` / `trace` logic (validate a setup, read the store).
+//! - [`mcp`] — minimal MCP stdio server so an agent can read its traces and submit feedback.
 //! - [`run`] — shared server bootstrap for the `firstpass` and `firstpass-proxy` binaries.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -22,6 +23,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod gate;
+pub mod mcp;
 pub mod provider;
 pub mod proxy;
 pub mod router;

@@ -11,6 +11,7 @@ USAGE:
     firstpass up                  start the proxy (serves until Ctrl-C)
     firstpass doctor              validate config, provider key, and gate binaries
     firstpass trace [--limit N]   print recent audit traces as JSON lines (default 20)
+    firstpass mcp                 serve MCP over stdio (agent reads traces + submits feedback)
     firstpass --help | --version
 
 ENVIRONMENT (shared by every subcommand):
@@ -31,6 +32,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "doctor" => cmd_doctor(),
         "trace" => cmd_trace(&args),
+        "mcp" => {
+            // Synchronous stdio server; run it off the async runtime so nothing else contends.
+            let db = ProxyConfig::from_env()?.db_path;
+            tokio::task::spawn_blocking(move || firstpass_proxy::mcp::serve_stdio(&db)).await??;
+            Ok(())
+        }
         "--help" | "-h" | "help" => {
             println!("{HELP}");
             Ok(())
