@@ -15,6 +15,7 @@ pub mod live;
 pub mod metrics;
 pub mod policy;
 pub mod report;
+pub mod sandbox;
 pub mod sim;
 pub mod stats;
 
