@@ -23,6 +23,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod gate;
+pub mod judge;
 pub mod mcp;
 pub mod provider;
 pub mod proxy;

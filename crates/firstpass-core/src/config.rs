@@ -40,27 +40,53 @@ pub struct Config {
     pub gate_defs: Vec<GateDef>,
 }
 
-/// A user-defined subprocess gate (SPEC §8.1): any executable that reads the candidate as JSON on
-/// **stdin** (never argv — injection-resistant) and emits `{"verdict":"pass|fail|abstain", ...}`
-/// on stdout. This is the language-agnostic plugin mechanism — a test runner, a linter, or an LLM
-/// judge invoked by a script are all just commands here.
+/// A user-defined gate (SPEC §8.1). Exactly one kind per definition:
+/// - **subprocess** (`cmd`): any executable that reads the candidate as JSON on **stdin** (never
+///   argv — injection-resistant) and emits `{"verdict":"pass|fail|abstain", ...}` on stdout.
+/// - **judge** (`judge`): a native LLM-judge gate that grades the candidate against a rubric.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GateDef {
     /// The id a route references this gate by (must be unique and not shadow a built-in gate id).
     pub id: String,
-    /// The command to run: program first, then its args — e.g. `["pytest", "-q"]` or
-    /// `["bash", "-c", "…"]`. Must be non-empty.
+    /// Subprocess command: program first, then its args — e.g. `["pytest", "-q"]`. Set this **or**
+    /// `judge`, not both.
+    #[serde(default)]
     pub cmd: Vec<String>,
-    /// Hard timeout in milliseconds; the gate abstains (`timeout`) if the process runs longer.
+    /// Hard timeout in milliseconds for a subprocess gate; it abstains (`timeout`) if the process
+    /// runs longer.
     #[serde(default = "default_gate_timeout_ms")]
     pub timeout_ms: u64,
+    /// LLM-judge configuration. Set this **or** `cmd`, not both.
+    #[serde(default)]
+    pub judge: Option<JudgeDef>,
+}
+
+/// Configuration for a native LLM-judge gate (SPEC §8.3): a separate model grades the candidate
+/// against a rubric. The runner enforces maker ≠ checker (a model never grades its own output) and
+/// treats the candidate as data, not instructions.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeDef {
+    /// The judge model, as `provider/model` (must differ from the candidate's model at runtime).
+    pub model: String,
+    /// Pass iff the judge's score ≥ this threshold, in `[0, 1]`.
+    #[serde(default = "default_judge_threshold")]
+    pub threshold: f64,
+    /// What "good" means for this route — handed to the judge as the grading rubric.
+    #[serde(default)]
+    pub rubric: Option<String>,
 }
 
 /// Default subprocess-gate timeout: 30s. Long enough for a test suite, short enough to bound the
 /// enforce-path tail.
 fn default_gate_timeout_ms() -> u64 {
     30_000
+}
+
+/// Default judge pass threshold.
+fn default_judge_threshold() -> f64 {
+    0.7
 }
 
 /// One routing rule.
@@ -278,8 +304,9 @@ impl Config {
     /// Parse a TOML configuration document.
     ///
     /// # Errors
-    /// Returns [`Error::Config`] on invalid TOML, unknown fields, or an invalid gate definition
-    /// (empty `cmd`, or a duplicate/blank `id`).
+    /// Returns [`Error::Config`] on invalid TOML or unknown fields, or [`Error::InvalidConfig`] on
+    /// an invalid gate definition (not exactly one of `cmd`/`judge`, a judge threshold outside
+    /// `[0,1]`, or a duplicate/blank `id`).
     pub fn parse(toml_str: &str) -> Result<Self> {
         let config: Self = toml::from_str(toml_str)?;
         let mut seen = std::collections::HashSet::new();
@@ -287,10 +314,19 @@ impl Config {
             if def.id.trim().is_empty() {
                 return Err(Error::InvalidConfig("gate id must not be empty".to_owned()));
             }
-            if def.cmd.is_empty() {
+            // Exactly one kind: a subprocess `cmd` or a `judge`, never both, never neither.
+            if def.cmd.is_empty() == def.judge.is_none() {
                 return Err(Error::InvalidConfig(format!(
-                    "gate {:?} has an empty cmd",
+                    "gate {:?} must set exactly one of `cmd` or `judge`",
                     def.id
+                )));
+            }
+            if let Some(judge) = &def.judge
+                && !(0.0..=1.0).contains(&judge.threshold)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "gate {:?} judge threshold {} is outside [0, 1]",
+                    def.id, judge.threshold
                 )));
             }
             if !seen.insert(def.id.as_str()) {

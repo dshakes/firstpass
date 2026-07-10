@@ -33,10 +33,12 @@ ladder = ["anthropic/claude-opus-4-8"]
 id  = "unit-tests"
 cmd = ["your-test-runner", "--from-stdin"]
 
+# A native LLM-judge gate: a separate model grades the candidate against a rubric. The runner
+# enforces maker != checker (a model never grades its own output) and treats the candidate as data,
+# not instructions. Use a judge model outside the route's ladder so it never grades its own output.
 [[gate]]
-id         = "judge"          # e.g. a script that asks an LLM to grade the candidate
-cmd        = ["python3", "judge.py"]
-timeout_ms = 60000
+id    = "judge"
+judge = { model = "anthropic/claude-opus-4-8", threshold = 0.7, rubric = "The response fully and correctly resolves the request, with no errors." }
 
 [budget]
 per_request_usd = 0.50
