@@ -75,7 +75,7 @@ impl LiveBackend {
 /// Returns `(text, input_tokens, output_tokens)`. Transient failures (transport errors, 5xx) are
 /// retried with backoff — over thousands of sequential calls, the odd blip is inevitable and must
 /// not abort a whole run. A hard 4xx (bad key/model) or a decode error fails immediately.
-fn anthropic_call(
+pub(crate) fn anthropic_call(
     client: &reqwest::blocking::Client,
     base_url: &str,
     api_key: &str,
