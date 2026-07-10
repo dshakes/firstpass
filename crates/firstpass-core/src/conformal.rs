@@ -94,19 +94,34 @@ pub fn served_failure_rate(pairs: &[(f64, bool)], threshold: f64) -> (f64, usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::{Gate, ModelBackend, Rung, SimBackend, SimGate, task_suite};
 
-    /// Produce `(score, correct)` pairs by running rung 0 over a suite.
+    // ponytail: tiny inline SplitMix64, mirroring firstpass-bench's `sim::hash01` (which this
+    // crate must not depend on) — deterministic, dependency-free draws for the synthetic pairs
+    // below. Keeps the conformal guarantee test self-contained now that it lives in core.
+    fn hash01(seed: u64, a: u64, b: u64) -> f64 {
+        let mut s = seed
+            .wrapping_mul(0xD1B5_4A32_D192_ED03)
+            .wrapping_add(a.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .wrapping_add(b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+            .wrapping_add(0x1234_5678_9ABC_DEF0);
+        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Produce `(score, correct)` pairs with a gate score correlated with true correctness plus
+    /// noise (correct centers at 0.72, incorrect at 0.30) — the same shape `sim::SimGate` produces
+    /// for a real gate, without pulling in the bench simulation crate.
     fn pairs(seed: u64, n: usize) -> Vec<(f64, bool)> {
-        let suite = task_suite(n, seed);
-        let be = SimBackend::new(seed);
-        let gate = SimGate::new(seed ^ 0x99, 0.08, 0.10, 0.0);
-        let rung = Rung::new("anthropic/claude-haiku-4-5", 0.62);
-        suite
-            .iter()
-            .map(|t| {
-                let c = be.run(t, &rung);
-                (gate.judge(t, &rung, &c).score, c.correct)
+        (0..n as u64)
+            .map(|id| {
+                let correct = hash01(seed, id, 1) < 0.7;
+                let noise = (hash01(seed ^ 0x00C0_FFEE, id, 2) - 0.5) * 0.4;
+                let base = if correct { 0.72 } else { 0.30 };
+                ((base + noise).clamp(0.0, 1.0), correct)
             })
             .collect()
     }

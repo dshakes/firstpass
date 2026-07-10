@@ -11,7 +11,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod coding;
-pub mod conformal;
 pub mod live;
 pub mod metrics;
 pub mod policy;
@@ -198,7 +197,8 @@ fn run_core(
             (gate.judge(t, rung0, &c).score, c.correct)
         })
         .collect();
-    let conformal = conformal::calibrate(&pairs, cfg.conformal_alpha, cfg.conformal_delta, 50);
+    let conformal =
+        firstpass_core::conformal::calibrate(&pairs, cfg.conformal_alpha, cfg.conformal_delta, 50);
 
     // Kill criterion (SPEC §10): representative per-rung costs from the suite.
     let rung_cost = |r: &Rung| -> f64 {

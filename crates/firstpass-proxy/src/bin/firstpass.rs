@@ -2,6 +2,7 @@
 //! audit trail. Every subcommand reads the same environment as the server, so onboarding is one
 //! `base_url` swap and offboarding is one `unset`.
 
+use firstpass_proxy::calibrate::calibrate_from_store;
 use firstpass_proxy::{ProxyConfig, cli, load_all_traces, run};
 
 const HELP: &str = "\
@@ -11,6 +12,8 @@ USAGE:
     firstpass up                  start the proxy (serves until Ctrl-C)
     firstpass doctor              validate config, provider key, and gate binaries
     firstpass trace [--limit N]   print recent audit traces as JSON lines (default 20)
+    firstpass calibrate [--alpha A] [--delta D] [--min-n N]
+                                   recalibrate the serving threshold from deferred feedback
     firstpass mcp                 serve MCP over stdio (agent reads traces + submits feedback)
     firstpass --help | --version
 
@@ -32,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "doctor" => cmd_doctor(),
         "trace" => cmd_trace(&args),
+        "calibrate" => cmd_calibrate(&args),
         "mcp" => {
             // Synchronous stdio server; run it off the async runtime so nothing else contends.
             let db = ProxyConfig::from_env()?.db_path;
@@ -84,5 +88,30 @@ fn cmd_trace(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let config = ProxyConfig::from_env()?;
     let traces = load_all_traces(std::path::Path::new(&config.db_path)).unwrap_or_default();
     println!("{}", cli::format_traces(&traces, limit));
+    Ok(())
+}
+
+/// `firstpass calibrate [--alpha A] [--delta D] [--min-n N]` — recalibrate the conformal serving
+/// threshold from real deferred feedback recorded in the trace store. A store error is a hard
+/// failure (unlike `trace`'s best-effort read): calibration output that silently ignored missing
+/// data would be worse than no recommendation at all.
+fn cmd_calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let flag = |name: &str, default: f64| -> f64 {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(default)
+    };
+    let alpha = flag("--alpha", 0.1);
+    let delta = flag("--delta", 0.05);
+    let min_n = flag("--min-n", 30.0) as usize;
+
+    let config = ProxyConfig::from_env()?;
+    let report = calibrate_from_store(&config.db_path, alpha, delta, min_n)?;
+    print!("{}", report.render());
+    if !report.conformal.feasible {
+        std::process::exit(1);
+    }
     Ok(())
 }
