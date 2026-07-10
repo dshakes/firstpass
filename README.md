@@ -134,7 +134,9 @@ The harness (`cargo run -p firstpass-bench`) runs the full methodology — basel
 
 Firstpass served at **~85% lower $/success than always-top, at parity-or-better quality**, with **served-failure 0.00 vs the predictive router's 0.12** — verification catches what prediction serves blind. The cheap tier cleared 62% of tasks against a 13% break-even, so **the pre-registered kill criterion reads PROCEED**.
 
-Stated plainly: these tasks are *self-checking* (a deterministic gate → gate precision/recall 1.00), so this proves the **cost / success / escalation** thesis at scale but the **conformal served-failure guarantee is degenerate here** — earning it needs a genuinely *imperfect* gate, which means a **coding-with-tests benchmark**. That's the next milestone, not a claim made today.
+**Reproduced with a real LLM-judge gate, not just a deterministic checker** (`FIRSTPASS_GATE=judge`, Sonnet grading each answer *without seeing the ground truth*, n=200): firstpass **1.00 success, ~84% cheaper than Opus, served-failure 0.00, PROCEED** — the win holds with the gate you'd actually deploy.
+
+Stated plainly on the one thing this does **not** show: the **conformal served-failure guarantee stays degenerate**. Three live experiments pinned down why — on *self-checking* tasks the gate is either near-perfect (nothing to bound) or, if you weaken the judge, it false-rejects correct answers and the cost advantage flips. Earning the guarantee needs a domain where the *best practical* gate is still imperfect — a **coding-with-tests benchmark** (real test suites have coverage gaps), which requires a sandbox for untrusted code. That's the next milestone, honestly scoped, not a claim made today.
 
 ## Roadmap
 

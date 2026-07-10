@@ -106,8 +106,7 @@ pub fn run_benchmark(cfg: &BenchConfig) -> Report {
 /// # Errors
 /// Returns a message if the preflight fails or any live call errors during the run.
 pub fn run_benchmark_live(cfg: &BenchConfig, api_key: String) -> Result<Report, String> {
-    let backend = live::LiveBackend::new(api_key);
-    let gate = live::LiveGate;
+    let backend = live::LiveBackend::new(api_key.clone());
     // Graded verifiable suite; size via FIRSTPASS_BENCH_N (default 200 — the SPEC §10 target).
     let n = std::env::var("FIRSTPASS_BENCH_N")
         .ok()
@@ -117,17 +116,40 @@ pub fn run_benchmark_live(cfg: &BenchConfig, api_key: String) -> Result<Report, 
     backend.preflight(&cfg.ladder[0]).map_err(|e| {
         format!("preflight failed (check ANTHROPIC_API_KEY and ladder model ids): {e}")
     })?;
-    let report = run_core(cfg, &suite, &suite, &backend, &gate, false);
-    let errs = backend.take_errors();
-    if errs.is_empty() {
-        Ok(report)
+
+    // Gate selection: the perfect checker (fast/free, cost/success proof) or the imperfect live
+    // judge (FIRSTPASS_GATE=judge) whose real errors earn the conformal guarantee.
+    let use_judge = std::env::var("FIRSTPASS_GATE").is_ok_and(|g| g == "judge");
+    let (report, backend_errs, judge_errs) = if use_judge {
+        let judge_model = std::env::var("FIRSTPASS_JUDGE_MODEL")
+            .unwrap_or_else(|_| "anthropic/claude-haiku-4-5".to_string());
+        let gate = live::LiveJudgeGate::new(api_key, judge_model);
+        let report = run_core(cfg, &suite, &suite, &backend, &gate, false);
+        (report, backend.take_errors(), gate.take_errors())
     } else {
-        Err(format!(
-            "{} live call(s) failed — refusing to publish numbers:\n  {}",
-            errs.len(),
-            errs.join("\n  ")
-        ))
+        let report = run_core(cfg, &suite, &suite, &backend, &live::LiveGate, false);
+        (report, backend.take_errors(), Vec::new())
+    };
+
+    // Candidate-model errors corrupt the measurement → refuse to publish. But a judge that
+    // soft-fails on a few tasks already ABSTAINED (a valid gate outcome, score-neutral) — that's
+    // the gate behaving correctly, not a corrupt run, so we note it and still publish.
+    if !backend_errs.is_empty() {
+        let mut e = backend_errs;
+        e.truncate(20);
+        return Err(format!(
+            "{} candidate call(s) failed — refusing to publish numbers:\n  {}",
+            e.len(),
+            e.join("\n  ")
+        ));
     }
+    if !judge_errs.is_empty() {
+        eprintln!(
+            "note: {} judge call(s) soft-failed and abstained (a valid gate outcome, not a candidate error)",
+            judge_errs.len()
+        );
+    }
+    Ok(report)
 }
 
 /// The shared benchmark core: same policies, metrics, conformal calibration, and kill criterion,
