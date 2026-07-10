@@ -106,14 +106,17 @@ fn trace_pair(trace: &Trace, deferred: &[DeferredVerdict]) -> Option<(f64, bool)
 /// recorded.
 ///
 /// # Errors
-/// Returns [`StoreError`] if the trace store cannot be read.
+/// Returns [`StoreError`] if a stored trace's deferred verdicts cannot be read. An unreadable or
+/// not-yet-initialized store is treated as zero traces (a 0-pair, infeasible report), matching the
+/// forgiving behaviour of `firstpass trace` — calibrating before any traffic is a valid state, not
+/// an error.
 pub fn calibrate_from_store(
     db_path: impl AsRef<Path>,
     alpha: f64,
     delta: f64,
     min_n: usize,
 ) -> Result<CalibrationReport, StoreError> {
-    let traces = store::load_all_traces(&db_path)?;
+    let traces = store::load_all_traces(&db_path).unwrap_or_default();
     let mut pairs = Vec::with_capacity(traces.len());
     for trace in &traces {
         let deferred = store::load_deferred(&db_path, &trace.trace_id.to_string())?;

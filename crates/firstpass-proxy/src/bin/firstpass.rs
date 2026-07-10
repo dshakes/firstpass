@@ -92,9 +92,9 @@ fn cmd_trace(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `firstpass calibrate [--alpha A] [--delta D] [--min-n N]` — recalibrate the conformal serving
-/// threshold from real deferred feedback recorded in the trace store. A store error is a hard
-/// failure (unlike `trace`'s best-effort read): calibration output that silently ignored missing
-/// data would be worse than no recommendation at all.
+/// threshold from real deferred feedback recorded in the trace store. An empty or not-yet-created
+/// store reports 0 pairs (feasible: false) and exits 0, like `trace`; only a genuine read error on
+/// an existing trace's feedback bubbles up non-zero.
 fn cmd_calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let flag = |name: &str, default: f64| -> f64 {
         args.iter()
@@ -110,8 +110,8 @@ fn cmd_calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let config = ProxyConfig::from_env()?;
     let report = calibrate_from_store(&config.db_path, alpha, delta, min_n)?;
     print!("{}", report.render());
-    if !report.conformal.feasible {
-        std::process::exit(1);
-    }
+    // Infeasible is a valid finding (not enough clean feedback yet, or the gate is too weak), not a
+    // failure — the report says `feasible: false`. Only a store read error (the `?` above) exits
+    // non-zero, so scripting `firstpass calibrate` for its output stays reliable.
     Ok(())
 }
