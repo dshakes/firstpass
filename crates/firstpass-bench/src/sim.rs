@@ -158,6 +158,10 @@ pub struct Completion {
     pub correct: bool,
     /// Simulated wall-clock latency.
     pub latency_ms: u64,
+    /// The candidate's raw output text — `None` in simulation, `Some` on a live run so a live
+    /// judge gate can grade it. Ground truth (`correct`) is computed separately and never shown
+    /// to the judge.
+    pub output: Option<String>,
 }
 
 /// A model backend: run a task on a rung, get a completion. Real impls call a provider.
@@ -200,6 +204,7 @@ impl ModelBackend for SimBackend {
             out_tokens,
             correct,
             latency_ms,
+            output: None,
         }
     }
 }
