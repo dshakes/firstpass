@@ -49,3 +49,8 @@ on_exhausted    = "serve_best_attempt"
 [escalation]
 max_rungs_per_request = 3
 session_promotion = { after_failures = 3, window = "30m" }
+# Prefetch depth: fire this many rungs ahead concurrently, gating cheapest-first and serving the
+# first pass (the served result is identical to serial — only latency drops and wasted speculative
+# calls are paid for). 0 = serial (default). Raise it to cut worst-case escalation latency when the
+# extra spend is acceptable.
+speculation = 0

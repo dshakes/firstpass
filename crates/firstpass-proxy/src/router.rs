@@ -14,7 +14,9 @@ use firstpass_core::{
     PriceTable, RequestInfo, ServedFrom, Trace, Verdict,
 };
 use jiff::Timestamp;
+use std::collections::HashMap;
 use std::time::Instant;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// The outcome of an enforce-mode routing decision.
@@ -49,6 +51,9 @@ pub struct EnforceCtx<'a> {
     pub budget_per_request_usd: Option<f64>,
     /// Hard ceiling on rungs attempted this request.
     pub max_rungs: u32,
+    /// Prefetch depth: fire this many rungs ahead concurrently while gating in ladder order.
+    /// `0` = serial (the default): one call at a time, byte-identical to the original engine.
+    pub speculation: u32,
     /// Feature vector routed on (recorded in the trace).
     pub features: Features,
     /// Tenant id.
@@ -68,6 +73,101 @@ pub struct EnforceCtx<'a> {
 /// The trace's `prev_hash` is left as [`GENESIS_HASH`]; the trace-store writer overwrites it with
 /// the real chain head when persisting (keeping the single-writer chain invariant).
 pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
+    // Speculation is off by default (serial); the serial path is the original, proven engine, left
+    // untouched. Both paths produce the same ladder state; only the tail (serve + trace) is shared.
+    let LadderRun {
+        attempts,
+        spent,
+        gate_cost_total,
+        best,
+        mut served_rung,
+        hard_error,
+    } = if ctx.speculation == 0 {
+        run_serial(&ctx).await
+    } else {
+        run_speculative(&ctx).await
+    };
+
+    // Decide what to serve.
+    let (outcome, served_from, served_tokens) = match (served_rung, &best) {
+        (Some(_), Some((_, resp))) => (
+            EngineOutcome::Served(resp.clone()),
+            ServedFrom::Attempt,
+            (resp.in_tokens, resp.out_tokens),
+        ),
+        (None, Some((idx, resp))) => {
+            // No pass, but we produced output: serve the best (highest) attempt seen.
+            served_rung = Some(*idx);
+            (
+                EngineOutcome::Served(resp.clone()),
+                ServedFrom::BestAttempt,
+                (resp.in_tokens, resp.out_tokens),
+            )
+        }
+        (_, None) => {
+            let msg = hard_error.unwrap_or_else(|| "all rungs failed".to_owned());
+            (EngineOutcome::Failed(msg), ServedFrom::Error, (0, 0))
+        }
+    };
+
+    // Counterfactual: what the top rung would have cost for the served token counts.
+    let top_model = ctx.ladder.last().map(String::as_str).unwrap_or_default();
+    let baseline = ctx
+        .prices
+        .cost_usd(top_model, served_tokens.0, served_tokens.1)
+        .unwrap_or(spent);
+
+    let total_latency_ms = attempts.iter().map(|a| a.latency_ms).sum();
+    let escalations = attempts.len().saturating_sub(1) as u32;
+
+    let mut trace = Trace {
+        trace_id: Uuid::now_v7(),
+        prev_hash: GENESIS_HASH.to_owned(),
+        tenant_id: ctx.tenant_id,
+        session_id: ctx.session_id,
+        ts: Timestamp::now(),
+        mode: Mode::Enforce,
+        policy: PolicyRef {
+            id: ctx.policy_id,
+            explore: false,
+        },
+        request: RequestInfo {
+            api: ctx.api,
+            prompt_hash: ctx.prompt_hash,
+            features: ctx.features,
+        },
+        attempts,
+        deferred: vec![],
+        final_: FinalOutcome {
+            served_rung,
+            served_from,
+            total_cost_usd: spent,
+            gate_cost_usd: gate_cost_total,
+            total_latency_ms,
+            escalations,
+            counterfactual_baseline_usd: baseline,
+            savings_usd: 0.0,
+        },
+    };
+    trace.recompute_savings();
+    (outcome, trace)
+}
+
+/// The ladder state both engine variants produce; the shared tail turns it into a served outcome
+/// and audit trace. `spent`/`gate_cost_total` are running USD totals; `best` is the highest attempt
+/// that produced gradable output; `served_rung` is `Some` only when a gate actually passed.
+struct LadderRun {
+    attempts: Vec<Attempt>,
+    spent: f64,
+    gate_cost_total: f64,
+    best: Option<(u32, ModelResponse)>,
+    served_rung: Option<u32>,
+    hard_error: Option<String>,
+}
+
+/// Serial engine: one rung at a time — call, gate, serve the first pass, escalate on fail. This is
+/// the original, proven loop; `speculation == 0` routes here unchanged.
+async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
     let mut attempts: Vec<Attempt> = Vec::new();
     let mut spent = 0.0_f64;
     let mut gate_cost_total = 0.0_f64;
@@ -175,69 +275,212 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
         }
     }
 
-    // Decide what to serve.
-    let (outcome, served_from, served_tokens) = match (served_rung, &best) {
-        (Some(_), Some((_, resp))) => (
-            EngineOutcome::Served(resp.clone()),
-            ServedFrom::Attempt,
-            (resp.in_tokens, resp.out_tokens),
-        ),
-        (None, Some((idx, resp))) => {
-            // No pass, but we produced output: serve the best (highest) attempt seen.
-            served_rung = Some(*idx);
-            (
-                EngineOutcome::Served(resp.clone()),
-                ServedFrom::BestAttempt,
-                (resp.in_tokens, resp.out_tokens),
-            )
-        }
-        (_, None) => {
-            let msg = hard_error.unwrap_or_else(|| "all rungs failed".to_owned());
-            (EngineOutcome::Failed(msg), ServedFrom::Error, (0, 0))
-        }
-    };
-
-    // Counterfactual: what the top rung would have cost for the served token counts.
-    let top_model = ctx.ladder.last().map(String::as_str).unwrap_or_default();
-    let baseline = ctx
-        .prices
-        .cost_usd(top_model, served_tokens.0, served_tokens.1)
-        .unwrap_or(spent);
-
-    let total_latency_ms = attempts.iter().map(|a| a.latency_ms).sum();
-    let escalations = attempts.len().saturating_sub(1) as u32;
-
-    let mut trace = Trace {
-        trace_id: Uuid::now_v7(),
-        prev_hash: GENESIS_HASH.to_owned(),
-        tenant_id: ctx.tenant_id,
-        session_id: ctx.session_id,
-        ts: Timestamp::now(),
-        mode: Mode::Enforce,
-        policy: PolicyRef {
-            id: ctx.policy_id,
-            explore: false,
-        },
-        request: RequestInfo {
-            api: ctx.api,
-            prompt_hash: ctx.prompt_hash,
-            features: ctx.features,
-        },
+    LadderRun {
         attempts,
-        deferred: vec![],
-        final_: FinalOutcome {
-            served_rung,
-            served_from,
-            total_cost_usd: spent,
-            gate_cost_usd: gate_cost_total,
-            total_latency_ms,
-            escalations,
-            counterfactual_baseline_usd: baseline,
-            savings_usd: 0.0,
-        },
+        spent,
+        gate_cost_total,
+        best,
+        served_rung,
+        hard_error,
+    }
+}
+
+/// Speculative engine: prefetch up to `speculation` rungs ahead concurrently, but gate strictly in
+/// ladder order and serve the first rung whose gate passes. The SERVED result is therefore
+/// byte-identical to [`run_serial`] — only latency (prefetched rungs are already in flight) and
+/// honest wasted spend (speculative calls that completed but weren't served) differ.
+async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
+    let mut attempts: Vec<Attempt> = Vec::new();
+    let mut spent = 0.0_f64;
+    let mut gate_cost_total = 0.0_f64;
+    let mut best: Option<(u32, ModelResponse)> = None;
+    let mut served_rung: Option<u32> = None;
+    let mut hard_error: Option<String> = None;
+
+    let rung_limit = (ctx.max_rungs as usize).min(ctx.ladder.len());
+    let speculation = ctx.speculation as usize;
+    let mut inflight: HashMap<usize, JoinHandle<Result<ModelResponse, ProviderError>>> =
+        HashMap::new();
+
+    let mut idx = 0usize;
+    // `done` = a rung passed or hard-errored: stop consuming, then cancel/harvest the rest.
+    let mut done = false;
+    while idx < rung_limit && !done {
+        // Fire the window [idx ..= idx+speculation] concurrently. The rung we must gate now (idx)
+        // always fires; rungs ahead only while under budget, so speculation can't blow the cap.
+        let window_end = (idx + speculation).min(rung_limit - 1);
+        for j in idx..=window_end {
+            if inflight.contains_key(&j) {
+                continue;
+            }
+            if j > idx
+                && let Some(cap) = ctx.budget_per_request_usd
+                && spent >= cap
+            {
+                continue;
+            }
+            if let Some(handle) = spawn_rung(ctx, j) {
+                inflight.insert(j, handle);
+            }
+        }
+
+        let model_str = &ctx.ladder[idx];
+        let provider = match ModelRef::parse(model_str) {
+            Ok(m) => ctx.providers.get(&m.provider),
+            Err(_) => None,
+        };
+        let Some(provider) = provider else {
+            // Malformed ref / unknown provider: abstain and fail over (no task was spawned).
+            attempts.push(abstain_attempt(
+                idx as u32,
+                model_str,
+                "unknown",
+                reason::PROVIDER_ERROR,
+                0,
+            ));
+            idx += 1;
+            continue;
+        };
+        // Provider resolved ⇒ we spawned a task for `idx`; await it in strict ladder order.
+        let Some(handle) = inflight.remove(&idx) else {
+            attempts.push(abstain_attempt(
+                idx as u32,
+                model_str,
+                provider.id(),
+                reason::PROVIDER_ERROR,
+                0,
+            ));
+            idx += 1;
+            continue;
+        };
+        let start = Instant::now();
+        let joined = handle.await;
+        let ms = elapsed_ms(start);
+
+        match joined {
+            // Task panicked or was aborted out from under us: treat as a transport abstain.
+            Err(_) => {
+                attempts.push(abstain_attempt(
+                    idx as u32,
+                    model_str,
+                    provider.id(),
+                    reason::PROVIDER_ERROR,
+                    ms,
+                ));
+                idx += 1;
+            }
+            Ok(Err(err)) if err.is_failover_eligible() => {
+                attempts.push(abstain_attempt(
+                    idx as u32,
+                    model_str,
+                    provider.id(),
+                    reason::PROVIDER_ERROR,
+                    ms,
+                ));
+                idx += 1;
+            }
+            Ok(Err(err)) => {
+                // Hard error (4xx / decode): do not escalate — the request itself is the problem.
+                let (r, msg) = hard_reason(&err);
+                attempts.push(abstain_attempt(idx as u32, model_str, provider.id(), r, ms));
+                hard_error = Some(msg);
+                done = true;
+            }
+            Ok(Ok(resp)) => {
+                let model_cost = ctx
+                    .prices
+                    .cost_usd(model_str, resp.in_tokens, resp.out_tokens)
+                    .unwrap_or(0.0);
+                spent += model_cost;
+
+                let mut req = ctx.base_request.clone();
+                req.model = model_str.clone();
+                let mut gate_results: Vec<GateResult> = Vec::with_capacity(ctx.gates.len());
+                for g in ctx.gates {
+                    if !ctx.health.enabled(g.id()) {
+                        tracing::warn!(gate = %g.id(), "skipping auto-disabled gate");
+                        continue;
+                    }
+                    let r = g.evaluate(&req, &resp).await;
+                    ctx.health.record(g.id(), r.verdict == Verdict::Abstain);
+                    gate_results.push(r);
+                }
+                let gc: f64 = gate_results.iter().map(|g| g.cost_usd).sum();
+                gate_cost_total += gc;
+                spent += gc;
+
+                let verdict = aggregate(&gate_results);
+                attempts.push(Attempt {
+                    rung: idx as u32,
+                    model: model_str.clone(),
+                    provider: provider.id().to_owned(),
+                    in_tokens: resp.in_tokens,
+                    out_tokens: resp.out_tokens,
+                    cost_usd: model_cost,
+                    latency_ms: ms,
+                    gates: gate_results,
+                    verdict,
+                });
+                best = Some((idx as u32, resp));
+
+                if verdict == Verdict::Pass {
+                    served_rung = Some(idx as u32);
+                    done = true;
+                } else if let Some(cap) = ctx.budget_per_request_usd
+                    && spent >= cap
+                    && idx + 1 < rung_limit
+                {
+                    done = true;
+                }
+                idx += 1;
+            }
+        }
+    }
+
+    // Speculative rungs we never gated: those already finished DID bill us (honest waste, recorded
+    // in `spent`); those still in flight are cancelled — `abort()` drops the in-flight reqwest.
+    // ponytail: harvest is best-effort — a call that finishes between is_finished() and abort() is
+    // dropped uncounted; exact wasted-spend under cancellation is unknowable, don't fabricate it.
+    for (j, handle) in inflight.drain() {
+        if handle.is_finished() {
+            if let Ok(Ok(resp)) = handle.await {
+                spent += ctx
+                    .prices
+                    .cost_usd(&ctx.ladder[j], resp.in_tokens, resp.out_tokens)
+                    .unwrap_or(0.0);
+            }
+        } else {
+            handle.abort();
+        }
+    }
+
+    LadderRun {
+        attempts,
+        spent,
+        gate_cost_total,
+        best,
+        served_rung,
+        hard_error,
+    }
+}
+
+/// Spawn a rung's `complete()` as a concurrent task, or `None` if the model ref is malformed or its
+/// provider isn't registered (the consume path records that abstain in ladder order).
+fn spawn_rung(
+    ctx: &EnforceCtx<'_>,
+    j: usize,
+) -> Option<JoinHandle<Result<ModelResponse, ProviderError>>> {
+    let model_str = ctx.ladder.get(j)?;
+    let provider = match ModelRef::parse(model_str) {
+        Ok(m) => ctx.providers.get(&m.provider)?,
+        Err(_) => return None,
     };
-    trace.recompute_savings();
-    (outcome, trace)
+    let mut req = ctx.base_request.clone();
+    req.model = model_str.clone();
+    let auth = ctx.auth.clone();
+    Some(tokio::spawn(
+        async move { provider.complete(&req, &auth).await },
+    ))
 }
 
 fn elapsed_ms(start: Instant) -> u64 {
@@ -352,6 +595,7 @@ mod tests {
             prices,
             budget_per_request_usd: budget,
             max_rungs: 3,
+            speculation: 0,
             features: Features::new(firstpass_core::TaskKind::CodeEdit),
             tenant_id: "acme".into(),
             session_id: "sess-1".into(),
@@ -606,5 +850,147 @@ mod tests {
             trace.attempts[0].gates.is_empty(),
             "disabled gate must be skipped, not run"
         );
+    }
+
+    /// Like [`registry`], but every model is served by one `anthropic` mock, and its shared call
+    /// log is returned so a test can see which rungs `complete()` actually fired.
+    fn counted_registry(
+        outcomes: Vec<(&str, Result<ModelResponse, ProviderError>)>,
+    ) -> (
+        ProviderRegistry,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let mut outs = HashMap::new();
+        for (model, out) in outcomes {
+            outs.insert(model.to_owned(), out);
+        }
+        let mock = MockProvider::new("anthropic", outs);
+        let log = mock.call_log();
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert("anthropic".to_owned(), Arc::new(mock));
+        (ProviderRegistry::from_map(map), log)
+    }
+
+    #[tokio::test]
+    async fn speculation_prefetches_next_rung_but_serves_identically() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+
+        // Serial baseline: rung 0 passes → rung 1 is never even called.
+        let (providers, log) = counted_registry(vec![
+            (HAIKU, Ok(resp(HAIKU, "answer"))),
+            (SONNET, Ok(resp(SONNET, "other"))),
+        ]);
+        let health = GateHealthRegistry::new();
+        let (serial_out, serial_trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![HAIKU.to_owned()],
+            "serial must not touch rung 1 when rung 0 passes"
+        );
+
+        // Speculative (k=1): rung 1 fires concurrently, but rung 0 still serves.
+        let (providers, log) = counted_registry(vec![
+            (HAIKU, Ok(resp(HAIKU, "answer"))),
+            (SONNET, Ok(resp(SONNET, "other"))),
+        ]);
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.speculation = 1;
+        let (spec_out, spec_trace) = route_enforce(c).await;
+
+        assert!(
+            log.lock().unwrap().contains(&SONNET.to_owned()),
+            "speculation must fire rung 1 ahead: {:?}",
+            *log.lock().unwrap()
+        );
+
+        // Served result is byte-identical to serial (same rung, same bytes).
+        let (a, b) = match (serial_out, spec_out) {
+            (EngineOutcome::Served(a), EngineOutcome::Served(b)) => (a, b),
+            _ => panic!("both variants must serve"),
+        };
+        assert_eq!(
+            (a.model, a.text, a.out_tokens),
+            (b.model, b.text, b.out_tokens)
+        );
+        assert_eq!(spec_trace.final_.served_rung, Some(0));
+        assert_eq!(spec_trace.attempts.len(), 1, "only rung 0 is gated");
+        // Honest waste: the completed speculative rung's cost is recorded in the total.
+        assert!(
+            spec_trace.final_.total_cost_usd > serial_trace.final_.total_cost_usd,
+            "speculative waste must show in total cost: spec={} serial={}",
+            spec_trace.final_.total_cost_usd,
+            serial_trace.final_.total_cost_usd
+        );
+    }
+
+    #[tokio::test]
+    async fn speculation_preserves_escalation_result() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        // Rung 0 empty (fails non-empty), rung 1 real (passes) — prefetched concurrently.
+        let (providers, _log) = counted_registry(vec![
+            (HAIKU, Ok(resp(HAIKU, ""))),
+            (SONNET, Ok(resp(SONNET, "real answer"))),
+        ]);
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.speculation = 2; // window wider than the ladder must clamp, not panic
+        let (out, trace) = route_enforce(c).await;
+        match out {
+            EngineOutcome::Served(r) => assert_eq!(r.model, SONNET),
+            EngineOutcome::Failed(e) => panic!("expected served, got {e}"),
+        }
+        assert_eq!(trace.final_.served_rung, Some(1));
+        assert_eq!(trace.attempts.len(), 2);
+        assert_eq!(trace.final_.escalations, 1);
+        assert_eq!(trace.attempts[0].verdict, Verdict::Fail);
+        assert_eq!(trace.attempts[1].verdict, Verdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn speculation_never_fires_past_max_rungs() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned(), OPUS.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        // All fail the gate → best-attempt fallback serves the highest reached rung.
+        let (providers, log) = counted_registry(vec![
+            (HAIKU, Ok(resp(HAIKU, ""))),
+            (SONNET, Ok(resp(SONNET, ""))),
+            (OPUS, Ok(resp(OPUS, ""))),
+        ]);
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.max_rungs = 2;
+        c.speculation = 5; // huge window, but the ceiling is 2 rungs
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(
+            !log.lock().unwrap().contains(&OPUS.to_owned()),
+            "must not fire beyond max_rungs: {:?}",
+            *log.lock().unwrap()
+        );
+        assert_eq!(trace.attempts.len(), 2);
+        assert_eq!(trace.final_.served_from, ServedFrom::BestAttempt);
+        assert_eq!(trace.final_.served_rung, Some(1));
+        match out {
+            EngineOutcome::Served(r) => assert_eq!(r.model, SONNET),
+            EngineOutcome::Failed(e) => panic!("expected best-attempt served, got {e}"),
+        }
     }
 }
