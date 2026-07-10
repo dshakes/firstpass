@@ -19,12 +19,37 @@ const FORWARDED_REQUEST_HEADERS: &[&str] = &[
     "content-type",
 ];
 
-// ponytail: buffered (non-streaming) passthrough only. SSE streaming passthrough — proxying
-// `stream: true` messages chunk-by-chunk instead of buffering the full body — is a follow-up
-// once observe mode is proven; it needs its own latency test, not a speculative build now.
+/// Build the upstream `POST /v1/messages` request, forwarding the allow-listed headers and the
+/// caller's body byte-for-byte. Shared by the buffered and streaming paths.
+fn build_request(
+    client: &reqwest::Client,
+    base: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> reqwest::RequestBuilder {
+    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+    let mut req = client.post(url);
+    for name in FORWARDED_REQUEST_HEADERS {
+        if let Some(value) = headers.get(*name) {
+            req = req.header(*name, value.clone());
+        }
+    }
+    req.body(body)
+}
 
-/// Forward one `POST /v1/messages` request to the upstream provider and return its response
-/// unchanged.
+/// Copy the response's content-type (the only response header observe mode relays).
+fn passthrough_headers(response: &reqwest::Response) -> HeaderMap {
+    // reqwest and axum both build on the same `http` crate, so header types carry over
+    // without re-encoding.
+    let mut out = HeaderMap::new();
+    if let Some(content_type) = response.headers().get(header::CONTENT_TYPE) {
+        out.insert(header::CONTENT_TYPE, content_type.clone());
+    }
+    out
+}
+
+/// Forward one `POST /v1/messages` request and return its response **buffered** (full body).
+/// Used for non-streaming requests, where the assembled body also feeds the audit trace.
 ///
 /// # Errors
 /// Returns [`ProxyError::Upstream`] if the upstream request fails at the transport level
@@ -36,25 +61,27 @@ pub async fn forward_anthropic(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
-    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
-    let mut req = client.post(url);
-
-    for name in FORWARDED_REQUEST_HEADERS {
-        if let Some(value) = headers.get(*name) {
-            req = req.header(*name, value.clone());
-        }
-    }
-
-    let response = req.body(body).send().await?;
+    let response = build_request(client, base, headers, body).send().await?;
     let status = response.status();
-
-    // reqwest and axum both build on the same `http` crate, so header types carry over
-    // without re-encoding.
-    let mut out_headers = HeaderMap::new();
-    if let Some(content_type) = response.headers().get(header::CONTENT_TYPE) {
-        out_headers.insert(header::CONTENT_TYPE, content_type.clone());
-    }
-
+    let out_headers = passthrough_headers(&response);
     let body = response.bytes().await?;
     Ok((status, out_headers, body))
+}
+
+/// Forward one `POST /v1/messages` request and return the raw response for **streaming**
+/// relay (`stream: true`) — the caller pipes `response.bytes_stream()` to the client without
+/// buffering, preserving SSE chunk-by-chunk and keeping time-to-first-byte low.
+///
+/// # Errors
+/// Returns [`ProxyError::Upstream`] on a transport-level failure (see [`forward_anthropic`]).
+pub async fn forward_anthropic_streaming(
+    client: &reqwest::Client,
+    base: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, reqwest::Response), ProxyError> {
+    let response = build_request(client, base, headers, body).send().await?;
+    let status = response.status();
+    let out_headers = passthrough_headers(&response);
+    Ok((status, out_headers, response))
 }

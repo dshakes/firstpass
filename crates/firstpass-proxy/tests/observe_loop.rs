@@ -147,3 +147,76 @@ async fn two_requests_form_a_valid_two_link_chain() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+/// A minimal Anthropic-shaped SSE body (message_start … message_stop).
+const SSE_RESPONSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// Start a mock upstream that answers with a streaming (`text/event-stream`) response.
+async fn spawn_mock_sse_upstream() -> String {
+    let router = axum::Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            axum::response::Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                .body(axum::body::Body::from(SSE_RESPONSE))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// SPEC §7.4: a `stream: true` request is relayed chunk-by-chunk with its SSE content-type
+/// preserved (not buffered as JSON), and a request-side trace is still recorded off-path.
+#[tokio::test]
+async fn streaming_request_is_relayed_and_traced() {
+    let upstream = spawn_mock_sse_upstream().await;
+    let (proxy, db_path) = spawn_proxy(&upstream).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{proxy}/v1/messages"))
+        .header("x-api-key", "test")
+        .json(&json!({
+            "model": "claude-haiku-4-5",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream",
+        "streaming responses must preserve the SSE content-type"
+    );
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("message_start") && body.contains("message_stop"),
+        "the SSE events must be relayed to the caller: {body:?}"
+    );
+
+    // A request-side trace is still recorded off-path (streamed-response token usage is a follow-on).
+    let traces = wait_for_traces(&db_path, 1).await;
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].attempts.len(), 1);
+    verify_chain(&traces, GENESIS_HASH).unwrap();
+
+    let _ = std::fs::remove_file(&db_path);
+}
