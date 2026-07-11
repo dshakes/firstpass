@@ -260,7 +260,12 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
     <div class="step done"><div class="dot"></div><h4><span>M0 ✓</span> Proof harness</h4><p>Baselines, bootstrap CIs, conformal guarantee, kill criterion.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>M1 ✓</span> The proxy</h4><p>Observe + enforce, escalation, cross-provider failover, trace store — real HTTP.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>M2 ✓</span> Gate framework</h4><p>Subprocess plugins, schema gates, budgets, feedback API.</p></div>
-    <div class="step next"><div class="dot"></div><h4><span>M3 →</span> Live proof</h4><p>Real-provider numbers, judge gates, published binaries + Homebrew tap.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>M3 ✓</span> Live proof</h4><p>Real-provider numbers (n=200) and a real LLM-judge gate — both done, against real Anthropic.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>✓</span> Speculative escalation</h4><p>Cheap and next-rung run in parallel — latency win, byte-identical served result.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>✓</span> Fail-closed sandbox + coding-with-tests conformal</h4><p>gVisor-first, network-isolated code execution; a continuous gate with real error — the conformal guarantee stops being degenerate.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>✓</span> Learning loop</h4><p><code>firstpass calibrate</code> recalibrates the serving threshold from real deferred feedback.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>✓</span> Prod hardening + GA readiness</h4><p>Timeouts, load-shedding, opaque errors, body caps — ADR 0003 gap analysis.</p></div>
+    <div class="step next"><div class="dot"></div><h4><span>→</span> Packaging</h4><p>Published binaries + Homebrew tap — the cargo-dist release workflow hasn't been run yet.</p></div>
   </div>
 </div></section>
 </main>

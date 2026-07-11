@@ -136,7 +136,7 @@ Firstpass served at **~85% lower $/success than always-top, at parity-or-better 
 
 **Reproduced with a real LLM-judge gate, not just a deterministic checker** (`FIRSTPASS_GATE=judge`, Sonnet grading each answer *without seeing the ground truth*, n=200): firstpass **1.00 success, ~84% cheaper than Opus, served-failure 0.00, PROCEED** — the win holds with the gate you'd actually deploy.
 
-Stated plainly on the one thing this does **not** show: the **conformal served-failure guarantee stays degenerate**. Three live experiments pinned down why — on *self-checking* tasks the gate is either near-perfect (nothing to bound) or, if you weaken the judge, it false-rejects correct answers and the cost advantage flips. Earning the guarantee needs a domain where the *best practical* gate is still imperfect — a **coding-with-tests benchmark** (real test suites have coverage gaps), which requires a sandbox for untrusted code. That's the next milestone, honestly scoped, not a claim made today.
+Stated plainly on the one thing this did **not** show at the time: the **conformal served-failure guarantee stayed degenerate** on self-checking tasks — the gate is either near-perfect (nothing to bound) or, if you weaken the judge, it false-rejects correct answers and the cost advantage flips. Earning the guarantee needed a domain where the *best practical* gate is still imperfect — a **coding-with-tests benchmark** (real test suites have coverage gaps), which needed a sandbox for untrusted code. **Both are now built**: a fail-closed code-execution sandbox ([ADR 0002](docs/adr/0002-bench-code-execution-sandbox.md) — gVisor `runsc` first, `runc` fallback with a warning, `--network none`, capability drops, no host mounts) and a coding-with-tests benchmark with a **continuous gate score**, so conformal calibrates on `(gate_score, oracle_correct)` with real error instead of a zero-error self-checker. A live-provider run of that benchmark hasn't been reported here yet.
 
 ## Roadmap
 
@@ -144,7 +144,12 @@ Stated plainly on the one thing this does **not** show: the **conformal served-f
 - **M1 ✓** — Rust proxy: Anthropic + OpenAI clients, observe **and** enforce, escalation, cross-provider failover, SQLite trace store — over real HTTP.
 - **M2 ✓** — gate framework: subprocess plugins, inline + schema gates, **native LLM-judge gate** (maker≠checker, candidate-as-data), error-budget auto-disable, feedback API + deferred verdicts.
 - **M2.5 ✓** — real-traffic proxy: **SSE streaming passthrough**, tool/multimodal-safe enforce; **`firstpass` CLI** (`up` / `doctor` / `trace`) + **MCP server**; live-provider proof harness (`--live`).
-- **M3 →** — 200-task live benchmark ✓ (cost/success proof at scale); still ahead: a **coding-with-tests benchmark** (a real *imperfect* gate, to earn the conformal guarantee), a 30-day self-host dogfood GA, and published binaries + Homebrew tap.
+- **M3 ✓** — 200-task live benchmark (cost/success proof at scale) **and** a real LLM-judge gate reproduction — both done against real Anthropic. Only **published binaries + a Homebrew tap** remain from this milestone (the cargo-dist `release.yml` has never been run — see [`docs/runbooks/release.md`](docs/runbooks/release.md)).
+- **Speculative escalation ✓** — cheap and next-rung run in parallel for latency, serving a byte-identical result to sequential escalation.
+- **Sandbox + coding-with-tests conformal ✓** — the fail-closed code-execution sandbox and continuous-gate benchmark described above (ADR 0002).
+- **Learning loop ✓** — `firstpass calibrate` recalibrates the serving threshold from real deferred feedback; conformal moved to `firstpass-core` so proxy and bench share it.
+- **Prod hardening ✓** — HTTP client timeouts, a bounded trace channel with load-shedding, opaque error responses, an explicit request-body cap, sandbox shell-quoting; see [ADR 0003](docs/adr/0003-production-ga-readiness.md) for the full GA-readiness gap analysis.
+- **Not yet done** — published binaries + Homebrew tap, an external security audit, SOC 2 (see [`docs/compliance/soc2-controls.md`](docs/compliance/soc2-controls.md) for the readiness map, not a claim), a hosted multi-tenant plane, and a real 30-day soak (procedure in [`docs/runbooks/soak.md`](docs/runbooks/soak.md); hasn't been run and closed out).
 - **Hosted GA →** — multi-tenant control plane, BYOK KMS envelope encryption, sandboxed gate execution — designed in [ADR 0001](docs/adr/0001-hosted-ga-architecture.md), gated behind dogfood GA.
 
 ## Links
