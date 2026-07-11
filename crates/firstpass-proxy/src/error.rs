@@ -41,6 +41,11 @@ pub enum ProxyError {
     /// An internal failure (e.g. the trace store errored). Never leaks internals to the caller.
     #[error("internal error")]
     Internal(String),
+
+    /// The tenant exceeded its configured request rate (ADR 0004 §D6). The body is intentionally
+    /// opaque — no bucket state or limit value is disclosed.
+    #[error("rate limited")]
+    RateLimited,
 }
 
 impl ProxyError {
@@ -52,6 +57,7 @@ impl ProxyError {
             ProxyError::NotFound(_) => "not_found",
             ProxyError::Unauthorized => "unauthorized",
             ProxyError::Internal(_) => "internal_error",
+            ProxyError::RateLimited => "rate_limited",
         }
     }
 
@@ -62,6 +68,7 @@ impl ProxyError {
             ProxyError::NotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::Unauthorized => StatusCode::UNAUTHORIZED,
             ProxyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ProxyError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -77,6 +84,7 @@ impl ProxyError {
             ProxyError::Engine(_) => "no rung could serve a valid response".to_owned(),
             ProxyError::Unauthorized => "unauthorized".to_owned(),
             ProxyError::Internal(_) => "internal error".to_owned(),
+            ProxyError::RateLimited => "rate limited".to_owned(),
         }
     }
 

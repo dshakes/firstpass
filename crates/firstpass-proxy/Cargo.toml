@@ -40,6 +40,7 @@ tracing-subscriber.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
 tower.workspace = true
+governor.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 aws-sigv4.workspace = true

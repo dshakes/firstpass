@@ -74,6 +74,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
                 firstpass_core::conformal::AdaptiveConformal::new(a.alpha, a.gamma, init),
             ))
         });
+    let tenant_rate_limiter = crate::proxy::build_tenant_rate_limiter(&config);
 
     let state = AppState {
         config: Arc::new(config),
@@ -87,6 +88,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         gate_health: Arc::new(gate_health),
         traces,
         adaptive,
+        tenant_rate_limiter,
     };
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;

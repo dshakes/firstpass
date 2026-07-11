@@ -196,12 +196,19 @@ impl GateHealth {
     }
 }
 
-/// Per-gate error budgets for a running proxy (app-level, shared across requests). Lookup by
-/// gate id; unknown gates default to enabled with no accounting (a gate the operator didn't
-/// register a budget for is simply never auto-disabled).
+/// Per-`(tenant, gate)` error budgets for a running proxy (app-level, shared across requests;
+/// ADR 0004 §D6). Budgets (window + max abstain fraction) are registered per gate id at startup;
+/// the actual rolling-window accounting is a separate [`GateHealth`] per `(tenant, gate)` pair, so
+/// one tenant tripping a gate's budget auto-disables it only for that tenant, not globally. With
+/// auth off every request carries the tenant id `"default"`, so there is exactly one bucket per
+/// gate and behavior is unchanged from the pre-D6 global registry.
+///
+/// Unregistered gates default to enabled with no accounting (a gate the operator didn't register
+/// a budget for is simply never auto-disabled).
 #[derive(Debug, Default)]
 pub struct GateHealthRegistry {
-    gates: std::collections::HashMap<String, GateHealth>,
+    budgets: std::collections::HashMap<String, (usize, f64)>,
+    state: Mutex<std::collections::HashMap<(String, String), GateHealth>>,
 }
 
 impl GateHealthRegistry {
@@ -219,22 +226,40 @@ impl GateHealthRegistry {
         window: usize,
         max_error_rate: f64,
     ) -> Self {
-        self.gates
-            .insert(gate_id.into(), GateHealth::new(window, max_error_rate));
+        self.budgets
+            .insert(gate_id.into(), (window, max_error_rate));
         self
     }
 
-    /// Whether `gate_id` is currently enabled (unregistered gates are always enabled).
+    /// Whether `gate_id` is currently enabled for `tenant` (unregistered gates are always
+    /// enabled; a poisoned accounting lock fails open rather than blocking every request).
     #[must_use]
-    pub fn enabled(&self, gate_id: &str) -> bool {
-        self.gates.get(gate_id).is_none_or(GateHealth::is_enabled)
+    pub fn enabled(&self, tenant: &str, gate_id: &str) -> bool {
+        let Some(&(window, max_error_rate)) = self.budgets.get(gate_id) else {
+            return true;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return true;
+        };
+        state
+            .entry((tenant.to_owned(), gate_id.to_owned()))
+            .or_insert_with(|| GateHealth::new(window, max_error_rate))
+            .is_enabled()
     }
 
-    /// Record one outcome for `gate_id` (`errored` = abstained/crashed). No-op if unregistered.
-    pub fn record(&self, gate_id: &str, errored: bool) {
-        if let Some(h) = self.gates.get(gate_id) {
-            h.record(gate_id, errored);
-        }
+    /// Record one outcome for `(tenant, gate_id)` (`errored` = abstained/crashed). No-op if the
+    /// gate has no registered budget, or if the accounting lock is poisoned.
+    pub fn record(&self, tenant: &str, gate_id: &str, errored: bool) {
+        let Some(&(window, max_error_rate)) = self.budgets.get(gate_id) else {
+            return;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state
+            .entry((tenant.to_owned(), gate_id.to_owned()))
+            .or_insert_with(|| GateHealth::new(window, max_error_rate))
+            .record(gate_id, errored);
     }
 }
 
@@ -553,5 +578,35 @@ mod tests {
             h.record("g", false);
         }
         assert!(h.is_enabled());
+    }
+
+    #[test]
+    fn gate_health_registry_default_tenant_is_a_single_bucket() {
+        // With auth off (single-operator), every request uses the same "default" tenant, so this
+        // is exactly the pre-D6 global-registry behavior.
+        let registry = GateHealthRegistry::new().with_budget("g", 4, 0.5);
+        for _ in 0..4 {
+            registry.record("default", "g", true);
+        }
+        assert!(!registry.enabled("default", "g"));
+    }
+
+    #[test]
+    fn gate_health_registry_scopes_budget_per_tenant() {
+        // ADR 0004 §D6: tenant A tripping the budget must not affect tenant B on the same gate.
+        let registry = GateHealthRegistry::new().with_budget("g", 4, 0.5);
+        for _ in 0..4 {
+            registry.record("tenant-a", "g", true);
+        }
+        assert!(!registry.enabled("tenant-a", "g"), "A should be disabled");
+        assert!(registry.enabled("tenant-b", "g"), "B must be unaffected");
+    }
+
+    #[test]
+    fn gate_health_registry_unregistered_gate_always_enabled() {
+        let registry = GateHealthRegistry::new();
+        assert!(registry.enabled("tenant-a", "unknown-gate"));
+        registry.record("tenant-a", "unknown-gate", true); // no-op, must not panic
+        assert!(registry.enabled("tenant-a", "unknown-gate"));
     }
 }
