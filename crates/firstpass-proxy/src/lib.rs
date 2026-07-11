@@ -15,6 +15,7 @@
 //! - [`router`] — the enforce-mode escalation engine.
 //! - [`proxy`] — axum routing, observe passthrough, and enforce dispatch.
 //! - [`error`] — structured, no-leak error responses.
+//! - [`key_custody`] — per-tenant AES-256-GCM envelope key custody (ADR 0004 §D5, pre-review).
 //! - [`metrics`] — Prometheus recorder install + `GET /metrics`.
 //! - [`cli`] — `firstpass doctor` / `trace` logic (validate a setup, read the store).
 //! - [`mcp`] — minimal MCP stdio server so an agent can read its traces and submit feedback.
@@ -27,6 +28,7 @@ pub mod config;
 pub mod error;
 pub mod gate;
 pub mod judge;
+pub mod key_custody;
 pub mod mcp;
 pub mod metrics;
 pub mod provider;
