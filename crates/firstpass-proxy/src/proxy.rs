@@ -60,14 +60,39 @@ impl std::fmt::Debug for AppState {
 /// than blocking the hot path or growing memory without limit (the audit chain over persisted
 /// traces stays valid; a dropped trace is simply absent).
 fn offer_trace(traces: &store::TraceSender, trace: Trace) {
+    record_trace_metrics(&trace);
     match traces.try_send(trace) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             tracing::warn!("trace channel full; dropping trace (writer behind under load)");
+            metrics::counter!("firstpass_traces_dropped_total").increment(1);
         }
         Err(TrySendError::Closed(_)) => {
             tracing::warn!("trace writer is gone; dropping trace");
         }
+    }
+}
+
+/// Record the real signals every trace carries: enforce-mode latency/escalations (observe mode
+/// forwards unchanged, so its wall-clock time isn't a routing-decision latency), and what got
+/// served — regardless of mode, since an upstream failure is worth counting either way.
+fn record_trace_metrics(trace: &Trace) {
+    if trace.mode == Mode::Enforce {
+        metrics::histogram!("firstpass_enforce_latency_ms")
+            .record(trace.final_.total_latency_ms as f64);
+        if trace.final_.escalations > 0 {
+            metrics::counter!("firstpass_escalations_total")
+                .increment(u64::from(trace.final_.escalations));
+        }
+    }
+    let served_from = match trace.final_.served_from {
+        ServedFrom::Attempt => "attempt",
+        ServedFrom::BestAttempt => "best_attempt",
+        ServedFrom::Error => "error",
+    };
+    metrics::counter!("firstpass_served_total", "served_from" => served_from).increment(1);
+    if trace.final_.served_from == ServedFrom::Error {
+        metrics::counter!("firstpass_upstream_failures_total").increment(1);
     }
 }
 
@@ -76,16 +101,29 @@ fn offer_trace(traces: &store::TraceSender, trace: Trace) {
 /// oversized body can't exhaust memory.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-/// Build the axum router: `POST /v1/messages`, `GET /v1/capabilities`, `GET /healthz`.
-pub fn app(state: AppState) -> Router {
-    Router::new()
+/// Build the axum router: `POST /v1/messages`, `GET /v1/capabilities`, `GET /healthz`,
+/// `GET /metrics`.
+///
+/// # Errors
+/// [`ProxyError::Internal`] if the Prometheus recorder fails to install (see
+/// [`crate::metrics::install`]).
+pub fn app(state: AppState) -> Result<Router, ProxyError> {
+    crate::metrics::install()?;
+    let max_concurrency = state.config.max_concurrency;
+    Ok(Router::new()
         .route("/v1/messages", post(messages))
         .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(crate::metrics::handler))
         // Explicit body-size ceiling (DoS/OOM guard) across every route.
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state)
+        // Concurrency load-shed: cap in-flight requests under the cap rather than falling over.
+        // Deliberately NOT a request timeout — that would sever in-flight SSE streams.
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            max_concurrency,
+        ))
+        .with_state(state))
 }
 
 /// `GET /healthz` — liveness probe.
@@ -1277,5 +1315,50 @@ mod tests {
             axum::http::StatusCode::BAD_REQUEST
         );
         let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_renders_after_a_real_request() {
+        use tower::ServiceExt;
+
+        let (state, mut rx) = enforce_state(
+            &["anthropic/claude-haiku-4-5"],
+            &["non-empty"],
+            vec![(
+                "anthropic/claude-haiku-4-5",
+                Ok(model_resp("anthropic/claude-haiku-4-5", "hello")),
+            )],
+        );
+        let router = app(state).expect("prometheus recorder installs");
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(user_body()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        rx.try_recv().expect("a trace was enqueued");
+
+        let metrics_req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let metrics_resp = router.oneshot(metrics_req).await.unwrap();
+        assert_eq!(metrics_resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(metrics_resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("firstpass_enforce_latency_ms"),
+            "metrics body missing enforce latency histogram: {body}"
+        );
+        assert!(
+            body.contains("firstpass_served_total"),
+            "metrics body missing served counter: {body}"
+        );
     }
 }

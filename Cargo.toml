@@ -33,6 +33,9 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 bytes = "1"
+tower = { version = "0.5", features = ["limit", "util"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # Internal crates
 firstpass-core = { path = "crates/firstpass-core", version = "0.1.0" }
