@@ -21,8 +21,18 @@ pub struct ProxyConfig {
     pub upstream_openai: String,
     /// Path to the SQLite trace database.
     pub db_path: String,
-    /// Tenant identifier stamped on every trace.
+    /// Tenant identifier stamped on every trace when `require_auth` is off (single-operator
+    /// default). When `require_auth` is on, the per-request tenant comes from the verified API
+    /// key instead, and this is only the fallback for operator-scoped tooling.
     pub tenant_id: String,
+    /// Multi-tenant auth gate (ADR 0004 §D1). Default `false` — single-operator behavior is
+    /// byte-identical: no auth checks, tenant is the static [`Self::tenant_id`]. Set via
+    /// `FIRSTPASS_REQUIRE_AUTH`. **Experimental / pre-external-review (ADR 0004 §D7).**
+    pub require_auth: bool,
+    /// Per-tenant Argon2id API-key hashes (ADR 0004 §D1). Empty unless configured via
+    /// `FIRSTPASS_TENANT_KEYS` (path to a JSON `{ tenant_id: hash }`) or `FIRSTPASS_TENANT_KEYS_JSON`
+    /// (inline JSON). Only consulted when `require_auth` is on.
+    pub tenant_keys: crate::tenant_auth::TenantKeys,
     /// Salt mixed into the prompt hash so raw prompt text never touches storage.
     pub prompt_salt: String,
     /// Default mode when no routing config matches (`observe` unless overridden).
@@ -53,6 +63,11 @@ pub enum ConfigError {
     /// The routing config file could not be read or parsed.
     #[error("routing config error: {0}")]
     Config(String),
+
+    /// The multi-tenant auth config (`FIRSTPASS_TENANT_KEYS`) is invalid (ADR 0004 §D1). The
+    /// message never echoes hash material — only the structural problem.
+    #[error("tenant auth config error: {0}")]
+    Auth(#[from] crate::tenant_auth::AuthConfigError),
 }
 
 impl ProxyConfig {
@@ -72,8 +87,19 @@ impl ProxyConfig {
             ),
             None => None,
         };
+        // Read the tenant-keys file (if any) here and hand its *content* to `from_lookup` via the
+        // synthetic `FIRSTPASS_TENANT_KEYS_JSON` key, keeping file I/O out of the testable path.
+        // An inline `FIRSTPASS_TENANT_KEYS_JSON` in the real env takes precedence if both are set.
+        let tenant_keys_json = match env::var("FIRSTPASS_TENANT_KEYS").ok() {
+            Some(path) => Some(
+                std::fs::read_to_string(&path)
+                    .map_err(|e| ConfigError::Config(format!("reading {path}: {e}")))?,
+            ),
+            None => None,
+        };
         Self::from_lookup(|key| match key {
             "FIRSTPASS_CONFIG_TOML" => routing_toml.clone(),
+            "FIRSTPASS_TENANT_KEYS_JSON" => env::var(key).ok().or_else(|| tenant_keys_json.clone()),
             other => env::var(other).ok(),
         })
     }
@@ -119,12 +145,35 @@ impl ProxyConfig {
             None => DEFAULT_MAX_CONCURRENCY,
         };
 
+        // Multi-tenant auth (ADR 0004 §D1) — default OFF. Anything other than an explicit truthy
+        // value leaves single-operator behavior byte-identical.
+        let require_auth = lookup("FIRSTPASS_REQUIRE_AUTH")
+            .map(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        let tenant_keys = match lookup("FIRSTPASS_TENANT_KEYS_JSON") {
+            Some(json) => crate::tenant_auth::TenantKeys::from_json(&json)?,
+            None => crate::tenant_auth::TenantKeys::default(),
+        };
+        if require_auth && tenant_keys.is_empty() {
+            tracing::warn!(
+                "FIRSTPASS_REQUIRE_AUTH is on but no tenant keys are configured — every request \
+                 will be rejected with 401 until FIRSTPASS_TENANT_KEYS is set"
+            );
+        }
+
         Ok(Self {
             bind,
             upstream_anthropic,
             upstream_openai,
             db_path,
             tenant_id,
+            require_auth,
+            tenant_keys,
             prompt_salt,
             mode,
             routing,
