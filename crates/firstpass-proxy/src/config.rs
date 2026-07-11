@@ -32,6 +32,11 @@ pub struct ProxyConfig {
     /// Per-tenant Argon2id API-key hashes (ADR 0004 §D1). Empty unless configured via
     /// `FIRSTPASS_TENANT_KEYS` (path to a JSON `{ tenant_id: hash }`) or `FIRSTPASS_TENANT_KEYS_JSON`
     /// (inline JSON). Only consulted when `require_auth` is on.
+    ///
+    /// The stored `hash` is the Argon2id hash of a tenant's **secret** (make one with
+    /// `TenantKeys::hash_key`). A tenant then authenticates with the key `<tenant_id>.<secret>` —
+    /// the tenant id names which hash to verify, so a request does exactly one Argon2 check. Tenant
+    /// ids must not contain a `.` (the first `.` splits id from secret).
     pub tenant_keys: crate::tenant_auth::TenantKeys,
     /// Salt mixed into the prompt hash so raw prompt text never touches storage.
     pub prompt_salt: String,
