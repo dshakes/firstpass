@@ -36,12 +36,18 @@ pub struct TenantId(pub String);
 
 /// Argon2id-hashed per-tenant API keys, keyed by tenant id.
 ///
+/// A presented key has the form `<tenant_id>.<secret>`: the (non-secret) tenant id names which
+/// hash to check, so verification is O(1) — exactly one Argon2 verify — rather than one per tenant.
+///
 /// `Debug` deliberately redacts every hash — they are password-equivalent secrets — revealing
 /// only the configured tenant ids so a `ProxyConfig` dump can never leak credential material.
 #[derive(Clone, Default)]
 pub struct TenantKeys {
-    /// `tenant_id` -> PHC-encoded Argon2id hash string.
+    /// `tenant_id` -> PHC-encoded Argon2id hash of that tenant's secret.
     hashes: HashMap<String, String>,
+    /// A valid Argon2 hash of a throwaway secret, verified against on the unknown-tenant path so an
+    /// invalid key takes the same time whether or not the named tenant exists — no existence oracle.
+    decoy: String,
 }
 
 impl std::fmt::Debug for TenantKeys {
@@ -86,7 +92,9 @@ impl TenantKeys {
                 tenant: tenant.clone(),
             })?;
         }
-        Ok(Self { hashes })
+        // Decoy hash for the unknown-tenant path (equalizes verify time). Computed once at startup.
+        let decoy = Self::hash_key("firstpass-unknown-tenant-decoy")?;
+        Ok(Self { hashes, decoy })
     }
 
     /// Whether any tenant keys are configured.
@@ -95,27 +103,30 @@ impl TenantKeys {
         self.hashes.is_empty()
     }
 
-    /// Verify a presented key against every tenant's stored hash, returning the owning tenant on a
-    /// match. Uses the crate's constant-time Argon2 [`PasswordVerifier`] — never a plain `==`.
+    /// Verify a presented `<tenant_id>.<secret>` key, returning the owning tenant on a match. The
+    /// tenant id (before the first `.`, not itself secret) names which hash to check, so this does
+    /// **exactly one** Argon2 verify — O(1), not O(tenants) — using the crate's constant-time
+    /// [`PasswordVerifier`], never a plain `==`.
     ///
-    /// ponytail: O(N) Argon2 verifications per failed request (N = tenant count). Argon2 is
-    /// deliberately slow, so this is fine for a handful of tenants; if the roster grows, move to a
-    /// keyed format (`<tenant_id>.<secret>`) so we look the tenant up and verify exactly one hash.
+    /// An unknown tenant id (or a malformed key) still performs one Argon2 verify against a decoy
+    /// hash, so an invalid key takes the same time whether or not the named tenant exists — this
+    /// closes both the CPU-amplification DoS and the tenant-existence timing oracle. Tenant ids must
+    /// not contain `.` (they are simple identifiers; the first `.` splits id from secret).
     #[must_use]
     pub fn verify(&self, presented_key: &str) -> Option<TenantId> {
         let argon = Argon2::default();
-        for (tenant, hash) in &self.hashes {
-            // Hashes were validated at construction; if one somehow won't parse, treat it as a
-            // non-match rather than panicking on the request path.
-            let Ok(parsed) = PasswordHash::new(hash) else {
-                continue;
-            };
-            if argon
-                .verify_password(presented_key.as_bytes(), &parsed)
-                .is_ok()
+        let (tenant_id, secret) = presented_key.split_once('.').unwrap_or(("", presented_key));
+        if let Some(hash) = self.hashes.get(tenant_id) {
+            if let Ok(parsed) = PasswordHash::new(hash)
+                && argon.verify_password(secret.as_bytes(), &parsed).is_ok()
             {
-                return Some(TenantId(tenant.clone()));
+                return Some(TenantId(tenant_id.to_owned()));
             }
+            return None;
+        }
+        // Unknown tenant: burn one verify against the decoy to equalize timing, then fail.
+        if let Ok(decoy) = PasswordHash::new(&self.decoy) {
+            let _ = argon.verify_password(secret.as_bytes(), &decoy);
         }
         None
     }
@@ -190,14 +201,17 @@ mod tests {
         let json = format!("{{\"acme\": {hash:?}}}");
         let keys = TenantKeys::from_json(&json).unwrap();
 
-        // Correct key resolves to its tenant.
+        // Correct `<tenant>.<secret>` key resolves to its tenant.
         assert_eq!(
-            keys.verify("s3cret-key").map(|t| t.0).as_deref(),
+            keys.verify("acme.s3cret-key").map(|t| t.0).as_deref(),
             Some("acme")
         );
-        // Wrong key resolves to nothing.
-        assert!(keys.verify("wrong-key").is_none());
-        // Empty presented key never matches.
+        // Right tenant, wrong secret → nothing.
+        assert!(keys.verify("acme.wrong-key").is_none());
+        // Unknown tenant → nothing (and it still burns a decoy verify — no existence oracle).
+        assert!(keys.verify("ghost.s3cret-key").is_none());
+        // Malformed (no `.`) and empty keys never match.
+        assert!(keys.verify("s3cret-key").is_none());
         assert!(keys.verify("").is_none());
     }
 
@@ -209,15 +223,17 @@ mod tests {
         let keys = TenantKeys::from_json(&json).unwrap();
 
         assert_eq!(
-            keys.verify("key-a").map(|t| t.0).as_deref(),
+            keys.verify("tenant-a.key-a").map(|t| t.0).as_deref(),
             Some("tenant-a")
         );
         assert_eq!(
-            keys.verify("key-b").map(|t| t.0).as_deref(),
+            keys.verify("tenant-b.key-b").map(|t| t.0).as_deref(),
             Some("tenant-b")
         );
-        // A key belonging to neither tenant is rejected.
-        assert!(keys.verify("key-c").is_none());
+        // Tenant A's id with tenant B's secret is rejected — you can't cross tenants.
+        assert!(keys.verify("tenant-a.key-b").is_none());
+        // A secret for no configured tenant is rejected.
+        assert!(keys.verify("tenant-c.key-c").is_none());
     }
 
     #[test]
