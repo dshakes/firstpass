@@ -19,6 +19,7 @@
 //! - [`metrics`] — Prometheus recorder install + `GET /metrics`.
 //! - [`cli`] — `firstpass doctor` / `trace` logic (validate a setup, read the store).
 //! - [`mcp`] — minimal MCP stdio server so an agent can read its traces and submit feedback.
+//! - [`tenant_auth`] — experimental multi-tenant API-key auth (ADR 0004 §D1, default-off).
 //! - [`run`] — shared server bootstrap for the `firstpass` and `firstpass-proxy` binaries.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -37,9 +38,11 @@ pub mod router;
 pub mod run;
 pub mod store;
 pub mod subprocess;
+pub mod tenant_auth;
 pub mod upstream;
 
 pub use config::ProxyConfig;
 pub use error::ProxyError;
 pub use proxy::{AppState, app};
 pub use store::{TraceSender, load_all_traces};
+pub use tenant_auth::{TenantId, TenantKeys};

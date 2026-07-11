@@ -110,7 +110,7 @@ async fn main() {
         fb.status()
     );
 
-    let view = store::load_trace_view(&db, &trace_id)
+    let view = store::load_trace_view(&db, "default", &trace_id)
         .expect("view")
         .expect("trace");
     println!(

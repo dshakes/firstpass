@@ -238,7 +238,9 @@ async fn enforce_escalates_over_real_http_then_feedback_attaches() {
         .unwrap();
     assert_eq!(fb.status(), 202);
 
-    let view = store::load_trace_view(&db, &trace_id).unwrap().unwrap();
+    let view = store::load_trace_view(&db, "default", &trace_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(view.deferred.len(), 1);
     assert_eq!(view.deferred[0].gate_id, "tests");
     // Sealed bodies untouched: chain still verifies after the late outcome.
