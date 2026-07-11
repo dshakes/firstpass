@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::HeaderMap;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -46,6 +47,40 @@ pub struct AppState {
     pub gate_health: Arc<GateHealthRegistry>,
     /// Fire-and-forget sender to the background trace writer.
     pub traces: store::TraceSender,
+    /// Per-tenant request rate limiter (ADR 0004 §D6). `None` (the default) disables rate
+    /// limiting entirely — set via [`build_tenant_rate_limiter`] from
+    /// [`ProxyConfig::tenant_rate_per_sec`].
+    pub tenant_rate_limiter: Option<Arc<governor::DefaultKeyedRateLimiter<String>>>,
+}
+
+/// Build the per-tenant keyed rate limiter from config (ADR 0004 §D6). Returns `None` when
+/// `FIRSTPASS_TENANT_RATE_PER_SEC` is unset (the default) — single-operator and existing
+/// deployments see no limiter and no behavior change.
+#[must_use]
+pub fn build_tenant_rate_limiter(
+    config: &ProxyConfig,
+) -> Option<Arc<governor::DefaultKeyedRateLimiter<String>>> {
+    let per_sec = config.tenant_rate_per_sec?;
+    Some(Arc::new(governor::RateLimiter::keyed(
+        governor::Quota::per_second(per_sec),
+    )))
+}
+
+/// Axum middleware (ADR 0004 §D6): enforce the per-tenant request rate limit. Must run AFTER
+/// [`auth_middleware`] so the resolved [`TenantId`] is already in request extensions. A no-op
+/// (never returns 429) when [`AppState::tenant_rate_limiter`] is `None`.
+pub async fn tenant_rate_limit_middleware(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(limiter) = &state.tenant_rate_limiter
+        && limiter.check_key(&tenant.0).is_err()
+    {
+        return ProxyError::RateLimited.into_response();
+    }
+    next.run(req).await
 }
 
 impl std::fmt::Debug for AppState {
@@ -116,10 +151,18 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
     // `TenantId` into request extensions (the authenticated tenant when `require_auth` is on, the
     // static default when off — ADR 0004 §D1/§D2). Operator routes (`/healthz`, `/metrics`) are
     // NOT tenant-facing and stay outside the auth layer.
+    // Per-tenant rate limit (ADR 0004 §D6) runs INSIDE (after) the auth layer below — axum layers
+    // wrap outward-in, so a layer added earlier in the chain executes later on the request path —
+    // so the resolved `TenantId` is already in extensions when this middleware checks it. A no-op
+    // when `FIRSTPASS_TENANT_RATE_PER_SEC` is unset.
     let business = Router::new()
         .route("/v1/messages", post(messages))
         .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            tenant_rate_limit_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -1053,6 +1096,7 @@ mod tests {
             providers,
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
+            tenant_rate_limiter: None,
         };
         (state, rx)
     }
@@ -1170,6 +1214,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
+            tenant_rate_limiter: None,
         };
         let resp = messages(
             State(state),
@@ -1242,6 +1287,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
+            tenant_rate_limiter: None,
         };
 
         // Plain text enforces: the mock serves 200.
@@ -1337,6 +1383,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
+            tenant_rate_limiter: None,
         };
         (state, db, trace_id)
     }
@@ -1510,9 +1557,20 @@ mod tests {
 
     /// Build an `AppState` whose config toggles auth and (optionally) carries a tenant-keys JSON.
     fn auth_state(require_auth: bool, keys_json: Option<String>) -> AppState {
+        auth_state_rated(require_auth, keys_json, None)
+    }
+
+    /// Like [`auth_state`], but also wires `FIRSTPASS_TENANT_RATE_PER_SEC` (ADR 0004 §D6) when
+    /// `rate_per_sec` is `Some`.
+    fn auth_state_rated(
+        require_auth: bool,
+        keys_json: Option<String>,
+        rate_per_sec: Option<u32>,
+    ) -> AppState {
         let config = ProxyConfig::from_lookup(|k| match k {
             "FIRSTPASS_REQUIRE_AUTH" => require_auth.then(|| "true".to_owned()),
             "FIRSTPASS_TENANT_KEYS_JSON" => keys_json.clone(),
+            "FIRSTPASS_TENANT_RATE_PER_SEC" => rate_per_sec.map(|n| n.to_string()),
             _ => None,
         })
         .unwrap();
@@ -1521,12 +1579,14 @@ mod tests {
         // channel closed (the auth tests exercise `/v1/capabilities`, which enqueues no trace).
         std::mem::forget(_rx);
         let providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        let tenant_rate_limiter = build_tenant_rate_limiter(&config);
         AppState {
             config: Arc::new(config),
             http: reqwest::Client::new(),
             providers: ProviderRegistry::from_map(providers),
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
+            tenant_rate_limiter,
         }
     }
 
@@ -1593,5 +1653,85 @@ mod tests {
             .unwrap();
         // A valid key clears the middleware and reaches the handler.
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// Two tenants, keyed so requests carry a real, distinct `TenantId` (ADR 0004 §D6).
+    fn two_tenant_state(rate_per_sec: Option<u32>) -> AppState {
+        let hash_a = crate::tenant_auth::TenantKeys::hash_key("key-a").unwrap();
+        let hash_b = crate::tenant_auth::TenantKeys::hash_key("key-b").unwrap();
+        let keys = format!("{{\"tenant-a\": {hash_a:?}, \"tenant-b\": {hash_b:?}}}");
+        auth_state_rated(true, Some(keys), rate_per_sec)
+    }
+
+    #[tokio::test]
+    async fn tenant_exceeding_rate_limit_gets_429_opaque() {
+        use tower::ServiceExt;
+        // Burst capacity == rate for `Quota::per_second`, so 1 req/sec allows exactly 1 request
+        // before the next is rejected. Only 2 requests (not 3+) to stay well clear of the 1s
+        // replenish window even under real per-request Argon2-verify latency in the auth layer.
+        let router = app(two_tenant_state(Some(1))).expect("router");
+
+        let r1 = router
+            .clone()
+            .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), axum::http::StatusCode::OK);
+
+        let r2 = router
+            .clone()
+            .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let json = body_json(r2).await;
+        assert_eq!(json["error"]["type"], "rate_limited");
+        // Opaque: no bucket state or limit value leaked to the caller.
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(!msg.contains('1'), "no limit value in body: {msg}");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_buckets_are_independent_per_tenant() {
+        use tower::ServiceExt;
+        let router = app(two_tenant_state(Some(1))).expect("router");
+
+        // Tenant A exhausts its 1 req/sec budget...
+        let a1 = router
+            .clone()
+            .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
+            .await
+            .unwrap();
+        assert_eq!(a1.status(), axum::http::StatusCode::OK);
+        let a2 = router
+            .clone()
+            .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
+            .await
+            .unwrap();
+        assert_eq!(a2.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+
+        // ...but tenant B, on the same gate/route, is unaffected (independent bucket).
+        let b1 = router
+            .clone()
+            .oneshot(cap_request(Some("Bearer tenant-b.key-b")))
+            .await
+            .unwrap();
+        assert_eq!(b1.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_unset_never_429s() {
+        use tower::ServiceExt;
+        // Backward-compat: with no FIRSTPASS_TENANT_RATE_PER_SEC, drive many requests through and
+        // confirm none are ever rate-limited (default-off).
+        let router = app(two_tenant_state(None)).expect("router");
+        for _ in 0..20 {
+            let resp = router
+                .clone()
+                .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        }
     }
 }

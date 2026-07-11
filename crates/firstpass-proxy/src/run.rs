@@ -47,6 +47,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
     let bind = config.bind.clone();
     let providers = ProviderRegistry::new(&config.upstream_anthropic, &config.upstream_openai);
     let gate_health = build_gate_health(&config);
+    let tenant_rate_limiter = crate::proxy::build_tenant_rate_limiter(&config);
 
     let state = AppState {
         config: Arc::new(config),
@@ -59,6 +60,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         providers,
         gate_health: Arc::new(gate_health),
         traces,
+        tenant_rate_limiter,
     };
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;

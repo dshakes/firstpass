@@ -259,12 +259,13 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                 // error budget has auto-disabled, and feeding each outcome back to the budget.
                 let mut gate_results: Vec<GateResult> = Vec::with_capacity(ctx.gates.len());
                 for g in ctx.gates {
-                    if !ctx.health.enabled(g.id()) {
+                    if !ctx.health.enabled(&ctx.tenant_id, g.id()) {
                         tracing::warn!(gate = %g.id(), "skipping auto-disabled gate");
                         continue;
                     }
                     let r = g.evaluate(&req, &resp).await;
-                    ctx.health.record(g.id(), r.verdict == Verdict::Abstain);
+                    ctx.health
+                        .record(&ctx.tenant_id, g.id(), r.verdict == Verdict::Abstain);
                     gate_results.push(r);
                 }
                 let gc: f64 = gate_results.iter().map(|g| g.cost_usd).sum();
@@ -423,12 +424,13 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                 req.model = model_str.clone();
                 let mut gate_results: Vec<GateResult> = Vec::with_capacity(ctx.gates.len());
                 for g in ctx.gates {
-                    if !ctx.health.enabled(g.id()) {
+                    if !ctx.health.enabled(&ctx.tenant_id, g.id()) {
                         tracing::warn!(gate = %g.id(), "skipping auto-disabled gate");
                         continue;
                     }
                     let r = g.evaluate(&req, &resp).await;
-                    ctx.health.record(g.id(), r.verdict == Verdict::Abstain);
+                    ctx.health
+                        .record(&ctx.tenant_id, g.id(), r.verdict == Verdict::Abstain);
                     gate_results.push(r);
                 }
                 let gc: f64 = gate_results.iter().map(|g| g.cost_usd).sum();
@@ -858,13 +860,14 @@ mod tests {
         let providers = registry(vec![("anthropic", HAIKU, Ok(resp(HAIKU, "")))]); // empty text
         let (auth, prices) = (Auth::default(), PriceTable::defaults());
 
-        // Drive the "non-empty" budget over threshold so it is disabled before the run.
+        // Drive the "non-empty" budget over threshold so it is disabled before the run, for the
+        // same tenant `ctx()` below uses ("acme") — the budget is per-(tenant, gate).
         let health = GateHealthRegistry::new().with_budget("non-empty", 4, 0.5);
         for _ in 0..4 {
-            health.record("non-empty", true);
+            health.record("acme", "non-empty", true);
         }
         assert!(
-            !health.enabled("non-empty"),
+            !health.enabled("acme", "non-empty"),
             "precondition: gate is auto-disabled"
         );
 
