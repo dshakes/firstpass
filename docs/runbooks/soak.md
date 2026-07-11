@@ -28,11 +28,13 @@ whatever the gate picked.
 
 ## 2. What to watch during the soak
 
-There is no metrics/alerting exporter in the codebase today (see
-[`docs/compliance/soc2-controls.md`](../compliance/soc2-controls.md) —
-monitoring is a documented gap, not a shipped Prometheus endpoint). Watch
-these signals by tailing structured `tracing` output and querying the trace
-store directly:
+A Prometheus `/metrics` endpoint ships today (`firstpass_enforce_latency_ms`,
+`firstpass_escalations_total`, `firstpass_served_total{served_from}`,
+`firstpass_upstream_failures_total`, `firstpass_traces_dropped_total`) — scrape
+it into your monitoring stack and alert on it. **Alerting rules themselves are
+the operator's to wire** (the proxy exposes the signal; it does not ship
+thresholds). Alongside the scrape, watch these signals by tailing structured
+`tracing` output and querying the trace store directly:
 
 | Signal | How to check | What "healthy" looks like |
 | --- | --- | --- |

@@ -26,7 +26,7 @@ process regulated personal data as part of its own function.
 | Encryption at rest | None. The SQLite trace store is plaintext on disk; there is no KMS-backed envelope encryption | **GAP** — [ADR 0001](../adr/0001-hosted-ga-architecture.md) proposes cloud + KMS-backed key/trace encryption for a hosted plane; **not implemented**. Self-hosted operators must supply disk-level encryption themselves |
 | Vulnerability management | `cargo audit` (RustSec advisories) + `cargo deny check advisories`, weekly and on every PR — `.github/workflows/audit.yml` | **Satisfied** (new — this change) |
 | Access control | Single-operator process; no authn/authz layer at the proxy (see threat model §1) | **GAP** — anyone who can reach the listening port with a valid provider key can route through it. Acceptable in the documented single-operator/self-hosted deployment; a hosted multi-tenant plane would need real authn (ADR 0001) |
-| Monitoring / alerting | Structured `tracing` logs on every warn/error path (gate crashes, trace-writer failure, provider errors); `GET /healthz` liveness probe (`crates/firstpass-proxy/src/proxy.rs`) | **Partial gap** — logs and a liveness probe exist; there is **no metrics endpoint** (no Prometheus `/metrics` exporter in the code today) and no alerting wired to any of it. [ADR 0003](../adr/0003-production-ga-readiness.md) lists a metrics endpoint and health signal as an explicit GA exit criterion, not yet built |
+| Monitoring / alerting | Prometheus `GET /metrics` exporter (enforce latency, escalations, served/upstream-failure/dropped-trace counters); structured `tracing` logs on every warn/error path; `GET /healthz` liveness probe (`crates/firstpass-proxy/src/{metrics,proxy}.rs`) | **Partial** — metrics, logs, and a liveness probe now ship; **alerting rules are not wired** (the operator scrapes `/metrics` and sets thresholds in their own monitoring stack). Deeper readiness (health that reflects dependency state, per-tenant metrics) remains per [ADR 0003](../adr/0003-production-ga-readiness.md) |
 | Incident response | [`docs/runbooks/soak.md`](../runbooks/soak.md) covers the observe-mode soak and rollback path; a dedicated incident-response runbook (on-call rotation, sev classification) is listed in ADR 0003 as a GA exit criterion, not yet written | **Partial** — soak/rollback documented; formal IR runbook is a gap |
 
 ## Availability
@@ -58,8 +58,9 @@ a customer or auditor until they change:
    plane in ADR 0001).
 2. **Authentication/authorization** at the proxy boundary (currently: whoever
    can reach the port and holds a valid provider key can route through it).
-3. **Metrics/alerting** — no `/metrics` exporter exists in the code today;
-   only structured logs and `/healthz`.
+3. **Alerting** — a Prometheus `/metrics` exporter now ships (plus structured
+   logs and `/healthz`), but alerting rules/thresholds are the operator's to
+   wire in their monitoring stack; none are shipped.
 4. **Formal incident-response runbook and SLO/error budget.**
 5. **External security audit / SOC 2 audit itself** — has not happened.
 6. **Hosted multi-tenant plane** — does not exist; every control in this
