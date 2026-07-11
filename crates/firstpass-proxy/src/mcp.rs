@@ -57,7 +57,7 @@ fn tool_schemas() -> Value {
 /// (a message with no `id`, which must not be answered). Tool calls touch the trace store at
 /// `db_path`; everything else is pure.
 #[must_use]
-pub fn handle_rpc(req: &Value, db_path: &str) -> Option<Value> {
+pub fn handle_rpc(req: &Value, db_path: &str, tenant: &str) -> Option<Value> {
     let is_notification = req.get("id").is_none();
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req
@@ -75,7 +75,7 @@ pub fn handle_rpc(req: &Value, db_path: &str) -> Option<Value> {
             }),
         )),
         "tools/list" => Some(ok(id, json!({ "tools": tool_schemas() }))),
-        "tools/call" => Some(handle_tool_call(id, req.get("params"), db_path)),
+        "tools/call" => Some(handle_tool_call(id, req.get("params"), db_path, tenant)),
         "ping" => Some(ok(id, json!({}))),
         // Notifications (e.g. `notifications/initialized`) and anything else without an id: silent.
         _ if is_notification => None,
@@ -85,7 +85,7 @@ pub fn handle_rpc(req: &Value, db_path: &str) -> Option<Value> {
 
 /// Dispatch a `tools/call`. Tool-level failures come back as an `isError` result (MCP convention),
 /// not a protocol error, so the agent can read the reason as content.
-fn handle_tool_call(id: Value, params: Option<&Value>, db_path: &str) -> Value {
+fn handle_tool_call(id: Value, params: Option<&Value>, db_path: &str, tenant: &str) -> Value {
     let name = params
         .and_then(|p| p.get("name"))
         .and_then(Value::as_str)
@@ -96,9 +96,9 @@ fn handle_tool_call(id: Value, params: Option<&Value>, db_path: &str) -> Value {
         .unwrap_or_else(|| json!({}));
 
     let result = match name {
-        "list_traces" => tool_list_traces(&args, db_path),
-        "get_trace" => tool_get_trace(&args, db_path),
-        "submit_feedback" => tool_submit_feedback(&args, db_path),
+        "list_traces" => tool_list_traces(&args, db_path, tenant),
+        "get_trace" => tool_get_trace(&args, db_path, tenant),
+        "submit_feedback" => tool_submit_feedback(&args, db_path, tenant),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -111,31 +111,34 @@ fn handle_tool_call(id: Value, params: Option<&Value>, db_path: &str) -> Value {
     }
 }
 
-fn tool_list_traces(args: &Value, db_path: &str) -> Result<String, String> {
+fn tool_list_traces(args: &Value, db_path: &str, tenant: &str) -> Result<String, String> {
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
         .map_or(20, |n| n as usize);
     // Mirror `firstpass trace`: an absent/unreadable store (no traffic yet) is "no traces", not an
     // error — unlike get_trace/submit_feedback, which name a specific trace and should fail loudly.
-    let all = store::load_all_traces(db_path).unwrap_or_default();
+    // Tenant-scoped (ADR 0004 §D3): the reader only ever sees its own tenant's traces.
+    let all = store::load_tenant_traces(db_path, tenant).unwrap_or_default();
     let start = all.len().saturating_sub(limit);
     let recent = &all[start..];
     serde_json::to_string(recent).map_err(|e| format!("encode error: {e}"))
 }
 
-fn tool_get_trace(args: &Value, db_path: &str) -> Result<String, String> {
+fn tool_get_trace(args: &Value, db_path: &str, tenant: &str) -> Result<String, String> {
     let trace_id = args
         .get("trace_id")
         .and_then(Value::as_str)
         .ok_or("missing `trace_id`")?;
-    match store::load_trace_view(db_path, trace_id).map_err(|e| format!("store error: {e}"))? {
+    match store::load_trace_view(db_path, tenant, trace_id)
+        .map_err(|e| format!("store error: {e}"))?
+    {
         Some(trace) => serde_json::to_string(&trace).map_err(|e| format!("encode error: {e}")),
         None => Err(format!("unknown trace_id {trace_id:?}")),
     }
 }
 
-fn tool_submit_feedback(args: &Value, db_path: &str) -> Result<String, String> {
+fn tool_submit_feedback(args: &Value, db_path: &str, tenant: &str) -> Result<String, String> {
     let trace_id = args
         .get("trace_id")
         .and_then(Value::as_str)
@@ -162,7 +165,9 @@ fn tool_submit_feedback(args: &Value, db_path: &str) -> Result<String, String> {
         }
     };
 
-    if !store::trace_exists(db_path, trace_id).map_err(|e| format!("store error: {e}"))? {
+    // Tenant-scoped existence check (ADR 0004 §D3/§D4): a trace owned by another tenant reads as
+    // unknown, so an agent cannot attach feedback across the tenant boundary.
+    if !store::trace_exists(db_path, tenant, trace_id).map_err(|e| format!("store error: {e}"))? {
         return Err(format!("unknown trace_id {trace_id:?}"));
     }
     let dv = DeferredVerdict {
@@ -187,9 +192,13 @@ fn err(id: Value, code: i64, message: &str) -> Value {
 /// Serve MCP over stdio: read newline-delimited JSON-RPC from stdin, write responses to stdout.
 /// Blocks until stdin closes. Synchronous by design — one request in flight at a time.
 ///
+/// All store reads/writes are scoped to `tenant` (ADR 0004 §D3): the reader is bound to a single
+/// tenant for its whole session and never reads or writes across the boundary. Single-operator
+/// runs pass the default tenant, so behavior is unchanged.
+///
 /// # Errors
 /// Returns an [`std::io::Error`] if reading stdin or writing stdout fails.
-pub fn serve_stdio(db_path: &str) -> std::io::Result<()> {
+pub fn serve_stdio(db_path: &str, tenant: &str) -> std::io::Result<()> {
     use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -199,7 +208,7 @@ pub fn serve_stdio(db_path: &str) -> std::io::Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(req) => handle_rpc(&req, db_path),
+            Ok(req) => handle_rpc(&req, db_path, tenant),
             Err(_) => Some(err(Value::Null, -32700, "parse error")),
         };
         if let Some(resp) = response {
@@ -224,7 +233,7 @@ mod tests {
     #[test]
     fn initialize_announces_protocol_and_server() {
         let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" });
-        let resp = handle_rpc(&req, "unused.db").unwrap();
+        let resp = handle_rpc(&req, "unused.db", "default").unwrap();
         assert_eq!(resp["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(resp["result"]["serverInfo"]["name"], "firstpass");
         assert_eq!(resp["id"], 1);
@@ -233,7 +242,7 @@ mod tests {
     #[test]
     fn tools_list_exposes_the_three_tools() {
         let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
-        let resp = handle_rpc(&req, "unused.db").unwrap();
+        let resp = handle_rpc(&req, "unused.db", "default").unwrap();
         let names: Vec<&str> = resp["result"]["tools"]
             .as_array()
             .unwrap()
@@ -246,17 +255,17 @@ mod tests {
     #[test]
     fn notifications_get_no_response() {
         let req = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-        assert!(handle_rpc(&req, "unused.db").is_none());
+        assert!(handle_rpc(&req, "unused.db", "default").is_none());
     }
 
     #[test]
     fn unknown_method_errors_for_requests_but_not_notifications() {
         let request = json!({ "jsonrpc": "2.0", "id": 9, "method": "does/not/exist" });
-        let resp = handle_rpc(&request, "unused.db").unwrap();
+        let resp = handle_rpc(&request, "unused.db", "default").unwrap();
         assert_eq!(resp["error"]["code"], -32601);
 
         let notification = json!({ "jsonrpc": "2.0", "method": "does/not/exist" });
-        assert!(handle_rpc(&notification, "unused.db").is_none());
+        assert!(handle_rpc(&notification, "unused.db", "default").is_none());
     }
 
     #[test]
@@ -264,7 +273,7 @@ mod tests {
         let db = tmp_db();
         let req = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
                           "params": { "name": "list_traces", "arguments": {} } });
-        let resp = handle_rpc(&req, &db).unwrap();
+        let resp = handle_rpc(&req, &db, "default").unwrap();
         assert!(
             resp["result"]["isError"].is_null(),
             "empty store is not an error"
@@ -279,7 +288,7 @@ mod tests {
         let _ = store::load_all_traces(&db);
         let req = json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
                           "params": { "name": "get_trace", "arguments": { "trace_id": "nope" } } });
-        let resp = handle_rpc(&req, &db).unwrap();
+        let resp = handle_rpc(&req, &db, "default").unwrap();
         assert_eq!(resp["result"]["isError"], true);
     }
 
@@ -292,14 +301,17 @@ mod tests {
         let bad = json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": { "name": "submit_feedback", "arguments": {
                 "trace_id": "t", "gate_id": "g", "verdict": "banana", "reporter": "ci" } } });
-        assert_eq!(handle_rpc(&bad, &db).unwrap()["result"]["isError"], true);
+        assert_eq!(
+            handle_rpc(&bad, &db, "default").unwrap()["result"]["isError"],
+            true
+        );
 
         // Valid shape but unknown trace → tool error.
         let unknown = json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/call",
             "params": { "name": "submit_feedback", "arguments": {
                 "trace_id": "missing", "gate_id": "g", "verdict": "pass", "reporter": "ci" } } });
         assert_eq!(
-            handle_rpc(&unknown, &db).unwrap()["result"]["isError"],
+            handle_rpc(&unknown, &db, "default").unwrap()["result"]["isError"],
             true
         );
     }
@@ -308,7 +320,7 @@ mod tests {
     fn unknown_tool_is_tool_error() {
         let req = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
                           "params": { "name": "no_such_tool", "arguments": {} } });
-        let resp = handle_rpc(&req, "unused.db").unwrap();
+        let resp = handle_rpc(&req, "unused.db", "default").unwrap();
         assert_eq!(resp["result"]["isError"], true);
     }
 }

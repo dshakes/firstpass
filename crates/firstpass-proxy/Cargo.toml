@@ -25,6 +25,7 @@ serde_json.workspace = true
 jiff.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+argon2.workspace = true
 axum.workspace = true
 tokio.workspace = true
 reqwest.workspace = true

@@ -9,7 +9,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use bytes::Bytes;
 use firstpass_core::features::{hour_bucket, token_bucket};
 use firstpass_core::hashchain::sha256_hex;
@@ -28,6 +28,7 @@ use crate::gate::{GateHealthRegistry, resolve_gates};
 use crate::provider::{Auth, ChatMessage, ModelRequest, ModelResponse, ProviderRegistry};
 use crate::router::{EnforceCtx, EngineOutcome, route_enforce};
 use crate::store;
+use crate::tenant_auth::{TenantId, auth_middleware};
 use crate::upstream::{forward_anthropic, forward_anthropic_streaming};
 use firstpass_core::Route;
 
@@ -110,10 +111,22 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub fn app(state: AppState) -> Result<Router, ProxyError> {
     crate::metrics::install()?;
     let max_concurrency = state.config.max_concurrency;
-    Ok(Router::new()
+
+    // Tenant-facing business routes: every one runs the auth middleware, which injects the resolved
+    // `TenantId` into request extensions (the authenticated tenant when `require_auth` is on, the
+    // static default when off — ADR 0004 §D1/§D2). Operator routes (`/healthz`, `/metrics`) are
+    // NOT tenant-facing and stay outside the auth layer.
+    let business = Router::new()
         .route("/v1/messages", post(messages))
         .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    Ok(Router::new()
+        .merge(business)
         .route("/healthz", get(healthz))
         .route("/metrics", get(crate::metrics::handler))
         // Explicit body-size ceiling (DoS/OOM guard) across every route.
@@ -176,7 +189,11 @@ struct FeedbackRequest {
 /// the outcome-feedback loop (SPEC §8.3.4). The verdict is stored in a **separate** table keyed
 /// by `trace_id`; the sealed, hashed trace is never mutated, so the audit chain stays verifiable.
 /// Returns `202 Accepted`. This is the signal that later calibrates the gates.
-async fn feedback(State(state): State<AppState>, body: Bytes) -> Response {
+async fn feedback(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant)): Extension<TenantId>,
+    body: Bytes,
+) -> Response {
     let req: FeedbackRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -204,9 +221,16 @@ async fn feedback(State(state): State<AppState>, body: Bytes) -> Response {
 
     let db = state.config.db_path.clone();
 
-    // Reject feedback for an unknown trace, so orphan outcomes can't accumulate.
-    let (db_check, tid_check) = (db.clone(), req.trace_id.clone());
-    match tokio::task::spawn_blocking(move || store::trace_exists(&db_check, &tid_check)).await {
+    // Reject feedback for an unknown trace, so orphan outcomes can't accumulate — AND deny
+    // cross-tenant feedback (IDOR, ADR 0004 §D4). `trace_exists` is scoped to the caller's tenant,
+    // so a trace owned by another tenant is indistinguishable from a missing one: both return `404`
+    // (never `403`, which would be an existence oracle).
+    let (db_check, tenant_check, tid_check) = (db.clone(), tenant.clone(), req.trace_id.clone());
+    match tokio::task::spawn_blocking(move || {
+        store::trace_exists(&db_check, &tenant_check, &tid_check)
+    })
+    .await
+    {
         Ok(Ok(true)) => {}
         Ok(Ok(false)) => {
             return ProxyError::NotFound(format!("unknown trace_id {:?}", req.trace_id))
@@ -261,7 +285,12 @@ const SUBAGENT_HEADER: &str = "x-firstpass-subagent";
 /// escalation engine (gate + escalate + failover); everything else is an **observe**
 /// passthrough (forward unchanged, trace asynchronously). Either way the trace is recorded
 /// off the response path.
-async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn messages(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant)): Extension<TenantId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let session_header = header_str(&headers, SESSION_HEADER);
 
     // Only parse the request for routing when a routing config is loaded — an observe-only
@@ -276,8 +305,16 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             // routes are tiny (a handful of strings).
             let route = route.clone();
             if enforce_can_handle(&features, &body) {
-                return handle_enforce(&state, &headers, &body, features, &route, session_header)
-                    .await;
+                return handle_enforce(
+                    &state,
+                    &headers,
+                    &body,
+                    features,
+                    &route,
+                    session_header,
+                    tenant,
+                )
+                .await;
             }
             // The request carries tools / images / tool-result blocks the text-only enforce path
             // can't round-trip faithfully yet. Rather than drop them and serve corrupted output,
@@ -287,7 +324,7 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             );
         }
     }
-    observe_passthrough(state, headers, body, session_header).await
+    observe_passthrough(state, headers, body, session_header, tenant).await
 }
 
 /// Whether the enforce path can faithfully handle this request. Enforce normalizes content to
@@ -370,6 +407,7 @@ async fn handle_enforce(
     features: Features,
     route: &Route,
     session_header: Option<String>,
+    tenant: String,
 ) -> Response {
     let Some(base_request) = parse_model_request(body) else {
         return ProxyError::BadRequest(
@@ -408,7 +446,9 @@ async fn handle_enforce(
         speculation,
         serve_threshold,
         features,
-        tenant_id: state.config.tenant_id.clone(),
+        // The tenant stamped on the enforce trace is the resolved identity from the auth layer
+        // (authenticated key, or the static default when auth is off) — never the request body.
+        tenant_id: tenant,
         session_id,
         prompt_hash: prompt_hash(&state.config.prompt_salt, body),
         api: "anthropic.messages".to_owned(),
@@ -505,10 +545,11 @@ async fn observe_passthrough(
     headers: HeaderMap,
     body: Bytes,
     session_header: Option<String>,
+    tenant: String,
 ) -> Response {
     // Streaming requests are relayed chunk-by-chunk rather than buffered (SPEC §7.4).
     if is_stream_request(&body) {
-        return observe_stream(state, headers, body, session_header).await;
+        return observe_stream(state, headers, body, session_header, tenant).await;
     }
     let start = Instant::now();
     let result = forward_anthropic(
@@ -531,11 +572,12 @@ async fn observe_passthrough(
                 Some(resp_body.clone()),
                 latency_ms,
                 session_header,
+                tenant,
             );
             (status, resp_headers, resp_body).into_response()
         }
         Err(err) => {
-            spawn_trace(&state, body, None, latency_ms, session_header);
+            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
             err.into_response()
         }
     }
@@ -554,6 +596,7 @@ async fn observe_stream(
     headers: HeaderMap,
     body: Bytes,
     session_header: Option<String>,
+    tenant: String,
 ) -> Response {
     let start = Instant::now();
     let result = forward_anthropic_streaming(
@@ -567,12 +610,12 @@ async fn observe_stream(
 
     match result {
         Ok((status, resp_headers, response)) => {
-            spawn_stream_trace(&state, body, latency_ms, session_header);
+            spawn_stream_trace(&state, body, latency_ms, session_header, tenant);
             let stream_body = Body::from_stream(response.bytes_stream());
             (status, resp_headers, stream_body).into_response()
         }
         Err(err) => {
-            spawn_trace(&state, body, None, latency_ms, session_header);
+            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
             err.into_response()
         }
     }
@@ -584,11 +627,15 @@ fn spawn_stream_trace(
     req_body: Bytes,
     latency_ms: u64,
     session_header: Option<String>,
+    tenant: String,
 ) {
     let config = state.config.clone();
     let traces = state.traces.clone();
     tokio::spawn(async move {
-        let trace = build_stream_trace(&config, &req_body, latency_ms, session_header.as_deref());
+        let mut trace =
+            build_stream_trace(&config, &req_body, latency_ms, session_header.as_deref());
+        // Stamp the resolved tenant identity — never the config default nor anything request-borne.
+        trace.tenant_id = tenant;
         offer_trace(&traces, trace);
     });
 }
@@ -603,11 +650,12 @@ fn spawn_trace(
     resp_body: Option<Bytes>,
     latency_ms: u64,
     session_header: Option<String>,
+    tenant: String,
 ) {
     let config = state.config.clone();
     let traces = state.traces.clone();
     tokio::spawn(async move {
-        let trace = match resp_body {
+        let mut trace = match resp_body {
             Some(resp) => build_trace(
                 &config,
                 &req_body,
@@ -617,6 +665,8 @@ fn spawn_trace(
             ),
             None => build_error_trace(&config, &req_body, latency_ms, session_header.as_deref()),
         };
+        // Stamp the resolved tenant identity — never the config default nor anything request-borne.
+        trace.tenant_id = tenant;
         offer_trace(&traces, trace);
     });
 }
@@ -1030,7 +1080,13 @@ mod tests {
                 Ok(model_resp("anthropic/claude-haiku-4-5", "hello")),
             )],
         );
-        let resp = messages(State(state), HeaderMap::new(), user_body()).await;
+        let resp = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            user_body(),
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let json = body_json(resp).await;
         assert_eq!(json["type"], "message");
@@ -1059,7 +1115,13 @@ mod tests {
                 ),
             ],
         );
-        let resp = messages(State(state), HeaderMap::new(), user_body()).await;
+        let resp = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            user_body(),
+        )
+        .await;
         let json = body_json(resp).await;
         assert_eq!(json["content"][0]["text"], "answer");
 
@@ -1079,7 +1141,13 @@ mod tests {
                 Err(ProviderError::Transport("down".into())),
             )],
         );
-        let resp = messages(State(state), HeaderMap::new(), user_body()).await;
+        let resp = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            user_body(),
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_GATEWAY);
         // A trace is still recorded for the failed decision.
         assert!(rx.try_recv().is_ok());
@@ -1103,7 +1171,13 @@ mod tests {
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
         };
-        let resp = messages(State(state), HeaderMap::new(), user_body()).await;
+        let resp = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            user_body(),
+        )
+        .await;
         // Observe path forwards upstream; the bogus host yields a gateway error, not our 200.
         assert_ne!(resp.status(), axum::http::StatusCode::OK);
     }
@@ -1173,7 +1247,13 @@ mod tests {
         // Plain text enforces: the mock serves 200.
         let plain =
             Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
-        let resp = messages(State(state.clone()), HeaderMap::new(), plain).await;
+        let resp = messages(
+            State(state.clone()),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            plain,
+        )
+        .await;
         assert_eq!(
             resp.status(),
             axum::http::StatusCode::OK,
@@ -1184,7 +1264,13 @@ mod tests {
         let tools = Bytes::from_static(
             br#"{"model":"m","tools":[{"name":"get_weather"}],"messages":[{"role":"user","content":"hi"}]}"#,
         );
-        let resp = messages(State(state.clone()), HeaderMap::new(), tools).await;
+        let resp = messages(
+            State(state.clone()),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            tools,
+        )
+        .await;
         assert_ne!(
             resp.status(),
             axum::http::StatusCode::OK,
@@ -1195,7 +1281,13 @@ mod tests {
         let toolres = Bytes::from_static(
             br#"{"model":"m","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"42"}]}]}"#,
         );
-        let resp = messages(State(state), HeaderMap::new(), toolres).await;
+        let resp = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            toolres,
+        )
+        .await;
         assert_ne!(
             resp.status(),
             axum::http::StatusCode::OK,
@@ -1262,11 +1354,16 @@ mod tests {
             })
             .to_string(),
         );
-        let resp = feedback(State(state), body).await;
+        let resp = feedback(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            body,
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
 
         // The deferred verdict is visible on the trace view...
-        let view = crate::store::load_trace_view(&db, &trace_id)
+        let view = crate::store::load_trace_view(&db, "default", &trace_id)
             .unwrap()
             .unwrap();
         assert_eq!(view.deferred.len(), 1);
@@ -1290,8 +1387,43 @@ mod tests {
             })
             .to_string(),
         );
-        let resp = feedback(State(state), body).await;
+        let resp = feedback(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            body,
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// D4 IDOR: a real trace owned by "default" cannot receive feedback from another tenant. The
+    /// caller gets a `404` (not `403`), so there is no existence oracle across the boundary.
+    #[tokio::test]
+    async fn feedback_across_tenants_is_404_not_403() {
+        let (state, db, trace_id) = feedback_state().await;
+        let body = Bytes::from(
+            serde_json::json!({
+                "trace_id": trace_id,
+                "gate_id": "tests",
+                "verdict": "pass",
+                "score": 1.0,
+                "reporter": "attacker",
+            })
+            .to_string(),
+        );
+        // Caller authenticated as a *different* tenant than the trace's owner.
+        let resp = feedback(
+            State(state),
+            Extension(TenantId("tenant-b".to_owned())),
+            body,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "cross-tenant feedback must look exactly like a missing trace"
+        );
         let _ = std::fs::remove_file(&db);
     }
 
@@ -1303,7 +1435,13 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(
-            feedback(State(state.clone()), bad_verdict).await.status(),
+            feedback(
+                State(state.clone()),
+                Extension(TenantId("default".to_owned())),
+                bad_verdict
+            )
+            .await
+            .status(),
             axum::http::StatusCode::BAD_REQUEST
         );
         let bad_score = Bytes::from(
@@ -1311,7 +1449,13 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(
-            feedback(State(state), bad_score).await.status(),
+            feedback(
+                State(state),
+                Extension(TenantId("default".to_owned())),
+                bad_score
+            )
+            .await
+            .status(),
             axum::http::StatusCode::BAD_REQUEST
         );
         let _ = std::fs::remove_file(&db);
@@ -1360,5 +1504,93 @@ mod tests {
             body.contains("firstpass_served_total"),
             "metrics body missing served counter: {body}"
         );
+    }
+
+    // --- Multi-tenant auth (ADR 0004 §D1) integration tests, driven through the real router ---
+
+    /// Build an `AppState` whose config toggles auth and (optionally) carries a tenant-keys JSON.
+    fn auth_state(require_auth: bool, keys_json: Option<String>) -> AppState {
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_REQUIRE_AUTH" => require_auth.then(|| "true".to_owned()),
+            "FIRSTPASS_TENANT_KEYS_JSON" => keys_json.clone(),
+            _ => None,
+        })
+        .unwrap();
+        let (traces, _rx) = mpsc::channel(64);
+        // Deliberately leak the receiver for the test's lifetime so the sender never reports the
+        // channel closed (the auth tests exercise `/v1/capabilities`, which enqueues no trace).
+        std::mem::forget(_rx);
+        let providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(providers),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            traces,
+        }
+    }
+
+    fn cap_request(auth_header: Option<&str>) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/capabilities");
+        if let Some(h) = auth_header {
+            b = b.header("authorization", h);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn auth_off_allows_unauthenticated_request() {
+        use tower::ServiceExt;
+        let router = app(auth_state(false, None)).expect("router");
+        let resp = router.oneshot(cap_request(None)).await.unwrap();
+        // Default-off: no key required, request proceeds to the handler.
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_on_missing_key_is_401_opaque() {
+        use tower::ServiceExt;
+        let hash = crate::tenant_auth::TenantKeys::hash_key("key-a").unwrap();
+        let keys = format!("{{\"tenant-a\": {hash:?}}}");
+        let router = app(auth_state(true, Some(keys))).expect("router");
+
+        let resp = router.oneshot(cap_request(None)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"]["type"], "unauthorized");
+        // Opaque: the body must not name tenants or hint which key would work.
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(!msg.contains("tenant"), "no tenant oracle in body: {msg}");
+    }
+
+    #[tokio::test]
+    async fn auth_on_invalid_key_is_401() {
+        use tower::ServiceExt;
+        let hash = crate::tenant_auth::TenantKeys::hash_key("key-a").unwrap();
+        let keys = format!("{{\"tenant-a\": {hash:?}}}");
+        let router = app(auth_state(true, Some(keys))).expect("router");
+
+        let resp = router
+            .oneshot(cap_request(Some("Bearer wrong-key")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_on_valid_key_proceeds() {
+        use tower::ServiceExt;
+        let hash = crate::tenant_auth::TenantKeys::hash_key("key-a").unwrap();
+        let keys = format!("{{\"tenant-a\": {hash:?}}}");
+        let router = app(auth_state(true, Some(keys))).expect("router");
+
+        let resp = router
+            .oneshot(cap_request(Some("Bearer key-a")))
+            .await
+            .unwrap();
+        // A valid key clears the middleware and reaches the handler.
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 }

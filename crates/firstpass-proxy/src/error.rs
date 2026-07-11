@@ -33,6 +33,11 @@ pub enum ProxyError {
     #[error("{0}")]
     NotFound(String),
 
+    /// Authentication failed: a missing or invalid tenant API key when `require_auth` is on
+    /// (ADR 0004 §D1). The body is intentionally opaque — no "unknown tenant" oracle.
+    #[error("unauthorized")]
+    Unauthorized,
+
     /// An internal failure (e.g. the trace store errored). Never leaks internals to the caller.
     #[error("internal error")]
     Internal(String),
@@ -45,6 +50,7 @@ impl ProxyError {
             ProxyError::BadRequestBody | ProxyError::BadRequest(_) => "bad_request",
             ProxyError::Engine(_) => "engine_error",
             ProxyError::NotFound(_) => "not_found",
+            ProxyError::Unauthorized => "unauthorized",
             ProxyError::Internal(_) => "internal_error",
         }
     }
@@ -54,6 +60,7 @@ impl ProxyError {
             ProxyError::Upstream(_) | ProxyError::Engine(_) => StatusCode::BAD_GATEWAY,
             ProxyError::BadRequestBody | ProxyError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::NotFound(_) => StatusCode::NOT_FOUND,
+            ProxyError::Unauthorized => StatusCode::UNAUTHORIZED,
             ProxyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -68,6 +75,7 @@ impl ProxyError {
             ProxyError::BadRequestBody => "failed to read request body".to_owned(),
             ProxyError::Upstream(_) => "upstream request failed".to_owned(),
             ProxyError::Engine(_) => "no rung could serve a valid response".to_owned(),
+            ProxyError::Unauthorized => "unauthorized".to_owned(),
             ProxyError::Internal(_) => "internal error".to_owned(),
         }
     }

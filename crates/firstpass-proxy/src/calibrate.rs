@@ -119,11 +119,15 @@ fn trace_pair(trace: &Trace, deferred: &[DeferredVerdict]) -> Option<(f64, bool)
 /// an error.
 pub fn calibrate_from_store(
     db_path: impl AsRef<Path>,
+    tenant: &str,
     alpha: f64,
     delta: f64,
     min_n: usize,
 ) -> Result<CalibrationReport, StoreError> {
-    let traces = store::load_all_traces(&db_path).unwrap_or_default();
+    // Tenant-scoped (ADR 0004 §D3): a tenant only ever calibrates against its own feedback. The
+    // per-trace `load_deferred` below is safe unscoped because every `trace` here already belongs
+    // to `tenant`.
+    let traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
     let mut pairs = Vec::with_capacity(traces.len());
     for trace in &traces {
         let deferred = store::load_deferred(&db_path, &trace.trace_id.to_string())?;
@@ -297,7 +301,7 @@ mod tests {
         }
 
         // alpha=0.2 for the same Hoeffding-slack reason as the calibrate_pairs test above.
-        let report = calibrate_from_store(&db_path, 0.2, 0.1, 30).unwrap();
+        let report = calibrate_from_store(&db_path, "tenant-a", 0.2, 0.1, 30).unwrap();
         assert_eq!(
             report.n_pairs, 80,
             "only the 80 traces with deferred feedback pair up"
@@ -307,6 +311,13 @@ mod tests {
             report.empirical_served_failure <= 0.2 + 1e-9,
             "empirical served-failure {} must respect alpha on clean synthetic data",
             report.empirical_served_failure
+        );
+
+        // D7 isolation: a different tenant sees none of tenant-a's pairs — calibration is empty.
+        let other = calibrate_from_store(&db_path, "tenant-b", 0.2, 0.1, 30).unwrap();
+        assert_eq!(
+            other.n_pairs, 0,
+            "tenant-b must not see tenant-a's feedback"
         );
 
         let _ = std::fs::remove_file(&db_path);
