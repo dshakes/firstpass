@@ -1586,8 +1586,9 @@ mod tests {
         let keys = format!("{{\"tenant-a\": {hash:?}}}");
         let router = app(auth_state(true, Some(keys))).expect("router");
 
+        // Keyed format: `<tenant_id>.<secret>`.
         let resp = router
-            .oneshot(cap_request(Some("Bearer key-a")))
+            .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
             .await
             .unwrap();
         // A valid key clears the middleware and reaches the handler.
