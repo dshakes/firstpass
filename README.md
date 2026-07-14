@@ -61,7 +61,7 @@ To turn on cheapest-first routing + gating, copy [`firstpass.example.toml`](firs
 | **pip** | `pip install firstpass` |
 | **uvx** | `uvx firstpass` |
 | **Homebrew** | `brew install dshakes/tap/firstpass` |
-| **npm** | `npx @firstpass/firstpass` |
+| **npm** | `npx @dshakesnotbot/firstpass` |
 | **curl \| sh** | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh \| sh` |
 | **PowerShell** | `irm https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.ps1 \| iex` |
 | **crates.io** | `cargo install firstpass-proxy` |
@@ -83,7 +83,7 @@ Or upgrade through whichever channel you installed from:
 | --- | --- |
 | Homebrew | `brew upgrade firstpass` |
 | pip / uvx | `pip install -U firstpass` · `uvx firstpass@latest` |
-| npm | `npm update -g @firstpass/firstpass` |
+| npm | `npm update -g @dshakesnotbot/firstpass` |
 | crates.io | `cargo install firstpass-proxy` (reinstalls latest) |
 | Docker | `docker pull ghcr.io/dshakes/firstpass:latest` |
 
