@@ -28,12 +28,25 @@ jobs:
             echo "::notice::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish."
             exit 0
           fi
-          # core first; --dry-run-tolerant of an already-published version
-          cargo publish -p firstpass-core || echo "firstpass-core: already published or unchanged"
+          # Publish one crate; tolerate ONLY "this exact version already exists"
+          # (idempotent re-run). Any other error — auth, unverified email, name
+          # taken — fails the job loudly instead of being masked.
+          publish_one () {
+            local pkg="$1" out
+            if out=$(cargo publish -p "$pkg" 2>&1); then
+              echo "$out"; echo "::notice::$pkg published"; return 0
+            fi
+            echo "$out"
+            if echo "$out" | grep -qiE "already (uploaded|exists)|is already uploaded"; then
+              echo "::notice::$pkg: this version already on crates.io — tolerated"; return 0
+            fi
+            echo "::error::$pkg publish failed (see log above)"; return 1
+          }
+          publish_one firstpass-core
           # wait for the index to serve core before proxy's verify build resolves it
           # ponytail: fixed backoff loop; crates.io index propagation is usually <1min
           for i in $(seq 1 20); do
             if cargo publish -p firstpass-proxy --dry-run >/dev/null 2>&1; then break; fi
             echo "waiting for firstpass-core on the index ($i)…"; sleep 15
           done
-          cargo publish -p firstpass-proxy || echo "firstpass-proxy: already published or unchanged"
+          publish_one firstpass-proxy
