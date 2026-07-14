@@ -11,15 +11,19 @@ ci = "github"
 # (download the binary from the GitHub Release, no external account). homebrew
 # and npm additionally auto-publish to a tap / the npm registry at release time
 # — that push is gated on operator secrets that do NOT exist yet:
-#   homebrew → a tap repo (dshakes/homebrew-firstpass) + HOMEBREW_TAP_TOKEN secret
+#   homebrew → the dshakes/homebrew-tap repo (exists) + HOMEBREW_TAP_TOKEN secret
 #   npm      → an owned @firstpass scope + NPM_TOKEN secret
 # The formula/package are still generated as release artifacts regardless; only
 # the registry push needs the secrets. See docs/runbooks/release.md.
 installers = ["shell", "powershell", "homebrew", "npm"]
-# Homebrew tap repo the formula is pushed to (must be created before a release).
-tap = "dshakes/homebrew-firstpass"
+# Homebrew tap repo the formula is pushed to (shared dshakes tap; already exists).
+# Users install via `brew install dshakes/tap/firstpass`.
+tap = "dshakes/homebrew-tap"
 # npm scope for the installer package (must be owned before `npm publish`).
 npm-scope = "@firstpass"
 publish-jobs = ["homebrew", "npm"]
+# Ship the self-updater so installed users can run `firstpass-proxy-update` (and
+# `firstpass-update`) to pull the latest release — the built-in "upgrade" path.
+install-updater = true
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

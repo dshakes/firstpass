@@ -1,9 +1,15 @@
 name: python-wheels
 # Build Firstpass as Python wheels so `pip install firstpass` and `uvx firstpass`
-# work without a Rust toolchain — the same maturin `bindings = "bin"` model ruff
-# and uv use. Wheels are built from crates/firstpass-proxy/pyproject.toml on every
-# v* tag. Publishing to PyPI runs ONLY when the PYPI_API_TOKEN secret exists, so a
-# tag still produces wheel artifacts before the token is set (no failing job).
+# work without a Rust toolchain — the maturin `bindings = "bin"` model ruff/uv use.
+# Wheels + sdist build on every v* tag. Publishing to PyPI uses trusted publishing
+# (OIDC, no long-lived token) and is gated on the repo variable PUBLISH_TO_PYPI —
+# mirrors the distil release setup. Until that var is 'true' a tag still produces
+# wheel artifacts; only the registry push is skipped.
+#
+# One-time PyPI setup (pypi.org → Publishing → Add a pending publisher):
+#   Project: firstpass · Owner: dshakes · Repo: firstpass
+#   Workflow: python-wheels.yml · Environment: pypi
+# then set repo variable PUBLISH_TO_PYPI = true.
 on:
   push:
     tags: ["v*"]
@@ -39,22 +45,40 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: crates/firstpass-proxy/dist/*.whl
 
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/firstpass-proxy
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: crates/firstpass-proxy/dist/*.tar.gz
+
   publish:
     name: publish to PyPI
-    needs: wheels
+    needs: [wheels, sdist]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    env:
-      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+    # Trusted publishing; opt-in via repo variable once the PyPI publisher exists.
+    if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_TO_PYPI == 'true' }}
+    environment:
+      name: pypi
+      url: https://pypi.org/p/firstpass
+    permissions:
+      id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
-      - uses: astral-sh/setup-uv@v5
-      - name: Publish (skipped until PYPI_API_TOKEN is set)
-        if: ${{ env.PYPI_API_TOKEN != '' }}
-        run: uv publish dist/*.whl
-        env:
-          UV_PUBLISH_TOKEN: ${{ env.PYPI_API_TOKEN }}
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # tolerate re-running a release for a version already on PyPI
+          skip-existing: true

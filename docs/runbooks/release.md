@@ -35,10 +35,13 @@ only the push is skipped. Set the secret to light the channel up.
 | --- | --- | --- |
 | Prebuilt binaries, `curl \| sh`, PowerShell | cargo-dist (`release.yml`) | nothing — attaches to the GitHub Release |
 | Docker / GHCR | `docker.yml` | nothing — built-in `GITHUB_TOKEN` |
-| Homebrew | cargo-dist `publish-homebrew-formula` | a tap repo (`dshakes/homebrew-firstpass`) **+ `HOMEBREW_TAP_TOKEN`** |
+| Homebrew | cargo-dist `publish-homebrew-formula` → `dshakes/homebrew-tap` | **`HOMEBREW_TAP_TOKEN`** (tap repo already exists) |
 | npm | cargo-dist `publish-npm` | an owned `@firstpass` scope **+ `NPM_TOKEN`** |
-| pip / uvx (wheels) | maturin (`python-wheels.yml`) | **`PYPI_API_TOKEN`** |
-| crates.io (`cargo install firstpass-proxy`) | `cargo publish` (manual) | a crates.io token; publish `firstpass-core` **before** `firstpass-proxy` (path-dep order) |
+| pip / uvx (wheels) | maturin (`python-wheels.yml`), trusted publishing | repo var **`PUBLISH_TO_PYPI=true`** + a PyPI pending publisher (no token) |
+| crates.io (`cargo install firstpass-proxy`) | `crates-io.yml` (core→proxy) | repo var **`PUBLISH_TO_CRATES=true`** + **`CARGO_REGISTRY_TOKEN`** |
+
+Installed binaries also carry a self-updater (`install-updater = true`): users
+run `firstpass-proxy-update` to pull the latest release in place.
 
 `cargo install --git` and Docker `:latest` (on `main`) already work with no
 release. The `dist plan` / build steps below cover the cargo-dist channels; the
@@ -134,15 +137,19 @@ their publish jobs are in `release.yml`; pip/uvx wheels build via
 `python-wheels.yml`. Each is a no-op until its secret exists (see *Distribution
 channels & required secrets* above). To light one up:
 
-- **Homebrew:** create the tap repo `dshakes/homebrew-firstpass`, add a
-  `HOMEBREW_TAP_TOKEN` secret with push access to it. Next tag publishes the
-  formula; users then `brew install dshakes/firstpass/firstpass`.
+- **Homebrew:** the tap repo `dshakes/homebrew-tap` already exists (shared with
+  distil/compass). Add a `HOMEBREW_TAP_TOKEN` secret with push access to it;
+  the next tag pushes `Formula/firstpass.rb` and users `brew install
+  dshakes/tap/firstpass`.
 - **npm:** own the `@firstpass` scope on npmjs, add an `NPM_TOKEN` secret.
-- **pip / uvx:** add a `PYPI_API_TOKEN` secret; the tag build publishes wheels
-  for all five target platforms, then `pip install firstpass` / `uvx firstpass`.
-- **crates.io:** manual and ordered — `cargo publish -p firstpass-core` first
-  (a `firstpass-core` version must exist on crates.io before `firstpass-proxy`
-  resolves), then `cargo publish -p firstpass-proxy`. `firstpass-bench` is
+- **pip / uvx:** register a PyPI trusted publisher (project `firstpass`, repo
+  `dshakes/firstpass`, workflow `python-wheels.yml`, environment `pypi`), then
+  set repo variable `PUBLISH_TO_PYPI=true`. No long-lived token — OIDC only.
+  The tag build publishes wheels for all five targets + sdist, then `pip install
+  firstpass` / `uvx firstpass`.
+- **crates.io:** set repo variable `PUBLISH_TO_CRATES=true` and a
+  `CARGO_REGISTRY_TOKEN` secret. `crates-io.yml` publishes `firstpass-core`
+  first, waits for the index, then `firstpass-proxy`. `firstpass-bench` is
   `publish = false`.
 
 ## Rollback: pin to a prior version

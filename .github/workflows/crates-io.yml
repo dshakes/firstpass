@@ -1,0 +1,39 @@
+name: crates-io
+# Publish the library + proxy crates to crates.io on a v* tag, so
+# `cargo install firstpass-proxy` works from the registry. Opt-in via the repo
+# variable PUBLISH_TO_CRATES (mirrors the PUBLISH_TO_PYPI gate) and gated on the
+# CARGO_REGISTRY_TOKEN secret. firstpass-bench is publish=false and skipped.
+# Order matters: firstpass-core must land before firstpass-proxy resolves it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_TO_CRATES == 'true' }}
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish firstpass-core, then firstpass-proxy
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish."
+            exit 0
+          fi
+          # core first; --dry-run-tolerant of an already-published version
+          cargo publish -p firstpass-core || echo "firstpass-core: already published or unchanged"
+          # wait for the index to serve core before proxy's verify build resolves it
+          # ponytail: fixed backoff loop; crates.io index propagation is usually <1min
+          for i in $(seq 1 20); do
+            if cargo publish -p firstpass-proxy --dry-run >/dev/null 2>&1; then break; fi
+            echo "waiting for firstpass-core on the index ($i)…"; sleep 15
+          done
+          cargo publish -p firstpass-proxy || echo "firstpass-proxy: already published or unchanged"
