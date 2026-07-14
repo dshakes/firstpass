@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+documentation = "https://docs.rs/firstpass-core"
+keywords = ["llm", "routing", "audit", "verification"]
+categories = ["data-structures"]
 
 [dependencies]
 serde.workspace = true
