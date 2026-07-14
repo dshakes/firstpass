@@ -102,11 +102,15 @@
 
     <h2 id="install">Install</h2>
     <table class="t"><thead><tr><th>Method</th><th>Command</th></tr></thead><tbody>
+      <tr><td>pip / uvx</td><td><code>uvx firstpass</code> · <code>pip install firstpass</code></td></tr>
+      <tr><td>Homebrew</td><td><code>brew install dshakes/tap/firstpass</code></td></tr>
+      <tr><td>npm</td><td><code>npx @firstpass/firstpass</code></td></tr>
       <tr><td>curl | sh</td><td><code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh</code></td></tr>
       <tr><td>Docker</td><td><code>docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest</code></td></tr>
       <tr><td>Cargo</td><td><code>cargo install --git https://github.com/dshakes/firstpass firstpass-proxy</code></td></tr>
+      <tr><td>crates.io</td><td><code>cargo install firstpass-proxy</code></td></tr>
     </tbody></table>
-    <div class="callout"><b>Availability:</b> <code>cargo install --git</code> and the Docker image work today. The <code>curl | sh</code> installer and prebuilt binaries publish with the first tagged release; Homebrew follows once a formula tap is set up.</div>
+    <div class="callout"><b>Availability:</b> <code>cargo install --git</code> and the Docker image work today. Every other channel — pip · uvx · Homebrew · npm · crates.io · <code>curl | sh</code> · prebuilt binaries — is wired end-to-end and lights up on the first tagged release (each registry push is gated on an operator secret). Upgrade in place with <code>firstpass-proxy-update</code>, or via your channel (<code>brew upgrade</code>, <code>pip install -U firstpass</code>, …).</div>
 
     <h2 id="quickstart">Quickstart</h2>
     <p>See the whole loop in ~10 seconds — no API keys. The demo stands up a mock upstream and drives one real decision, escalation and all.</p>

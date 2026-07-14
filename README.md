@@ -60,7 +60,7 @@ To turn on cheapest-first routing + gating, copy [`firstpass.example.toml`](firs
 | --- | --- |
 | **pip** | `pip install firstpass` |
 | **uvx** | `uvx firstpass` |
-| **Homebrew** | `brew install dshakes/firstpass/firstpass` |
+| **Homebrew** | `brew install dshakes/tap/firstpass` |
 | **npm** | `npx @firstpass/firstpass` |
 | **curl \| sh** | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh \| sh` |
 | **PowerShell** | `irm https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.ps1 \| iex` |
@@ -68,6 +68,24 @@ To turn on cheapest-first routing + gating, copy [`firstpass.example.toml`](firs
 | **Prebuilt binary** | macOS · Linux · Windows, all checksummed, from the Release page |
 
 > Prebuilt binaries and the `curl \| sh` / PowerShell installers are produced by [cargo-dist](https://opensource.axo.dev/cargo-dist/); the pip/uvx wheels by [maturin](https://www.maturin.rs/) (the same model `ruff` and `uv` ship with). The container image publishes to [GHCR](https://github.com/dshakes/firstpass/pkgs/container/firstpass) on every push to `main`. **Publishing gates that need an operator secret (not code):** a Homebrew **tap repo + `HOMEBREW_TAP_TOKEN`**, an **`NPM_TOKEN`**, a **`PYPI_API_TOKEN`**, and a **crates.io token** — until each is set, that channel's build still runs but skips the registry push. See [`docs/runbooks/release.md`](docs/runbooks/release.md).
+
+### Upgrade
+
+Binaries from `curl | sh` / PowerShell ship a self-updater (via cargo-dist):
+
+```bash
+firstpass-proxy-update      # pulls the latest release in place
+```
+
+Or upgrade through whichever channel you installed from:
+
+| Installed via | Upgrade |
+| --- | --- |
+| Homebrew | `brew upgrade firstpass` |
+| pip / uvx | `pip install -U firstpass` · `uvx firstpass@latest` |
+| npm | `npm update -g @firstpass/firstpass` |
+| crates.io | `cargo install firstpass-proxy` (reinstalls latest) |
+| Docker | `docker pull ghcr.io/dshakes/firstpass:latest` |
 
 ## Prediction vs. proof
 

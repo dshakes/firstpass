@@ -237,15 +237,23 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
 
   <h3 style="margin:40px 0 0;font-size:16px;font-weight:600;color:var(--mut)">Or install the proxy</h3>
   <div class="inst" id="inst">
-    <div class="tab on" data-t="curl"><span class="i">⬇</span> curl | sh</div>
+    <div class="tab on" data-t="pip"><span class="i">🐍</span> pip / uvx</div>
+    <div class="tab" data-t="brew"><span class="i">🍺</span> Homebrew</div>
+    <div class="tab" data-t="npm"><span class="i">📦</span> npm</div>
+    <div class="tab" data-t="curl"><span class="i">⬇</span> curl | sh</div>
     <div class="tab" data-t="docker"><span class="i">🐳</span> Docker</div>
     <div class="tab" data-t="cargo"><span class="i">🦀</span> Cargo</div>
-    <div class="panel on" data-p="curl"><div class="code"><button class="copy" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh">copy</button><pre style="margin:0"><span class="cy">curl</span> --proto '=https' --tlsv1.2 -LsSf \
+    <div class="panel on" data-p="pip"><div class="code"><button class="copy" data-copy="uvx firstpass">copy</button><pre style="margin:0"><span class="cy">uvx</span> firstpass                 <span class="c"># run without installing</span>
+<span class="cy">pip</span> install firstpass         <span class="c"># or install it</span></pre></div></div>
+    <div class="panel" data-p="brew"><div class="code"><button class="copy" data-copy="brew install dshakes/tap/firstpass">copy</button><pre style="margin:0"><span class="cy">brew</span> install dshakes/tap/firstpass</pre></div></div>
+    <div class="panel" data-p="npm"><div class="code"><button class="copy" data-copy="npx @firstpass/firstpass">copy</button><pre style="margin:0"><span class="cy">npx</span> @firstpass/firstpass</pre></div></div>
+    <div class="panel" data-p="curl"><div class="code"><button class="copy" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh">copy</button><pre style="margin:0"><span class="cy">curl</span> --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh <span class="a">|</span> sh</pre></div></div>
     <div class="panel" data-p="docker"><div class="code"><button class="copy" data-copy="docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest">copy</button><pre style="margin:0"><span class="cy">docker</span> run -p 8080:8080 <span class="a">-e</span> FIRSTPASS_BIND=0.0.0.0:8080 \
   ghcr.io/dshakes/firstpass:latest</pre></div></div>
-    <div class="panel" data-p="cargo"><div class="code"><button class="copy" data-copy="cargo install --git https://github.com/dshakes/firstpass firstpass-proxy">copy</button><pre style="margin:0"><span class="cy">cargo</span> install --git https://github.com/dshakes/firstpass firstpass-proxy</pre></div><p style="color:var(--mut2);font-size:12.5px;margin:12px 0 0">Works today — builds from source.</p></div>
+    <div class="panel" data-p="cargo"><div class="code"><button class="copy" data-copy="cargo install --git https://github.com/dshakes/firstpass firstpass-proxy">copy</button><pre style="margin:0"><span class="cy">cargo</span> install --git https://github.com/dshakes/firstpass firstpass-proxy</pre></div></div>
   </div>
+  <p style="color:var(--mut2);font-size:12.5px;margin:12px 0 0"><code>cargo install --git</code> and Docker work today; pip · uvx · Homebrew · npm · curl · binaries light up on the first tagged release. Upgrade in place with <code>firstpass-proxy-update</code>.</p>
 
   <h3 style="margin:40px 0 14px;font-size:16px;font-weight:600;color:var(--mut)">Then point your agent at it</h3>
   <div class="code"><button class="copy" data-copy="export ANTHROPIC_BASE_URL=http://127.0.0.1:8080">copy</button><pre style="margin:0">firstpass-proxy                                    <span class="c"># observe mode — logs, changes nothing</span>
@@ -265,7 +273,7 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Fail-closed sandbox + coding-with-tests conformal</h4><p>gVisor-first, network-isolated code execution; a continuous gate with real error — the conformal guarantee stops being degenerate.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Learning loop</h4><p><code>firstpass calibrate</code> recalibrates the serving threshold from real deferred feedback.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Prod hardening + GA readiness</h4><p>Timeouts, load-shedding, opaque errors, body caps — ADR 0003 gap analysis.</p></div>
-    <div class="step next"><div class="dot"></div><h4><span>→</span> Packaging</h4><p>Published binaries + Homebrew tap — the cargo-dist release workflow hasn't been run yet.</p></div>
+    <div class="step next"><div class="dot"></div><h4><span>→</span> Packaging</h4><p>All channels wired and locally verified — pip · uvx · Homebrew · npm · crates.io · binaries · self-updater. One tagged release away (no <code>v*</code> tag pushed yet).</p></div>
   </div>
 </div></section>
 </main>
