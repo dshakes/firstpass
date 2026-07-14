@@ -26,8 +26,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Both macOS wheels build on the arm64 runner (x86_64 via cross) —
+          # the macos-13 Intel runner is being retired and queues indefinitely.
           - { runner: macos-latest,   target: aarch64-apple-darwin }
-          - { runner: macos-13,       target: x86_64-apple-darwin }
+          - { runner: macos-latest,   target: x86_64-apple-darwin }
           - { runner: ubuntu-22.04,   target: x86_64-unknown-linux-gnu }
           - { runner: ubuntu-22.04,   target: aarch64-unknown-linux-gnu }
           - { runner: windows-latest, target: x86_64-pc-windows-msvc }
@@ -40,6 +42,10 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
+          # ring's aarch64 asm needs __ARM_ARCH defined or the manylinux cross-gcc
+          # errors ("ARM assembler must define __ARM_ARCH"). Target-scoped, so it
+          # only affects the aarch64-linux build.
+          before-script-linux: export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.target }}
