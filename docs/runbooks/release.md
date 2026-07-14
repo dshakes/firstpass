@@ -24,11 +24,25 @@ without deciding to.
   human-gated step — see above).
 - A clean `main` at the commit you intend to release: `git status` shows
   nothing pending, and CI (`ci.yml`, `audit.yml`) is green on that commit.
-- **Homebrew is not part of this release yet.** `dist-workspace.toml` deferred
-  it explicitly: *"Homebrew is deferred until a tap repo + HOMEBREW_TAP_TOKEN
-  secret exist — re-add `homebrew` + `tap`/`publish-jobs` then."* Today's
-  `installers = ["shell", "powershell"]` — a release ships `curl | sh` /
-  PowerShell installer scripts and raw platform archives, not a `brew install`.
+## Distribution channels & required secrets
+
+A tagged release drives **eight** channels. They are all wired and locally
+verified; each registry push is gated on an operator secret, and the build for
+that channel still runs (producing artifacts) even when the secret is absent —
+only the push is skipped. Set the secret to light the channel up.
+
+| Channel | Built by | Push gated on |
+| --- | --- | --- |
+| Prebuilt binaries, `curl \| sh`, PowerShell | cargo-dist (`release.yml`) | nothing — attaches to the GitHub Release |
+| Docker / GHCR | `docker.yml` | nothing — built-in `GITHUB_TOKEN` |
+| Homebrew | cargo-dist `publish-homebrew-formula` | a tap repo (`dshakes/homebrew-firstpass`) **+ `HOMEBREW_TAP_TOKEN`** |
+| npm | cargo-dist `publish-npm` | an owned `@firstpass` scope **+ `NPM_TOKEN`** |
+| pip / uvx (wheels) | maturin (`python-wheels.yml`) | **`PYPI_API_TOKEN`** |
+| crates.io (`cargo install firstpass-proxy`) | `cargo publish` (manual) | a crates.io token; publish `firstpass-core` **before** `firstpass-proxy` (path-dep order) |
+
+`cargo install --git` and Docker `:latest` (on `main`) already work with no
+release. The `dist plan` / build steps below cover the cargo-dist channels; the
+maturin wheels build in parallel off the same `v*` tag.
 
 ## 1. Confirm the plan
 
@@ -113,13 +127,23 @@ shasum -a 256 -c <artifact-name>.sha256
 binary — `firstpass doctor` against a known-good config — before considering
 the release verified, not just downloaded.
 
-## 7. Homebrew tap
+## 7. Registry channels (Homebrew, npm, pip, crates.io)
 
-Not part of this release process today (see Prerequisites). When a tap repo
-and `HOMEBREW_TAP_TOKEN` secret exist, re-add `"homebrew"` to `installers` in
-`dist-workspace.toml` and the corresponding `tap`/`publish-jobs` config, run
-`dist init` to regenerate `release.yml`, and this section gets rewritten to
-cover `brew install <org>/firstpass/firstpass` and the tap-repo update step.
+`homebrew` and `npm` are already in `installers` (`dist-workspace.toml`) and
+their publish jobs are in `release.yml`; pip/uvx wheels build via
+`python-wheels.yml`. Each is a no-op until its secret exists (see *Distribution
+channels & required secrets* above). To light one up:
+
+- **Homebrew:** create the tap repo `dshakes/homebrew-firstpass`, add a
+  `HOMEBREW_TAP_TOKEN` secret with push access to it. Next tag publishes the
+  formula; users then `brew install dshakes/firstpass/firstpass`.
+- **npm:** own the `@firstpass` scope on npmjs, add an `NPM_TOKEN` secret.
+- **pip / uvx:** add a `PYPI_API_TOKEN` secret; the tag build publishes wheels
+  for all five target platforms, then `pip install firstpass` / `uvx firstpass`.
+- **crates.io:** manual and ordered — `cargo publish -p firstpass-core` first
+  (a `firstpass-core` version must exist on crates.io before `firstpass-proxy`
+  resolves), then `cargo publish -p firstpass-proxy`. `firstpass-bench` is
+  `publish = false`.
 
 ## Rollback: pin to a prior version
 

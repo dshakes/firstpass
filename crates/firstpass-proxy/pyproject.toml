@@ -1,0 +1,31 @@
+# Ship the Firstpass Rust binaries as a Python wheel — the same pattern ruff and
+# uv use (maturin `bindings = "bin"`). Enables `pip install firstpass` and
+# `uvx firstpass` without a Rust toolchain. Wheels are built per-platform in CI
+# (.github/workflows/python-wheels.yml); publishing to PyPI is gated on a
+# PYPI token, so this is "one token + tag away", not live.
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "firstpass"
+description = "Drop-in, Anthropic-compatible LLM proxy that routes each request to the cheapest model that provably passes a quality gate, escalates on failure, and records a tamper-evident audit trace."
+requires-python = ">=3.8"
+license = "Apache-2.0"
+keywords = ["llm", "proxy", "routing", "anthropic", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Build Tools",
+    "Programming Language :: Rust",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://dshakes.github.io/firstpass"
+Repository = "https://github.com/dshakes/firstpass"
+
+[tool.maturin]
+# Package the crate's [[bin]] targets (firstpass + firstpass-proxy) as scripts.
+bindings = "bin"
+manifest-path = "Cargo.toml"

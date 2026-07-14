@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 homepage = "https://dshakes.github.io/firstpass"
 authors.workspace = true
+documentation = "https://docs.rs/firstpass-proxy"
+keywords = ["llm", "proxy", "routing", "anthropic", "ai"]
+categories = ["web-programming::http-server", "command-line-utilities"]
 
 [[bin]]
 name = "firstpass-proxy"

@@ -47,13 +47,27 @@ To turn on cheapest-first routing + gating, copy [`firstpass.example.toml`](firs
 
 ## Install
 
+**Works today** (no release required):
+
 | Method | Command |
 | --- | --- |
-| **curl \| sh** | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh \| sh` |
-| **Docker** | `docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest` |
 | **From source** | `cargo install --git https://github.com/dshakes/firstpass firstpass-proxy` |
+| **Docker** | `docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest` |
 
-> The `curl \| sh` installer and prebuilt binaries (macOS · Linux · Windows, all checksummed) are produced by [cargo-dist](https://opensource.axo.dev/cargo-dist/) and attach to each [GitHub Release](https://github.com/dshakes/firstpass/releases). The container image is published to [GHCR](https://github.com/dshakes/firstpass/pkgs/container/firstpass) on every push to `main`. Homebrew is planned (needs a formula tap). `cargo install --git` and Docker work today.
+**Lit up by the first tagged release** — every format below is wired end-to-end (verified locally) and attaches to the [GitHub Release](https://github.com/dshakes/firstpass/releases) / its registry the moment a `v*` tag is pushed:
+
+| Method | Command |
+| --- | --- |
+| **pip** | `pip install firstpass` |
+| **uvx** | `uvx firstpass` |
+| **Homebrew** | `brew install dshakes/firstpass/firstpass` |
+| **npm** | `npx @firstpass/firstpass` |
+| **curl \| sh** | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh \| sh` |
+| **PowerShell** | `irm https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.ps1 \| iex` |
+| **crates.io** | `cargo install firstpass-proxy` |
+| **Prebuilt binary** | macOS · Linux · Windows, all checksummed, from the Release page |
+
+> Prebuilt binaries and the `curl \| sh` / PowerShell installers are produced by [cargo-dist](https://opensource.axo.dev/cargo-dist/); the pip/uvx wheels by [maturin](https://www.maturin.rs/) (the same model `ruff` and `uv` ship with). The container image publishes to [GHCR](https://github.com/dshakes/firstpass/pkgs/container/firstpass) on every push to `main`. **Publishing gates that need an operator secret (not code):** a Homebrew **tap repo + `HOMEBREW_TAP_TOKEN`**, an **`NPM_TOKEN`**, a **`PYPI_API_TOKEN`**, and a **crates.io token** — until each is set, that channel's build still runs but skips the registry push. See [`docs/runbooks/release.md`](docs/runbooks/release.md).
 
 ## Prediction vs. proof
 
