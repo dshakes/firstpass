@@ -59,8 +59,18 @@ fn parse_mbpp_line(line: &str) -> Result<CodingTask, String> {
     // a real coverage gap a candidate can pass on visible and still fail on hidden.
     let n_visible = hidden_cases.len().div_ceil(2);
     let visible_cases = hidden_cases[..n_visible].to_vec();
-    let prompt =
-        format!("{text}\n\nWrite the solution to `solution.py` defining the required function(s).");
+    // Show the candidate the VISIBLE tests (the gate) so it knows the exact function
+    // name/signature to implement — MBPP's `text` alone doesn't specify it, and the
+    // asserts call a specific name. The candidate is meant to see its gate; the HIDDEN
+    // tests stay held out as the oracle, preserving the real coverage gap.
+    let visible_src: Vec<&str> = test_list[..n_visible]
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let prompt = format!(
+        "{text}\n\nYour solution must pass these tests:\n{}\n\nWrite the solution to `solution.py` defining the required function(s).",
+        visible_src.join("\n")
+    );
     Ok(CodingTask {
         id: format!("mbpp-{task_id}"),
         prompt,
