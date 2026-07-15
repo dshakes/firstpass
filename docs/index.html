@@ -270,10 +270,10 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
     <div class="step done"><div class="dot"></div><h4><span>M2 ✓</span> Gate framework</h4><p>Subprocess plugins, schema gates, budgets, feedback API.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>M3 ✓</span> Live proof</h4><p>Real-provider numbers (n=200) and a real LLM-judge gate — both done, against real Anthropic.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Speculative escalation</h4><p>Cheap and next-rung run in parallel — latency win, byte-identical served result.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Fail-closed sandbox + coding-with-tests conformal</h4><p>gVisor-first, network-isolated code execution; a continuous gate with real error — the conformal guarantee stops being degenerate.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>✓</span> Fail-closed sandbox + coding-with-tests conformal</h4><p>gVisor-first, network-isolated code execution. Run live on 964 real MBPP tasks: a feasible distribution-free ≤10%@95% served-failure bound — the guarantee arithmetic couldn't earn.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Learning loop</h4><p><code>firstpass calibrate</code> recalibrates the serving threshold from real deferred feedback.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Prod hardening + GA readiness</h4><p>Timeouts, load-shedding, opaque errors, body caps — ADR 0003 gap analysis.</p></div>
-    <div class="step next"><div class="dot"></div><h4><span>→</span> Packaging</h4><p>All channels wired and locally verified — pip · uvx · Homebrew · npm · crates.io · binaries · self-updater. One tagged release away (no <code>v*</code> tag pushed yet).</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>✓</span> Packaging</h4><p>Published on every channel — pip · uvx · Homebrew · npm · crates.io · Docker · binaries · self-updater. Each release auto-publishes all of them via a hands-off pipeline (npm + PyPI via OIDC, no tokens).</p></div>
   </div>
 </div></section>
 </main>
