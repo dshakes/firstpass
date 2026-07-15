@@ -176,9 +176,10 @@ On self-checking arithmetic the **conformal served-failure guarantee is degenera
 |---|---|
 | gate false-accept rate | **14.5%** — passes every visible test, fails the hidden oracle (the coverage-gap error arithmetic can't produce) |
 | served-failure if you ship on "tests pass" | 4.1% — ~1 in 24 "passing" answers is wrong |
-| **conformal bound (threshold 0.50)** | **≤10% served-failure at 95% confidence** — distribution-free, empirically 7.2%, while **serving 82%** of requests |
+| **conformal bound (threshold 0.50)** | **≤10% served-failure at 95% confidence** — distribution-free, empirically 7.6%, while **serving 82%** of requests |
+| **+ self-consistency LLM-judge on the gate** | same 82% coverage, same ≤10% certified bound, empirical served-failure **7.6% → 5.9%** — the judge catches full-pass false-accepts the tests miss |
 
-This is the guarantee arithmetic could not earn: a **mathematical, distribution-free bound on how often a wrong answer reaches you**, on a standard public benchmark — something no predictive router, gateway, or orchestrator offers.
+This is the guarantee arithmetic could not earn: a **mathematical, distribution-free bound on how often a wrong answer reaches you**, on a standard public benchmark — something no predictive router, gateway, or orchestrator offers. Add a calibrated judge to the gate and the *actual* error tightens further at no cost to coverage.
 
 ## Roadmap
 
