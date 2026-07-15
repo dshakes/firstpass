@@ -36,7 +36,7 @@ only the push is skipped. Set the secret to light the channel up.
 | Prebuilt binaries, `curl \| sh`, PowerShell | cargo-dist (`release.yml`) | nothing — attaches to the GitHub Release |
 | Docker / GHCR | `docker.yml` | nothing — built-in `GITHUB_TOKEN` |
 | Homebrew | cargo-dist `publish-homebrew-formula` → `dshakes/homebrew-tap` | **`HOMEBREW_TAP_TOKEN`** (tap repo already exists) |
-| npm | cargo-dist `publish-npm` | an owned `@dshakesnotbot` scope **+ `NPM_TOKEN`** |
+| npm | `npm-publish.yml` (OIDC trusted publishing) | an npm **Trusted Publisher** for the package → workflow `npm-publish.yml` (no token) |
 | pip / uvx (wheels) | maturin (`python-wheels.yml`), trusted publishing | repo var **`PUBLISH_TO_PYPI=true`** + a PyPI pending publisher (no token) |
 | crates.io (`cargo install firstpass-proxy`) | `crates-io.yml` (core→proxy) | repo var **`PUBLISH_TO_CRATES=true`** + **`CARGO_REGISTRY_TOKEN`** |
 
@@ -141,7 +141,10 @@ channels & required secrets* above). To light one up:
   distil/compass). Add a `HOMEBREW_TAP_TOKEN` secret with push access to it;
   the next tag pushes `Formula/firstpass.rb` and users `brew install
   dshakes/tap/firstpass`.
-- **npm:** own the `@dshakesnotbot` scope on npmjs, add an `NPM_TOKEN` secret.
+- **npm:** OIDC trusted publishing (no token). On npmjs.com → the package →
+  Trusted Publisher → GitHub Actions: org `dshakes`, repo `firstpass`, workflow
+  `npm-publish.yml`, environment blank, allowed action `npm publish`. The npm
+  package builds via cargo-dist and `npm-publish.yml` pushes it on release.
 - **pip / uvx:** register a PyPI trusted publisher (project `firstpass`, repo
   `dshakes/firstpass`, workflow `python-wheels.yml`, environment `pypi`), then
   set repo variable `PUBLISH_TO_PYPI=true`. No long-lived token — OIDC only.
