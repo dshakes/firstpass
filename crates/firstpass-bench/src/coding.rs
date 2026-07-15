@@ -486,23 +486,37 @@ impl Judge for LiveJudge {
         );
         let mut yes = 0u32;
         let mut got = 0u32;
-        for _ in 0..self.samples {
+        let mut last_err = String::new();
+        for s in 0..self.samples {
+            // Space samples out: firing K calls back-to-back per task bursts the provider and draws
+            // empty/limited responses. A small gap keeps the judge reliable under load.
+            if s > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
             // Retry a sample a few times: an occasional empty/unparseable reply is transient. Break
             // as soon as one resolves to a verdict.
             for attempt in 0..4u32 {
-                if let Ok((text, _, _)) = crate::live::anthropic_call(
+                match crate::live::anthropic_call(
                     &self.client,
                     &self.base_url,
                     &self.api_key,
                     &self.model,
                     Some(system),
                     &user,
-                    16,
-                ) && let Some(v) = parse_verdict(&text)
-                {
-                    got += 1;
-                    yes += u32::from(v);
-                    break;
+                    256,
+                ) {
+                    Ok((text, _, _)) => {
+                        if let Some(v) = parse_verdict(&text) {
+                            got += 1;
+                            yes += u32::from(v);
+                            break;
+                        }
+                        last_err = format!(
+                            "unparseable: {:?}",
+                            text.chars().take(40).collect::<String>()
+                        );
+                    }
+                    Err(e) => last_err = e,
                 }
                 std::thread::sleep(std::time::Duration::from_millis(
                     200 * u64::from(attempt + 1),
@@ -510,12 +524,9 @@ impl Judge for LiveJudge {
             }
         }
         if got == 0 {
-            // No verdict after retries (persistent rate-limit or empty response) — ABSTAIN. The
-            // caller defers to the deterministic test gate; we never fabricate a score. Logged.
-            eprintln!(
-                "judge: abstained on {} after retries; deferring to test gate",
-                task.id
-            );
+            // No verdict after retries — ABSTAIN. The caller defers to the deterministic test gate;
+            // we never fabricate a score. Log the actual cause so it's diagnosable, not silent.
+            eprintln!("judge: abstained on {} — last error: {last_err}", task.id);
             return Ok(None);
         }
         Ok(Some(f64::from(yes) / f64::from(got)))
