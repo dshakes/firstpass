@@ -2,7 +2,10 @@
 # Build:  docker build -t firstpass .
 # Run:    docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 firstpass
 
-FROM rust:1.93-slim AS builder
+# Pin to bookworm (Debian 12, glibc 2.36) so the binary matches the distroless
+# cc-debian12 runtime below — an unpinned `-slim` tracks newer Debian (glibc 2.39+)
+# and the binary then fails at runtime with `GLIBC_2.39 not found`.
+FROM rust:1.93-slim-bookworm AS builder
 WORKDIR /build
 # Cache dependencies: copy manifests first, then sources.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
