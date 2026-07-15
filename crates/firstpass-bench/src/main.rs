@@ -9,8 +9,8 @@
 //!   firstpass-bench --coding-live  # coding-with-tests with a LIVE candidate model (needs ANTHROPIC_API_KEY)
 
 use firstpass_bench::coding::{
-    CandidateSolver, CodingReport, GeneratedSolver, LiveSolver, coding_suite,
-    generated_coding_suite, mock_solutions, run_coding_benchmark,
+    CandidateSolver, CodingReport, GeneratedSolver, Judge, LiveJudge, LiveSolver, coding_suite,
+    generated_coding_suite, mock_solutions, run_coding_benchmark, run_coding_benchmark_judged,
 };
 use firstpass_bench::dataset::load_mbpp_jsonl;
 use firstpass_bench::sandbox::establish_sandbox;
@@ -95,14 +95,42 @@ fn main() {
         } else {
             Box::new(mock_solutions())
         };
-        match run_coding_benchmark(
-            &tasks,
-            solver.as_ref(),
-            sb.as_ref(),
-            cfg.conformal_alpha,
-            cfg.conformal_delta,
-            50, // min served samples for a conformal bound (matches the arithmetic path)
-        ) {
+        // Optional judge gate: FIRSTPASS_CODING_JUDGE=<model> adds a continuous, correctness-aware
+        // score so conformal can separate full-visible-pass false-accepts (the test-only gate can't).
+        // FIRSTPASS_CODING_JUDGE_SAMPLES=<n> averages n judge calls (self-consistency; default 1).
+        let judge: Option<Box<dyn Judge>> = std::env::var("FIRSTPASS_CODING_JUDGE")
+            .ok()
+            .filter(|m| !m.is_empty())
+            .and_then(|model| {
+                let jkey = std::env::var("ANTHROPIC_API_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())?;
+                let samples = std::env::var("FIRSTPASS_CODING_JUDGE_SAMPLES")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+                Some(Box::new(LiveJudge::new(jkey, model, samples)) as Box<dyn Judge>)
+            });
+        let result = match &judge {
+            Some(j) => run_coding_benchmark_judged(
+                &tasks,
+                solver.as_ref(),
+                j.as_ref(),
+                sb.as_ref(),
+                cfg.conformal_alpha,
+                cfg.conformal_delta,
+                50,
+            ),
+            None => run_coding_benchmark(
+                &tasks,
+                solver.as_ref(),
+                sb.as_ref(),
+                cfg.conformal_alpha,
+                cfg.conformal_delta,
+                50, // min served samples for a conformal bound (matches the arithmetic path)
+            ),
+        };
+        match result {
             Ok(report) => print_coding(&report),
             Err(e) => {
                 eprintln!("coding benchmark failed: {e}");
@@ -183,8 +211,26 @@ fn print_coding(r: &CodingReport) {
     );
     if !r.conformal.feasible {
         println!(
-            "  (infeasible on this run — a real bound needs more served samples: FIRSTPASS_CODING_N=200 --coding-live)"
+            "  (test-only gate: full-pass false-accepts score 1.0 = correct answers, so no threshold\n   separates them. Add a judge gate: FIRSTPASS_CODING_JUDGE=claude-sonnet-5)"
         );
+    }
+    if let (Some(cc), Some(sf)) = (r.conformal_combined.as_ref(), r.served_failure_combined) {
+        println!(
+            "- conformal (COMBINED score = test + judge): threshold {:.3}, served {:.0}%, calib-risk {:.1}%, feasible={}",
+            cc.threshold,
+            cc.served_frac * 100.0,
+            cc.calib_risk * 100.0,
+            cc.feasible
+        );
+        println!(
+            "- served-failure at the combined threshold:                  {:.1}%",
+            sf * 100.0
+        );
+        if cc.feasible {
+            println!(
+                "  ^ FEASIBLE distribution-free bound — the judge separates full-pass false-accepts\n    the test-only gate cannot. This is the guarantee arithmetic could not earn."
+            );
+        }
     }
     let shown = r.outcomes.len().min(12);
     println!("\nper-task (gate_score / oracle_correct), first {shown}:");
