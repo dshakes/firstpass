@@ -1,9 +1,14 @@
 name: npm-publish
 # Publish the npm package via OIDC TRUSTED PUBLISHING — no token, no 2FA.
 # cargo-dist generates the @dshakesnotbot/firstpass-proxy tarball as a release
-# asset (npm is in `installers` but NOT `publish-jobs`); this job downloads it
-# once the GitHub Release is published and pushes it to npm using the repo's OIDC
-# identity.
+# asset (npm is in `installers` but NOT `publish-jobs`); this job downloads it and
+# pushes it to npm using the repo's OIDC identity.
+#
+# TRIGGER: `workflow_run` after the "Release" workflow finishes — NOT `release:
+# published`. A release created by GITHUB_TOKEN (which cargo-dist uses) does NOT
+# fire the `release` event — GitHub suppresses token-created events to avoid
+# recursion, so a `release`-triggered job silently never runs. `workflow_run` fires
+# regardless, so npm auto-publishes on every stable release with no manual step.
 #
 # One-time npm setup (npmjs.com → the package → Trusted Publisher → GitHub Actions):
 #   Organization or user : dshakes
@@ -13,8 +18,9 @@ name: npm-publish
 #   Allowed actions      : npm publish
 # Then the NPM_TOKEN secret can be deleted — OIDC replaces it.
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -28,8 +34,13 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # Finals only — mirror cargo-dist (brew/npm skip prereleases). Dispatch always runs.
-    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    # Manual dispatch, or after a SUCCESSFUL Release run on a stable v* tag (skip
+    # rc/prereleases, which carry a '-' suffix — mirrors cargo-dist's brew/npm policy).
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v') &&
+      !contains(github.event.workflow_run.head_branch, '-')) }}
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -39,8 +50,14 @@ jobs:
       - name: Download the npm package tarball from the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          TAG: ${{ github.event.workflow_run.head_branch || github.event.inputs.tag }}
         run: |
+          # workflow_run.head_branch is the tag for a tag-triggered Release; fall back
+          # to the latest release if it isn't a resolvable tag.
+          if [ -z "$TAG" ] || ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            TAG="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          fi
+          echo "publishing npm for release: $TAG"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*-npm-package.tar.gz' --dir .
           ls -la ./*-npm-package.tar.gz
       - name: Publish to npm
