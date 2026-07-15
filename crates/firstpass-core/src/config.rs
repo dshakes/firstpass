@@ -233,6 +233,12 @@ pub struct Escalation {
     /// distribution shift. `None` (default) uses the fixed `serve_threshold` above — byte-identical.
     #[serde(default)]
     pub adaptive: Option<AdaptiveConfig>,
+    /// Opt-in: route tool-calling / multimodal requests through enforce instead of falling back to
+    /// observe (ADR 0005). `false` (default) is byte-identical to today — such requests pass through
+    /// un-gated. Turn on **only after** verifying enforce faithfully round-trips your tool workload;
+    /// content fidelity is preserved either way, but escalating a live tool turn is operator-gated.
+    #[serde(default)]
+    pub enforce_structured: bool,
 }
 
 /// Config for online/adaptive conformal serving ([`crate::conformal::AdaptiveConformal`]).
@@ -262,6 +268,7 @@ impl Default for Escalation {
             speculation: 0,
             serve_threshold: None,
             adaptive: None,
+            enforce_structured: false,
         }
     }
 }

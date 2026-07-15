@@ -11,20 +11,50 @@ use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// One message in a normalized chat conversation.
+/// One message in a normalized chat conversation. `content` is either a plain string (the common
+/// case — serializes byte-identically to a text message) OR the original array of content blocks
+/// (`text` / `tool_use` / `tool_result` / `image`), forwarded verbatim so tool and multimodal turns
+/// survive the enforce path (ADR 0005). Use [`ChatMessage::text_view`] to read a text projection for
+/// gating.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// `"user"`, `"assistant"`, or `"system"`.
     pub role: String,
-    /// Message text.
-    pub content: String,
+    /// Message content — a string, or an array of content blocks, forwarded as-is to the provider.
+    pub content: Value,
+}
+
+impl ChatMessage {
+    /// A text-only message (the common path).
+    #[must_use]
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Value::String(content.into()),
+        }
+    }
+
+    /// Concatenate the text this message carries, for gating. A string is itself; an array yields the
+    /// joined `text` blocks (tool_use/tool_result/image blocks contribute no gating text).
+    #[must_use]
+    pub fn text_view(&self) -> String {
+        match &self.content {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
+    }
 }
 
 /// A provider-agnostic model request, built once per incoming call and re-used (with
 /// `model` swapped) across every rung of the ladder.
 ///
-// ponytail: multimodal content and tool-result blocks are collapsed to plain text for now —
-// enough to route and gate on. A richer content-block model is a later batch.
+// Message content is carried verbatim (string or content-block array, ADR 0005); gates read a text
+// projection via `ChatMessage::text_view`. `tools` is opaque passthrough.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRequest {
     /// `provider/model`, e.g. `"anthropic/claude-haiku-4-5"`.
@@ -153,7 +183,7 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
 #[derive(Serialize)]
 struct AnthropicWireMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    content: &'a Value,
 }
 
 /// Strip the `provider/` prefix from a ladder model id for the provider's wire API — Anthropic and
@@ -272,7 +302,7 @@ impl Provider for AnthropicProvider {
 #[derive(Serialize)]
 struct OpenAiWireMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    content: Value,
 }
 
 #[derive(Serialize)]
@@ -311,12 +341,12 @@ impl Provider for OpenAiProvider {
         if let Some(system) = req.system.as_deref() {
             messages.push(OpenAiWireMessage {
                 role: "system",
-                content: system,
+                content: Value::String(system.to_owned()),
             });
         }
         messages.extend(req.messages.iter().map(|m| OpenAiWireMessage {
             role: &m.role,
-            content: &m.content,
+            content: m.content.clone(),
         }));
         let body = OpenAiWireRequest {
             model: wire_model(&req.model),
