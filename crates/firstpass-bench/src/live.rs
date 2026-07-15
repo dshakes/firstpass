@@ -95,9 +95,11 @@ pub(crate) fn anthropic_call(
     let url = format!("{base_url}/v1/messages");
 
     let mut last = String::new();
-    for attempt in 0u32..4 {
+    for attempt in 0u32..6 {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(400 * u64::from(attempt)));
+            // Exponential backoff (capped) — matters for 429 rate-limit bursts from parallel judges.
+            let ms = (300u64 * 2u64.pow(attempt.min(4))).min(4000);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
         }
         let resp = match client
             .post(&url)
@@ -121,15 +123,16 @@ pub(crate) fn anthropic_call(
                 continue;
             }
         };
-        if status.is_server_error() {
+        if status.is_server_error() || status.as_u16() == 429 {
+            // 5xx and 429 (rate limit) are transient → retry with backoff.
             last = format!(
                 "HTTP {status}: {}",
                 text.chars().take(200).collect::<String>()
             );
-            continue; // 5xx → retry
+            continue;
         }
         if !status.is_success() {
-            // 4xx is a hard error (bad key/model/request) — don't retry.
+            // Other 4xx is a hard error (bad key/model/request) — don't retry.
             return Err(format!(
                 "HTTP {status}: {}",
                 text.chars().take(300).collect::<String>()

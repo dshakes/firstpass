@@ -97,7 +97,8 @@ fn main() {
         };
         // Optional judge gate: FIRSTPASS_CODING_JUDGE=<model> adds a continuous, correctness-aware
         // score so conformal can separate full-visible-pass false-accepts (the test-only gate can't).
-        // FIRSTPASS_CODING_JUDGE_SAMPLES=<n> averages n judge calls (self-consistency; default 1).
+        // FIRSTPASS_CODING_JUDGE_SAMPLES=<n> = self-consistency: score is the YES-verdict frequency
+        // over n samples (default 5).
         let judge: Option<Box<dyn Judge>> = std::env::var("FIRSTPASS_CODING_JUDGE")
             .ok()
             .filter(|m| !m.is_empty())
@@ -108,7 +109,7 @@ fn main() {
                 let samples = std::env::var("FIRSTPASS_CODING_JUDGE_SAMPLES")
                     .ok()
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(1);
+                    .unwrap_or(5); // self-consistency: verdict frequency over 5 samples
                 Some(Box::new(LiveJudge::new(jkey, model, samples)) as Box<dyn Judge>)
             });
         let result = match &judge {
