@@ -988,6 +988,72 @@ mod tests {
         assert_eq!(trace.attempts[1].verdict, Verdict::Pass);
     }
 
+    /// Latency A/B: p50/p95/p99 of serial vs speculative escalation over many requests. Every request
+    /// escalates (rung 0 fails the gate) and each rung costs ~DELAY ms; serial pays both rungs
+    /// sequentially while speculation prefetches rung 1 during rung 0's gate. Run with `--nocapture`
+    /// to see the distribution. Offline (mock delays) but the exact shape a live serial-vs-spec A/B
+    /// produces — swap the mock for a live provider for real-provider numbers.
+    #[tokio::test]
+    async fn latency_ab_speculative_beats_serial_p95() {
+        const DELAY: u64 = 40;
+        const N: usize = 30;
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+
+        fn pctl(sorted: &[u64], p: f64) -> u64 {
+            let i = (((sorted.len() - 1) as f64) * p).round() as usize;
+            sorted[i]
+        }
+
+        let mut serial = Vec::with_capacity(N);
+        let mut spec = Vec::with_capacity(N);
+        for run in 0..(2 * N) {
+            let speculation = u32::from(run >= N); // first N serial, next N speculative
+            let mut outs: HashMap<String, Result<ModelResponse, ProviderError>> = HashMap::new();
+            outs.insert(HAIKU.to_owned(), Ok(resp(HAIKU, ""))); // empty → fails gate → escalate
+            outs.insert(SONNET.to_owned(), Ok(resp(SONNET, "ok")));
+            let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+            map.insert(
+                "anthropic".to_owned(),
+                Arc::new(MockProvider::new("anthropic", outs).with_delay(DELAY)),
+            );
+            let providers = ProviderRegistry::from_map(map);
+            let health = GateHealthRegistry::new();
+            let mut c = ctx(
+                &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+            );
+            c.speculation = speculation;
+            let start = std::time::Instant::now();
+            let _ = route_enforce(c).await;
+            let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if speculation == 0 {
+                serial.push(ms);
+            } else {
+                spec.push(ms);
+            }
+        }
+        serial.sort_unstable();
+        spec.sort_unstable();
+        println!(
+            "latency A/B (per-rung {DELAY}ms, escalate every request):\n  serial     p50={} p95={} p99={}\n  spec(k=1)  p50={} p95={} p99={}",
+            pctl(&serial, 0.5),
+            pctl(&serial, 0.95),
+            pctl(&serial, 0.99),
+            pctl(&spec, 0.5),
+            pctl(&spec, 0.95),
+            pctl(&spec, 0.99),
+        );
+        // Speculation runs rung 0 + rung 1 concurrently → ~1 rung of latency vs ~2 serial.
+        assert!(
+            pctl(&spec, 0.95) * 4 < pctl(&serial, 0.95) * 3,
+            "spec p95 {}ms should beat serial p95 {}ms by >25%",
+            pctl(&spec, 0.95),
+            pctl(&serial, 0.95)
+        );
+    }
+
     #[tokio::test]
     async fn speculation_never_fires_past_max_rungs() {
         let ladder = vec![HAIKU.to_owned(), SONNET.to_owned(), OPUS.to_owned()];
