@@ -293,29 +293,35 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             // Clone the matched route so no borrow of `state.config` is held across the await;
             // routes are tiny (a handful of strings).
             let route = route.clone();
-            if enforce_can_handle(&features, &body) {
+            if enforce_can_handle(&features, &body, routing.escalation.enforce_structured) {
                 return handle_enforce(&state, &headers, &body, features, &route, session_header)
                     .await;
             }
-            // The request carries tools / images / tool-result blocks the text-only enforce path
-            // can't round-trip faithfully yet. Rather than drop them and serve corrupted output,
-            // fall through to transparent observe passthrough (correct, un-gated) for this request.
+            // Tools / images / tool-result blocks, or a streaming turn the enforce path can't emit as
+            // SSE. With `enforce_structured` off (default) that's every tool/multimodal request; with
+            // it on it's only the streaming ones (ADR 0005 P3). Rather than corrupt the call, fall
+            // through to transparent observe passthrough (correct, un-gated) for this request.
             tracing::info!(
-                "enforce route matched but request has tool/image content; serving via observe passthrough"
+                "enforce route matched but request is tool/image/streaming; serving via observe passthrough"
             );
         }
     }
     observe_passthrough(state, headers, body, session_header).await
 }
 
-/// Whether the enforce path can faithfully handle this request. Enforce normalizes content to
-/// text and re-synthesizes a text response, so it cannot round-trip tool calls or images — a
-/// request that declares tools, carries images, or contains tool_use/tool_result blocks is served
-/// via transparent observe passthrough instead of being silently corrupted.
+/// Whether the enforce path can faithfully handle this request.
 ///
-// ponytail: full tool/multimodal round-tripping through the ladder is the follow-on (needs
-// provider-adapter work + live verification); this guard just refuses to corrupt in the meantime.
-fn enforce_can_handle(features: &Features, body: &[u8]) -> bool {
+/// Request content is now carried verbatim (ADR 0005 P1), so tool_use/tool_result/image blocks
+/// survive the round trip. Whether such requests are actually *routed* is the operator's call:
+/// - `enforce_structured == false` (default): tools/images/tool-blocks fall back to observe —
+///   byte-identical to before the ADR (invariant I1).
+/// - `enforce_structured == true` (opt-in, live-verified): they're routed through enforce, except
+///   **streaming** turns — enforce answers with a single JSON body, not SSE, so a `stream:true`
+///   request still goes to observe until the streaming tool path lands (ADR 0005 P3).
+fn enforce_can_handle(features: &Features, body: &[u8], enforce_structured: bool) -> bool {
+    if enforce_structured {
+        return !is_stream_request(body);
+    }
     features.tool_count == 0 && !features.has_images && !messages_have_tool_blocks(body)
 }
 
@@ -457,10 +463,11 @@ async fn handle_enforce(
 /// Parse an Anthropic Messages request body into the normalized [`ModelRequest`]. Returns
 /// `None` if the body isn't valid JSON or lacks a `messages` array.
 ///
-// Content blocks are collapsed to their concatenated text. Requests carrying tool_use/tool_result
-// or image blocks never reach this function — `enforce_can_handle` routes them to transparent
-// observe passthrough instead, so nothing is silently dropped here. Full multimodal round-tripping
-// through the ladder is the follow-up; the enforce beachhead is text/code.
+// Message content is preserved **verbatim** (string or array of blocks) — a plain-string content
+// serializes byte-identical on the wire, and tool_use/tool_result/image blocks survive the round
+// trip (ADR 0005, invariant I2). Gates operate on `ChatMessage::text_view()`, not the raw content,
+// so gate behavior is unchanged. Which requests actually enter enforce is still governed by
+// `enforce_can_handle`; this function only guarantees no fidelity is lost once they do.
 fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
     let json: Value = serde_json::from_slice(body).ok()?;
     let messages_json = json.get("messages")?.as_array()?;
@@ -472,7 +479,10 @@ fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
                 .and_then(Value::as_str)
                 .unwrap_or("user")
                 .to_owned(),
-            content: content_to_text(m.get("content")),
+            content: m
+                .get("content")
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new())),
         })
         .collect();
     let system = json
@@ -496,19 +506,6 @@ fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
         max_tokens,
         tools,
     })
-}
-
-/// Flatten Anthropic message content (a string, or an array of `{type,text}` blocks) to text.
-fn content_to_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
 }
 
 /// Render a served [`ModelResponse`] back into an Anthropic Messages response envelope, so the
@@ -947,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_model_request_flattens_content_blocks() {
+    fn parse_model_request_preserves_content_verbatim_and_projects_text() {
         let body = br#"{"model":"m","system":"sys","max_tokens":50,
             "messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},
                         {"role":"assistant","content":"c"}]}"#;
@@ -955,8 +952,49 @@ mod tests {
         assert_eq!(req.system.as_deref(), Some("sys"));
         assert_eq!(req.max_tokens, 50);
         assert_eq!(req.messages.len(), 2);
-        assert_eq!(req.messages[0].content, "a\nb");
-        assert_eq!(req.messages[1].content, "c");
+        // I2: the block array is carried verbatim, not flattened away...
+        assert_eq!(
+            req.messages[0].content,
+            serde_json::json!([{"type":"text","text":"a"},{"type":"text","text":"b"}])
+        );
+        // ...and a plain string stays a plain string (I1: byte-identical on the wire).
+        assert_eq!(req.messages[1].content, Value::String("c".to_owned()));
+        // Gates see the same text they always did.
+        assert_eq!(req.messages[0].text_view(), "a\nb");
+        assert_eq!(req.messages[1].text_view(), "c");
+    }
+
+    #[test]
+    fn tool_and_image_blocks_survive_the_request_round_trip() {
+        // ADR 0005 I2: tool_use / tool_result / image blocks are never dropped on the request side.
+        let body = br#"{"model":"m","max_tokens":50,"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"calc","input":{"x":1}}]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"2"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+            ]}]}"#;
+        let req = parse_model_request(body).unwrap();
+        let round_tripped = serde_json::to_value(&req.messages).unwrap();
+        assert_eq!(
+            round_tripped,
+            serde_json::json!([
+                {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"calc","input":{"x":1}}]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":"2"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+                ]}
+            ])
+        );
+    }
+
+    #[test]
+    fn text_message_serializes_byte_identical_to_a_plain_string() {
+        // I1: a string-content message must not gain array wrapping on the wire.
+        let m = ChatMessage::text("user", "hello");
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            r#"{"role":"user","content":"hello"}"#
+        );
     }
 
     #[test]
@@ -1161,8 +1199,24 @@ mod tests {
         );
         let f_plain = extract_features(&HeaderMap::new(), &plain);
         let f_tools = extract_features(&HeaderMap::new(), &tools);
-        assert!(enforce_can_handle(&f_plain, &plain));
-        assert!(!enforce_can_handle(&f_tools, &tools));
+        // Default (enforce_structured = false): plain text routes, tools fall back to observe.
+        assert!(enforce_can_handle(&f_plain, &plain, false));
+        assert!(!enforce_can_handle(&f_tools, &tools, false));
+    }
+
+    #[test]
+    fn structured_enforce_routes_tools_but_not_streaming() {
+        // ADR 0005 P2: with the opt-in flag on, tool requests route through enforce...
+        let tools = Bytes::from_static(
+            br#"{"model":"m","tools":[{"name":"t"}],"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let streaming_tools = Bytes::from_static(
+            br#"{"model":"m","stream":true,"tools":[{"name":"t"}],"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let f = extract_features(&HeaderMap::new(), &tools);
+        assert!(enforce_can_handle(&f, &tools, true));
+        // ...but a streaming turn still goes to observe (enforce can't emit SSE yet — P3).
+        assert!(!enforce_can_handle(&f, &streaming_tools, true));
     }
 
     /// B2: an enforce route serves plain text (200 from the mock) but falls back to transparent

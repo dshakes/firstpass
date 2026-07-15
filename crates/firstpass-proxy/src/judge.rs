@@ -115,10 +115,7 @@ pub fn build_judge_request(judge_model: &str, rubric: &str, candidate: &str) -> 
     ModelRequest {
         model: judge_model.to_owned(),
         system: Some(JUDGE_SYSTEM.to_owned()),
-        messages: vec![ChatMessage {
-            role: "user".to_owned(),
-            content: user,
-        }],
+        messages: vec![ChatMessage::text("user", user)],
         max_tokens: 256,
         tools: Value::Null, // the judge runs no tools (§8.3)
     }
@@ -215,7 +212,7 @@ mod tests {
             "system pins anti-injection"
         );
         assert_eq!(req.tools, Value::Null, "judge runs no tools");
-        let user = &req.messages[0].content;
+        let user = req.messages[0].text_view();
         assert!(user.contains("BEGIN_CANDIDATE") && user.contains("the answer is 42"));
     }
 
