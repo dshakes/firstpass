@@ -21,7 +21,7 @@ Proof over prediction. Built for agent fleets.
 
 Firstpass is a **drop-in, Anthropic-compatible proxy**. Point your agent's `base_url` at it and every request is routed to the cheapest model first, its **real output** is checked by a gate you define (tests, typecheck, schema, a judge), and it escalates one rung only when the gate fails — writing a tamper-evident audit trace for every decision.
 
-> **Honestly scoped.** The proxy routes, gates, escalates, fails over, audits, and learns end-to-end over real HTTP — no test doubles in the plane, and the enforce path is [live-verified](#proof-not-adjectives) against real Anthropic. The [proof harness](#proof-not-adjectives) has a **200-task live result** below; still ahead: a coding-with-tests benchmark (to earn the conformal guarantee), a 30-day dogfood, and prebuilt binaries. See the [roadmap](#roadmap). Nothing here is claimed as measured that isn't.
+> **Honestly scoped.** The proxy routes, gates, escalates, fails over, audits, and learns end-to-end over real HTTP — no test doubles in the plane, and the enforce path is [live-verified](#proof-not-adjectives) against real Anthropic. The [proof harness](#proof-not-adjectives) has a **200-task live result** and an **earned distribution-free served-failure bound on real MBPP** below; still ahead: a 30-day dogfood and the hosted control plane. See the [roadmap](#roadmap). Nothing here is claimed as measured that isn't.
 
 ## Quickstart
 
@@ -168,7 +168,17 @@ Firstpass served at **~85% lower $/success than always-top, at parity-or-better 
 
 **Reproduced with a real LLM-judge gate, not just a deterministic checker** (`FIRSTPASS_GATE=judge`, Sonnet grading each answer *without seeing the ground truth*, n=200): firstpass **1.00 success, ~84% cheaper than Opus, served-failure 0.00, PROCEED** — the win holds with the gate you'd actually deploy.
 
-Stated plainly on the one thing this did **not** show at the time: the **conformal served-failure guarantee stayed degenerate** on self-checking tasks — the gate is either near-perfect (nothing to bound) or, if you weaken the judge, it false-rejects correct answers and the cost advantage flips. Earning the guarantee needed a domain where the *best practical* gate is still imperfect — a **coding-with-tests benchmark** (real test suites have coverage gaps), which needed a sandbox for untrusted code. **Both are now built**: a fail-closed code-execution sandbox ([ADR 0002](docs/adr/0002-bench-code-execution-sandbox.md) — gVisor `runsc` first, `runc` fallback with a warning, `--network none`, capability drops, no host mounts) and a coding-with-tests benchmark with a **continuous gate score**, so conformal calibrates on `(gate_score, oracle_correct)` with real error instead of a zero-error self-checker. A live-provider run of that benchmark hasn't been reported here yet.
+On self-checking arithmetic the **conformal served-failure guarantee is degenerate** — the gate is near-perfect, so there's nothing to bound. Earning the guarantee needs a domain where the *best practical* gate is still imperfect: a **coding-with-tests benchmark**, where real test suites have coverage gaps. That's now built (a fail-closed sandbox for untrusted code — [ADR 0002](docs/adr/0002-bench-code-execution-sandbox.md), gVisor `runsc` first, `--network none`, capability drops, no host mounts — and a continuous gate score) **and run live**:
+
+**Live — real MBPP, real models (the imperfect-gate domain the guarantee needs):** a Haiku candidate writes code for **964 MBPP test-split tasks**; each solution runs against its visible tests (the gate) and a held-out hidden oracle (ground truth) in the fail-closed sandbox.
+
+| metric | value |
+|---|---|
+| gate false-accept rate | **14.5%** — passes every visible test, fails the hidden oracle (the coverage-gap error arithmetic can't produce) |
+| served-failure if you ship on "tests pass" | 4.1% — ~1 in 24 "passing" answers is wrong |
+| **conformal bound (threshold 0.50)** | **≤10% served-failure at 95% confidence** — distribution-free, empirically 7.2%, while **serving 82%** of requests |
+
+This is the guarantee arithmetic could not earn: a **mathematical, distribution-free bound on how often a wrong answer reaches you**, on a standard public benchmark — something no predictive router, gateway, or orchestrator offers.
 
 ## Roadmap
 
@@ -178,7 +188,7 @@ Stated plainly on the one thing this did **not** show at the time: the **conform
 - **M2.5 ✓** — real-traffic proxy: **SSE streaming passthrough**, tool/multimodal-safe enforce; **`firstpass` CLI** (`up` / `doctor` / `trace`) + **MCP server**; live-provider proof harness (`--live`).
 - **M3 ✓** — 200-task live benchmark (cost/success proof at scale) **and** a real LLM-judge gate reproduction — both done against real Anthropic. Only **published binaries + a Homebrew tap** remain from this milestone (the cargo-dist `release.yml` has never been run — see [`docs/runbooks/release.md`](docs/runbooks/release.md)).
 - **Speculative escalation ✓** — cheap and next-rung run in parallel for latency, serving a byte-identical result to sequential escalation.
-- **Sandbox + coding-with-tests conformal ✓** — the fail-closed code-execution sandbox and continuous-gate benchmark described above (ADR 0002).
+- **Sandbox + coding-with-tests conformal ✓** — fail-closed sandbox + continuous-gate benchmark (ADR 0002), **run live on 964 MBPP tasks: a feasible distribution-free ≤10%@95% served-failure bound** (the guarantee arithmetic couldn't earn).
 - **Learning loop ✓** — `firstpass calibrate` recalibrates the serving threshold from real deferred feedback; conformal moved to `firstpass-core` so proxy and bench share it.
 - **Prod hardening ✓** — HTTP client timeouts, a bounded trace channel with load-shedding, opaque error responses, an explicit request-body cap, sandbox shell-quoting; see [ADR 0003](docs/adr/0003-production-ga-readiness.md) for the full GA-readiness gap analysis.
 - **Not yet done** — published binaries + Homebrew tap, an external security audit, SOC 2 (see [`docs/compliance/soc2-controls.md`](docs/compliance/soc2-controls.md) for the readiness map, not a claim), a hosted multi-tenant plane, and a real 30-day soak (procedure in [`docs/runbooks/soak.md`](docs/runbooks/soak.md); hasn't been run and closed out).
