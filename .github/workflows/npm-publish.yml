@@ -43,5 +43,19 @@ jobs:
         run: |
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*-npm-package.tar.gz' --dir .
           ls -la ./*-npm-package.tar.gz
-      - name: Publish to npm (OIDC — no token)
-        run: npm publish "$(ls ./*-npm-package.tar.gz)" --access public
+      - name: Publish to npm
+        # npm can't configure trusted publishing until the package EXISTS, so the
+        # first publish needs a token (use a classic Automation token — it bypasses
+        # 2FA). Once the package exists + a Trusted Publisher is configured, delete
+        # the NPM_TOKEN secret and every future release publishes via OIDC (no token).
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          TARBALL="$(ls ./*-npm-package.tar.gz)"
+          if [ -n "$NPM_TOKEN" ]; then
+            echo "bootstrap publish with NPM_TOKEN"
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
+          else
+            echo "OIDC trusted publishing (no token)"
+          fi
+          npm publish "$TARBALL" --access public
