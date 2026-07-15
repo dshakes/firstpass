@@ -253,7 +253,7 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
   ghcr.io/dshakes/firstpass:latest</pre></div></div>
     <div class="panel" data-p="cargo"><div class="code"><button class="copy" data-copy="cargo install --git https://github.com/dshakes/firstpass firstpass-proxy">copy</button><pre style="margin:0"><span class="cy">cargo</span> install --git https://github.com/dshakes/firstpass firstpass-proxy</pre></div></div>
   </div>
-  <p style="color:var(--mut2);font-size:12.5px;margin:12px 0 0"><code>cargo install --git</code> and Docker work today; pip · uvx · Homebrew · npm · curl · binaries light up on the first tagged release. Upgrade in place with <code>firstpass-proxy-update</code>.</p>
+  <p style="color:var(--mut2);font-size:12.5px;margin:12px 0 0">Install any way you like — pip · uvx · Homebrew · npm · crates.io · Docker · curl | sh · prebuilt binaries — all published and kept in sync every release. Upgrade in place with <code>firstpass-proxy-update</code>.</p>
 
   <h3 style="margin:40px 0 14px;font-size:16px;font-weight:600;color:var(--mut)">Then point your agent at it</h3>
   <div class="code"><button class="copy" data-copy="export ANTHROPIC_BASE_URL=http://127.0.0.1:8080">copy</button><pre style="margin:0">firstpass-proxy                                    <span class="c"># observe mode — logs, changes nothing</span>
@@ -269,9 +269,9 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
     <div class="step done"><div class="dot"></div><h4><span>M1 ✓</span> The proxy</h4><p>Observe + enforce, escalation, cross-provider failover, trace store — real HTTP.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>M2 ✓</span> Gate framework</h4><p>Subprocess plugins, schema gates, budgets, feedback API.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>M3 ✓</span> Live proof</h4><p>Real-provider numbers (n=200) and a real LLM-judge gate — both done, against real Anthropic.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Speculative escalation</h4><p>Cheap and next-rung run in parallel — latency win, byte-identical served result.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>✓</span> Speculative escalation</h4><p>Cheap and next-rung run in parallel. Measured p95: ~84ms serial → ~42ms speculative (~2× faster), byte-identical served result.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Fail-closed sandbox + coding-with-tests conformal</h4><p>gVisor-first, network-isolated code execution. Run live on 964 real MBPP tasks: a feasible distribution-free ≤10%@95% served-failure bound — the guarantee arithmetic couldn't earn.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Learning loop</h4><p><code>firstpass calibrate</code> recalibrates the serving threshold from real deferred feedback.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>✓</span> Learning loop</h4><p><code>firstpass calibrate</code> recalibrates the serving threshold from real deferred feedback — plus online/adaptive conformal (ACI) that tracks the bound under distribution shift.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Prod hardening + GA readiness</h4><p>Timeouts, load-shedding, opaque errors, body caps — ADR 0003 gap analysis.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Packaging</h4><p>Published on every channel — pip · uvx · Homebrew · npm · crates.io · Docker · binaries · self-updater. Each release auto-publishes all of them via a hands-off pipeline (npm + PyPI via OIDC, no tokens).</p></div>
   </div>
