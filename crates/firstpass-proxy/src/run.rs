@@ -45,7 +45,18 @@ pub fn build_gate_health(config: &ProxyConfig) -> GateHealthRegistry {
 pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>> {
     let (traces, writer) = store::open(&config.db_path)?;
     let bind = config.bind.clone();
-    let providers = ProviderRegistry::new(&config.upstream_anthropic, &config.upstream_openai);
+    // Build the provider registry from any `[[provider]]` entries in the routing config (Groq,
+    // Together, Ollama, …), on top of the built-in anthropic/openai defaults. No config => defaults.
+    let provider_defs = config
+        .routing
+        .as_ref()
+        .map(|r| r.providers.as_slice())
+        .unwrap_or_default();
+    let providers = ProviderRegistry::from_config(
+        provider_defs,
+        &config.upstream_anthropic,
+        &config.upstream_openai,
+    );
     let gate_health = build_gate_health(&config);
     // Online adaptive conformal (opt-in): seed the live threshold from the fixed one (or 0.5) and
     // let /v1/feedback track it. Absent config => None => fixed-threshold behavior, byte-identical.

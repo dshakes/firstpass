@@ -147,6 +147,22 @@ cp firstpass.example.toml firstpass.toml
 FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy
 ```
 
+**Any provider, including open-source models.** `anthropic` and `openai` are built in; a `[[provider]]` entry adds any other. Because the OpenAI Chat Completions API is the de-facto standard, one entry covers Groq, Together, Fireworks, DeepSeek, Mistral, xAI, OpenRouter, Azure — or a local **Ollama / vLLM** server running open-source Llama / Qwen / DeepSeek weights. A ladder rung is then `<id>/<model>`, so a route can open on a cheap open-source rung and escalate to a frontier model only when the gate fails:
+
+```toml
+[[provider]]
+id = "groq"
+dialect = "openai"
+base_url = "https://api.groq.com/openai"
+api_key_env = "GROQ_API_KEY"
+
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]
+gates = ["unit-tests"]
+```
+
 **Endpoints:** `POST /v1/messages` (drop-in) · `POST /v1/feedback` · `GET /v1/capabilities` · `GET /healthz`.
 
 ## Proof, not adjectives

@@ -193,6 +193,17 @@ fn wire_model(model: &str) -> &str {
     model.split_once('/').map_or(model, |(_, m)| m)
 }
 
+/// Resolve the API key for a provider call. A configured `api_key_env` wins (that env var is *this*
+/// provider's key — e.g. `GROQ_API_KEY` for a Groq rung); otherwise fall back to the per-request
+/// BYOK override from headers/env (the built-in `anthropic`/`openai` path). Empty string when
+/// neither is set (a keyless local endpoint).
+fn resolve_api_key(api_key_env: Option<&str>, byok_override: Option<&str>) -> String {
+    api_key_env
+        .and_then(|e| std::env::var(e).ok())
+        .or_else(|| byok_override.map(str::to_owned))
+        .unwrap_or_default()
+}
+
 #[derive(Serialize)]
 struct AnthropicWireRequest<'a> {
     model: &'a str,
@@ -209,8 +220,13 @@ struct AnthropicWireRequest<'a> {
 // wire call (see `wire_model`); sending it verbatim 404s.
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
+    /// Ladder prefix / trace label for this provider (usually `"anthropic"`).
+    pub id: String,
     /// Base URL, e.g. `https://api.anthropic.com`.
     pub base_url: String,
+    /// Env var the API key is read from when no per-request BYOK header is present. `None` for the
+    /// built-in provider, which resolves the key via [`Auth`] (`x-api-key` header or env).
+    pub api_key_env: Option<String>,
     /// Shared, connection-pooled HTTP client.
     pub http: reqwest::Client,
 }
@@ -218,7 +234,7 @@ pub struct AnthropicProvider {
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn id(&self) -> &str {
-        "anthropic"
+        &self.id
     }
 
     async fn complete(
@@ -226,7 +242,7 @@ impl Provider for AnthropicProvider {
         req: &ModelRequest,
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
-        let key = auth.anthropic_key.as_deref().unwrap_or_default();
+        let key = resolve_api_key(self.api_key_env.as_deref(), auth.anthropic_key.as_deref());
         let body = AnthropicWireRequest {
             model: wire_model(&req.model),
             system: req.system.as_deref(),
@@ -319,8 +335,14 @@ struct OpenAiWireRequest<'a> {
 // before relying on it in production.
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
-    /// Base URL, e.g. `https://api.openai.com`.
+    /// Ladder prefix / trace label for this provider (`"openai"`, `"groq"`, `"together"`, …).
+    pub id: String,
+    /// Base URL, e.g. `https://api.openai.com` or `https://api.groq.com/openai`.
     pub base_url: String,
+    /// Env var the API key is read from, e.g. `"GROQ_API_KEY"`. `None` for the built-in `openai`
+    /// provider (resolves via [`Auth`]: `authorization` header or `OPENAI_API_KEY`) and for keyless
+    /// local endpoints (Ollama / vLLM).
+    pub api_key_env: Option<String>,
     /// Shared, connection-pooled HTTP client.
     pub http: reqwest::Client,
 }
@@ -328,7 +350,7 @@ pub struct OpenAiProvider {
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn id(&self) -> &str {
-        "openai"
+        &self.id
     }
 
     async fn complete(
@@ -336,7 +358,7 @@ impl Provider for OpenAiProvider {
         req: &ModelRequest,
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
-        let key = auth.openai_key.as_deref().unwrap_or_default();
+        let key = resolve_api_key(self.api_key_env.as_deref(), auth.openai_key.as_deref());
         let mut messages = Vec::with_capacity(req.messages.len() + 1);
         if let Some(system) = req.system.as_deref() {
             messages.push(OpenAiWireMessage {
@@ -423,34 +445,72 @@ impl std::fmt::Debug for ProviderRegistry {
 }
 
 impl ProviderRegistry {
-    /// Build the standard registry: Anthropic + OpenAI, sharing one HTTP client.
-    ///
-    /// The enforce path is request/response (never streamed through the adapter), so the client
-    /// carries a total request timeout as well as a connect timeout — a hung or slow upstream can't
-    /// pin a routing decision indefinitely. Falls back to a default client if the builder fails
-    /// (only on TLS backend init, which is fatal anyway).
-    #[must_use]
-    pub fn new(anthropic_base: impl Into<String>, openai_base: impl Into<String>) -> Self {
-        let http = reqwest::Client::builder()
+    /// One HTTP client shared by every provider. The enforce path is request/response (never
+    /// streamed through the adapter), so it carries a total request timeout as well as a connect
+    /// timeout — a hung or slow upstream can't pin a routing decision indefinitely. Falls back to a
+    /// default client if the builder fails (only on TLS backend init, which is fatal anyway).
+    fn build_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(120))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
+    /// Build the standard registry: the built-in `anthropic` + `openai` providers.
+    #[must_use]
+    pub fn new(anthropic_base: impl Into<String>, openai_base: impl Into<String>) -> Self {
+        Self::from_config(&[], anthropic_base, openai_base)
+    }
+
+    /// Build the registry with the built-in `anthropic` / `openai` providers plus every configured
+    /// `[[provider]]` entry — so a ladder can route to any OpenAI-compatible or Anthropic-compatible
+    /// endpoint (Groq, Together, Fireworks, DeepSeek, Mistral, xAI, OpenRouter, Ollama, vLLM, Azure,
+    /// …) by id. A `[[provider]]` whose id is `anthropic` or `openai` overrides the built-in default
+    /// (e.g. to point `openai` at Azure). Shares one HTTP client across all of them.
+    #[must_use]
+    pub fn from_config(
+        defs: &[firstpass_core::ProviderDef],
+        anthropic_base: impl Into<String>,
+        openai_base: impl Into<String>,
+    ) -> Self {
+        let http = Self::build_http_client();
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
         providers.insert(
             "anthropic".to_owned(),
             Arc::new(AnthropicProvider {
+                id: "anthropic".to_owned(),
                 base_url: anthropic_base.into(),
+                api_key_env: None,
                 http: http.clone(),
             }),
         );
         providers.insert(
             "openai".to_owned(),
             Arc::new(OpenAiProvider {
+                id: "openai".to_owned(),
                 base_url: openai_base.into(),
-                http,
+                api_key_env: None,
+                http: http.clone(),
             }),
         );
+        for def in defs {
+            let provider: Arc<dyn Provider> = match def.dialect {
+                firstpass_core::Dialect::Anthropic => Arc::new(AnthropicProvider {
+                    id: def.id.clone(),
+                    base_url: def.base_url.clone(),
+                    api_key_env: def.api_key_env.clone(),
+                    http: http.clone(),
+                }),
+                firstpass_core::Dialect::Openai => Arc::new(OpenAiProvider {
+                    id: def.id.clone(),
+                    base_url: def.base_url.clone(),
+                    api_key_env: def.api_key_env.clone(),
+                    http: http.clone(),
+                }),
+            };
+            providers.insert(def.id.clone(), provider);
+        }
         Self { providers }
     }
 
@@ -547,6 +607,52 @@ mod tests {
         assert_eq!(wire_model("anthropic/claude-haiku-4-5"), "claude-haiku-4-5");
         assert_eq!(wire_model("openai/gpt-5.5"), "gpt-5.5");
         assert_eq!(wire_model("claude-opus-4-8"), "claude-opus-4-8"); // no prefix → unchanged
+    }
+
+    #[test]
+    fn from_config_registers_custom_providers_alongside_builtins() {
+        let defs = vec![
+            firstpass_core::ProviderDef {
+                id: "groq".to_owned(),
+                dialect: firstpass_core::Dialect::Openai,
+                base_url: "https://api.groq.com/openai".to_owned(),
+                api_key_env: Some("GROQ_API_KEY".to_owned()),
+            },
+            // A custom provider may override a built-in id (e.g. point `openai` at Azure).
+            firstpass_core::ProviderDef {
+                id: "openai".to_owned(),
+                dialect: firstpass_core::Dialect::Openai,
+                base_url: "https://my-azure.openai.azure.com".to_owned(),
+                api_key_env: Some("AZURE_OPENAI_KEY".to_owned()),
+            },
+        ];
+        let reg = ProviderRegistry::from_config(
+            &defs,
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+        );
+        // Built-in anthropic is still present; the custom groq resolves and labels itself "groq".
+        assert_eq!(reg.get("anthropic").unwrap().id(), "anthropic");
+        assert_eq!(reg.get("groq").unwrap().id(), "groq");
+        // Unknown provider → None (router fails over rather than guessing).
+        assert!(reg.get("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn resolve_api_key_prefers_configured_env_then_byok() {
+        // Use PATH (always present) to exercise the env branch without mutating process env.
+        let path = std::env::var("PATH").expect("PATH is set");
+        // Configured env wins over any BYOK override (the env var is *this* provider's key).
+        assert_eq!(resolve_api_key(Some("PATH"), Some("byok")), path);
+        // An unset configured env → fall back to the per-request BYOK override.
+        assert_eq!(
+            resolve_api_key(Some("FIRSTPASS_DEFINITELY_UNSET_KEY"), Some("byok")),
+            "byok"
+        );
+        // No configured env → fall back to BYOK.
+        assert_eq!(resolve_api_key(None, Some("byok")), "byok");
+        // Neither → empty (keyless local endpoint).
+        assert_eq!(resolve_api_key(None, None), "");
     }
 
     #[test]

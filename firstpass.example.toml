@@ -6,6 +6,27 @@
 # Routes are matched top-to-bottom; the first match wins. Each route binds a slice
 # of traffic to a mode, a model ladder (cheapest first), and the gates that must pass.
 
+# Providers a ladder can route to. `anthropic` and `openai` are built in; declare a `[[provider]]`
+# for anything else. Any OpenAI-compatible endpoint — Groq, Together, Fireworks, DeepSeek, Mistral,
+# xAI, OpenRouter, Azure, or a local Ollama / vLLM server — is one entry, no rebuild. A ladder rung
+# then reads `<id>/<model>`, so you can start a rung on a cheap open-source model and escalate to a
+# frontier model only when the gate fails. `dialect` is `openai` or `anthropic`; `api_key_env` names
+# the env var holding that provider's key (omit for a keyless local endpoint). Bespoke-auth providers
+# (AWS Bedrock SigV4, Vertex AI) are not covered by these two dialects yet.
+# [[provider]]
+# id = "groq"
+# dialect = "openai"
+# base_url = "https://api.groq.com/openai"
+# api_key_env = "GROQ_API_KEY"
+#
+# [[provider]]
+# id = "ollama"                       # local, open-source models — no key needed
+# dialect = "openai"
+# base_url = "http://localhost:11434"
+#
+# Then a ladder can open on an OSS rung and escalate to a frontier model on gate failure:
+#   ladder = ["ollama/llama-3.3-70b", "groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]
+
 [[route]]
 match = { agent = "claude-code", subagent = ["test-runner", "explore"] }
 mode  = "enforce"

@@ -38,6 +38,41 @@ pub struct Config {
     /// `deferred_gates`. Declared as `[[gate]]` sections in TOML.
     #[serde(rename = "gate", default)]
     pub gate_defs: Vec<GateDef>,
+    /// Extra model providers a ladder can route to, beyond the built-in `anthropic` / `openai`.
+    /// Any OpenAI-compatible endpoint (Groq, Together, Fireworks, DeepSeek, Mistral, xAI,
+    /// OpenRouter, Ollama, vLLM, Azure, …) is one `[[provider]]` entry — no rebuild. Declared as
+    /// `[[provider]]` sections; a ladder rung is then `<id>/<model>`.
+    #[serde(rename = "provider", default)]
+    pub providers: Vec<ProviderDef>,
+}
+
+/// The wire API a provider speaks. `anthropic` = Messages API; `openai` = Chat Completions API
+/// (the de-facto standard that nearly every hosted and open-source model host implements).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Dialect {
+    /// Anthropic Messages API (`POST /v1/messages`).
+    Anthropic,
+    /// OpenAI Chat Completions API (`POST /v1/chat/completions`).
+    Openai,
+}
+
+/// A model provider a ladder can route to. Declared as `[[provider]]` in TOML; referenced from a
+/// ladder as `<id>/<model>` (e.g. `groq/llama-3.3-70b-versatile`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDef {
+    /// Ladder prefix for this provider, e.g. `"groq"`. Overrides a built-in of the same id.
+    pub id: String,
+    /// Which wire API it speaks.
+    pub dialect: Dialect,
+    /// Base URL, e.g. `"https://api.groq.com/openai"` or `"http://localhost:11434"` for Ollama.
+    pub base_url: String,
+    /// Env var the API key is read from at call time, e.g. `"GROQ_API_KEY"`. Omit for a keyless
+    /// endpoint (local Ollama / vLLM). Per-request BYOK headers still apply to the built-in
+    /// `anthropic` / `openai` providers.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 /// A user-defined gate (SPEC §8.1). Exactly one kind per definition:
@@ -519,6 +554,41 @@ timeout_ms = 60000
         assert!((a.gamma - 0.02).abs() < 1e-9, "gamma defaults to 0.02");
         // Absent => None (fixed-threshold serving, default byte-identical behavior).
         assert!(Config::parse("").unwrap().escalation.adaptive.is_none());
+    }
+
+    #[test]
+    fn parses_provider_entries_and_ladders_can_reference_them() {
+        let c = Config::parse(
+            r#"
+[[provider]]
+id = "groq"
+dialect = "openai"
+base_url = "https://api.groq.com/openai"
+api_key_env = "GROQ_API_KEY"
+
+[[provider]]
+id = "ollama"
+dialect = "openai"
+base_url = "http://localhost:11434"
+
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.providers.len(), 2);
+        let groq = &c.providers[0];
+        assert_eq!(groq.id, "groq");
+        assert_eq!(groq.dialect, Dialect::Openai);
+        assert_eq!(groq.base_url, "https://api.groq.com/openai");
+        assert_eq!(groq.api_key_env.as_deref(), Some("GROQ_API_KEY"));
+        // A keyless local endpoint (Ollama) parses with no api_key_env.
+        assert_eq!(c.providers[1].id, "ollama");
+        assert!(c.providers[1].api_key_env.is_none());
+        // Absent => no extra providers (built-ins only).
+        assert!(Config::parse("").unwrap().providers.is_empty());
     }
 
     #[test]
