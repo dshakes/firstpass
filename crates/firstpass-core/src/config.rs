@@ -228,6 +228,26 @@ pub struct Escalation {
     /// aggregate gate verdict is `Pass` — byte-identical to today.
     #[serde(default)]
     pub serve_threshold: Option<f64>,
+    /// Online/adaptive conformal (Gibbs-Candès ACI): when set, the serve threshold is tracked
+    /// **live** from deferred feedback instead of held fixed, so served-failure stays at target under
+    /// distribution shift. `None` (default) uses the fixed `serve_threshold` above — byte-identical.
+    #[serde(default)]
+    pub adaptive: Option<AdaptiveConfig>,
+}
+
+/// Config for online/adaptive conformal serving ([`crate::conformal::AdaptiveConformal`]).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveConfig {
+    /// Target served-failure rate the online loop holds to.
+    pub alpha: f64,
+    /// Step size (default 0.02) — larger tracks shift faster but noisier.
+    #[serde(default = "default_adaptive_gamma")]
+    pub gamma: f64,
+}
+
+fn default_adaptive_gamma() -> f64 {
+    0.02
 }
 
 const fn default_max_rungs() -> u32 {
@@ -241,6 +261,7 @@ impl Default for Escalation {
             session_promotion: None,
             speculation: 0,
             serve_threshold: None,
+            adaptive: None,
         }
     }
 }
@@ -478,6 +499,19 @@ timeout_ms = 60000
 
         let dup = "[[gate]]\nid = \"g\"\ncmd = [\"a\"]\n[[gate]]\nid = \"g\"\ncmd = [\"b\"]\n";
         assert!(matches!(Config::parse(dup), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn parses_adaptive_conformal_config() {
+        let c = Config::parse("[escalation.adaptive]\nalpha = 0.1\n").unwrap();
+        let a = c
+            .escalation
+            .adaptive
+            .expect("[escalation.adaptive] should parse");
+        assert!((a.alpha - 0.1).abs() < 1e-9);
+        assert!((a.gamma - 0.02).abs() < 1e-9, "gamma defaults to 0.02");
+        // Absent => None (fixed-threshold serving, default byte-identical behavior).
+        assert!(Config::parse("").unwrap().escalation.adaptive.is_none());
     }
 
     #[test]

@@ -47,6 +47,22 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
     let bind = config.bind.clone();
     let providers = ProviderRegistry::new(&config.upstream_anthropic, &config.upstream_openai);
     let gate_health = build_gate_health(&config);
+    // Online adaptive conformal (opt-in): seed the live threshold from the fixed one (or 0.5) and
+    // let /v1/feedback track it. Absent config => None => fixed-threshold behavior, byte-identical.
+    let adaptive = config
+        .routing
+        .as_ref()
+        .and_then(|r| r.escalation.adaptive.as_ref())
+        .map(|a| {
+            let init = config
+                .routing
+                .as_ref()
+                .and_then(|r| r.escalation.serve_threshold)
+                .unwrap_or(0.5);
+            Arc::new(std::sync::Mutex::new(
+                firstpass_core::conformal::AdaptiveConformal::new(a.alpha, a.gamma, init),
+            ))
+        });
 
     let state = AppState {
         config: Arc::new(config),
@@ -59,6 +75,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         providers,
         gate_health: Arc::new(gate_health),
         traces,
+        adaptive,
     };
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;

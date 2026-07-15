@@ -54,3 +54,12 @@ session_promotion = { after_failures = 3, window = "30m" }
 # calls are paid for). 0 = serial (default). Raise it to cut worst-case escalation latency when the
 # extra spend is acceptable.
 speculation = 0
+# Serve threshold: a rung is served iff its aggregate gate score >= this value. Omit to serve on a
+# gate Pass (default, byte-identical).
+# serve_threshold = 0.5
+# Online/adaptive conformal (Gibbs-Candès ACI): when set, the serve threshold is tracked LIVE from
+# /v1/feedback outcomes instead of held fixed — so served-failure stays at `alpha` even as the
+# workload drifts. This is the self-tuning loop; omit for the fixed threshold above.
+# [escalation.adaptive]
+# alpha = 0.10   # target served-failure rate the loop holds to
+# gamma = 0.02   # step size — larger tracks shift faster but noisier
