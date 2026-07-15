@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.93"
 license = "Apache-2.0"
@@ -38,7 +38,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # Internal crates
-firstpass-core = { path = "crates/firstpass-core", version = "0.1.2" }
+firstpass-core = { path = "crates/firstpass-core", version = "0.1.3" }
 
 [profile.release]
 lto = "thin"
