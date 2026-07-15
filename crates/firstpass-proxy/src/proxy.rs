@@ -45,6 +45,10 @@ pub struct AppState {
     pub gate_health: Arc<GateHealthRegistry>,
     /// Fire-and-forget sender to the background trace writer.
     pub traces: store::TraceSender,
+    /// Optional online/adaptive conformal serve threshold (Gibbs-Candès ACI). `None` = fixed
+    /// `serve_threshold` from config (default). When present, `/v1/feedback` nudges it live and the
+    /// enforce path reads its current value per request — the reactive, self-tuning loop.
+    pub adaptive: Option<Arc<std::sync::Mutex<firstpass_core::conformal::AdaptiveConformal>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -222,6 +226,12 @@ async fn feedback(State(state): State<AppState>, body: Bytes) -> Response {
         }
     }
 
+    // Correctness signal for the online adaptive loop — only a clear Pass/Fail nudges the threshold.
+    let feedback_signal = match verdict {
+        Verdict::Pass => Some(true),
+        Verdict::Fail => Some(false),
+        Verdict::Abstain => None,
+    };
     let dv = DeferredVerdict {
         gate_id: req.gate_id,
         verdict,
@@ -232,11 +242,19 @@ async fn feedback(State(state): State<AppState>, body: Bytes) -> Response {
     let trace_id = req.trace_id.clone();
     match tokio::task::spawn_blocking(move || store::append_deferred(&db, &req.trace_id, &dv)).await
     {
-        Ok(Ok(())) => (
-            axum::http::StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "status": "recorded", "trace_id": trace_id })),
-        )
-            .into_response(),
+        Ok(Ok(())) => {
+            // Close the reactive loop: nudge the live serve threshold toward the target.
+            if let (Some(a), Some(correct)) = (state.adaptive.as_ref(), feedback_signal)
+                && let Ok(mut g) = a.lock()
+            {
+                g.observe_served(correct);
+            }
+            (
+                axum::http::StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "status": "recorded", "trace_id": trace_id })),
+            )
+                .into_response()
+        }
         Ok(Err(e)) => {
             tracing::error!(%e, "feedback: append_deferred failed");
             ProxyError::Internal(e.to_string()).into_response()
@@ -394,6 +412,13 @@ async fn handle_enforce(
         ),
         None => (None, 3, 0, None),
     };
+    // Online adaptive conformal: serve against the LIVE-tracked threshold (updated by /v1/feedback).
+    // Falls back to the fixed config threshold when adaptive is off or its lock is poisoned.
+    let serve_threshold = state
+        .adaptive
+        .as_ref()
+        .and_then(|a| a.lock().ok().map(|g| g.threshold()))
+        .or(serve_threshold);
 
     let ctx = EnforceCtx {
         ladder: &route.ladder,
@@ -1003,6 +1028,7 @@ mod tests {
             providers,
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
+            adaptive: None,
         };
         (state, rx)
     }
@@ -1102,6 +1128,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
+            adaptive: None,
         };
         let resp = messages(State(state), HeaderMap::new(), user_body()).await;
         // Observe path forwards upstream; the bogus host yields a gateway error, not our 200.
@@ -1168,6 +1195,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
+            adaptive: None,
         };
 
         // Plain text enforces: the mock serves 200.
@@ -1245,8 +1273,41 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
+            adaptive: None,
         };
         (state, db, trace_id)
+    }
+
+    #[tokio::test]
+    async fn feedback_nudges_the_adaptive_threshold() {
+        use firstpass_core::conformal::AdaptiveConformal;
+        let (mut state, _db, trace_id) = feedback_state().await;
+        let aci = Arc::new(std::sync::Mutex::new(AdaptiveConformal::new(0.1, 0.2, 0.5)));
+        state.adaptive = Some(aci.clone());
+        let before = aci.lock().unwrap().threshold();
+
+        // A served FAILURE raises the threshold (serve more conservatively).
+        let fail = Bytes::from(
+            serde_json::json!({ "trace_id": trace_id, "gate_id": "tests", "verdict": "fail", "reporter": "ci" })
+                .to_string(),
+        );
+        assert_eq!(
+            feedback(State(state.clone()), fail).await.status(),
+            axum::http::StatusCode::ACCEPTED
+        );
+        let after_fail = aci.lock().unwrap().threshold();
+        assert!(
+            after_fail > before,
+            "served fail should raise the live threshold: {before} -> {after_fail}"
+        );
+
+        // A served PASS nudges it back down — the loop is reactive both ways.
+        let pass = Bytes::from(
+            serde_json::json!({ "trace_id": trace_id, "gate_id": "tests", "verdict": "pass", "reporter": "ci" })
+                .to_string(),
+        );
+        let _ = feedback(State(state), pass).await;
+        assert!(aci.lock().unwrap().threshold() < after_fail);
     }
 
     #[tokio::test]
