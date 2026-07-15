@@ -1,6 +1,6 @@
 # ADR 0005 — Enforce through tool-calling and multimodal requests
 
-- Status: Accepted — P1+P2 implemented (default-off), P3 queued
+- Status: Accepted — P1+P2+P3 implemented (default-off); live-verify is the operator's final gate
 - Date: 2026-07-15
 - Supersedes: —
 - Related: SPEC §7.1 (enforce), §7.4 (pluggable), ADR 0001 (hosted plane)
@@ -81,17 +81,25 @@ Concretely:
   `text_message_serializes_byte_identical_to_a_plain_string` (I1),
   `tool_and_image_blocks_survive_the_request_round_trip` and
   `parse_model_request_preserves_content_verbatim_and_projects_text` (I2).
+  Response-side fidelity is enforced in `anthropic_response_json`: served content
+  blocks come **verbatim** from the upstream response (`resp.raw`), so `tool_use`
+  reaches the caller intact instead of being reconstructed as a single text block.
 - **P2 — flag + relaxed gate. ✅ Done (default-off).** `[escalation]
   enforce_structured` added (default `false`). When on, `enforce_can_handle`
-  routes tool/image/tool-block requests through enforce — **except streaming**,
-  which still falls to observe (that's P3). Guarded by
-  `structured_enforce_routes_tools_but_not_streaming`. **Live-verify (I3) is still
-  required before an operator turns it on in production** — the flag ships off and
-  documented as such; the code path is proven offline, not yet against a live tool
-  workload.
-- **P3 — streaming tool round-trip. Queued.** Extend to SSE tool_use deltas (the
-  observe stream path already relays SSE; enforce streaming with tools is the last
-  piece). Until then, `enforce_structured` deliberately excludes `stream:true`.
+  routes tool/image/streaming requests through enforce. Guarded by
+  `structured_enforce_routes_tools_and_streaming`.
+- **P3 — streaming through enforce. ✅ Done.** A `stream:true` request that reaches
+  enforce is served the gated result **re-emitted as SSE** (`anthropic_sse_from_message`):
+  the gate needs the whole candidate, so enforce buffers, gates, then streams the
+  served blocks out — one delta per block, with `tool_use` input carried as an
+  `input_json_delta`. Proven by `enforce_sse_reemission_preserves_text_and_tool_use`.
+
+**On I3 (live-verify).** Fidelity is now enforced *in code* and proven offline on
+both sides — request wire body (`anthropic_wire_forwards_tool_and_image_content_verbatim`),
+response blocks (verbatim from `raw`), and the SSE round trip. The remaining live-verify
+step is an operator's final confidence check against their own tool workload before
+enabling the flag in production; it is no longer the *only* thing standing between the
+code and correctness. The flag still ships **off** by default.
 
 ## Risks
 

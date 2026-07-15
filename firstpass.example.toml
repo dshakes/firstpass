@@ -54,10 +54,10 @@ session_promotion = { after_failures = 3, window = "30m" }
 # calls are paid for). 0 = serial (default). Raise it to cut worst-case escalation latency when the
 # extra spend is acceptable.
 speculation = 0
-# Route tool-calling / multimodal requests through enforce instead of passing them through un-gated
-# (ADR 0005). Off by default = byte-identical to observe fallback. Request content round-trips
-# verbatim either way; turn this on ONLY after verifying enforce faithfully handles your tool
-# workload live. Streaming tool turns still pass through until the streaming path lands.
+# Route tool-calling / multimodal / streaming requests through enforce instead of passing them
+# through un-gated (ADR 0005). Off by default = byte-identical to observe fallback. Content
+# round-trips verbatim and a streaming client is served the gated result as SSE. Turn this on ONLY
+# after verifying enforce faithfully handles your tool workload live.
 # enforce_structured = true
 # Serve threshold: a rung is served iff its aggregate gate score >= this value. Omit to serve on a
 # gate Pass (default, byte-identical).

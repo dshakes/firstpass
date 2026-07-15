@@ -549,6 +549,54 @@ mod tests {
         assert_eq!(wire_model("claude-opus-4-8"), "claude-opus-4-8"); // no prefix → unchanged
     }
 
+    #[test]
+    fn anthropic_wire_forwards_tool_and_image_content_verbatim() {
+        // ADR 0005 I3 (request side): the Anthropic adapter serializes tool_use / tool_result /
+        // image content blocks byte-for-byte into the wire body — enforce forwards them, it does not
+        // flatten them. A plain-string message still serializes as a bare string (I1).
+        let messages = [
+            ChatMessage::text("user", "hi"),
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: serde_json::json!([
+                    { "type": "tool_use", "id": "t1", "name": "calc", "input": { "x": 1 } }
+                ]),
+            },
+            ChatMessage {
+                role: "user".to_owned(),
+                content: serde_json::json!([
+                    { "type": "tool_result", "tool_use_id": "t1", "content": "2" },
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AA==" } }
+                ]),
+            },
+        ];
+        let body = AnthropicWireRequest {
+            model: "claude-haiku-4-5",
+            system: None,
+            max_tokens: 64,
+            messages: messages
+                .iter()
+                .map(|m| AnthropicWireMessage {
+                    role: &m.role,
+                    content: &m.content,
+                })
+                .collect(),
+        };
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(wire["messages"][0]["content"], serde_json::json!("hi"));
+        assert_eq!(
+            wire["messages"][1]["content"],
+            serde_json::json!([{ "type": "tool_use", "id": "t1", "name": "calc", "input": { "x": 1 } }])
+        );
+        assert_eq!(
+            wire["messages"][2]["content"],
+            serde_json::json!([
+                { "type": "tool_result", "tool_use_id": "t1", "content": "2" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AA==" } }
+            ])
+        );
+    }
+
     fn resp(model: &str, text: &str) -> ModelResponse {
         ModelResponse {
             model: model.to_owned(),

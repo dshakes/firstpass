@@ -297,12 +297,12 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                 return handle_enforce(&state, &headers, &body, features, &route, session_header)
                     .await;
             }
-            // Tools / images / tool-result blocks, or a streaming turn the enforce path can't emit as
-            // SSE. With `enforce_structured` off (default) that's every tool/multimodal request; with
-            // it on it's only the streaming ones (ADR 0005 P3). Rather than corrupt the call, fall
-            // through to transparent observe passthrough (correct, un-gated) for this request.
+            // With `enforce_structured` off (default), tool/image/tool-block requests fall through
+            // to transparent observe passthrough (correct, un-gated) rather than being routed —
+            // byte-identical to before ADR 0005. (With it on, `enforce_can_handle` returns true and
+            // we never reach here.)
             tracing::info!(
-                "enforce route matched but request is tool/image/streaming; serving via observe passthrough"
+                "enforce route matched but request carries tools/images; serving via observe passthrough"
             );
         }
     }
@@ -311,16 +311,16 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
 
 /// Whether the enforce path can faithfully handle this request.
 ///
-/// Request content is now carried verbatim (ADR 0005 P1), so tool_use/tool_result/image blocks
-/// survive the round trip. Whether such requests are actually *routed* is the operator's call:
+/// Request content is carried verbatim (ADR 0005 P1), so tool_use/tool_result/image blocks survive
+/// the round trip, and a streaming client is served the gated result as SSE (P3). Whether such
+/// requests are actually *routed* is the operator's call:
 /// - `enforce_structured == false` (default): tools/images/tool-blocks fall back to observe —
 ///   byte-identical to before the ADR (invariant I1).
-/// - `enforce_structured == true` (opt-in, live-verified): they're routed through enforce, except
-///   **streaming** turns — enforce answers with a single JSON body, not SSE, so a `stream:true`
-///   request still goes to observe until the streaming tool path lands (ADR 0005 P3).
+/// - `enforce_structured == true` (opt-in, live-verified): tools, images, and streaming all route
+///   through enforce.
 fn enforce_can_handle(features: &Features, body: &[u8], enforce_structured: bool) -> bool {
     if enforce_structured {
-        return !is_stream_request(body);
+        return true;
     }
     features.tool_count == 0 && !features.has_images && !messages_have_tool_blocks(body)
 }
@@ -451,11 +451,25 @@ async fn handle_enforce(
     offer_trace(&state.traces, trace);
 
     match outcome {
-        EngineOutcome::Served(resp) => (
-            axum::http::StatusCode::OK,
-            Json(anthropic_response_json(&resp)),
-        )
-            .into_response(),
+        EngineOutcome::Served(resp) => {
+            let message = anthropic_response_json(&resp);
+            // A streaming client gets the gated result re-emitted as SSE (ADR 0005 P3): the gate
+            // needs the whole candidate, so enforce can't stream token-by-token from the model — it
+            // buffers to gate, then streams the served blocks out. tool_use blocks are preserved.
+            if is_stream_request(body) {
+                (
+                    axum::http::StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/event-stream; charset=utf-8",
+                    )],
+                    anthropic_sse_from_message(&message),
+                )
+                    .into_response()
+            } else {
+                (axum::http::StatusCode::OK, Json(message)).into_response()
+            }
+        }
         EngineOutcome::Failed(msg) => ProxyError::Engine(msg).into_response(),
     }
 }
@@ -510,15 +524,123 @@ fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
 
 /// Render a served [`ModelResponse`] back into an Anthropic Messages response envelope, so the
 /// caller sees the same wire shape regardless of which provider actually answered.
+///
+/// The `content` blocks come **verbatim** from the upstream response (`resp.raw`) when it is an
+/// Anthropic message — so `tool_use` / `thinking` / multiple text blocks reach the caller intact
+/// (ADR 0005 I2). Only when `raw` has no Anthropic `content` array (a synthetic response, or the
+/// OpenAI adapter, which has `choices` instead) do we fall back to a single reconstructed text
+/// block. The envelope (`id`, `model`, `usage`) is always normalized so the served model id is the
+/// prefixed ladder id, not the bare wire id.
 fn anthropic_response_json(resp: &ModelResponse) -> Value {
+    let content = resp
+        .raw
+        .get("content")
+        .filter(|c| c.is_array())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([{ "type": "text", "text": resp.text }]));
     serde_json::json!({
         "id": format!("msg_{}", Uuid::now_v7()),
         "type": "message",
         "role": "assistant",
         "model": resp.model,
-        "content": [{ "type": "text", "text": resp.text }],
+        "content": content,
         "usage": { "input_tokens": resp.in_tokens, "output_tokens": resp.out_tokens },
     })
+}
+
+/// Append one `event: <type>\ndata: <json>\n\n` SSE frame.
+fn sse_event(out: &mut String, event: &str, data: &Value) {
+    out.push_str("event: ");
+    out.push_str(event);
+    out.push_str("\ndata: ");
+    out.push_str(&data.to_string());
+    out.push_str("\n\n");
+}
+
+/// Re-emit a served Anthropic message envelope (from [`anthropic_response_json`]) as an SSE stream
+/// body, so a `stream: true` client is served even though enforce buffered the response to gate it
+/// (ADR 0005 P3). The gate needs the full candidate, so this is not token-by-token streaming from
+/// the model — each content block is emitted as a single delta. `tool_use` blocks are preserved:
+/// their `input` is streamed as one `input_json_delta` (invariant I2), so the caller reconstructs
+/// the exact tool call.
+fn anthropic_sse_from_message(message: &Value) -> String {
+    let mut out = String::new();
+
+    // message_start carries the envelope with content emptied — the blocks stream next.
+    let mut start_msg = message.clone();
+    start_msg["content"] = Value::Array(Vec::new());
+    sse_event(
+        &mut out,
+        "message_start",
+        &serde_json::json!({ "type": "message_start", "message": start_msg }),
+    );
+
+    let empty = Vec::new();
+    let blocks = message
+        .get("content")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    for (i, block) in blocks.iter().enumerate() {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => {
+                // Start with an empty input object, then stream the real input as one JSON delta.
+                let mut shell = block.clone();
+                shell["input"] = serde_json::json!({});
+                sse_event(
+                    &mut out,
+                    "content_block_start",
+                    &serde_json::json!({ "type": "content_block_start", "index": i, "content_block": shell }),
+                );
+                let input_json = block
+                    .get("input")
+                    .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
+                sse_event(
+                    &mut out,
+                    "content_block_delta",
+                    &serde_json::json!({ "type": "content_block_delta", "index": i,
+                        "delta": { "type": "input_json_delta", "partial_json": input_json } }),
+                );
+            }
+            _ => {
+                // text (and any other text-bearing block): start empty, stream the text as one delta.
+                let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                sse_event(
+                    &mut out,
+                    "content_block_start",
+                    &serde_json::json!({ "type": "content_block_start", "index": i,
+                        "content_block": { "type": "text", "text": "" } }),
+                );
+                sse_event(
+                    &mut out,
+                    "content_block_delta",
+                    &serde_json::json!({ "type": "content_block_delta", "index": i,
+                        "delta": { "type": "text_delta", "text": text } }),
+                );
+            }
+        }
+        sse_event(
+            &mut out,
+            "content_block_stop",
+            &serde_json::json!({ "type": "content_block_stop", "index": i }),
+        );
+    }
+
+    let out_tokens = message
+        .pointer("/usage/output_tokens")
+        .cloned()
+        .unwrap_or_else(|| Value::from(0));
+    sse_event(
+        &mut out,
+        "message_delta",
+        &serde_json::json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" },
+            "usage": { "output_tokens": out_tokens } }),
+    );
+    sse_event(
+        &mut out,
+        "message_stop",
+        &serde_json::json!({ "type": "message_stop" }),
+    );
+    out
 }
 
 /// Observe mode (SPEC §7.1a): forward unchanged, return unchanged, trace asynchronously.
@@ -1205,8 +1327,9 @@ mod tests {
     }
 
     #[test]
-    fn structured_enforce_routes_tools_but_not_streaming() {
-        // ADR 0005 P2: with the opt-in flag on, tool requests route through enforce...
+    fn structured_enforce_routes_tools_and_streaming() {
+        // ADR 0005 P2+P3: with the opt-in flag on, tool and streaming requests both route through
+        // enforce (streaming is served as the gated result re-emitted as SSE).
         let tools = Bytes::from_static(
             br#"{"model":"m","tools":[{"name":"t"}],"messages":[{"role":"user","content":"hi"}]}"#,
         );
@@ -1215,8 +1338,55 @@ mod tests {
         );
         let f = extract_features(&HeaderMap::new(), &tools);
         assert!(enforce_can_handle(&f, &tools, true));
-        // ...but a streaming turn still goes to observe (enforce can't emit SSE yet — P3).
-        assert!(!enforce_can_handle(&f, &streaming_tools, true));
+        assert!(enforce_can_handle(&f, &streaming_tools, true));
+    }
+
+    #[test]
+    fn enforce_sse_reemission_preserves_text_and_tool_use() {
+        // ADR 0005 P3 + I2: a served response with a text block AND a tool_use block round-trips
+        // through the SSE re-emitter — the tool call's input survives as an input_json_delta.
+        let resp = ModelResponse {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            text: "let me check".to_owned(),
+            in_tokens: 5,
+            out_tokens: 7,
+            raw: serde_json::json!({
+                "content": [
+                    { "type": "text", "text": "let me check" },
+                    { "type": "tool_use", "id": "tu_1", "name": "get_weather", "input": { "city": "Paris" } }
+                ]
+            }),
+        };
+        let sse = anthropic_sse_from_message(&anthropic_response_json(&resp));
+
+        // Parse every data frame structurally (key order is not part of the contract).
+        let frames: Vec<Value> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<Value>(d).expect("each SSE data frame is valid JSON"))
+            .collect();
+
+        // Full lifecycle, in order.
+        assert_eq!(frames.first().unwrap()["type"], "message_start");
+        assert_eq!(frames.last().unwrap()["type"], "message_stop");
+        // The text block streams its text as a text_delta.
+        assert!(frames.iter().any(|f| f["delta"]["type"] == "text_delta"
+            && f["delta"]["text"] == "let me check"));
+        // The tool_use block is present with its id/name, and its input streams as one JSON delta —
+        // not dropped (ADR 0005 I2).
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["content_block"]["type"] == "tool_use"
+                    && f["content_block"]["name"] == "get_weather"
+                    && f["content_block"]["id"] == "tu_1")
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["delta"]["type"] == "input_json_delta"
+                    && f["delta"]["partial_json"] == r#"{"city":"Paris"}"#)
+        );
     }
 
     /// B2: an enforce route serves plain text (200 from the mock) but falls back to transparent
