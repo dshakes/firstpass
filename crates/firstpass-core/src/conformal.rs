@@ -91,6 +91,77 @@ pub fn served_failure_rate(pairs: &[(f64, bool)], threshold: f64) -> (f64, usize
     (fails as f64 / served.len() as f64, served.len())
 }
 
+/// Online / adaptive conformal — Gibbs & Candès (2021), *Adaptive Conformal Inference Under
+/// Distribution Shift*. [`calibrate`] fixes a threshold ONCE and assumes exchangeability; under real
+/// drift (models change, prompts change, the gate's error rate moves) the realized served-failure
+/// wanders off target. `AdaptiveConformal` instead tracks the serving threshold **online** from
+/// realized outcomes, so the long-run served-failure rate stays at `alpha` as the workload shifts.
+///
+/// This is the "gate that recalibrates itself from live feedback": every deferred verdict nudges the
+/// threshold, so it never drifts too loose (serving junk) or too strict (escalating needlessly). Feed
+/// it the deferred-feedback stream and read [`AdaptiveConformal::threshold`] on the router hot path.
+#[derive(Debug, Clone)]
+pub struct AdaptiveConformal {
+    alpha: f64,
+    gamma: f64,
+    threshold: f64,
+    served: u64,
+    served_fails: u64,
+}
+
+impl AdaptiveConformal {
+    /// `alpha` = target served-failure rate; `gamma` = step size (e.g. 0.01–0.05, larger tracks
+    /// shift faster but noisier); `init_threshold` = starting `λ` (e.g. a [`calibrate`] result).
+    #[must_use]
+    pub fn new(alpha: f64, gamma: f64, init_threshold: f64) -> Self {
+        Self {
+            alpha,
+            gamma,
+            threshold: init_threshold.clamp(0.0, 1.0),
+            served: 0,
+            served_fails: 0,
+        }
+    }
+
+    /// Serve iff `score ≥` the current threshold.
+    #[must_use]
+    pub fn should_serve(&self, score: f64) -> bool {
+        score >= self.threshold
+    }
+
+    /// The current serving threshold `λ_t`.
+    #[must_use]
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+
+    /// Observe a **served** item's realized correctness (from deferred feedback) and adapt `λ`. The
+    /// ACI update raises `λ` when served errors exceed `alpha` (serve more conservatively) and lowers
+    /// it when they're below (serve more), so realized served-failure converges to `alpha`.
+    pub fn observe_served(&mut self, was_correct: bool) {
+        let err = f64::from(!was_correct);
+        self.threshold = (self.threshold + self.gamma * (err - self.alpha)).clamp(0.0, 1.0);
+        self.served += 1;
+        self.served_fails += u64::from(!was_correct);
+    }
+
+    /// Realized served-failure rate so far (running diagnostic).
+    #[must_use]
+    pub fn realized_served_failure(&self) -> f64 {
+        if self.served == 0 {
+            0.0
+        } else {
+            self.served_fails as f64 / self.served as f64
+        }
+    }
+
+    /// Number of served items observed so far.
+    #[must_use]
+    pub fn served(&self) -> u64 {
+        self.served
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +227,77 @@ mod tests {
         let r = calibrate(&calib, 0.0, 0.05, 50);
         assert!(!r.feasible);
         assert_eq!(r.served_frac, 0.0);
+    }
+
+    #[test]
+    fn adaptive_update_moves_threshold_the_right_way() {
+        let mut a = AdaptiveConformal::new(0.10, 0.05, 0.5);
+        // A served FAILURE raises the threshold (serve more conservatively).
+        a.observe_served(false);
+        assert!(a.threshold() > 0.5);
+        // A served SUCCESS nudges it back down (serve more).
+        let mut b = AdaptiveConformal::new(0.10, 0.05, 0.5);
+        b.observe_served(true);
+        assert!(b.threshold() < 0.5);
+    }
+
+    // Generate a `(score, correct)` stream; after the shift, INCORRECT items score high (the gate
+    // degrades and starts leaking false-accepts past the old threshold).
+    fn shifted(id: u64, shift: bool) -> (f64, bool) {
+        let correct = hash01(42, id, 1) < 0.7;
+        let noise = (hash01(42 ^ 0xBEEF, id, 2) - 0.5) * 0.3;
+        let base = if correct {
+            0.78
+        } else if shift {
+            0.58
+        } else {
+            0.30
+        };
+        ((base + noise).clamp(0.0, 1.0), correct)
+    }
+
+    #[test]
+    fn adaptive_tracks_alpha_under_shift_where_fixed_drifts() {
+        let alpha = 0.10;
+        let n = 6000u64;
+
+        // Fixed threshold calibrated on the pre-shift regime (what a one-shot `calibrate` gives you).
+        let calib: Vec<(f64, bool)> = (0..n).map(|id| shifted(id, false)).collect();
+        let fixed = calibrate(&calib, alpha, 0.05, 50).threshold;
+
+        // Run the FIXED threshold and an ADAPTIVE one over the same post-shift stream.
+        let mut aci = AdaptiveConformal::new(alpha, 0.03, fixed);
+        let (mut fx_served, mut fx_fails) = (0u64, 0u64);
+        let (mut ac_served, mut ac_fails) = (0u64, 0u64);
+        for id in n..(5 * n) {
+            let (score, correct) = shifted(id, true);
+            if score >= fixed {
+                fx_served += 1;
+                fx_fails += u64::from(!correct);
+            }
+            if aci.should_serve(score) {
+                aci.observe_served(correct);
+                ac_served += 1;
+                ac_fails += u64::from(!correct);
+            }
+        }
+        let fixed_rate = fx_fails as f64 / fx_served.max(1) as f64;
+        let aci_rate = ac_fails as f64 / ac_served.max(1) as f64;
+
+        // Under shift the FIXED threshold serves the new false-accepts and drifts above alpha...
+        assert!(
+            fixed_rate > alpha + 0.05,
+            "fixed should drift high under shift, got {fixed_rate:.3}"
+        );
+        // ...while ADAPTIVE re-converges: strictly better than fixed and near the target.
+        assert!(
+            aci_rate < fixed_rate,
+            "adaptive {aci_rate:.3} should beat fixed {fixed_rate:.3}"
+        );
+        assert!(
+            aci_rate <= alpha + 0.06,
+            "adaptive {aci_rate:.3} should track alpha {alpha}"
+        );
+        assert!(ac_served > 0);
     }
 }
