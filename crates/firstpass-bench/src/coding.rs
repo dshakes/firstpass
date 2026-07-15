@@ -494,7 +494,9 @@ impl Judge for LiveJudge {
                 std::thread::sleep(std::time::Duration::from_millis(150));
             }
             // Retry a sample a few times: an occasional empty/unparseable reply is transient. Break
-            // as soon as one resolves to a verdict.
+            // as soon as one resolves to a verdict. ESCALATE the token budget each attempt — an empty
+            // ("no text content") means interleaved thinking ate the budget before the verdict, so
+            // 256 → 512 → 1024 → 2048 gives a starved judgment room to finish.
             for attempt in 0..4u32 {
                 match crate::live::anthropic_call(
                     &self.client,
@@ -503,7 +505,7 @@ impl Judge for LiveJudge {
                     &self.model,
                     Some(system),
                     &user,
-                    256,
+                    256 * 2u32.pow(attempt),
                 ) {
                     Ok((text, _, _)) => {
                         if let Some(v) = parse_verdict(&text) {
