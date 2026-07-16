@@ -36,6 +36,16 @@ bytes = "1"
 tower = { version = "0.5", features = ["limit", "util"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# Bespoke provider auth (ADR 0006 P2/P3): AWS SigV4 request signing (Bedrock), GCP OAuth (Vertex).
+# Delegated to maintained crates — never hand-rolled signing/token crypto.
+# Pinned below current latest: newer aws-sigv4/aws-credential-types/aws-smithy-runtime-api
+# releases bump their declared MSRV past this workspace's rust-version (1.93); these are the
+# newest releases that still build on it.
+aws-sigv4 = { version = "=1.4.5", features = ["sign-http", "http1"] }
+aws-credential-types = "=1.2.14"
+aws-smithy-runtime-api = "=1.12.3"
+gcp_auth = "0.12"
+http = "1"
 
 # Internal crates
 firstpass-core = { path = "crates/firstpass-core", version = "0.1.4" }

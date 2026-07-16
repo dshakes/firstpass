@@ -61,6 +61,24 @@ pub enum Dialect {
     Gemini,
 }
 
+/// How a provider call is credentialed — orthogonal to [`Dialect`] (ADR 0006): dialect shapes the
+/// request/response body, auth scheme shapes how the request is signed/credentialed. Default
+/// (`api_key_env` / BYOK header) is unchanged for every existing `[[provider]]` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthScheme {
+    /// API key in a header (`x-api-key`, `Authorization: Bearer`, or `x-goog-api-key`) — today's
+    /// behavior for `anthropic` / `openai` / `gemini`.
+    #[default]
+    ApiKey,
+    /// AWS SigV4 request signing (Bedrock) — credentials from `AWS_ACCESS_KEY_ID` /
+    /// `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, region-scoped.
+    AwsSigv4,
+    /// GCP OAuth2 bearer token (Vertex AI) — minted and cached by `gcp_auth` from
+    /// `GOOGLE_APPLICATION_CREDENTIALS` or the ambient environment.
+    GcpOauth,
+}
+
 /// A model provider a ladder can route to. Declared as `[[provider]]` in TOML; referenced from a
 /// ladder as `<id>/<model>` (e.g. `groq/llama-3.3-70b-versatile`).
 #[derive(Debug, Clone, Deserialize)]
@@ -71,12 +89,25 @@ pub struct ProviderDef {
     /// Which wire API it speaks.
     pub dialect: Dialect,
     /// Base URL, e.g. `"https://api.groq.com/openai"` or `"http://localhost:11434"` for Ollama.
+    /// Unused for `aws_sigv4/gcp_oauth` auth (those construct the URL from `region`/`project`).
+    #[serde(default)]
     pub base_url: String,
     /// Env var the API key is read from at call time, e.g. `"GROQ_API_KEY"`. Omit for a keyless
     /// endpoint (local Ollama / vLLM). Per-request BYOK headers still apply to the built-in
     /// `anthropic` / `openai` providers.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// How this provider's requests are credentialed. `api_key` (default) is byte-identical to
+    /// today; `aws_sigv4` / `gcp_oauth` are the Bedrock/Vertex auth schemes (ADR 0006).
+    #[serde(default)]
+    pub auth: AuthScheme,
+    /// Cloud region, e.g. `"us-east-1"` — required for `aws_sigv4` (Bedrock) and `gcp_oauth`
+    /// (Vertex).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// GCP project id — required for `gcp_oauth` (Vertex).
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// A user-defined gate (SPEC §8.1). Exactly one kind per definition:
@@ -593,6 +624,37 @@ ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]
         assert!(c.providers[1].api_key_env.is_none());
         // Absent => no extra providers (built-ins only).
         assert!(Config::parse("").unwrap().providers.is_empty());
+    }
+
+    #[test]
+    fn parses_aws_sigv4_provider_and_defaults_auth_to_api_key() {
+        let c = Config::parse(
+            r#"
+[[provider]]
+id = "bedrock"
+dialect = "anthropic"
+auth = "aws_sigv4"
+region = "us-east-1"
+"#,
+        )
+        .unwrap();
+        let bedrock = &c.providers[0];
+        assert_eq!(bedrock.auth, AuthScheme::AwsSigv4);
+        assert_eq!(bedrock.region.as_deref(), Some("us-east-1"));
+        assert!(bedrock.project.is_none());
+
+        // Omitting `auth` on an existing provider entry defaults to ApiKey (I1: no behavior
+        // change for today's `[[provider]]` entries).
+        let c2 = Config::parse(
+            r#"
+[[provider]]
+id = "groq"
+dialect = "openai"
+base_url = "https://api.groq.com/openai"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c2.providers[0].auth, AuthScheme::ApiKey);
     }
 
     #[test]

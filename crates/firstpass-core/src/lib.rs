@@ -31,8 +31,8 @@ pub mod trace;
 pub mod verdict;
 
 pub use config::{
-    Budget, Config, Dialect, Escalation, GateDef, JudgeDef, Mode, ModelRef, OnExhausted,
-    ProviderDef, Route, SessionPromotion,
+    AuthScheme, Budget, Config, Dialect, Escalation, GateDef, JudgeDef, Mode, ModelRef,
+    OnExhausted, ProviderDef, Route, SessionPromotion,
 };
 pub use conformal::{ConformalResult, calibrate, served_failure_rate};
 pub use cost::{ModelPrice, PriceTable};
