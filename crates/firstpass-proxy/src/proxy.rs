@@ -1608,7 +1608,13 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(
-            feedback(State(state.clone()), fail).await.status(),
+            feedback(
+                State(state.clone()),
+                Extension(TenantId("default".to_owned())),
+                fail
+            )
+            .await
+            .status(),
             axum::http::StatusCode::ACCEPTED
         );
         let after_fail = aci.lock().unwrap().threshold();
@@ -1622,7 +1628,12 @@ mod tests {
             serde_json::json!({ "trace_id": trace_id, "gate_id": "tests", "verdict": "pass", "reporter": "ci" })
                 .to_string(),
         );
-        let _ = feedback(State(state), pass).await;
+        let _ = feedback(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            pass,
+        )
+        .await;
         assert!(aci.lock().unwrap().threshold() < after_fail);
     }
 
@@ -1812,6 +1823,7 @@ mod tests {
             providers: ProviderRegistry::from_map(providers),
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
+            adaptive: None,
         }
     }
 
