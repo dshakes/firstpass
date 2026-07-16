@@ -32,7 +32,9 @@ use serde_json::{Value, json};
 async fn spawn_upstream() -> String {
     let router = Router::new()
         .route("/v1/messages", post(anthropic_messages))
-        .route("/v1/chat/completions", post(openai_chat));
+        .route("/v1/chat/completions", post(openai_chat))
+        // Gemini's `{model}:generateContent` is a single path segment.
+        .route("/v1beta/models/{model_action}", post(gemini_generate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -83,9 +85,26 @@ async fn openai_chat(body: Bytes) -> Response {
     .into_response()
 }
 
-/// Start the real proxy with an enforce route over `ladder`, pointed at `upstream`. Returns the
-/// proxy base URL and the temp DB path.
-async fn spawn_proxy(upstream: &str, ladder: &[&str]) -> (String, std::path::PathBuf) {
+/// Gemini `generateContent` wire response — a `candidates[].content.parts[].text` shape with
+/// `usageMetadata`. The API key rides in the `x-goog-api-key` header (the mock doesn't check it).
+async fn gemini_generate(body: Bytes) -> Response {
+    // The incoming Gemini body has no top-level `model` (it's in the URL), so just echo a good answer.
+    let _ = &body;
+    Json(json!({
+        "candidates": [{ "content": { "role": "model", "parts": [{ "text": "gemini says hi" }] } }],
+        "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 3 },
+    }))
+    .into_response()
+}
+
+/// Start the real proxy with an enforce route over `ladder`, pointed at `upstream`. `providers_toml`
+/// is extra `[[provider]]` TOML (empty for the built-in anthropic/openai path). Returns the proxy
+/// base URL and the temp DB path.
+async fn spawn_proxy(
+    upstream: &str,
+    ladder: &[&str],
+    providers_toml: &str,
+) -> (String, std::path::PathBuf) {
     let db_path = std::env::temp_dir().join(format!("firstpass-e2e-{}.db", uuid::Uuid::now_v7()));
     let ladder_toml = ladder
         .iter()
@@ -93,7 +112,7 @@ async fn spawn_proxy(upstream: &str, ladder: &[&str]) -> (String, std::path::Pat
         .collect::<Vec<_>>()
         .join(", ");
     let routing = format!(
-        "[[route]]\nmatch = {{}}\nmode = \"enforce\"\nladder = [{ladder_toml}]\ngates = [\"non-empty\"]\n"
+        "{providers_toml}\n[[route]]\nmatch = {{}}\nmode = \"enforce\"\nladder = [{ladder_toml}]\ngates = [\"non-empty\"]\n"
     );
     let upstream = upstream.to_owned();
     let db_str = db_path.to_string_lossy().into_owned();
@@ -107,8 +126,18 @@ async fn spawn_proxy(upstream: &str, ladder: &[&str]) -> (String, std::path::Pat
     })
     .unwrap();
 
-    // The REAL registry — real reqwest-backed Anthropic/OpenAI clients pointed at the local server.
-    let providers = ProviderRegistry::new(&config.upstream_anthropic, &config.upstream_openai);
+    // The REAL registry, built exactly as production does — built-in anthropic/openai plus any
+    // configured `[[provider]]` (e.g. gemini), all real reqwest clients pointed at the local server.
+    let provider_defs = config
+        .routing
+        .as_ref()
+        .map(|r| r.providers.as_slice())
+        .unwrap_or_default();
+    let providers = ProviderRegistry::from_config(
+        provider_defs,
+        &config.upstream_anthropic,
+        &config.upstream_openai,
+    );
     let (traces, _writer) = store::open(&db_path).unwrap();
     let state = AppState {
         config: Arc::new(config),
@@ -150,6 +179,7 @@ async fn enforce_escalates_over_real_http_then_feedback_attaches() {
             "anthropic/claude-sonnet-5",
             "anthropic/claude-opus-4-8",
         ],
+        "",
     )
     .await;
 
@@ -222,7 +252,12 @@ async fn cross_provider_failover_over_real_http() {
     let upstream = spawn_upstream().await;
     // Rung 0 (anthropic) 503s → failover to rung 1 (openai), whose REAL client decodes the
     // OpenAI wire response. Proves the Anthropic→OpenAI failover path end to end.
-    let (proxy, db) = spawn_proxy(&upstream, &["anthropic/claude-fail5xx", "openai/gpt-5.5"]).await;
+    let (proxy, db) = spawn_proxy(
+        &upstream,
+        &["anthropic/claude-fail5xx", "openai/gpt-5.5"],
+        "",
+    )
+    .await;
 
     let resp = reqwest::Client::new()
         .post(format!("{proxy}/v1/messages"))
@@ -251,6 +286,47 @@ async fn cross_provider_failover_over_real_http() {
     assert_eq!(trace.attempts[1].verdict, Verdict::Pass, "openai served");
     assert_eq!(trace.attempts[1].provider, "openai");
     assert_eq!(trace.final_.served_rung, Some(1));
+    verify_chain(&traces, GENESIS_HASH).unwrap();
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn gemini_dialect_serves_over_real_http() {
+    let upstream = spawn_upstream().await;
+    // A `[[provider]] gemini` pointed at the local server, with a gemini rung in the ladder. The
+    // REAL GeminiProvider reqwest client translates the request, POSTs to
+    // `/v1beta/models/{model}:generateContent`, and decodes the generateContent response — proving
+    // the whole Gemini wire path end to end, not just the offline translation unit tests.
+    let providers =
+        format!("[[provider]]\nid = \"gemini\"\ndialect = \"gemini\"\nbase_url = \"{upstream}\"\n");
+    let (proxy, db) = spawn_proxy(&upstream, &["gemini/gemini-2.0-flash"], &providers).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/messages"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 128,
+            "messages": [{ "role": "user", "content": "hi gemini" }],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // The proxy served the Gemini output, re-rendered in the Anthropic wire shape the caller speaks.
+    assert_eq!(resp.status(), 200);
+    let served: Value = resp.json().await.unwrap();
+    assert_eq!(served["content"][0]["text"], "gemini says hi");
+    assert_eq!(served["model"], "gemini/gemini-2.0-flash");
+
+    let traces = wait_for_traces(&db, 1).await;
+    let trace = &traces[0];
+    assert_eq!(trace.attempts[0].verdict, Verdict::Pass);
+    assert_eq!(trace.attempts[0].provider, "gemini");
+    // Token usage came from the Gemini `usageMetadata`, proving the response decode wired through.
+    assert_eq!(trace.attempts[0].in_tokens, 5);
+    assert_eq!(trace.attempts[0].out_tokens, 3);
     verify_chain(&traces, GENESIS_HASH).unwrap();
 
     let _ = std::fs::remove_file(&db);
