@@ -10,9 +10,8 @@
 # for anything else. Any OpenAI-compatible endpoint — Groq, Together, Fireworks, DeepSeek, Mistral,
 # xAI, OpenRouter, Azure, or a local Ollama / vLLM server — is one entry, no rebuild. A ladder rung
 # then reads `<id>/<model>`, so you can start a rung on a cheap open-source model and escalate to a
-# frontier model only when the gate fails. `dialect` is `openai` or `anthropic`; `api_key_env` names
-# the env var holding that provider's key (omit for a keyless local endpoint). Bespoke-auth providers
-# (AWS Bedrock SigV4, Vertex AI) are not covered by these two dialects yet.
+# frontier model only when the gate fails. `dialect` is `openai`, `anthropic`, or `gemini`;
+# `api_key_env` names the env var holding that provider's key (omit for a keyless local endpoint).
 # [[provider]]
 # id = "groq"
 # dialect = "openai"
@@ -30,8 +29,31 @@
 # base_url = "https://generativelanguage.googleapis.com"
 # api_key_env = "GEMINI_API_KEY"
 #
-# Then a ladder can open on an OSS rung and escalate to a frontier model on gate failure:
+# `auth` is a separate axis from `dialect` (ADR 0006): it picks how the request is credentialed.
+# Bedrock and Vertex both speak the Anthropic body shape but need bespoke request signing/tokens
+# instead of a header API key — set `auth`, not `dialect`, to get them.
+#
+# [[provider]]
+# id = "bedrock"                       # Claude on AWS Bedrock — SigV4-signed, no api_key_env
+# dialect = "anthropic"
+# auth = "aws_sigv4"
+# region = "us-east-1"
+# # Credentials come from the standard AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / (optional)
+# # AWS_SESSION_TOKEN env vars — never put in config or the URL.
+#
+# [[provider]]
+# id = "vertex"                        # Claude on Google Vertex AI — OAuth2 bearer, no api_key_env
+# dialect = "anthropic"
+# auth = "gcp_oauth"
+# region = "us-central1"
+# project = "my-gcp-project"
+# # Token minted from GOOGLE_APPLICATION_CREDENTIALS (a service-account JSON key file) or the
+# # ambient environment (gcloud ADC, GKE workload identity, …); cached and refreshed by gcp_auth.
+#
+# Then a ladder can open on an OSS rung and escalate to a frontier model on gate failure, or fail
+# over across clouds for the same model:
 #   ladder = ["ollama/llama-3.3-70b", "groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]
+#   ladder = ["bedrock/anthropic.claude-3-5-haiku-20241022-v1:0", "anthropic/claude-sonnet-5"]
 
 [[route]]
 match = { agent = "claude-code", subagent = ["test-runner", "explore"] }

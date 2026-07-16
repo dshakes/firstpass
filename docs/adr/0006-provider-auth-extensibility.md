@@ -1,6 +1,7 @@
 # ADR 0006 — Provider dialects and bespoke-auth backends (Gemini, Bedrock, Vertex)
 
-- Status: Accepted — Gemini implemented; Bedrock + Vertex designed, gated on a dependency decision
+- Status: Accepted — Gemini, Bedrock, and Vertex all implemented (offline-tested;
+  Bedrock/Vertex are LIVE-UNVERIFIED — not yet exercised against real AWS/GCP)
 - Date: 2026-07-15
 - Related: `[[provider]]` config (multi-provider routing), ADR 0001 (hosted plane)
 
@@ -43,23 +44,29 @@ Keep dialect and auth as separate, additive axes on `[[provider]]`.
   - **Bedrock** = `anthropic` body + SigV4 signing + `/model/{id}/invoke` URL.
   - **Vertex** = `anthropic` or `gemini` body + GCP OAuth bearer + Vertex URL.
 
-## The dependency decision (why Bedrock/Vertex are not yet coded)
+## The dependency decision (resolved — Bedrock/Vertex are now coded)
 
 SigV4 signing and GCP service-account OAuth are **security-sensitive auth
 primitives**. Hand-rolling either — canonical-request construction and HMAC
 signing-key derivation for SigV4, or RS256 JWT minting and token exchange for GCP
 — is exactly the class of code where a subtle bug becomes an auth vulnerability.
-The responsible implementations use maintained crates:
+The responsible implementations use maintained crates, now added to the
+workspace:
 
-- Bedrock: `aws-sigv4` + `aws-credential-types` (or the `aws-sdk-bedrockruntime`
-  client), credentials from the standard env vars / provider chain.
-- Vertex: `gcp_auth` (service-account → cached access token).
+- Bedrock: `aws-sigv4` 1.4 + `aws-credential-types` 1.2 (pinned below their
+  latest release — newer point releases bump the declared MSRV past this
+  workspace's `rust-version`; see `Cargo.toml` for the exact pins), credentials
+  from the standard `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/
+  `AWS_SESSION_TOKEN` env vars.
+- Vertex: `gcp_auth` 0.12 (service-account → cached access token).
 
-Adding these pulls the AWS Smithy / GCP auth stacks into the dependency tree,
-which is a **supply-chain and `cargo-deny` decision** (new licenses + advisory
-surface, larger binary) that belongs to the operator, not to a silent import.
-So this ADR ships the **design and the seam**; wiring Bedrock/Vertex is a
-one-adapter change once the dependency footprint is signed off.
+This pulled the AWS Smithy / GCP auth stacks into the dependency tree — a
+**supply-chain and `cargo-deny` decision** (new licenses + advisory surface,
+larger binary) that the operator has now signed off on. `cargo deny check`
+passes for the new crates (Apache-2.0/MIT, no advisories); the only new
+findings are `bans.multiple-versions` warnings (transitive `http`/`sha2`/
+`digest` version splits from the AWS/GCP stacks pulling in their own copies) —
+non-blocking under this repo's `multiple-versions = "warn"` policy.
 
 ## Consequences / Invariants
 
@@ -77,15 +84,25 @@ one-adapter change once the dependency footprint is signed off.
 
 - **P1 — Gemini dialect. ✅ Done.** `Dialect::Gemini` + `GeminiProvider`; offline
   translation tests; example config entry; docs.
-- **P2 — Bedrock (SigV4). Designed; gated on the `aws-sigv4` dependency sign-off.**
-  Anthropic body + SigV4 auth + `/model/{id}/invoke`; creds from env; offline test
-  that a signed request carries an `Authorization` SigV4 header and the right host.
-- **P3 — Vertex (GCP OAuth). Designed; gated on the `gcp_auth` dependency sign-off.**
-  Anthropic/Gemini body + cached OAuth bearer + Vertex URL.
+- **P2 — Bedrock (SigV4). ✅ Done.** `AuthScheme::AwsSigv4` + `BedrockProvider`:
+  Anthropic body (`anthropic_messages_body`, model in the URL not the body) + SigV4
+  signing via `aws-sigv4`/`aws-credential-types` (`sign_bedrock`) +
+  `/model/{id}/invoke`; creds from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/
+  `AWS_SESSION_TOKEN`. Offline tests assert the signed request carries an
+  `AWS4-HMAC-SHA256` `authorization` header and the right `host` header, given dummy
+  credentials — signature validity against real AWS is LIVE-UNVERIFIED.
+- **P3 — Vertex (GCP OAuth). ✅ Done.** `AuthScheme::GcpOauth` + `VertexProvider`:
+  Anthropic body + cached OAuth bearer minted by `gcp_auth` (`cloud-platform` scope)
+  + Vertex `rawPredict` URL. Offline tests cover URL construction and the
+  missing-region/missing-project error paths; the live token exchange and Vertex
+  endpoint are LIVE-UNVERIFIED.
 
 ## Risks
 
 - **Auth vulnerability from hand-rolled signing** — mitigated by I3 (delegate to
-  maintained crates; that is the reason P2/P3 are gated, not rushed).
+  maintained crates; that is why P2/P3 waited on the dependency decision rather
+  than shipping bespoke signing).
 - **Dependency/supply-chain growth** — the AWS/GCP auth stacks are non-trivial;
-  the operator weighs that against needing Bedrock/Vertex before it lands.
+  now accepted (see the dependency decision above). Still open: neither adapter
+  has been exercised against a real AWS/GCP endpoint (LIVE-UNVERIFIED) — verify
+  against real credentials before relying on either in production.

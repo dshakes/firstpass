@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use axum::http::HeaderMap;
@@ -283,27 +284,7 @@ impl Provider for AnthropicProvider {
 
         let json: Value =
             serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
-
-        let text = json
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter_map(|b| b.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .ok_or_else(|| ProviderError::Decode("missing content[].text".to_owned()))?;
-
-        let in_tokens = json
-            .pointer("/usage/input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let out_tokens = json
-            .pointer("/usage/output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let (text, in_tokens, out_tokens) = anthropic_parse_response(&json)?;
 
         Ok(ModelResponse {
             model: req.model.clone(),
@@ -313,6 +294,55 @@ impl Provider for AnthropicProvider {
             raw: json,
         })
     }
+}
+
+/// Extract `(text, in_tokens, out_tokens)` from an Anthropic Messages API response. Shared by
+/// [`AnthropicProvider`] and every auth scheme that wraps the Anthropic body shape (Bedrock,
+/// Vertex — ADR 0006): they all get the same response back, only the request's auth/URL differ.
+fn anthropic_parse_response(json: &Value) -> Result<(String, u64, u64), ProviderError> {
+    let text = json
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .ok_or_else(|| ProviderError::Decode("missing content[].text".to_owned()))?;
+
+    let in_tokens = json
+        .pointer("/usage/input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let out_tokens = json
+        .pointer("/usage/output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    Ok((text, in_tokens, out_tokens))
+}
+
+/// Build an Anthropic Messages-shaped request body with the model **omitted** — Bedrock and Vertex
+/// both put the model in the URL, not the body (ADR 0006 P2/P3), unlike direct Anthropic API calls
+/// which need `model` in the body ([`AnthropicWireRequest`]). `anthropic_version` is the dialect
+/// version string each host expects (`bedrock-2023-05-31` / `vertex-2023-10-16`).
+fn anthropic_messages_body(req: &ModelRequest, anthropic_version: &str) -> Value {
+    let messages: Vec<Value> = req
+        .messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+    let mut body = serde_json::json!({
+        "anthropic_version": anthropic_version,
+        "max_tokens": req.max_tokens,
+        "messages": messages,
+    });
+    if let Some(system) = req.system.as_deref() {
+        body["system"] = serde_json::json!(system);
+    }
+    body
 }
 
 #[derive(Serialize)]
@@ -552,6 +582,276 @@ impl Provider for GeminiProvider {
     }
 }
 
+/// AWS credentials read fresh from the standard env vars at call time — never cached, never
+/// logged (ADR 0006 P2). `AWS_SESSION_TOKEN` is optional (long-lived IAM user keys have none;
+/// STS-issued temporary credentials do).
+struct AwsEnvCredentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+}
+
+impl AwsEnvCredentials {
+    fn from_env() -> Result<Self, ProviderError> {
+        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
+            .map_err(|_| ProviderError::Transport("AWS_ACCESS_KEY_ID is not set".to_owned()))?;
+        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .map_err(|_| ProviderError::Transport("AWS_SECRET_ACCESS_KEY is not set".to_owned()))?;
+        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+        Ok(Self {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        })
+    }
+}
+
+/// Build the Bedrock `invoke` URL for a region + wire model id.
+fn bedrock_url(region: &str, model: &str) -> String {
+    format!("https://bedrock-runtime.{region}.amazonaws.com/model/{model}/invoke")
+}
+
+/// SigV4-sign a Bedrock `InvokeModel` request, returning the fully-built (headers + body) HTTP
+/// request ready to hand to reqwest. Delegates all canonical-request construction and HMAC signing
+/// to `aws-sigv4` (ADR 0006 I3) — this function only wires host/service/region into that crate's
+/// API and applies the resulting signature. Split out from [`BedrockProvider::complete`] so the
+/// signing shape (not its cryptographic validity, which only a real AWS call can prove) is
+/// unit-testable offline with dummy credentials.
+///
+// LIVE-UNVERIFIED: tests assert the produced request carries an `AWS4-HMAC-SHA256` authorization
+// header and the expected host, against dummy credentials. Signature validity is only provable
+// against a real Bedrock endpoint.
+fn sign_bedrock(
+    url: &str,
+    region: &str,
+    body: &[u8],
+    creds: &AwsEnvCredentials,
+) -> Result<http::Request<Vec<u8>>, ProviderError> {
+    let host = url
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(str::to_owned))
+        .ok_or_else(|| ProviderError::Transport(format!("invalid bedrock URL: {url}")))?;
+
+    let identity: aws_smithy_runtime_api::client::identity::Identity =
+        aws_credential_types::Credentials::new(
+            creds.access_key_id.clone(),
+            creds.secret_access_key.clone(),
+            creds.session_token.clone(),
+            None,
+            "firstpass",
+        )
+        .into();
+
+    let signing_params: aws_sigv4::http_request::SigningParams<'_> =
+        aws_sigv4::sign::v4::SigningParams::builder()
+            .identity(&identity)
+            .region(region)
+            .name("bedrock")
+            .time(SystemTime::now())
+            .settings(aws_sigv4::http_request::SigningSettings::default())
+            .build()
+            .map_err(|e| ProviderError::Transport(format!("sigv4 signing params: {e}")))?
+            .into();
+
+    let headers = [
+        ("host", host.as_str()),
+        ("content-type", "application/json"),
+    ];
+    let signable = aws_sigv4::http_request::SignableRequest::new(
+        "POST",
+        url,
+        headers.into_iter(),
+        aws_sigv4::http_request::SignableBody::Bytes(body),
+    )
+    .map_err(|e| ProviderError::Transport(format!("sigv4 signable request: {e}")))?;
+
+    let (instructions, _signature) = aws_sigv4::http_request::sign(signable, &signing_params)
+        .map_err(|e| ProviderError::Transport(format!("sigv4 sign: {e}")))?
+        .into_parts();
+
+    let mut req = http::Request::builder()
+        .method("POST")
+        .uri(url)
+        .header("host", host)
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .map_err(|e| ProviderError::Transport(format!("build bedrock request: {e}")))?;
+    instructions.apply_to_request_http1x(&mut req);
+    Ok(req)
+}
+
+/// Speaks `POST https://bedrock-runtime.{region}.amazonaws.com/model/{model}/invoke` (Claude on AWS
+/// Bedrock) — an Anthropic-shaped body ([`anthropic_messages_body`]) authenticated with AWS SigV4
+/// request signing rather than an API key (ADR 0006 P2). Credentials come from the standard
+/// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` env vars, read fresh per
+/// call — never logged, never put in the URL (I2).
+///
+// LIVE-UNVERIFIED: the request/response translation and signing call shape are unit-tested
+// offline; this has not been exercised against a real Bedrock endpoint. Verify against real AWS
+// credentials before relying on it in production.
+#[derive(Debug, Clone)]
+pub struct BedrockProvider {
+    /// Ladder prefix / trace label (usually `"bedrock"`).
+    pub id: String,
+    /// AWS region Bedrock is called in, e.g. `"us-east-1"`.
+    pub region: Option<String>,
+    /// Shared, connection-pooled HTTP client.
+    pub http: reqwest::Client,
+}
+
+#[async_trait]
+impl Provider for BedrockProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn complete(
+        &self,
+        req: &ModelRequest,
+        _auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        let region = self.region.as_deref().ok_or_else(|| {
+            ProviderError::Transport("bedrock provider requires a region".to_owned())
+        })?;
+        let model = wire_model(&req.model);
+        let url = bedrock_url(region, model);
+        let body = anthropic_messages_body(req, "bedrock-2023-05-31");
+        let body_bytes =
+            serde_json::to_vec(&body).map_err(|e| ProviderError::Decode(e.to_string()))?;
+
+        let creds = AwsEnvCredentials::from_env()?;
+        let signed = sign_bedrock(&url, region, &body_bytes, &creds)?;
+        let http_req = reqwest::Request::try_from(signed)
+            .map_err(|e| ProviderError::Transport(format!("build reqwest request: {e}")))?;
+
+        let resp = self
+            .http
+            .execute(http_req)
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+
+        let json: Value =
+            serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
+        let (text, in_tokens, out_tokens) = anthropic_parse_response(&json)?;
+        Ok(ModelResponse {
+            model: req.model.clone(),
+            text,
+            in_tokens,
+            out_tokens,
+            raw: json,
+        })
+    }
+}
+
+/// Build the Vertex AI `rawPredict` URL for a region + project + wire model id (Claude on Vertex).
+fn vertex_url(region: &str, project: &str, model: &str) -> String {
+    format!(
+        "https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:rawPredict"
+    )
+}
+
+/// Speaks `POST https://{region}-aiplatform.googleapis.com/.../publishers/anthropic/models/{model}:rawPredict`
+/// (Claude on Google Vertex AI) — an Anthropic-shaped body ([`anthropic_messages_body`])
+/// authenticated with a GCP OAuth2 bearer token rather than an API key (ADR 0006 P3). The token is
+/// minted and cached by `gcp_auth` from `GOOGLE_APPLICATION_CREDENTIALS` or the ambient GCP
+/// environment — this adapter never caches or logs it, and it never goes in the URL (I2).
+///
+// LIVE-UNVERIFIED: the request/response translation is unit-tested offline; this has not been
+// exercised against a real Vertex endpoint. Verify against a real service account before relying
+// on it in production.
+#[derive(Debug, Clone)]
+pub struct VertexProvider {
+    /// Ladder prefix / trace label (usually `"vertex"`).
+    pub id: String,
+    /// GCP region Vertex is called in, e.g. `"us-central1"`.
+    pub region: Option<String>,
+    /// GCP project id.
+    pub project: Option<String>,
+    /// Shared, connection-pooled HTTP client.
+    pub http: reqwest::Client,
+}
+
+#[async_trait]
+impl Provider for VertexProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn complete(
+        &self,
+        req: &ModelRequest,
+        _auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        let region = self.region.as_deref().ok_or_else(|| {
+            ProviderError::Transport("vertex provider requires a region".to_owned())
+        })?;
+        let project = self.project.as_deref().ok_or_else(|| {
+            ProviderError::Transport("vertex provider requires a project".to_owned())
+        })?;
+        let model = wire_model(&req.model);
+        let url = vertex_url(region, project, model);
+        let body = anthropic_messages_body(req, "vertex-2023-10-16");
+
+        // ponytail: gcp_auth re-detects the auth method per call (the token itself is cached inside
+        // the provider). Cache the provider in a OnceCell if Vertex ever becomes a hot path.
+        let provider = gcp_auth::provider()
+            .await
+            .map_err(|e| ProviderError::Transport(format!("gcp_auth provider: {e}")))?;
+        let token = provider
+            .token(&["https://www.googleapis.com/auth/cloud-platform"])
+            .await
+            .map_err(|e| ProviderError::Transport(format!("gcp_auth token: {e}")))?;
+
+        let resp = self
+            .http
+            .post(url)
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {}", token.as_str()),
+            )
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+
+        let json: Value =
+            serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
+        let (text, in_tokens, out_tokens) = anthropic_parse_response(&json)?;
+        Ok(ModelResponse {
+            model: req.model.clone(),
+            text,
+            in_tokens,
+            out_tokens,
+            raw: json,
+        })
+    }
+}
+
 /// Lookup from provider id (`"anthropic"`, `"openai"`, ...) to the [`Provider`] that serves it.
 #[derive(Clone)]
 pub struct ProviderRegistry {
@@ -617,25 +917,41 @@ impl ProviderRegistry {
             }),
         );
         for def in defs {
-            let provider: Arc<dyn Provider> = match def.dialect {
-                firstpass_core::Dialect::Anthropic => Arc::new(AnthropicProvider {
+            // Auth scheme comes first (ADR 0006): `aws_sigv4`/`gcp_oauth` are bespoke-auth
+            // backends that wrap the Anthropic body shape regardless of `dialect`; `api_key`
+            // (the default) is today's dialect-driven dispatch, unchanged.
+            let provider: Arc<dyn Provider> = match def.auth {
+                firstpass_core::AuthScheme::AwsSigv4 => Arc::new(BedrockProvider {
                     id: def.id.clone(),
-                    base_url: def.base_url.clone(),
-                    api_key_env: def.api_key_env.clone(),
+                    region: def.region.clone(),
                     http: http.clone(),
                 }),
-                firstpass_core::Dialect::Openai => Arc::new(OpenAiProvider {
+                firstpass_core::AuthScheme::GcpOauth => Arc::new(VertexProvider {
                     id: def.id.clone(),
-                    base_url: def.base_url.clone(),
-                    api_key_env: def.api_key_env.clone(),
+                    region: def.region.clone(),
+                    project: def.project.clone(),
                     http: http.clone(),
                 }),
-                firstpass_core::Dialect::Gemini => Arc::new(GeminiProvider {
-                    id: def.id.clone(),
-                    base_url: def.base_url.clone(),
-                    api_key_env: def.api_key_env.clone(),
-                    http: http.clone(),
-                }),
+                firstpass_core::AuthScheme::ApiKey => match def.dialect {
+                    firstpass_core::Dialect::Anthropic => Arc::new(AnthropicProvider {
+                        id: def.id.clone(),
+                        base_url: def.base_url.clone(),
+                        api_key_env: def.api_key_env.clone(),
+                        http: http.clone(),
+                    }),
+                    firstpass_core::Dialect::Openai => Arc::new(OpenAiProvider {
+                        id: def.id.clone(),
+                        base_url: def.base_url.clone(),
+                        api_key_env: def.api_key_env.clone(),
+                        http: http.clone(),
+                    }),
+                    firstpass_core::Dialect::Gemini => Arc::new(GeminiProvider {
+                        id: def.id.clone(),
+                        base_url: def.base_url.clone(),
+                        api_key_env: def.api_key_env.clone(),
+                        http: http.clone(),
+                    }),
+                },
             };
             providers.insert(def.id.clone(), provider);
         }
@@ -783,6 +1099,9 @@ mod tests {
             dialect: firstpass_core::Dialect::Gemini,
             base_url: "https://generativelanguage.googleapis.com".to_owned(),
             api_key_env: Some("GEMINI_API_KEY".to_owned()),
+            auth: firstpass_core::AuthScheme::ApiKey,
+            region: None,
+            project: None,
         }];
         let reg = ProviderRegistry::from_config(
             &defs,
@@ -800,6 +1119,9 @@ mod tests {
                 dialect: firstpass_core::Dialect::Openai,
                 base_url: "https://api.groq.com/openai".to_owned(),
                 api_key_env: Some("GROQ_API_KEY".to_owned()),
+                auth: firstpass_core::AuthScheme::ApiKey,
+                region: None,
+                project: None,
             },
             // A custom provider may override a built-in id (e.g. point `openai` at Azure).
             firstpass_core::ProviderDef {
@@ -807,6 +1129,9 @@ mod tests {
                 dialect: firstpass_core::Dialect::Openai,
                 base_url: "https://my-azure.openai.azure.com".to_owned(),
                 api_key_env: Some("AZURE_OPENAI_KEY".to_owned()),
+                auth: firstpass_core::AuthScheme::ApiKey,
+                region: None,
+                project: None,
             },
         ];
         let reg = ProviderRegistry::from_config(
@@ -819,6 +1144,155 @@ mod tests {
         assert_eq!(reg.get("groq").unwrap().id(), "groq");
         // Unknown provider → None (router fails over rather than guessing).
         assert!(reg.get("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn anthropic_messages_body_omits_model_and_includes_system_only_when_set() {
+        let req = ModelRequest {
+            model: "bedrock/anthropic.claude-3-5-haiku".to_owned(),
+            system: Some("be terse".to_owned()),
+            messages: vec![
+                ChatMessage::text("user", "hi"),
+                ChatMessage {
+                    role: "assistant".to_owned(),
+                    content: serde_json::json!([{ "type": "text", "text": "hello" }]),
+                },
+            ],
+            max_tokens: 128,
+            tools: Value::Null,
+        };
+        let body = anthropic_messages_body(&req, "bedrock-2023-05-31");
+        // Model goes in the URL for Bedrock/Vertex, never the body.
+        assert!(body.get("model").is_none());
+        assert_eq!(body["anthropic_version"], "bedrock-2023-05-31");
+        assert_eq!(body["max_tokens"], 128);
+        assert_eq!(body["system"], "be terse");
+        assert_eq!(body["messages"][0]["content"], serde_json::json!("hi"));
+        // Content-block arrays forward verbatim, same as the direct Anthropic adapter (ADR 0005).
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([{ "type": "text", "text": "hello" }])
+        );
+
+        // No system prompt => no `system` key at all (not `null`).
+        let req_no_system = ModelRequest {
+            system: None,
+            ..req
+        };
+        let body2 = anthropic_messages_body(&req_no_system, "vertex-2023-10-16");
+        assert!(body2.get("system").is_none());
+    }
+
+    #[test]
+    fn bedrock_url_construction_and_missing_region() {
+        assert_eq!(
+            bedrock_url("us-east-1", "anthropic.claude-3-5-haiku-20241022-v1:0"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-haiku-20241022-v1:0/invoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_complete_errors_without_a_region() {
+        let provider = BedrockProvider {
+            id: "bedrock".to_owned(),
+            region: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "bedrock/anthropic.claude-3-5-haiku".to_owned(),
+            system: None,
+            messages: vec![],
+            max_tokens: 16,
+            tools: Value::Null,
+        };
+        let err = provider.complete(&req, &Auth::default()).await.unwrap_err();
+        assert!(matches!(err, ProviderError::Transport(_)));
+    }
+
+    #[test]
+    fn bedrock_signing_produces_a_sigv4_authorization_header() {
+        // Dummy, non-production credentials — this only proves the *shape* of the signed request
+        // (algorithm header + host), not cryptographic validity against real AWS (LIVE-UNVERIFIED).
+        let creds = AwsEnvCredentials {
+            access_key_id: "AKIDEXAMPLE".to_owned(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            session_token: None,
+        };
+        let url = bedrock_url("us-east-1", "anthropic.claude-3-5-haiku");
+        let body = br#"{"anthropic_version":"bedrock-2023-05-31"}"#;
+        let signed = sign_bedrock(&url, "us-east-1", body, &creds).unwrap();
+
+        let auth_header = signed
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .expect("authorization header present");
+        assert!(auth_header.starts_with("AWS4-HMAC-SHA256"));
+
+        let host_header = signed
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .expect("host header present");
+        assert_eq!(host_header, "bedrock-runtime.us-east-1.amazonaws.com");
+    }
+
+    #[test]
+    fn vertex_url_construction_and_missing_project() {
+        assert_eq!(
+            vertex_url("us-central1", "my-project", "claude-3-5-sonnet"),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/anthropic/models/claude-3-5-sonnet:rawPredict"
+        );
+    }
+
+    #[tokio::test]
+    async fn vertex_complete_errors_without_a_project() {
+        let provider = VertexProvider {
+            id: "vertex".to_owned(),
+            region: Some("us-central1".to_owned()),
+            project: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "vertex/claude-3-5-sonnet".to_owned(),
+            system: None,
+            messages: vec![],
+            max_tokens: 16,
+            tools: Value::Null,
+        };
+        let err = provider.complete(&req, &Auth::default()).await.unwrap_err();
+        assert!(matches!(err, ProviderError::Transport(_)));
+    }
+
+    #[test]
+    fn from_config_wires_bedrock_and_vertex_auth_schemes() {
+        let defs = vec![
+            firstpass_core::ProviderDef {
+                id: "bedrock".to_owned(),
+                dialect: firstpass_core::Dialect::Anthropic,
+                base_url: String::new(),
+                api_key_env: None,
+                auth: firstpass_core::AuthScheme::AwsSigv4,
+                region: Some("us-east-1".to_owned()),
+                project: None,
+            },
+            firstpass_core::ProviderDef {
+                id: "vertex".to_owned(),
+                dialect: firstpass_core::Dialect::Anthropic,
+                base_url: String::new(),
+                api_key_env: None,
+                auth: firstpass_core::AuthScheme::GcpOauth,
+                region: Some("us-central1".to_owned()),
+                project: Some("my-project".to_owned()),
+            },
+        ];
+        let reg = ProviderRegistry::from_config(
+            &defs,
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+        );
+        assert_eq!(reg.get("bedrock").unwrap().id(), "bedrock");
+        assert_eq!(reg.get("vertex").unwrap().id(), "vertex");
     }
 
     #[test]
