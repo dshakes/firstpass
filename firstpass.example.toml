@@ -24,6 +24,12 @@
 # dialect = "openai"
 # base_url = "http://localhost:11434"
 #
+# [[provider]]
+# id = "gemini"                       # Google Gemini (its own dialect; key via x-goog-api-key)
+# dialect = "gemini"
+# base_url = "https://generativelanguage.googleapis.com"
+# api_key_env = "GEMINI_API_KEY"
+#
 # Then a ladder can open on an OSS rung and escalate to a frontier model on gate failure:
 #   ladder = ["ollama/llama-3.3-70b", "groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]
 

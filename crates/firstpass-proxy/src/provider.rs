@@ -1,5 +1,5 @@
-//! Normalized model access: a provider-agnostic request/response shape, and the two wire
-//! adapters (Anthropic Messages, OpenAI Chat Completions) that speak it. The router
+//! Normalized model access: a provider-agnostic request/response shape, and the wire adapters
+//! (Anthropic Messages, OpenAI Chat Completions, Google Gemini) that speak it. The router
 //! ([`crate::router`]) only ever talks to [`Provider`]; it never knows which wire format is
 //! behind a given rung.
 
@@ -430,6 +430,128 @@ impl Provider for OpenAiProvider {
     }
 }
 
+/// Build the Gemini `generateContent` request body from a normalized [`ModelRequest`]. Split out
+/// (pure, no I/O) so the translation is unit-tested offline. Gemini uses `contents` with roles
+/// `user` / `model` (not `assistant`) and a separate `system_instruction`; the system prompt and the
+/// per-message text projection ([`ChatMessage::text_view`]) are what we send. Tool/multimodal blocks
+/// for Gemini (its `functionCall` / `functionResponse` / `inlineData` shapes) are a follow-on — this
+/// adapter routes text, matching the OpenAI adapter's current scope.
+fn gemini_request_body(req: &ModelRequest) -> Value {
+    let contents: Vec<Value> = req
+        .messages
+        .iter()
+        .map(|m| {
+            let role = if m.role == "assistant" {
+                "model"
+            } else {
+                "user"
+            };
+            serde_json::json!({ "role": role, "parts": [{ "text": m.text_view() }] })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "contents": contents,
+        "generationConfig": { "maxOutputTokens": req.max_tokens },
+    });
+    if let Some(system) = req.system.as_deref() {
+        body["system_instruction"] = serde_json::json!({ "parts": [{ "text": system }] });
+    }
+    body
+}
+
+/// Extract `(text, in_tokens, out_tokens)` from a Gemini `generateContent` response. `text` is the
+/// concatenation of the first candidate's text parts; token counts come from `usageMetadata`.
+fn gemini_parse_response(json: &Value) -> Result<(String, u64, u64), ProviderError> {
+    let parts = json
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderError::Decode("missing candidates[0].content.parts".to_owned()))?;
+    let text = parts
+        .iter()
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    let in_tokens = json
+        .pointer("/usageMetadata/promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let out_tokens = json
+        .pointer("/usageMetadata/candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Ok((text, in_tokens, out_tokens))
+}
+
+/// Speaks `POST {base}/v1beta/models/{model}:generateContent` (Google Gemini Generative Language
+/// API). The API key goes in the `x-goog-api-key` header — never the URL query string, so it stays
+/// out of logs and proxies.
+///
+// LIVE-UNVERIFIED: the request/response translation is unit-tested offline; it has not yet been
+// exercised against a real Gemini endpoint. Verify against a real key before relying on it.
+#[derive(Debug, Clone)]
+pub struct GeminiProvider {
+    /// Ladder prefix / trace label (usually `"gemini"` or `"google"`).
+    pub id: String,
+    /// Base URL, e.g. `https://generativelanguage.googleapis.com`.
+    pub base_url: String,
+    /// Env var the API key is read from, e.g. `"GEMINI_API_KEY"`.
+    pub api_key_env: Option<String>,
+    /// Shared, connection-pooled HTTP client.
+    pub http: reqwest::Client,
+}
+
+#[async_trait]
+impl Provider for GeminiProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn complete(
+        &self,
+        req: &ModelRequest,
+        auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        let key = resolve_api_key(self.api_key_env.as_deref(), auth.openai_key.as_deref());
+        let body = gemini_request_body(req);
+        let url = format!(
+            "{}/v1beta/models/{}:generateContent",
+            self.base_url.trim_end_matches('/'),
+            wire_model(&req.model),
+        );
+        let resp = self
+            .http
+            .post(url)
+            .header("x-goog-api-key", key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+
+        let json: Value =
+            serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
+        let (text, in_tokens, out_tokens) = gemini_parse_response(&json)?;
+        Ok(ModelResponse {
+            model: req.model.clone(),
+            text,
+            in_tokens,
+            out_tokens,
+            raw: json,
+        })
+    }
+}
+
 /// Lookup from provider id (`"anthropic"`, `"openai"`, ...) to the [`Provider`] that serves it.
 #[derive(Clone)]
 pub struct ProviderRegistry {
@@ -503,6 +625,12 @@ impl ProviderRegistry {
                     http: http.clone(),
                 }),
                 firstpass_core::Dialect::Openai => Arc::new(OpenAiProvider {
+                    id: def.id.clone(),
+                    base_url: def.base_url.clone(),
+                    api_key_env: def.api_key_env.clone(),
+                    http: http.clone(),
+                }),
+                firstpass_core::Dialect::Gemini => Arc::new(GeminiProvider {
                     id: def.id.clone(),
                     base_url: def.base_url.clone(),
                     api_key_env: def.api_key_env.clone(),
@@ -607,6 +735,61 @@ mod tests {
         assert_eq!(wire_model("anthropic/claude-haiku-4-5"), "claude-haiku-4-5");
         assert_eq!(wire_model("openai/gpt-5.5"), "gpt-5.5");
         assert_eq!(wire_model("claude-opus-4-8"), "claude-opus-4-8"); // no prefix → unchanged
+    }
+
+    #[test]
+    fn gemini_request_maps_roles_and_system_instruction() {
+        let req = ModelRequest {
+            model: "gemini/gemini-2.0-flash".to_owned(),
+            system: Some("be terse".to_owned()),
+            messages: vec![
+                ChatMessage::text("user", "hi"),
+                ChatMessage::text("assistant", "hello"),
+            ],
+            max_tokens: 256,
+            tools: Value::Null,
+        };
+        let body = gemini_request_body(&req);
+        // System prompt goes in system_instruction, not contents.
+        assert_eq!(body["system_instruction"]["parts"][0]["text"], "be terse");
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 256);
+        // Anthropic's "assistant" role becomes Gemini's "model"; "user" stays "user".
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "hi");
+        assert_eq!(body["contents"][1]["role"], "model");
+        assert_eq!(body["contents"][1]["parts"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn gemini_response_parses_text_and_usage() {
+        let json = serde_json::json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                { "text": "the answer " }, { "text": "is 42" }
+            ] } }],
+            "usageMetadata": { "promptTokenCount": 11, "candidatesTokenCount": 4 }
+        });
+        let (text, in_tok, out_tok) = gemini_parse_response(&json).unwrap();
+        assert_eq!(text, "the answer is 42");
+        assert_eq!(in_tok, 11);
+        assert_eq!(out_tok, 4);
+        // A response with no candidates is a decode error, not a fabricated empty answer.
+        assert!(gemini_parse_response(&serde_json::json!({ "candidates": [] })).is_err());
+    }
+
+    #[test]
+    fn from_config_wires_the_gemini_dialect() {
+        let defs = vec![firstpass_core::ProviderDef {
+            id: "gemini".to_owned(),
+            dialect: firstpass_core::Dialect::Gemini,
+            base_url: "https://generativelanguage.googleapis.com".to_owned(),
+            api_key_env: Some("GEMINI_API_KEY".to_owned()),
+        }];
+        let reg = ProviderRegistry::from_config(
+            &defs,
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+        );
+        assert_eq!(reg.get("gemini").unwrap().id(), "gemini");
     }
 
     #[test]

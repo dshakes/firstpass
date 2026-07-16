@@ -47,7 +47,8 @@ pub struct Config {
 }
 
 /// The wire API a provider speaks. `anthropic` = Messages API; `openai` = Chat Completions API
-/// (the de-facto standard that nearly every hosted and open-source model host implements).
+/// (the de-facto standard that nearly every hosted and open-source model host implements);
+/// `gemini` = Google's Generative Language API (`generateContent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Dialect {
@@ -55,6 +56,9 @@ pub enum Dialect {
     Anthropic,
     /// OpenAI Chat Completions API (`POST /v1/chat/completions`).
     Openai,
+    /// Google Gemini Generative Language API (`POST /v1beta/models/<model>:generateContent`),
+    /// authenticated with an API key in the `x-goog-api-key` header.
+    Gemini,
 }
 
 /// A model provider a ladder can route to. Declared as `[[provider]]` in TOML; referenced from a
