@@ -84,6 +84,7 @@
     <a href="#modes">Modes</a>
     <a href="#env">Environment</a>
     <a href="#routing">Routing config</a>
+    <a href="#providers">Providers</a>
     <a href="#gates">Gates</a>
     <div class="grp">Operate</div>
     <a href="#endpoints">Endpoints</a>
@@ -98,7 +99,7 @@
 
     <h2 id="overview">Overview</h2>
     <p>Every request flows through three moves: <b>route</b> to the cheapest rung of a ladder, <b>gate</b> the real output, and <b>escalate</b> one rung only if the gate fails — across providers, with cross-provider failover on a 5xx. The whole decision is written to a tamper-evident, hash-chained trace.</p>
-    <div class="pillrow"><span class="pill"><b>providers</b> Anthropic · OpenAI</span><span class="pill"><b>store</b> SQLite (WAL)</span><span class="pill"><b>config</b> env + TOML</span><span class="pill"><b>keys</b> BYOK, redacted</span></div>
+    <div class="pillrow"><span class="pill"><b>providers</b> Anthropic · OpenAI-compatible · Gemini · Bedrock · Vertex</span><span class="pill"><b>store</b> SQLite (WAL)</span><span class="pill"><b>config</b> env + TOML</span><span class="pill"><b>keys</b> BYOK, redacted</span></div>
 
     <h2 id="install">Install</h2>
     <table class="t"><thead><tr><th>Method</th><th>Command</th></tr></thead><tbody>
@@ -156,6 +157,61 @@ gates = ["schema", "cargo-test"]'>copy</button><pre style="margin:0"><span class
 <span class="c">[[route]]</span>
 <span class="cy">match</span> = {}
 <span class="cy">mode</span>  = <span class="p">"observe"</span></pre></div>
+
+    <h2 id="providers">Providers</h2>
+    <p><code>anthropic</code> and <code>openai</code> are built in. A <code>[[provider]]</code> entry adds any other, so a ladder rung — <code>&lt;id&gt;/&lt;model&gt;</code> — can point anywhere. Because the OpenAI Chat Completions API is the de-facto standard, one <code>openai</code>-dialect entry covers Groq, Together, Fireworks, DeepSeek, Mistral, xAI, OpenRouter, Azure, or a local <b>Ollama / vLLM</b> server running open-source models. <code>gemini</code> is its own dialect; <code>aws_sigv4</code> (Bedrock) and <code>gcp_oauth</code> (Vertex) are bespoke-auth backends whose signing/token minting is delegated to maintained crates — credentials come from the standard env vars and never touch a URL or a log.</p>
+    <div class="code"><button class="copy" data-copy='# any OpenAI-compatible host
+[[provider]]
+id = "groq"
+dialect = "openai"
+base_url = "https://api.groq.com/openai"
+api_key_env = "GROQ_API_KEY"
+
+# Google Gemini (own dialect)
+[[provider]]
+id = "gemini"
+dialect = "gemini"
+base_url = "https://generativelanguage.googleapis.com"
+api_key_env = "GEMINI_API_KEY"
+
+# AWS Bedrock (SigV4; creds from AWS_* env)
+[[provider]]
+id = "bedrock"
+dialect = "anthropic"
+auth = "aws_sigv4"
+region = "us-east-1"
+
+# open-source rung → frontier escalation on gate fail
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]'>copy</button><pre style="margin:0"><span class="c"># any OpenAI-compatible host</span>
+<span class="c">[[provider]]</span>
+<span class="cy">id</span>          = <span class="p">"groq"</span>
+<span class="cy">dialect</span>     = <span class="p">"openai"</span>
+<span class="cy">base_url</span>    = <span class="p">"https://api.groq.com/openai"</span>
+<span class="cy">api_key_env</span> = <span class="p">"GROQ_API_KEY"</span>
+
+<span class="c"># Google Gemini (own dialect)</span>
+<span class="c">[[provider]]</span>
+<span class="cy">id</span>          = <span class="p">"gemini"</span>
+<span class="cy">dialect</span>     = <span class="p">"gemini"</span>
+<span class="cy">base_url</span>    = <span class="p">"https://generativelanguage.googleapis.com"</span>
+<span class="cy">api_key_env</span> = <span class="p">"GEMINI_API_KEY"</span>
+
+<span class="c"># AWS Bedrock (SigV4; creds from AWS_* env)</span>
+<span class="c">[[provider]]</span>
+<span class="cy">id</span>      = <span class="p">"bedrock"</span>
+<span class="cy">dialect</span> = <span class="p">"anthropic"</span>
+<span class="cy">auth</span>    = <span class="p">"aws_sigv4"</span>
+<span class="cy">region</span>  = <span class="p">"us-east-1"</span>
+
+<span class="c"># open-source rung → frontier escalation on gate fail</span>
+<span class="c">[[route]]</span>
+<span class="cy">match</span>  = {}
+<span class="cy">mode</span>   = <span class="p">"enforce"</span>
+<span class="cy">ladder</span> = [<span class="p">"groq/llama-3.3-70b-versatile"</span>, <span class="p">"anthropic/claude-sonnet-5"</span>]</pre></div>
+    <div class="callout"><b>Live status.</b> Anthropic is live-verified; OpenAI-compatible and Gemini are wire-tested against spec-accurate servers; Bedrock and Vertex are offline-tested (shape + signed headers) and <b>live-unverified</b> — verify against real AWS/GCP credentials before production.</div>
 
     <h2 id="gates">Gates</h2>
     <p>A gate reads the candidate output and returns a verdict. Two kinds:</p>

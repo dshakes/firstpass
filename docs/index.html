@@ -178,11 +178,17 @@
         <rect x="812" y="184" width="152" height="52" rx="10" fill="#0b0b0c" stroke="#41505f"/>
         <text class="nt" x="888" y="215" text-anchor="middle" font-size="11" font-weight="600" fill="#EDEDED">OpenAI-compatible</text>
       </g>
-      <text x="888" y="252" text-anchor="middle" font-size="9.5" fill="#8b98a5">+ Groq · Together · DeepSeek · Ollama · vLLM · any OpenAI-compatible host</text>
-      <!-- provider bus: both providers share the call/return interface -->
-      <line x1="806" y1="146" x2="806" y2="210" stroke="#41505f" stroke-width="1.5"/>
+      <g class="node" data-t="Gemini" data-d="Google Gemini adapter (generateContent) — its own wire dialect, key via the x-goog-api-key header. A third [[provider]] dialect alongside Anthropic and OpenAI-compatible.">
+        <rect x="812" y="248" width="152" height="44" rx="10" fill="#0b0b0c" stroke="#41505f"/>
+        <text class="nt" x="888" y="275" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Gemini</text>
+      </g>
+      <text x="888" y="312" text-anchor="middle" font-size="9.5" fill="#8b98a5">+ Groq · Together · DeepSeek · Ollama · vLLM — any OpenAI-compatible host</text>
+      <text x="888" y="326" text-anchor="middle" font-size="9.5" fill="#8b98a5">+ AWS Bedrock (SigV4) · Google Vertex (OAuth)</text>
+      <!-- provider bus: the provider adapters share the call/return interface -->
+      <line x1="806" y1="146" x2="806" y2="270" stroke="#41505f" stroke-width="1.5"/>
       <line x1="806" y1="146" x2="812" y2="146" stroke="#41505f" stroke-width="1.5"/>
       <line x1="806" y1="210" x2="812" y2="210" stroke="#41505f" stroke-width="1.5"/>
+      <line x1="806" y1="270" x2="812" y2="270" stroke="#41505f" stroke-width="1.5"/>
       <!-- escalate -> providers (call) -->
       <path d="M728 150 L802 150" fill="none" stroke="#19E3B1" stroke-width="2" marker-end="url(#mkm)"/>
       <text x="765" y="140" text-anchor="middle" font-size="9.5" fill="#19E3B1">call · BYOK</text>
