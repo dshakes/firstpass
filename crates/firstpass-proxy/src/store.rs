@@ -80,6 +80,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             body TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS traces_session_idx ON traces(session);
+        -- Tenant-scoped reads (ADR 0004 §D3) filter on `tenant`; index it with `seq` so a
+        -- per-tenant scan stays ordered and cheap. Existing rows keep their `tenant` value.
+        CREATE INDEX IF NOT EXISTS traces_tenant_seq_idx ON traces(tenant, seq);
         -- Deferred verdicts live in their OWN table, keyed by trace_id. They are NEVER folded
         -- into the sealed, hashed `traces.body`, so a late outcome can't alter a past record and
         -- the tamper-evident chain stays valid. They are merged onto a trace only on read.
@@ -156,6 +159,13 @@ fn insert(conn: &Connection, trace: &Trace, hash: &str) -> Result<(), StoreError
 /// Load every trace from the database in insertion (chain) order — used by tests and
 /// operators to verify the hash chain with [`firstpass_core::verify_chain`].
 ///
+/// **Operator-wide** read: every trace across ALL tenants, in `seq` order.
+///
+/// This deliberately crosses tenant boundaries and must stay reserved for operator-scoped work
+/// where a global view is intrinsic — namely verifying the single hash-chain, which spans every
+/// tenant's traces in one sequence (ADR 0004 §D3). For tenant-facing reads use
+/// [`load_tenant_traces`].
+///
 /// # Errors
 /// Returns [`StoreError::Sqlite`] on a database error, or [`StoreError::Json`] if a stored
 /// row is not valid trace JSON.
@@ -170,15 +180,42 @@ pub fn load_all_traces(db_path: impl AsRef<Path>) -> Result<Vec<Trace>, StoreErr
     Ok(traces)
 }
 
-/// Whether a trace with `trace_id` exists — used to reject feedback for unknown traces.
+/// **Tenant-scoped** read: only traces owned by `tenant`, in `seq` order (ADR 0004 §D3). Tenant A
+/// can never see tenant B's traces through this path.
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] on a database error, or [`StoreError::Json`] if a stored
+/// row is not valid trace JSON.
+pub fn load_tenant_traces(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+) -> Result<Vec<Trace>, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let mut stmt = conn.prepare("SELECT body FROM traces WHERE tenant = ?1 ORDER BY seq ASC")?;
+    let rows = stmt.query_map([tenant], |row| row.get::<_, String>(0))?;
+    let mut traces = Vec::new();
+    for row in rows {
+        traces.push(serde_json::from_str(&row?)?);
+    }
+    Ok(traces)
+}
+
+/// Whether a trace with `trace_id` exists **and is owned by `tenant`** — used to reject feedback
+/// for unknown traces and, crucially, to deny cross-tenant feedback (ADR 0004 §D3/§D4). A trace
+/// owned by another tenant is indistinguishable from a non-existent one here, so the caller can
+/// return a `404` with no existence oracle.
 ///
 /// # Errors
 /// Returns [`StoreError::Sqlite`] on a database error.
-pub fn trace_exists(db_path: impl AsRef<Path>, trace_id: &str) -> Result<bool, StoreError> {
+pub fn trace_exists(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+    trace_id: &str,
+) -> Result<bool, StoreError> {
     let conn = connect(db_path.as_ref())?;
     let n: i64 = conn.query_row(
-        "SELECT COUNT(1) FROM traces WHERE trace_id = ?1",
-        [trace_id],
+        "SELECT COUNT(1) FROM traces WHERE tenant = ?1 AND trace_id = ?2",
+        [tenant, trace_id],
         |row| row.get(0),
     )?;
     Ok(n > 0)
@@ -262,22 +299,25 @@ pub fn load_deferred(
     Ok(out)
 }
 
-/// Load a single trace by id with its deferred verdicts merged into `deferred` — the **view**
-/// for display/inspection. This is deliberately separate from [`load_all_traces`]: merging
-/// deferred verdicts changes the record, so a merged trace must NOT be fed to `verify_chain`
-/// (chain verification always runs on the sealed bodies from [`load_all_traces`]).
+/// Load a single trace by id **scoped to `tenant`**, with its deferred verdicts merged into
+/// `deferred` — the **view** for display/inspection (ADR 0004 §D3). A trace owned by another
+/// tenant returns `None`, exactly like a missing one, so an inspecting agent can never read across
+/// tenants. This is deliberately separate from [`load_all_traces`]: merging deferred verdicts
+/// changes the record, so a merged trace must NOT be fed to `verify_chain` (chain verification
+/// always runs on the sealed bodies from [`load_all_traces`]).
 ///
 /// # Errors
 /// Returns [`StoreError::Sqlite`] / [`StoreError::Json`] on database or decode errors.
 pub fn load_trace_view(
     db_path: impl AsRef<Path>,
+    tenant: &str,
     trace_id: &str,
 ) -> Result<Option<Trace>, StoreError> {
     let conn = connect(db_path.as_ref())?;
     let body: Option<String> = conn
         .query_row(
-            "SELECT body FROM traces WHERE trace_id = ?1",
-            [trace_id],
+            "SELECT body FROM traces WHERE tenant = ?1 AND trace_id = ?2",
+            [tenant, trace_id],
             |row| row.get(0),
         )
         .ok();
@@ -361,6 +401,72 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
     }
 
+    /// D7 cross-tenant isolation, at the store layer: with rows for tenants A and B, every
+    /// tenant-scoped read for A returns only A's data, and vice-versa. The operator-wide
+    /// [`load_all_traces`] still sees both (for chain verification).
+    #[tokio::test]
+    async fn tenant_scoped_reads_never_cross_the_boundary() {
+        let db_path =
+            std::env::temp_dir().join(format!("firstpass-isolation-{}.db", uuid::Uuid::now_v7()));
+        let (tx, handle) = open(&db_path).unwrap();
+
+        // Two traces for A, one for B.
+        let a0 = sample_trace("tenant-a", "sa-0");
+        let a1 = sample_trace("tenant-a", "sa-1");
+        let b0 = sample_trace("tenant-b", "sb-0");
+        let (a0_id, a1_id, b0_id) = (
+            a0.trace_id.to_string(),
+            a1.trace_id.to_string(),
+            b0.trace_id.to_string(),
+        );
+        tx.try_send(a0).unwrap();
+        tx.try_send(b0).unwrap();
+        tx.try_send(a1).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        // Scoped list: A sees exactly its two, B sees exactly its one.
+        let a_traces = load_tenant_traces(&db_path, "tenant-a").unwrap();
+        assert_eq!(a_traces.len(), 2, "A must see only A's traces");
+        assert!(a_traces.iter().all(|t| t.tenant_id == "tenant-a"));
+        let b_traces = load_tenant_traces(&db_path, "tenant-b").unwrap();
+        assert_eq!(b_traces.len(), 1, "B must see only B's trace");
+        assert!(b_traces.iter().all(|t| t.tenant_id == "tenant-b"));
+
+        // A can prove its own trace exists but cannot see B's, and vice-versa.
+        assert!(trace_exists(&db_path, "tenant-a", &a0_id).unwrap());
+        assert!(!trace_exists(&db_path, "tenant-a", &b0_id).unwrap());
+        assert!(trace_exists(&db_path, "tenant-b", &b0_id).unwrap());
+        assert!(!trace_exists(&db_path, "tenant-b", &a1_id).unwrap());
+
+        // The view is likewise scoped: cross-tenant reads are indistinguishable from a miss.
+        assert!(
+            load_trace_view(&db_path, "tenant-a", &a0_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            load_trace_view(&db_path, "tenant-a", &b0_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_trace_view(&db_path, "tenant-b", &a0_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // A tenant that owns nothing sees nothing.
+        assert!(load_tenant_traces(&db_path, "ghost").unwrap().is_empty());
+
+        // Operator-wide read still spans both, and the global chain stays valid.
+        let all = load_all_traces(&db_path).unwrap();
+        assert_eq!(all.len(), 3);
+        verify_chain(&all, GENESIS_HASH).unwrap();
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
     #[tokio::test]
     async fn deferred_verdicts_attach_on_read_without_breaking_the_chain() {
         let db_path = std::env::temp_dir().join(format!(
@@ -385,21 +491,29 @@ mod tests {
             reporter: "ci".to_owned(),
         };
         append_deferred(&db_path, &id0, &dv).unwrap();
-        assert!(trace_exists(&db_path, &id0).unwrap());
-        assert!(!trace_exists(&db_path, "no-such-trace").unwrap());
+        assert!(trace_exists(&db_path, "acme", &id0).unwrap());
+        assert!(!trace_exists(&db_path, "acme", "no-such-trace").unwrap());
+        // Cross-tenant: the same real trace id is invisible to a different tenant.
+        assert!(!trace_exists(&db_path, "other-tenant", &id0).unwrap());
 
         // The view surfaces the deferred verdict...
-        let view = load_trace_view(&db_path, &id0).unwrap().unwrap();
+        let view = load_trace_view(&db_path, "acme", &id0).unwrap().unwrap();
         assert_eq!(view.deferred.len(), 1);
         assert_eq!(view.deferred[0].gate_id, "tests");
         assert_eq!(view.deferred[0].verdict, Verdict::Pass);
         // ...the second trace has none.
         assert!(
-            load_trace_view(&db_path, &id1)
+            load_trace_view(&db_path, "acme", &id1)
                 .unwrap()
                 .unwrap()
                 .deferred
                 .is_empty()
+        );
+        // Cross-tenant: another tenant cannot read this trace's view at all.
+        assert!(
+            load_trace_view(&db_path, "other-tenant", &id0)
+                .unwrap()
+                .is_none()
         );
 
         // THE INVARIANT: the sealed bodies are untouched, so the chain still verifies. A late

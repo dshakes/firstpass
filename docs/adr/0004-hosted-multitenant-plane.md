@@ -28,8 +28,13 @@ uphold it does not ship.
 - Each tenant gets one or more API keys. The **plaintext key is shown once at creation**; only a
   **hash** is stored — Argon2id (`argon2` crate) with a per-key salt. Verification is constant-time
   (`subtle`), never a plain `==`.
+- The key is **`<tenant_id>.<secret>`**: the (non-secret) tenant id names which stored hash to
+  check, so verification is one Argon2 pass, not one per tenant — this avoids an unauthenticated
+  O(N)-hash CPU-amplification DoS. An unknown tenant id (or malformed key) still runs one verify
+  against a **decoy** hash, so an invalid key takes the same time whether or not the tenant exists
+  (no existence timing oracle). Tenant ids therefore must not contain `.`.
 - An auth middleware (axum `from_fn`/extractor) reads the key from an `Authorization: Bearer <key>`
-  (or `x-firstpass-key`) header, looks up the tenant, and injects a `TenantId` into request
+  (or `x-firstpass-key`) header, verifies it as above, and injects a `TenantId` into request
   extensions. **Every** business handler (`/v1/messages`, `/v1/feedback`, `/v1/capabilities`)
   requires it; `/healthz` and `/metrics` are operator-scoped (separate bind or operator auth), never
   tenant-facing.
@@ -43,6 +48,12 @@ uphold it does not ship.
 `TenantId` flows from the auth extractor → `EnforceCtx` → the `Trace` (replacing the static
 `FIRSTPASS_TENANT`). No code path may stamp a tenant from anything other than the authenticated
 identity. The observe passthrough and enforce engine both carry it; the trace writer persists it.
+
+**MCP is a local, single-tenant surface (trust boundary).** The `firstpass mcp` stdio server takes
+its tenant from a CLI arg (default tenant), not per-connection auth — correct for a local operator
+tool, where the HTTP proxy is the hosted front door. Its tools ARE tenant-scoped in code, but the
+tenant value is operator-supplied. If MCP is ever fronted as a shared multi-tenant service, it must
+gain the same per-connection auth as the HTTP plane, or all its scoping collapses to one tenant.
 
 ### D3 — Tenant-scoped trace store
 

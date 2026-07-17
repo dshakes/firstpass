@@ -27,6 +27,8 @@ jiff = { version = "0.2", features = ["serde"] }
 # Errors
 thiserror = "2"
 async-trait = "0.1"
+# Multi-tenant auth: Argon2id password hashing with constant-time verification (ADR 0004 §D1).
+argon2 = { version = "0.5", features = ["std"] }
 
 # Proxy: HTTP server/client, storage, async runtime, tracing
 axum = "0.8"
