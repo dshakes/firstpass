@@ -114,22 +114,27 @@ pub struct ProviderDef {
 /// - **subprocess** (`cmd`): any executable that reads the candidate as JSON on **stdin** (never
 ///   argv — injection-resistant) and emits `{"verdict":"pass|fail|abstain", ...}` on stdout.
 /// - **judge** (`judge`): a native LLM-judge gate that grades the candidate against a rubric.
+/// - **consistency** (`consistency`): a self-consistency uncertainty gate that scores the
+///   candidate by agreement with k fresh samples of the same model (Wang et al. 2022).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GateDef {
     /// The id a route references this gate by (must be unique and not shadow a built-in gate id).
     pub id: String,
     /// Subprocess command: program first, then its args — e.g. `["pytest", "-q"]`. Set this **or**
-    /// `judge`, not both.
+    /// `judge` / `consistency`, not both.
     #[serde(default)]
     pub cmd: Vec<String>,
     /// Hard timeout in milliseconds for a subprocess gate; it abstains (`timeout`) if the process
     /// runs longer.
     #[serde(default = "default_gate_timeout_ms")]
     pub timeout_ms: u64,
-    /// LLM-judge configuration. Set this **or** `cmd`, not both.
+    /// LLM-judge configuration. Set this **or** `cmd` / `consistency`, not both.
     #[serde(default)]
     pub judge: Option<JudgeDef>,
+    /// Self-consistency configuration. Set this **or** `cmd` / `judge`, not both.
+    #[serde(default)]
+    pub consistency: Option<ConsistencyDef>,
 }
 
 /// Configuration for a native LLM-judge gate (SPEC §8.3): a separate model grades the candidate
@@ -148,6 +153,29 @@ pub struct JudgeDef {
     pub rubric: Option<String>,
 }
 
+/// Configuration for a self-consistency uncertainty gate: resample the original request `k` times
+/// on the same model and score the candidate by agreement with the fresh samples.
+///
+/// Research basis: Wang et al. 2022 (self-consistency) and Farquhar et al., *Nature* 2024
+/// (semantic entropy). Answers a model reliably reproduces are far likelier correct; disagreement
+/// flags hallucination. This produces a continuous confidence score the conformal threshold
+/// machinery can calibrate.
+///
+/// **maker == checker is intentional** — unlike a judge gate, self-consistency is definitionally
+/// self-referential. This is the mechanism, not a bug.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsistencyDef {
+    /// The model used for resampling, as `provider/model`. May equal the candidate's model —
+    /// self-consistency is self-referential by design.
+    pub model: String,
+    /// Number of resample calls. Must be in `[2, 8]`; defaults to `3`.
+    #[serde(default = "default_consistency_k")]
+    pub k: u32,
+    /// Pass iff the mean agreement score ≥ this threshold, in `[0, 1]`.
+    pub threshold: f64,
+}
+
 /// Default subprocess-gate timeout: 30s. Long enough for a test suite, short enough to bound the
 /// enforce-path tail.
 fn default_gate_timeout_ms() -> u64 {
@@ -157,6 +185,11 @@ fn default_gate_timeout_ms() -> u64 {
 /// Default judge pass threshold.
 fn default_judge_threshold() -> f64 {
     0.7
+}
+
+/// Default self-consistency k (resample count).
+fn default_consistency_k() -> u32 {
+    3
 }
 
 /// One routing rule.
@@ -423,10 +456,18 @@ impl Config {
             if def.id.trim().is_empty() {
                 return Err(Error::InvalidConfig("gate id must not be empty".to_owned()));
             }
-            // Exactly one kind: a subprocess `cmd` or a `judge`, never both, never neither.
-            if def.cmd.is_empty() == def.judge.is_none() {
+            // Exactly one kind: subprocess `cmd`, `judge`, or `consistency` — never more, never none.
+            let kinds_set = [
+                !def.cmd.is_empty(),
+                def.judge.is_some(),
+                def.consistency.is_some(),
+            ]
+            .iter()
+            .filter(|&&b| b)
+            .count();
+            if kinds_set != 1 {
                 return Err(Error::InvalidConfig(format!(
-                    "gate {:?} must set exactly one of `cmd` or `judge`",
+                    "gate {:?} must set exactly one of `cmd`, `judge`, or `consistency`",
                     def.id
                 )));
             }
@@ -437,6 +478,20 @@ impl Config {
                     "gate {:?} judge threshold {} is outside [0, 1]",
                     def.id, judge.threshold
                 )));
+            }
+            if let Some(c) = &def.consistency {
+                if !(2..=8).contains(&c.k) {
+                    return Err(Error::InvalidConfig(format!(
+                        "gate {:?} consistency k {} is outside [2, 8]",
+                        def.id, c.k
+                    )));
+                }
+                if !(0.0..=1.0).contains(&c.threshold) {
+                    return Err(Error::InvalidConfig(format!(
+                        "gate {:?} consistency threshold {} is outside [0, 1]",
+                        def.id, c.threshold
+                    )));
+                }
             }
             if !seen.insert(def.id.as_str()) {
                 return Err(Error::InvalidConfig(format!(
@@ -576,6 +631,55 @@ timeout_ms = 60000
 
         let dup = "[[gate]]\nid = \"g\"\ncmd = [\"a\"]\n[[gate]]\nid = \"g\"\ncmd = [\"b\"]\n";
         assert!(matches!(Config::parse(dup), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn parses_consistency_gate_definition() {
+        let toml = r#"
+[[gate]]
+id          = "uncertainty"
+consistency = { model = "anthropic/claude-haiku-4-5", k = 5, threshold = 0.6 }
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert_eq!(c.gate_defs.len(), 1);
+        let cons = c.gate_defs[0].consistency.as_ref().unwrap();
+        assert_eq!(cons.model, "anthropic/claude-haiku-4-5");
+        assert_eq!(cons.k, 5);
+        assert!((cons.threshold - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn consistency_k_defaults_to_3() {
+        let toml = "[[gate]]\nid = \"u\"\nconsistency = { model = \"anthropic/claude-haiku-4-5\", threshold = 0.7 }\n";
+        let c = Config::parse(toml).unwrap();
+        assert_eq!(c.gate_defs[0].consistency.as_ref().unwrap().k, 3);
+    }
+
+    #[test]
+    fn rejects_exactly_one_of_violations_for_consistency() {
+        // cmd + consistency — two kinds set
+        let both = "[[gate]]\nid = \"g\"\ncmd = [\"x\"]\nconsistency = { model = \"a/b\", threshold = 0.5 }\n";
+        assert!(matches!(Config::parse(both), Err(Error::InvalidConfig(_))));
+
+        // consistency k out of bounds
+        let bad_k =
+            "[[gate]]\nid = \"g\"\nconsistency = { model = \"a/b\", k = 1, threshold = 0.5 }\n";
+        assert!(matches!(Config::parse(bad_k), Err(Error::InvalidConfig(_))));
+
+        let bad_k2 =
+            "[[gate]]\nid = \"g\"\nconsistency = { model = \"a/b\", k = 9, threshold = 0.5 }\n";
+        assert!(matches!(
+            Config::parse(bad_k2),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        // consistency threshold out of bounds
+        let bad_thresh =
+            "[[gate]]\nid = \"g\"\nconsistency = { model = \"a/b\", threshold = 1.1 }\n";
+        assert!(matches!(
+            Config::parse(bad_thresh),
+            Err(Error::InvalidConfig(_))
+        ));
     }
 
     #[test]
