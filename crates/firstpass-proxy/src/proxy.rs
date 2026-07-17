@@ -51,6 +51,11 @@ pub struct AppState {
     /// `serve_threshold` from config (default). When present, `/v1/feedback` nudges it live and the
     /// enforce path reads its current value per request — the reactive, self-tuning loop.
     pub adaptive: Option<Arc<std::sync::Mutex<firstpass_core::conformal::AdaptiveConformal>>>,
+    /// Optional UCB1 start-rung bandit (predict-to-start, verify-to-serve). `None` (default) =
+    /// start every request at rung 0, byte-identical to today. When present, `handle_enforce`
+    /// queries it for a predicted start rung per request and feeds back gate verdicts for online
+    /// learning — all in-memory, per-process.
+    pub bandit: Option<Arc<std::sync::Mutex<crate::bandit::StartRungBandit>>>,
     /// Per-tenant request rate limiter (ADR 0004 §D6). `None` (the default) disables rate
     /// limiting entirely — set via [`build_tenant_rate_limiter`] from
     /// [`ProxyConfig::tenant_rate_per_sec`].
@@ -507,6 +512,32 @@ async fn handle_enforce(
         .and_then(|a| a.lock().ok().map(|g| g.threshold()))
         .or(serve_threshold);
 
+    // Predict-to-start (bandit): choose where the ladder starts for this context.
+    // The gate still verifies the chosen rung's output before serving — prediction errors cost
+    // money/latency but can never cause a wrong answer to be served.
+    let bandit_ctx = crate::bandit::ContextBucket::from_features(&features);
+    let (start_rung, policy_id) = {
+        let chosen = state
+            .bandit
+            .as_ref()
+            .and_then(|b| b.lock().ok())
+            .map(|b| b.choose_start(&bandit_ctx, &route.ladder, &state.config.prices))
+            .unwrap_or(0);
+        if chosen > 0 {
+            (chosen, "bandit@v1".to_owned())
+        } else {
+            (0u32, "static-ladder@v0".to_owned())
+        }
+    };
+    // Emit metric whenever the bandit is configured (includes cold-start rung-0 choices).
+    if state.bandit.is_some() {
+        metrics::counter!(
+            "firstpass_bandit_start_rung",
+            "rung" => start_rung.to_string()
+        )
+        .increment(1);
+    }
+
     let ctx = EnforceCtx {
         ladder: &route.ladder,
         gates: &gates,
@@ -520,16 +551,29 @@ async fn handle_enforce(
         speculation,
         serve_threshold,
         features,
+        start_rung,
         // The tenant stamped on the enforce trace is the resolved identity from the auth layer
         // (authenticated key, or the static default when auth is off) — never the request body.
         tenant_id: tenant,
         session_id,
         prompt_hash: prompt_hash(&state.config.prompt_salt, body),
         api: "anthropic.messages".to_owned(),
-        policy_id: "static-ladder@v0".to_owned(),
+        policy_id,
     };
 
     let (outcome, trace) = route_enforce(ctx).await;
+
+    // Online bandit learning: feed back every gate verdict from this request so the bandit
+    // refines its start-rung estimates. Cheap in-memory update; done before offer_trace so the
+    // trace borrow is still live (we read attempts, then pass trace to offer_trace by value).
+    if let Some(bandit) = state.bandit.as_ref()
+        && let Ok(mut b) = bandit.lock()
+    {
+        for attempt in &trace.attempts {
+            b.observe(&bandit_ctx, attempt.rung, attempt.verdict);
+        }
+    }
+
     // The trace is already built; enqueue it off-path (non-blocking `try_send`, so no spawn needed).
     offer_trace(&state.traces, trace);
 
@@ -1282,6 +1326,7 @@ mod tests {
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
             adaptive: None,
+            bandit: None,
             tenant_rate_limiter: None,
         };
         (state, rx)
@@ -1401,6 +1446,7 @@ mod tests {
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
             adaptive: None,
+            bandit: None,
             tenant_rate_limiter: None,
         };
         let resp = messages(
@@ -1539,6 +1585,7 @@ mod tests {
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
             adaptive: None,
+            bandit: None,
             tenant_rate_limiter: None,
         };
 
@@ -1636,6 +1683,7 @@ mod tests {
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
             adaptive: None,
+            bandit: None,
             tenant_rate_limiter: None,
         };
         (state, db, trace_id)
@@ -1883,6 +1931,7 @@ mod tests {
             gate_health: Arc::new(GateHealthRegistry::new()),
             traces,
             adaptive: None,
+            bandit: None,
             tenant_rate_limiter,
         }
     }

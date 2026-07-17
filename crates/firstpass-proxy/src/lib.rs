@@ -23,6 +23,7 @@
 //! - [`run`] — shared server bootstrap for the `firstpass` and `firstpass-proxy` binaries.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod bandit;
 pub mod calibrate;
 pub mod cli;
 pub mod config;

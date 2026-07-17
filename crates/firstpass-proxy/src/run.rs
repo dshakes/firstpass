@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::bandit::{ContextBucket, StartRungBandit};
 use crate::gate::GateHealthRegistry;
 use crate::provider::ProviderRegistry;
 use crate::{AppState, ProxyConfig, app, store};
@@ -76,6 +77,29 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         });
     let tenant_rate_limiter = crate::proxy::build_tenant_rate_limiter(&config);
 
+    // UCB1 start-rung bandit (opt-in): warm-start from stored traces so learning survives
+    // restarts. Forgiving: an unreadable or absent store simply yields an empty bandit.
+    // ponytail: operator-wide load (load_all_traces) is correct here — the bandit is also
+    // operator-wide, keyed by context bucket, not by tenant.
+    let bandit = config
+        .routing
+        .as_ref()
+        .and_then(|r| r.escalation.bandit.as_ref())
+        .map(|bc| {
+            let mut b = StartRungBandit::new(bc.min_observations, bc.exploration);
+            if let Ok(traces_history) = store::load_all_traces(&config.db_path) {
+                for trace in &traces_history {
+                    let ctx = ContextBucket::from_features(&trace.request.features);
+                    b.feed_trace_attempts(&ctx, &trace.attempts);
+                }
+                tracing::info!(
+                    n = traces_history.len(),
+                    "bandit warm-started from trace store"
+                );
+            }
+            Arc::new(std::sync::Mutex::new(b))
+        });
+
     let state = AppState {
         config: Arc::new(config),
         // Observe passthrough may stream SSE, so only bound the CONNECT phase here — a total or
@@ -88,6 +112,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         gate_health: Arc::new(gate_health),
         traces,
         adaptive,
+        bandit,
         tenant_rate_limiter,
     };
 
