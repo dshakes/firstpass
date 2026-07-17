@@ -65,15 +65,23 @@ FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy
 
 Leaving is `unset ANTHROPIC_BASE_URL`. That's the whole offboarding story.
 
-## 🤖 Or let your agent onboard itself
+## 🤖 Agentic onboarding — one command does everything
 
-Firstpass is built agent-first — don't set it up by hand, delegate it:
+Don't follow docs. Firstpass detects your machine, plans the setup, executes it, and verifies itself:
 
-```text
-You → your coding agent:  "Install firstpass and route yourself through it."
+```console
+$ firstpass onboard --apply
+detected: shell=zsh · proxy_running=false · routed=false · claude_cli=true
+
+✓ proxy started (pid 17005, observe mode) — log: firstpass-proxy.log
+✓ wired ~/.zshrc — export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+→ optional: claude mcp add firstpass -- firstpass mcp
+✓ verified — proxy healthy · capabilities live
 ```
 
-Everything the agent needs ships in the box: [`llms.txt`](llms.txt) and [`AGENTS.md`](AGENTS.md) for machine-readable setup, `GET /v1/capabilities` for runtime discovery (what's routed, which gates, how to offboard), and a built-in **MCP server** (`firstpass mcp`) so agents can query routes, traces, and savings as tools. Your agent installs it, points itself at it, and starts producing receipts — stunningly little for you to do.
+It auto-detects your shell (zsh/bash/fish), whether the proxy is running, whether you're already routed, and which agents you have — then does only what's missing. **Idempotent** (re-run any time), **transparent** (`firstpass onboard` alone is a dry run showing the exact plan), and **reversible**: `firstpass offboard` strips the shell line, stops the proxy, and prints the unset — the whole exit in one command.
+
+For agents onboarding *themselves*: [`llms.txt`](llms.txt) + [`AGENTS.md`](AGENTS.md) ship machine-readable setup, `GET /v1/capabilities` gives runtime discovery, and `firstpass mcp` exposes traces and savings as tools.
 
 ## Benchmarks
 

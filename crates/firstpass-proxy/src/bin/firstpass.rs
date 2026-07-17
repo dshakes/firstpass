@@ -9,6 +9,8 @@ const HELP: &str = "\
 firstpass — the cheapest model that provably passes, with a receipt for every call.
 
 USAGE:
+    firstpass onboard [--apply]   agentic setup: detect env, start proxy, route your agent, verify
+    firstpass offboard            undo it: strip the rc line, stop the proxy, print the unset
     firstpass up                  start the proxy (serves until Ctrl-C)
     firstpass doctor              validate config, provider key, and gate binaries
     firstpass trace [--limit N]   print recent audit traces as JSON lines (default 20)
@@ -33,6 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run::init_tracing();
             run::serve(ProxyConfig::from_env()?).await
         }
+        "onboard" => cmd_onboard(args.iter().any(|a| a == "--apply")),
+        "offboard" => cmd_offboard(),
         "doctor" => cmd_doctor(),
         "trace" => cmd_trace(&args),
         "calibrate" => cmd_calibrate(&args),
@@ -79,6 +83,45 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
+}
+
+/// `firstpass onboard [--apply]` — agentic setup: detect the environment, plan the exact steps,
+/// execute them under `--apply` (dry run otherwise), and verify end-to-end.
+fn cmd_onboard(apply: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use firstpass_proxy::onboard;
+    let env = onboard::detect(
+        |k| std::env::var(k).ok(),
+        |bin| {
+            std::env::var("PATH")
+                .is_ok_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+        },
+        || {
+            let bind = std::env::var("FIRSTPASS_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
+            std::net::TcpStream::connect_timeout(
+                &bind
+                    .parse()
+                    .unwrap_or_else(|_| ([127, 0, 0, 1], 8080).into()),
+                std::time::Duration::from_millis(400),
+            )
+            .is_ok()
+        },
+    );
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let (rc, _) = onboard::shell_wiring(&env.shell, &home, &env.bind);
+    let steps = onboard::plan(&env, &home, onboard::rc_wired(&rc));
+    print!("{}", onboard::render(&env, &steps, apply));
+    if apply {
+        print!("\n{}", onboard::execute(&env, &steps)?);
+    }
+    Ok(())
+}
+
+/// `firstpass offboard` — the mirror: strip the marked rc line(s), stop the proxy onboard started,
+/// print the one command for this shell.
+fn cmd_offboard() -> Result<(), Box<dyn std::error::Error>> {
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    print!("{}", firstpass_proxy::onboard::offboard(&home)?);
+    Ok(())
 }
 
 /// The tenant a read-side CLI scopes to: `--tenant <id>` if given, else the configured default
