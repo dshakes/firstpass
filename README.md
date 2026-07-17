@@ -2,9 +2,9 @@
 
 # ⚡ Firstpass
 
-### Guessing is expensive. Proof is cheap.
+### Cheap until proven otherwise.
 
-The adaptive LLM router where every answer is **cheap until proven otherwise** — checked by your gate, escalated to a big model only on proof of need, wrong answers capped and **guaranteed**.
+The adaptive LLM router that checks **every answer** with your gate, pays for a big model **only on proof of need**, and caps wrong answers with a **mathematical guarantee**.
 
 [![CI](https://github.com/dshakes/firstpass/actions/workflows/ci.yml/badge.svg)](https://github.com/dshakes/firstpass/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/firstpass-proxy)](https://crates.io/crates/firstpass-proxy)
