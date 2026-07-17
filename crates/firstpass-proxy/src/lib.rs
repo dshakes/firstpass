@@ -32,6 +32,7 @@ pub mod judge;
 pub mod key_custody;
 pub mod mcp;
 pub mod metrics;
+pub mod onboard;
 pub mod provider;
 pub mod proxy;
 pub mod router;
