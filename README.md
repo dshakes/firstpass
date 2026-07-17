@@ -13,7 +13,7 @@ The adaptive LLM router that **proves every answer before serving it** — so th
 
 **[Website](https://dshakes.github.io/firstpass)** · [Install](#install) · [Quickstart](#quickstart) · [How it works](#how-it-works) · [Benchmarks](#benchmarks) · [Docs](https://dshakes.github.io/firstpass/usage.html)
 
-<img src="assets/demo.svg" alt="A live routing decision: the cheap model's answer fails the real test gate, firstpass escalates one rung, the stronger model passes, and the answer is served with a sealed receipt showing the saving" width="900">
+<img src="assets/hero.svg" alt="Firstpass cuts your AI bill — from $$$$ to $ — at the same quality, guaranteed: it checks every answer and pays for a big model only when truly needed" width="900">
 
 </div>
 
@@ -91,7 +91,7 @@ And the claim no other router makes: on **964 real MBPP coding tasks** (fail-clo
 
 ## How it works
 
-<div align="center"><img src="assets/hero.svg" alt="Requests flow to the cheapest model, its output is proven at the gate, passing answers are served with a receipt, failures escalate one rung — with the payoff: ~65% cheaper in harness and a guaranteed ceiling on wrong answers served" width="900"></div>
+<div align="center"><img src="assets/demo.svg" alt="A live routing decision: the cheap model's answer fails the real test gate, firstpass escalates one rung, the stronger model passes, and the answer is served with a sealed receipt showing the saving" width="900"></div>
 
 1. **Route** — every request opens on the cheapest rung of your model ladder.
 2. **Prove** — a *gate* checks the actual output: your unit tests, a JSON schema, or an LLM judge (maker ≠ checker).
