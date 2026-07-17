@@ -1,12 +1,14 @@
 <div align="center">
 
-<img src="assets/hero.svg" alt="Firstpass — the cheapest model takes the first pass, proven not guessed" width="840">
+<img src="assets/hero.svg" alt="Firstpass sends each request to the cheapest model first, proves the output passes your gate, and pays for a stronger model only when the cheap one fails — ~65% cheaper at equal-or-higher success, with a guaranteed ceiling of 10% wrong answers served at 95% confidence" width="880">
 
 # Firstpass
 
-**Route every LLM request to the cheapest model that _provably_ passes your quality gate — and get a signed receipt for the decision.**
+### Cut your LLM bill ~65% — without shipping worse answers.
 
-Proof over prediction. Built for agent fleets.
+**The adaptive router that sends each request to the _cheapest_ model first, proves the output passes your gate, and pays for a stronger model only when the cheap one can't do the job.**
+
+> **Cheapest-first. Proven before served.**
 
 [![CI](https://github.com/dshakes/firstpass/actions/workflows/ci.yml/badge.svg)](https://github.com/dshakes/firstpass/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -19,9 +21,37 @@ Proof over prediction. Built for agent fleets.
 
 ---
 
-Firstpass is a **drop-in, Anthropic-compatible proxy**. Point your agent's `base_url` at it and every request is routed to the cheapest model first, its **real output** is checked by a gate you define (tests, typecheck, schema, a judge), and it escalates one rung only when the gate fails — writing a tamper-evident audit trace for every decision.
+## The problem: you're overpaying to gamble
 
-> **Honestly scoped.** The proxy routes, gates, escalates, fails over, audits, and learns end-to-end over real HTTP — no test doubles in the plane, and the enforce path is [live-verified](#proof-not-adjectives) against real Anthropic. The [proof harness](#proof-not-adjectives) has a **200-task live result** and an **earned distribution-free served-failure bound on real MBPP** below; still ahead: a 30-day dogfood and the hosted control plane. See the [roadmap](#roadmap). Nothing here is claimed as measured that isn't.
+Every AI product faces the same tax, and both ways to pay it are bad:
+
+- **Send everything to the frontier model** → you overpay 10–100× for answers a small model would have nailed.
+- **Route by prediction** (the whole current crop of routers) → a classifier _guesses_ a model from the prompt and hopes. Nobody checks the real output, so a wrong guess ships to your user anyway.
+
+You're still gambling. You've just added infrastructure to do it.
+
+## The firstpass way: route on proof, not prediction
+
+1. **Try cheap.** Send to the cheapest rung of your model ladder.
+2. **Prove it.** Gate the _real output_ — your unit tests, a JSON schema, or a fresh-context LLM judge.
+3. **Escalate only on failure.** One rung up, budget-capped, with cross-provider failover.
+4. **Serve + receipt.** The first output that passes is what ships — with a tamper-evident, hash-chained trace of every decision.
+
+Change what "good" means by editing a gate. No classifier to retrain, no policy to relearn.
+
+## The moat: a number no other router will give you
+
+Firstpass is the only router that ships a **mathematical guarantee on how often a wrong answer reaches your user** — a distribution-free conformal bound of **≤10% served-failure at 95% confidence**, _earned live on 964 real coding tasks_ (not a claim, a measured result — see [Proof](#proof-not-adjectives)). And it's **adaptive**: the serve threshold self-tunes from live feedback, so that guarantee holds even as your traffic drifts.
+
+| | Predictive routers | **Firstpass** |
+|---|---|---|
+| Decides by | guessing from the prompt | **proving the real output** |
+| Wrong answer served | ships silently | **caught by the gate, escalated** |
+| Guarantee | none | **≤10% @ 95%, earned on real tasks** |
+| Improve by | retraining a model | **editing a gate — zero retrain** |
+| Every provider + OSS | some | **Anthropic · OpenAI · Gemini · Bedrock · Vertex · Groq · DeepSeek · Ollama/vLLM** |
+
+_Honest scope: the ~65% savings is measured in the [proof harness](#proof-not-adjectives); the served-failure bound is earned live on real MBPP. The enforce path is live-verified against real Anthropic. Still ahead: a 30-day dogfood and the hosted control plane — see the [roadmap](#roadmap). Nothing here is claimed as measured that isn't._
 
 ## Quickstart
 
