@@ -1,0 +1,48 @@
+<svg viewBox="0 0 1000 300" xmlns="http://www.w3.org/2000/svg" role="img" preserveAspectRatio="xMidYMid meet" font-family="ui-sans-serif, -apple-system, Segoe UI, Roboto, sans-serif">
+  <title>Cost per successful task, live benchmark on 200 graded tasks with real models: always-top 0.0023 dollars at 0.98 success; predictive router 0.0007 dollars at 0.88 success while silently serving wrong answers 12% of the time; always-cheap 0.0001 dollars but only 0.62 success; firstpass 0.0003 dollars at 1.00 success with zero wrong answers served.</title>
+  <defs>
+    <linearGradient id="bmint" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#19E3B1"/><stop offset="1" stop-color="#5EEACB"/>
+    </linearGradient>
+    <filter id="bglow" x="-40%" y="-80%" width="180%" height="260%">
+      <feGaussianBlur stdDeviation="2.4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect x="1.5" y="1.5" width="997" height="297" rx="14" fill="#0B0E14" stroke="#263449"/>
+
+  <text x="30" y="38" font-size="14.5" font-weight="700" fill="#E6EDF3">Cost per successful task <tspan fill="#8A97A6" font-weight="400">— live, 200 graded tasks, real models (lower is better)</tspan></text>
+
+  <!-- always-top -->
+  <text x="30" y="80" font-size="12" fill="#8A97A6">always-top <tspan font-size="10">(Opus)</tspan></text>
+  <rect x="190" y="64" width="700" height="22" rx="5" fill="#20262e">
+    <animate attributeName="width" from="0" to="700" dur="0.9s" begin="0.2s" fill="freeze"/>
+  </rect>
+  <text x="898" y="80" font-size="11.5" fill="#8A97A6">$0.0023</text>
+  <text x="196" y="79" font-size="10" fill="#8A97A6">success 0.98</text>
+
+  <!-- predictive router -->
+  <text x="30" y="128" font-size="12" fill="#8A97A6">predictive router</text>
+  <rect x="190" y="112" width="213" height="22" rx="5" fill="#3a2f22">
+    <animate attributeName="width" from="0" to="213" dur="0.6s" begin="0.5s" fill="freeze"/>
+  </rect>
+  <text x="411" y="128" font-size="11.5" fill="#8A97A6">$0.0007 · <tspan fill="#FF5C5C">serves wrong answers silently (0.12)</tspan></text>
+  <text x="196" y="127" font-size="10" fill="#8A97A6">success 0.88</text>
+
+  <!-- always-cheap -->
+  <text x="30" y="176" font-size="12" fill="#8A97A6">always-cheap <tspan font-size="10">(Haiku)</tspan></text>
+  <rect x="190" y="160" width="32" height="22" rx="5" fill="#20262e">
+    <animate attributeName="width" from="0" to="32" dur="0.4s" begin="0.7s" fill="freeze"/>
+  </rect>
+  <text x="230" y="176" font-size="11.5" fill="#8A97A6">$0.0001 · <tspan fill="#F5A623">success only 0.62 — unusable alone</tspan></text>
+
+  <!-- firstpass -->
+  <text x="30" y="224" font-size="12.5" font-weight="800" fill="#19E3B1">firstpass</text>
+  <rect x="190" y="208" width="91" height="22" rx="5" fill="url(#bmint)" filter="url(#bglow)">
+    <animate attributeName="width" from="0" to="91" dur="0.5s" begin="0.9s" fill="freeze"/>
+  </rect>
+  <text x="289" y="224" font-size="12" font-weight="700" fill="#19E3B1">$0.0003 · success 1.00 · wrong answers served: 0.00</text>
+
+  <line x1="30" y1="250" x2="970" y2="250" stroke="#1B2636"/>
+  <text x="30" y="276" font-size="11.5" fill="#8A97A6"><tspan fill="#19E3B1" font-weight="700">~85% cheaper than always-top at higher success</tspan> — and the wrong answers a predictive router ships, the gate catches.  <tspan fill="#E6EDF3">Reproduce: cargo run -p firstpass-bench -- --live</tspan></text>
+</svg>

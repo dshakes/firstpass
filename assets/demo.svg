@@ -1,0 +1,33 @@
+<svg viewBox="0 0 1000 320" xmlns="http://www.w3.org/2000/svg" role="img" preserveAspectRatio="xMidYMid meet" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <title>Live routing decision: the cheap model answers first, its output fails the real test gate, firstpass escalates one rung, the stronger model passes, and the answer is served with a sealed receipt showing the saving versus always-top-tier.</title>
+  <defs>
+    <filter id="tglow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="2.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- terminal chrome -->
+  <rect x="1.5" y="1.5" width="997" height="317" rx="14" fill="#0B0E14" stroke="#263449"/>
+  <rect x="1.5" y="1.5" width="997" height="40" rx="14" fill="#0F151C"/>
+  <rect x="1.5" y="28" width="997" height="14" fill="#0F151C"/>
+  <circle cx="26" cy="21" r="5.5" fill="#FF5C5C"/><circle cx="46" cy="21" r="5.5" fill="#F5B544"/><circle cx="66" cy="21" r="5.5" fill="#19E3B1"/>
+  <text x="500" y="26" text-anchor="middle" font-size="12" fill="#8A97A6">firstpass · enforce · POST /v1/messages</text>
+
+  <!-- transcript: always visible (content never gated on animation support) -->
+  <text x="30" y="72" font-size="13.5" fill="#8A97A6">→ request <tspan fill="#E6EDF3">agent=claude-code task=code_edit</tspan></text>
+
+  <text x="30" y="104" font-size="13.5" fill="#E6EDF3">rung 0  <tspan fill="#5EEACB">claude-haiku-4-5</tspan>  <tspan fill="#8A97A6">$0.0007</tspan></text>
+  <text x="30" y="136" font-size="13.5" fill="#8A97A6">        gate <tspan fill="#E6EDF3">cargo-test</tspan> → <tspan fill="#FF5C5C" font-weight="700">✗ fail</tspan>  (2 tests red — a wrong answer, caught before you saw it)</text>
+
+  <text x="30" y="168" font-size="13.5" fill="#F5A623">↑ escalate one rung — budget ok</text>
+
+  <text x="30" y="200" font-size="13.5" fill="#E6EDF3">rung 1  <tspan fill="#5EEACB">claude-sonnet-5</tspan>  <tspan fill="#8A97A6">$0.0121</tspan></text>
+  <text x="30" y="232" font-size="13.5" fill="#8A97A6">        gate <tspan fill="#E6EDF3">cargo-test</tspan> → <tspan fill="#19E3B1" font-weight="700">✓ pass</tspan>  (all green — proven, not guessed)</text>
+
+  <text x="30" y="272" font-size="14.5" font-weight="700" fill="#19E3B1" filter="url(#tglow)">✓ served rung 1 · saved $0.0502 vs always-top · receipt 0192f3a1 sealed ⛓<animate attributeName="opacity" values="1;0.75;1" dur="2.6s" repeatCount="indefinite"/></text>
+
+  <!-- blinking cursor (pure decoration) -->
+  <rect x="30" y="288" width="9" height="15" fill="#19E3B1">
+    <animate attributeName="opacity" values="1;0;1" dur="1.1s" repeatCount="indefinite"/>
+  </rect>
+</svg>
