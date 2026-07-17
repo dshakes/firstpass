@@ -1963,25 +1963,43 @@ mod tests {
     #[tokio::test]
     async fn tenant_exceeding_rate_limit_gets_429_opaque() {
         use tower::ServiceExt;
-        // Burst capacity == rate for `Quota::per_second`, so 1 req/sec allows exactly 1 request
-        // before the next is rejected. Only 2 requests (not 3+) to stay well clear of the 1s
-        // replenish window even under real per-request Argon2-verify latency in the auth layer.
+        // Burst capacity == rate for `Quota::per_second`, so 1 req/sec allows one request through
+        // and rejects the rest of a burst. The requests are fired CONCURRENTLY so they reach the
+        // limiter in one tight window — a serial sequence is wall-clock sensitive (each request
+        // pays a deliberately slow Argon2 verify, and on a loaded CI runner >1s can elapse between
+        // limiter checks, refilling the bucket and turning the expected 429 into a legit 200).
         let router = app(two_tenant_state(Some(1))).expect("router");
 
-        let r1 = router
-            .clone()
-            .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
-            .await
-            .unwrap();
-        assert_eq!(r1.status(), axum::http::StatusCode::OK);
+        let (r1, r2, r3, r4) = tokio::join!(
+            router
+                .clone()
+                .oneshot(cap_request(Some("Bearer tenant-a.key-a"))),
+            router
+                .clone()
+                .oneshot(cap_request(Some("Bearer tenant-a.key-a"))),
+            router
+                .clone()
+                .oneshot(cap_request(Some("Bearer tenant-a.key-a"))),
+            router
+                .clone()
+                .oneshot(cap_request(Some("Bearer tenant-a.key-a"))),
+        );
+        let responses = [r1.unwrap(), r2.unwrap(), r3.unwrap(), r4.unwrap()];
+        let ok = responses
+            .iter()
+            .filter(|r| r.status() == axum::http::StatusCode::OK)
+            .count();
+        assert!(ok >= 1, "the burst's first request must pass");
+        let limited: Vec<_> = responses
+            .into_iter()
+            .filter(|r| r.status() == axum::http::StatusCode::TOO_MANY_REQUESTS)
+            .collect();
+        assert!(
+            !limited.is_empty(),
+            "a 4-request burst against 1 req/sec must trip the limiter"
+        );
 
-        let r2 = router
-            .clone()
-            .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
-            .await
-            .unwrap();
-        assert_eq!(r2.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
-        let json = body_json(r2).await;
+        let json = body_json(limited.into_iter().next().unwrap()).await;
         assert_eq!(json["error"]["type"], "rate_limited");
         // Opaque: no bucket state or limit value leaked to the caller.
         let msg = json["error"]["message"].as_str().unwrap();
@@ -1993,19 +2011,24 @@ mod tests {
         use tower::ServiceExt;
         let router = app(two_tenant_state(Some(1))).expect("router");
 
-        // Tenant A exhausts its 1 req/sec budget...
-        let a1 = router
-            .clone()
-            .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
-            .await
-            .unwrap();
-        assert_eq!(a1.status(), axum::http::StatusCode::OK);
-        let a2 = router
-            .clone()
-            .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
-            .await
-            .unwrap();
-        assert_eq!(a2.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        // Tenant A bursts past its 1 req/sec budget (concurrent — see the sibling test for why a
+        // serial sequence would be wall-clock flaky)...
+        let (a1, a2, a3) = tokio::join!(
+            router
+                .clone()
+                .oneshot(cap_request(Some("Bearer tenant-a.key-a"))),
+            router
+                .clone()
+                .oneshot(cap_request(Some("Bearer tenant-a.key-a"))),
+            router
+                .clone()
+                .oneshot(cap_request(Some("Bearer tenant-a.key-a"))),
+        );
+        let a_limited = [a1.unwrap(), a2.unwrap(), a3.unwrap()]
+            .iter()
+            .filter(|r| r.status() == axum::http::StatusCode::TOO_MANY_REQUESTS)
+            .count();
+        assert!(a_limited >= 1, "tenant A's burst must trip its limiter");
 
         // ...but tenant B, on the same gate/route, is unaffected (independent bucket).
         let b1 = router
