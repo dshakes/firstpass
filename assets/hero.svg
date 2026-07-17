@@ -1,78 +1,52 @@
-<svg viewBox="0 0 1000 268" xmlns="http://www.w3.org/2000/svg" role="img" preserveAspectRatio="xMidYMid meet" font-family="ui-sans-serif, -apple-system, Segoe UI, Roboto, sans-serif">
-  <title>Firstpass — send each request to the cheapest model first, prove its output passes your gate, and pay for a stronger model only when the cheap one fails. Result: about 65% cheaper at equal-or-higher success, with a guaranteed ceiling of 10% wrong answers served at 95% confidence.</title>
+<svg viewBox="0 0 1000 360" xmlns="http://www.w3.org/2000/svg" role="img" preserveAspectRatio="xMidYMid meet" font-family="ui-sans-serif, -apple-system, Segoe UI, Roboto, sans-serif">
+  <title>Firstpass cuts your AI bill — from four dollar signs to one — at the same quality, guaranteed: it checks every answer and pays for a big model only when truly needed.</title>
   <defs>
-    <linearGradient id="mint" x1="0" y1="0" x2="1" y2="1">
+    <linearGradient id="mintg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#5EEACB"/><stop offset="1" stop-color="#19E3B1"/>
     </linearGradient>
-    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
-      <feGaussianBlur stdDeviation="2.6" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    <radialGradient id="haze" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#19E3B1" stop-opacity="0.12"/><stop offset="1" stop-color="#19E3B1" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="g1" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
-    <marker id="a" markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto"><path d="M0 0 L6 3.5 L0 7 Z" fill="#3A4A61"/></marker>
-    <marker id="am" markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto"><path d="M0 0 L6 3.5 L0 7 Z" fill="#19E3B1"/></marker>
-    <marker id="af" markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto"><path d="M0 0 L6 3.5 L0 7 Z" fill="#F5A623"/></marker>
+    <filter id="g2" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="7" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="am" markerWidth="9" markerHeight="9" refX="6" refY="4.5" orient="auto"><path d="M0 0 L8 4.5 L0 9 Z" fill="url(#mintg)"/></marker>
   </defs>
 
-  <rect x="1.5" y="1.5" width="997" height="265" rx="16" fill="#0B0E14" stroke="#263449"/>
+  <rect x="1.5" y="1.5" width="997" height="357" rx="18" fill="#0B0E14" stroke="#263449"/>
+  <ellipse cx="640" cy="170" rx="360" ry="170" fill="url(#haze)"/>
 
-  <!-- header -->
-  <text x="34" y="42" font-size="21" font-weight="700" fill="#E6EDF3">Firstpass</text>
-  <text x="132" y="42" font-size="12.5" fill="#19E3B1" font-weight="600">cheapest-first · proven before served</text>
+  <!-- brand -->
+  <text x="36" y="46" font-size="19" font-weight="800" fill="#E6EDF3">⚡ firstpass</text>
 
-  <!-- request -->
-  <text x="34" y="104" font-size="10.5" fill="#8A97A6" letter-spacing="1">REQUEST</text>
-  <circle cx="46" cy="150" r="7" fill="url(#mint)"/>
-  <path d="M53 150 L108 150" stroke="#3A4A61" stroke-width="2.5" marker-end="url(#a)"/>
+  <!-- YOUR AI BILL: $$$$ struck out -->
+  <text x="118" y="96" font-size="13" font-weight="700" fill="#8A97A6" letter-spacing="2">YOUR AI BILL</text>
+  <text x="110" y="205" font-size="104" font-weight="900" fill="#4A5563">$$$$</text>
+  <line x1="96" y1="172" x2="392" y2="172" stroke="#FF5C5C" stroke-width="7" stroke-linecap="round" transform="rotate(-7 244 172)"/>
 
-  <!-- rung 0: cheapest model -->
-  <rect x="112" y="128" width="132" height="44" rx="10" fill="#0F1A17" stroke="#1c4b40"/>
-  <text x="178" y="150" text-anchor="middle" font-size="12.5" font-weight="600" fill="#5EEACB">cheapest model</text>
-  <text x="178" y="164" text-anchor="middle" font-size="9.5" fill="#8A97A6">Haiku · OSS · Groq …</text>
-  <path d="M244 150 L300 150" stroke="#3A4A61" stroke-width="2.5" marker-end="url(#a)"/>
+  <!-- arrow -->
+  <path d="M430 168 L540 168" stroke="url(#mintg)" stroke-width="9" stroke-linecap="round" marker-end="url(#am)" stroke-dasharray="16 12">
+    <animate attributeName="stroke-dashoffset" from="28" to="0" dur="0.9s" repeatCount="indefinite"/>
+  </path>
 
-  <!-- the gate -->
-  <path d="M348 116 L392 150 L348 184 L304 150 Z" fill="#0F151C" stroke="#263449"/>
-  <text x="348" y="146" text-anchor="middle" font-size="11" font-weight="700" fill="#E6EDF3">GATE</text>
-  <text x="348" y="160" text-anchor="middle" font-size="8" fill="#8A97A6">tests·schema·judge</text>
+  <!-- the new bill: one $ -->
+  <text x="588" y="212" font-size="130" font-weight="900" fill="url(#mintg)" filter="url(#g2)">$</text>
 
-  <!-- pass → served -->
-  <path d="M392 150 L470 150" stroke="#19E3B1" stroke-width="2.5" marker-end="url(#am)"/>
-  <text x="431" y="142" text-anchor="middle" font-size="9.5" fill="#19E3B1" font-weight="600">pass</text>
-  <rect x="472" y="130" width="86" height="40" rx="9" fill="#0c1614" stroke="#19E3B1"/>
-  <text x="515" y="149" text-anchor="middle" font-size="12" font-weight="700" fill="#19E3B1">served ✓</text>
-  <text x="515" y="162" text-anchor="middle" font-size="8" fill="#8A97A6">+ signed receipt</text>
+  <!-- shield: same quality, guaranteed -->
+  <g filter="url(#g1)">
+    <path d="M772 82 L830 100 L830 158 C830 196 800 220 772 230 C744 220 714 196 714 158 L714 100 Z"
+          fill="#0c1614" stroke="#19E3B1" stroke-width="3"/>
+    <path d="M744 156 L766 178 L802 130" fill="none" stroke="#19E3B1" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="860" y="142" font-size="24" font-weight="900" fill="#E6EDF3">SAME</text>
+  <text x="860" y="172" font-size="24" font-weight="900" fill="#E6EDF3">QUALITY</text>
+  <text x="860" y="200" font-size="16" font-weight="800" fill="#19E3B1">guaranteed</text>
 
-  <!-- fail → escalate up one rung -->
-  <path d="M348 116 C348 92 348 78 380 78 L470 78" fill="none" stroke="#F5A623" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#af)"/>
-  <text x="360" y="70" font-size="9.5" fill="#F5A623" font-weight="600">fail → escalate one rung</text>
-  <rect x="472" y="58" width="86" height="40" rx="9" fill="#171310" stroke="#7a6320"/>
-  <text x="515" y="77" text-anchor="middle" font-size="11.5" font-weight="600" fill="#F5A623">stronger</text>
-  <text x="515" y="90" text-anchor="middle" font-size="8" fill="#8A97A6">only when needed</text>
-
-  <!-- travelling request packet -->
-  <circle r="4.5" fill="#38E8FF" filter="url(#glow)">
-    <animateMotion dur="3.4s" repeatCount="indefinite" path="M46 150 L178 150 L348 150 L515 150"/>
-  </circle>
-
-  <text x="34" y="216" font-size="10.5" fill="#8A97A6">Pay for the expensive model <tspan fill="#E6EDF3" font-weight="600">only when the cheap one can't do the job</tspan> — never on a guess.</text>
-  <text x="34" y="237" font-size="10.5" fill="#8A97A6">Change what “good” means by editing a gate. <tspan fill="#E6EDF3" font-weight="600">No classifier to retrain.</tspan></text>
-
-  <!-- payoff panel (right) -->
-  <line x1="600" y1="30" x2="600" y2="240" stroke="#1B2636"/>
-  <text x="628" y="52" font-size="10.5" fill="#8A97A6" letter-spacing="1">COST / SUCCESS · PROOF HARNESS</text>
-  <rect x="632" y="66" width="150" height="24" rx="5" fill="#20262e"/>
-  <text x="640" y="82" font-size="10" fill="#8A97A6">all-frontier</text>
-  <text x="774" y="82" text-anchor="end" font-size="10" fill="#8A97A6">100%</text>
-  <rect x="632" y="98" width="52.5" height="24" rx="5" fill="url(#mint)"/>
-  <rect x="632" y="98" width="150" height="24" rx="5" fill="none" stroke="#1c4b40"/>
-  <text x="640" y="114" font-size="10" font-weight="700" fill="#052019">firstpass</text>
-  <text x="774" y="114" text-anchor="end" font-size="10" fill="#5EEACB" font-weight="700">≈35%</text>
-  <text x="628" y="146" font-size="15" font-weight="800" fill="#19E3B1" filter="url(#glow)">~65% cheaper</text>
-  <text x="742" y="146" font-size="9.5" fill="#8A97A6">in harness · you measure yours</text>
-
-  <!-- guarantee chip: the validated, workload-independent claim -->
-  <rect x="628" y="160" width="336" height="44" rx="9" fill="#0c1614" stroke="#19E3B1"/>
-  <text x="644" y="180" font-size="12.5" font-weight="800" fill="#E6EDF3">Guaranteed: ≤10% wrong answers served</text>
-  <text x="644" y="196" font-size="9.5" fill="#8A97A6">at 95% confidence — earned live on 964 real coding tasks</text>
-
-  <text x="628" y="226" font-size="10" fill="#8A97A6"><tspan fill="#19E3B1" font-weight="700">adaptive</tspan> — self-tunes as traffic drifts  ·  every provider + open-source</text>
+  <!-- one plain-words line -->
+  <line x1="36" y1="272" x2="964" y2="272" stroke="#1B2636"/>
+  <text x="500" y="316" text-anchor="middle" font-size="21" font-weight="700" fill="#E6EDF3">It checks every answer — and pays for a big model <tspan fill="#19E3B1">only when truly needed</tspan>.</text>
+  <text x="500" y="341" text-anchor="middle" font-size="12.5" fill="#8A97A6">≤10% wrong answers served, at 95% confidence — measured live, not promised · self-tuning</text>
 </svg>
