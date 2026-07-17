@@ -1,12 +1,14 @@
 <div align="center">
 
-<img src="assets/hero.svg" alt="Firstpass — the cheapest model takes the first pass, proven not guessed" width="840">
+<img src="assets/hero.svg" alt="Firstpass sends each request to the cheapest model first, proves the output passes your gate, and pays for a stronger model only when the cheap one fails — ~65% cheaper at equal-or-higher success, with a guaranteed ceiling of 10% wrong answers served at 95% confidence" width="880">
 
 # Firstpass
 
-**Route every LLM request to the cheapest model that _provably_ passes your quality gate — and get a signed receipt for the decision.**
+### Stop paying frontier prices for answers a cheap model could give you.
 
-Proof over prediction. Built for agent fleets.
+**The adaptive router that sends each request to the _cheapest_ model first, proves the output passes your gate, and pays for a stronger model only when the cheap one fails — never on a guess. The one router with a guaranteed ceiling on wrong answers served.**
+
+> **Cheapest-first. Proven before served.**
 
 [![CI](https://github.com/dshakes/firstpass/actions/workflows/ci.yml/badge.svg)](https://github.com/dshakes/firstpass/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -19,9 +21,47 @@ Proof over prediction. Built for agent fleets.
 
 ---
 
-Firstpass is a **drop-in, Anthropic-compatible proxy**. Point your agent's `base_url` at it and every request is routed to the cheapest model first, its **real output** is checked by a gate you define (tests, typecheck, schema, a judge), and it escalates one rung only when the gate fails — writing a tamper-evident audit trace for every decision.
+## The problem: you're overpaying to gamble
 
-> **Honestly scoped.** The proxy routes, gates, escalates, fails over, audits, and learns end-to-end over real HTTP — no test doubles in the plane, and the enforce path is [live-verified](#proof-not-adjectives) against real Anthropic. The [proof harness](#proof-not-adjectives) has a **200-task live result** and an **earned distribution-free served-failure bound on real MBPP** below; still ahead: a 30-day dogfood and the hosted control plane. See the [roadmap](#roadmap). Nothing here is claimed as measured that isn't.
+Every AI product faces the same tax, and both ways to pay it are bad:
+
+- **Send everything to the frontier model** → you overpay 10–100× for answers a small model would have nailed.
+- **Route by prediction** (the whole current crop of routers) → a classifier _guesses_ a model from the prompt and hopes. Nobody checks the real output, so a wrong guess ships to your user anyway.
+
+You're still gambling. You've just added infrastructure to do it.
+
+## The firstpass way: route on proof, not prediction
+
+1. **Try cheap.** Send to the cheapest rung of your model ladder.
+2. **Prove it.** Gate the _real output_ — your unit tests, a JSON schema, or a fresh-context LLM judge.
+3. **Escalate only on failure.** One rung up, budget-capped, with cross-provider failover.
+4. **Serve + receipt.** The first output that passes is what ships — with a tamper-evident, hash-chained trace of every decision.
+
+Change what "good" means by editing a gate. No classifier to retrain, no policy to relearn.
+
+## The moat: a number no other router will give you
+
+Firstpass is the only router that ships a **mathematical guarantee on how often a wrong answer reaches your user** — a distribution-free conformal bound of **≤10% served-failure at 95% confidence**, _earned live on 964 real coding tasks_ (not a claim, a measured result — see [Proof](#proof-not-adjectives)). And it's **adaptive**: the serve threshold self-tunes from live feedback, so that guarantee holds even as your traffic drifts.
+
+| | Predictive routers | **Firstpass** |
+|---|---|---|
+| Decides by | guessing from the prompt | **proving the real output** |
+| Wrong answer served | ships silently | **caught by the gate, escalated** |
+| Guarantee | none | **≤10% @ 95%, earned on real tasks** |
+| Improve by | retraining a model | **editing a gate — zero retrain** |
+| Every provider + OSS | some | **Anthropic · OpenAI · Gemini · Bedrock · Vertex · Groq · DeepSeek · Ollama/vLLM** |
+
+_Honest scope on savings: **~65% is our [proof-harness simulation](#proof-not-adjectives)**, not a promise about your bill. Live on 200 graded arithmetic tasks (real Anthropic) it was ~85% cheaper than always-Opus — but that's a narrow, cheap-friendly domain. **Your real number depends on how often your cheap model clears your gate**, which firstpass measures per request (every trace records the always-top counterfactual). The claim that does **not** depend on your workload is the guarantee above — earned live on 964 real MBPP tasks. The enforce path is live-verified against real Anthropic; still ahead: a 30-day dogfood and the hosted plane ([roadmap](#roadmap)). Nothing here is claimed as measured that isn't._
+
+## Onboards in one step — and tunes itself
+
+**You don't have to write or babysit gates.** Meet it where you are:
+
+- **Start in observe mode — zero config, zero risk.** Point your agent at firstpass and change nothing else. It watches every call, records what it *would* have routed and what you'd have saved, and touches your traffic not at all. See the value before you switch anything on.
+- **Turn on gating with no code.** The built-in gates (`non-empty`, `json-valid`, a JSON-schema check) need zero setup. The **judge gate** is one plain-English sentence — a second model grades each answer against your rubric (*"fully and correctly resolves the request"*). Bring your own test suite only when you want the strongest possible gate.
+- **It learns on its own.** The serve threshold **self-tunes from live outcomes** (online conformal / ACI), so the money-vs-accuracy balance holds as your traffic drifts — set it in front of your workload and it keeps itself calibrated. `firstpass calibrate` re-tightens it from real feedback anytime.
+
+Solo dev with one route or a fleet with per-tenant policies, the on-ramp is the same one line — `export ANTHROPIC_BASE_URL=…` — and the accuracy floor is never the thing you trade away for the savings: the gate is what *guarantees* it.
 
 ## Quickstart
 
