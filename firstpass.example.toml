@@ -131,3 +131,13 @@ speculation = 0
 # [escalation.adaptive]
 # alpha = 0.10   # target served-failure rate the loop holds to
 # gamma = 0.02   # step size — larger tracks shift faster but noisier
+#
+# UCB1 start-rung bandit (predict-to-start, verify-to-serve): learns WHICH RUNG TO START on
+# per request context (task kind × prompt size), cutting expected cost by skipping rungs that
+# almost always fail for that context. The gate still verifies the chosen rung's output before
+# serving — a wrong prediction costs latency/money, never correctness. Cold-start safety:
+# below `min_observations` per context the bandit returns rung 0 (today's behavior). Learning
+# survives restarts via trace-store replay. Absent = every request starts at rung 0 (default).
+# [escalation.bandit]
+# min_observations = 50    # observations before prediction kicks in (cold-start guard)
+# exploration = 1.0        # UCB1 exploration constant c (Auer et al. 2002); 0 = pure exploitation

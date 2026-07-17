@@ -342,6 +342,12 @@ pub struct Escalation {
     /// content fidelity is preserved either way, but escalating a live tool turn is operator-gated.
     #[serde(default)]
     pub enforce_structured: bool,
+    /// UCB1 start-rung bandit: learn which rung to START the ladder on per request context, to
+    /// cut expected cost by skipping rungs that almost always fail for this context. `None`
+    /// (default) starts every request at rung 0 — byte-identical to today. Prediction may only
+    /// choose where the ladder STARTS; gating, escalation, and serving are untouched.
+    #[serde(default)]
+    pub bandit: Option<BanditConfig>,
 }
 
 /// Config for online/adaptive conformal serving ([`crate::conformal::AdaptiveConformal`]).
@@ -359,6 +365,30 @@ fn default_adaptive_gamma() -> f64 {
     0.02
 }
 
+/// Config for the UCB1 start-rung bandit (`firstpass_proxy::bandit::StartRungBandit`).
+///
+/// Absent (`None`) → start every request at rung 0 (byte-identical to today).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BanditConfig {
+    /// Minimum total gate-verdict observations in a context bucket before the bandit's
+    /// prediction kicks in. Below this, every request starts at rung 0 (cold-start safety).
+    #[serde(default = "default_bandit_min_observations")]
+    pub min_observations: usize,
+    /// UCB1 exploration constant `c` (Auer et al. 2002). Higher values explore more; 1.0 is the
+    /// theoretical default. Must be finite and `>= 0`; validated by [`Config::parse`].
+    #[serde(default = "default_bandit_exploration")]
+    pub exploration: f64,
+}
+
+fn default_bandit_min_observations() -> usize {
+    50
+}
+
+fn default_bandit_exploration() -> f64 {
+    1.0
+}
+
 const fn default_max_rungs() -> u32 {
     3
 }
@@ -372,6 +402,7 @@ impl Default for Escalation {
             serve_threshold: None,
             adaptive: None,
             enforce_structured: false,
+            bandit: None,
         }
     }
 }
@@ -499,6 +530,14 @@ impl Config {
                     def.id
                 )));
             }
+        }
+        if let Some(b) = &config.escalation.bandit
+            && (!b.exploration.is_finite() || b.exploration < 0.0)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "bandit.exploration must be finite and >= 0, got {}",
+                b.exploration
+            )));
         }
         Ok(config)
     }

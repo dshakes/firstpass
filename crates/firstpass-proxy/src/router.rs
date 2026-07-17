@@ -61,6 +61,14 @@ pub struct EnforceCtx<'a> {
     pub serve_threshold: Option<f64>,
     /// Feature vector routed on (recorded in the trace).
     pub features: Features,
+    /// Index of the first ladder rung to attempt this request (predict-to-start).
+    ///
+    /// `0` = today's default (every rung eligible). Bandit may set this higher to skip rungs
+    /// that are observed to almost always fail for this context. The gate still verifies the
+    /// chosen rung's output — prediction only affects where we *start*, never what we *serve*.
+    /// If the predicted start rung fails the gate the ladder continues upward as normal; there
+    /// is no downward retry (would re-spend money without new information).
+    pub start_rung: u32,
     /// Tenant id.
     pub tenant_id: String,
     /// Session id.
@@ -200,9 +208,13 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
     let mut served_rung: Option<u32> = None;
     let mut hard_error: Option<String> = None;
 
-    let rung_limit = (ctx.max_rungs as usize).min(ctx.ladder.len());
-    for (idx, model_str) in ctx.ladder.iter().take(rung_limit).enumerate() {
-        let idx = idx as u32;
+    let start = (ctx.start_rung as usize).min(ctx.ladder.len().saturating_sub(1));
+    // max_rungs caps the NUMBER of rungs attempted from start; rung_end is the exclusive upper
+    // bound on ladder indices. With start=0 this is identical to the original rung_limit logic.
+    let rungs_available = ctx.ladder.len().saturating_sub(start);
+    let rung_end = start + (ctx.max_rungs as usize).min(rungs_available);
+    for (i, model_str) in ctx.ladder[start..rung_end].iter().enumerate() {
+        let idx = (start + i) as u32;
         let start = Instant::now();
 
         // Resolve provider from `provider/model`. A missing provider/malformed ref is treated as
@@ -294,7 +306,7 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                 // Gate failed → escalate, unless the budget is already spent and a next rung exists.
                 if let Some(cap) = ctx.budget_per_request_usd
                     && spent >= cap
-                    && (idx as usize) + 1 < rung_limit
+                    && (idx as usize) + 1 < rung_end
                 {
                     break;
                 }
@@ -324,18 +336,21 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
     let mut served_rung: Option<u32> = None;
     let mut hard_error: Option<String> = None;
 
-    let rung_limit = (ctx.max_rungs as usize).min(ctx.ladder.len());
+    let start = (ctx.start_rung as usize).min(ctx.ladder.len().saturating_sub(1));
+    // rung_end is the exclusive upper bound on ladder indices (same semantics as serial's rung_end).
+    let rungs_available = ctx.ladder.len().saturating_sub(start);
+    let rung_end = start + (ctx.max_rungs as usize).min(rungs_available);
     let speculation = ctx.speculation as usize;
     let mut inflight: HashMap<usize, JoinHandle<Result<ModelResponse, ProviderError>>> =
         HashMap::new();
 
-    let mut idx = 0usize;
+    let mut idx = start;
     // `done` = a rung passed or hard-errored: stop consuming, then cancel/harvest the rest.
     let mut done = false;
-    while idx < rung_limit && !done {
+    while idx < rung_end && !done {
         // Fire the window [idx ..= idx+speculation] concurrently. The rung we must gate now (idx)
         // always fires; rungs ahead only while under budget, so speculation can't blow the cap.
-        let window_end = (idx + speculation).min(rung_limit - 1);
+        let window_end = (idx + speculation).min(rung_end - 1);
         for j in idx..=window_end {
             if inflight.contains_key(&j) {
                 continue;
@@ -380,9 +395,9 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
             idx += 1;
             continue;
         };
-        let start = Instant::now();
+        let t0 = Instant::now();
         let joined = handle.await;
-        let ms = elapsed_ms(start);
+        let ms = elapsed_ms(t0);
 
         match joined {
             // Task panicked or was aborted out from under us: treat as a transport abstain.
@@ -457,7 +472,7 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                     done = true;
                 } else if let Some(cap) = ctx.budget_per_request_usd
                     && spent >= cap
-                    && idx + 1 < rung_limit
+                    && idx + 1 < rung_end
                 {
                     done = true;
                 }
@@ -627,6 +642,7 @@ mod tests {
             speculation: 0,
             serve_threshold: None,
             features: Features::new(firstpass_core::TaskKind::CodeEdit),
+            start_rung: 0,
             tenant_id: "acme".into(),
             session_id: "sess-1".into(),
             prompt_hash: "deadbeef".into(),
@@ -1239,5 +1255,163 @@ mod tests {
 
         assert!(matches!(out, EngineOutcome::Served(r) if r.model == HAIKU));
         assert_eq!(trace.final_.served_from, ServedFrom::Attempt);
+    }
+
+    // ---- Bandit start_rung integration tests ----------------------------------------
+
+    /// Bandit off (default start_rung=0): `ctx()` already sets start_rung=0, and all existing
+    /// tests pass — this test just makes the invariant explicit.
+    #[tokio::test]
+    async fn bandit_off_start_rung_zero_is_byte_identical() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let (providers, log) = counted_registry(vec![
+            (HAIKU, Ok(resp(HAIKU, "answer"))),
+            (SONNET, Ok(resp(SONNET, "other"))),
+        ]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        assert_eq!(c.start_rung, 0, "default start_rung must be 0 (bandit off)");
+        let (out, trace) = route_enforce(c).await;
+        // Rung 0 (haiku) serves; rung 1 is never called.
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == HAIKU));
+        assert_eq!(trace.final_.served_rung, Some(0));
+        assert_eq!(*log.lock().unwrap(), vec![HAIKU.to_owned()]);
+    }
+
+    /// start_rung=1 skips rung 0 (haiku is never called), gates rung 1 (sonnet), serves on pass.
+    #[tokio::test]
+    async fn start_rung_1_skips_rung_0_and_serves_rung_1() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let (providers, log) = counted_registry(vec![
+            (HAIKU, Ok(resp(HAIKU, "haiku answer"))),
+            (SONNET, Ok(resp(SONNET, "sonnet answer"))),
+        ]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.start_rung = 1; // bandit would set this
+        let (out, trace) = route_enforce(c).await;
+
+        // Served from rung 1; rung 0 was never called.
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == SONNET));
+        assert_eq!(trace.final_.served_rung, Some(1));
+        assert_eq!(trace.attempts.len(), 1, "only rung 1 attempted");
+        assert_eq!(trace.attempts[0].rung, 1);
+        assert!(
+            !log.lock().unwrap().contains(&HAIKU.to_owned()),
+            "rung 0 must never fire when start_rung=1: {:?}",
+            *log.lock().unwrap()
+        );
+    }
+
+    /// start_rung=1, rung 1 fails the gate → escalates to rung 2, serves rung 2 on pass.
+    #[tokio::test]
+    async fn start_rung_1_escalates_to_rung_2_on_gate_fail() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned(), OPUS.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        // Rung 1 (sonnet) returns empty → fails non-empty; rung 2 (opus) passes.
+        let (providers, log) = counted_registry(vec![
+            (HAIKU, Ok(resp(HAIKU, "haiku"))),
+            (SONNET, Ok(resp(SONNET, ""))), // fails non-empty
+            (OPUS, Ok(resp(OPUS, "real answer"))),
+        ]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.start_rung = 1;
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == OPUS));
+        assert_eq!(trace.final_.served_rung, Some(2));
+        assert_eq!(trace.attempts.len(), 2); // rungs 1 and 2 only
+        assert_eq!(trace.attempts[0].rung, 1);
+        assert_eq!(trace.attempts[0].verdict, Verdict::Fail);
+        assert_eq!(trace.attempts[1].rung, 2);
+        assert_eq!(trace.attempts[1].verdict, Verdict::Pass);
+        // Rung 0 (haiku) must never have been called.
+        assert!(
+            !log.lock().unwrap().contains(&HAIKU.to_owned()),
+            "rung 0 must not fire with start_rung=1"
+        );
+    }
+
+    /// max_rungs is still respected when start_rung > 0: if start_rung=1 and max_rungs=1,
+    /// only rung 1 is attempted even if it fails the gate.
+    #[tokio::test]
+    async fn max_rungs_respected_with_nonzero_start_rung() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned(), OPUS.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        // All fail the gate (empty) but max_rungs=1 limits us to one attempt.
+        let (providers, _log) = counted_registry(vec![
+            (HAIKU, Ok(resp(HAIKU, ""))),
+            (SONNET, Ok(resp(SONNET, ""))),
+            (OPUS, Ok(resp(OPUS, ""))),
+        ]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.start_rung = 1;
+        c.max_rungs = 1;
+        let (_out, trace) = route_enforce(c).await;
+
+        assert_eq!(
+            trace.attempts.len(),
+            1,
+            "max_rungs=1 must limit to one attempt even with start_rung=1"
+        );
+        assert_eq!(trace.attempts[0].rung, 1, "the one attempt must be rung 1");
+    }
+
+    /// Guarantee invariant: bandit selects start_rung=1, but rung 1 fails the gate →
+    /// the engine escalates to rung 2 and serves its passing output, never the failing one.
+    #[tokio::test]
+    async fn invariant_failed_start_rung_never_served_escalates_to_passing_rung() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned(), OPUS.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let (providers, _log) = counted_registry(vec![
+            (HAIKU, Ok(resp(HAIKU, "haiku"))),
+            (SONNET, Ok(resp(SONNET, "  "))), // fails non-empty (whitespace only)
+            (OPUS, Ok(resp(OPUS, "the correct answer"))),
+        ]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.start_rung = 1;
+        let (out, trace) = route_enforce(c).await;
+
+        // The served answer must be the passing higher rung's output, never the failing one.
+        match out {
+            EngineOutcome::Served(r) => {
+                assert_eq!(r.model, OPUS, "must serve the passing rung's model");
+                assert_eq!(
+                    r.text, "the correct answer",
+                    "served text must be from the passing rung"
+                );
+            }
+            EngineOutcome::Failed(e) => panic!("expected served answer, got error: {e}"),
+        }
+        assert_eq!(trace.final_.served_rung, Some(2));
+        assert_eq!(trace.final_.served_from, ServedFrom::Attempt);
+        // The whitespace-only answer from rung 1 must never have been served.
+        assert_eq!(trace.attempts[0].rung, 1);
+        assert_eq!(trace.attempts[0].verdict, Verdict::Fail);
     }
 }

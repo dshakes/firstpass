@@ -22,6 +22,7 @@ The adaptive LLM router that checks **every answer** with your gate, pays for a 
 - 💸 **Cheapest model first, always** — you pay frontier prices only when a real check proves you must.
 - 🛡️ **A guarantee, not a vibe** — ≤10% wrong answers served at 95% confidence, earned live on 964 real coding tasks.
 - 🧠 **Self-tuning** — the serve threshold recalibrates from live outcomes as your traffic drifts. No retraining, ever.
+- 🎯 **Predict-to-start, verify-to-serve** — a UCB1 bandit learns which rung to *start* on per context; the gate still checks the output before it ships.
 - 🔍 **Proof, not prediction** — the gate checks the *actual output*; a wrong answer is caught, never shipped on a guess.
 - 🧾 **A receipt per decision** — hash-chained, tamper-evident, auditable: *why this model, what did it cost, what did it save*.
 - 🌐 **Every provider** — Anthropic, OpenAI, Gemini, Bedrock, Vertex, Groq, DeepSeek, OpenRouter, Azure, local Ollama/vLLM.

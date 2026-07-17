@@ -146,6 +146,7 @@ async fn spawn_proxy(
         gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
         traces,
         adaptive: None,
+        bandit: None,
         tenant_rate_limiter: None,
     };
 
