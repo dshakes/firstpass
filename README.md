@@ -2,9 +2,9 @@
 
 # ⚡ Firstpass
 
-### Cheap-model prices. Frontier-model reliability. Mathematically guaranteed.
+### Guessing is expensive. Proof is cheap.
 
-The adaptive LLM router that **proves every answer before serving it** — so the cheapest model that can do the job is the one you pay for.
+The adaptive LLM router where every answer is **cheap until proven otherwise** — checked by your gate, escalated to a big model only on proof of need, wrong answers capped and **guaranteed**.
 
 [![CI](https://github.com/dshakes/firstpass/actions/workflows/ci.yml/badge.svg)](https://github.com/dshakes/firstpass/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/firstpass-proxy)](https://crates.io/crates/firstpass-proxy)
