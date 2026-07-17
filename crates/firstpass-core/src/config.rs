@@ -658,6 +658,57 @@ base_url = "https://api.groq.com/openai"
     }
 
     #[test]
+    fn all_documented_provider_shapes_parse() {
+        // The exact `[[provider]]` shapes shown in the README / usage page / firstpass.example.toml.
+        // This is the guard that the documented provider instructions stay valid — one entry per
+        // dialect/auth combination we tell users to write.
+        let c = Config::parse(
+            r#"
+[[provider]]
+id = "groq"
+dialect = "openai"
+base_url = "https://api.groq.com/openai"
+api_key_env = "GROQ_API_KEY"
+
+[[provider]]
+id = "ollama"
+dialect = "openai"
+base_url = "http://localhost:11434"
+
+[[provider]]
+id = "gemini"
+dialect = "gemini"
+base_url = "https://generativelanguage.googleapis.com"
+api_key_env = "GEMINI_API_KEY"
+
+[[provider]]
+id = "bedrock"
+dialect = "anthropic"
+auth = "aws_sigv4"
+region = "us-east-1"
+
+[[provider]]
+id = "vertex"
+dialect = "anthropic"
+auth = "gcp_oauth"
+region = "us-east5"
+project = "my-gcp-project"
+"#,
+        )
+        .expect("every documented provider shape must parse");
+        assert_eq!(c.providers.len(), 5);
+
+        let gemini = c.providers.iter().find(|p| p.id == "gemini").unwrap();
+        assert_eq!(gemini.dialect, Dialect::Gemini);
+        assert_eq!(gemini.auth, AuthScheme::ApiKey);
+
+        let vertex = c.providers.iter().find(|p| p.id == "vertex").unwrap();
+        assert_eq!(vertex.auth, AuthScheme::GcpOauth);
+        assert_eq!(vertex.region.as_deref(), Some("us-east5"));
+        assert_eq!(vertex.project.as_deref(), Some("my-gcp-project"));
+    }
+
+    #[test]
     fn empty_match_is_wildcard() {
         let m = Match::default();
         assert!(m.matches(&Features::new(TaskKind::Other)));

@@ -163,6 +163,34 @@ ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]
 gates = ["unit-tests"]
 ```
 
+Other dialects and cloud-IAM backends use the same shape — set `dialect`, and for AWS/GCP set `auth`:
+
+```toml
+# Google Gemini — its own dialect (key in the x-goog-api-key header)
+[[provider]]
+id = "gemini"
+dialect = "gemini"
+base_url = "https://generativelanguage.googleapis.com"
+api_key_env = "GEMINI_API_KEY"
+
+# Claude on AWS Bedrock — SigV4-signed (creds from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+[[provider]]
+id = "bedrock"
+dialect = "anthropic"
+auth = "aws_sigv4"
+region = "us-east-1"
+
+# Claude on Google Vertex — OAuth bearer (creds from GOOGLE_APPLICATION_CREDENTIALS)
+[[provider]]
+id = "vertex"
+dialect = "anthropic"
+auth = "gcp_oauth"
+region = "us-east5"
+project = "my-gcp-project"
+```
+
+Bedrock and Vertex are **live-unverified** — offline-tested for request shape and SigV4 signed headers; verify with real AWS/GCP credentials before production. Every option is in [`firstpass.example.toml`](firstpass.example.toml) (validated by a parse test), and the [usage page](https://dshakes.github.io/firstpass/usage.html#providers) has the full walkthrough.
+
 **Endpoints:** `POST /v1/messages` (drop-in) · `POST /v1/feedback` · `GET /v1/capabilities` · `GET /healthz`.
 
 ## Proof, not adjectives

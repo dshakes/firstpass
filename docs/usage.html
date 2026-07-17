@@ -174,12 +174,20 @@ dialect = "gemini"
 base_url = "https://generativelanguage.googleapis.com"
 api_key_env = "GEMINI_API_KEY"
 
-# AWS Bedrock (SigV4; creds from AWS_* env)
+# AWS Bedrock (Claude on Bedrock; SigV4, creds from AWS_* env)
 [[provider]]
 id = "bedrock"
 dialect = "anthropic"
 auth = "aws_sigv4"
 region = "us-east-1"
+
+# Google Vertex (Claude on Vertex; OAuth, creds from GOOGLE_APPLICATION_CREDENTIALS)
+[[provider]]
+id = "vertex"
+dialect = "anthropic"
+auth = "gcp_oauth"
+region = "us-east5"
+project = "my-gcp-project"
 
 # open-source rung → frontier escalation on gate fail
 [[route]]
@@ -199,12 +207,20 @@ ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]'>copy</bu
 <span class="cy">base_url</span>    = <span class="p">"https://generativelanguage.googleapis.com"</span>
 <span class="cy">api_key_env</span> = <span class="p">"GEMINI_API_KEY"</span>
 
-<span class="c"># AWS Bedrock (SigV4; creds from AWS_* env)</span>
+<span class="c"># AWS Bedrock (Claude on Bedrock; SigV4, creds from AWS_* env)</span>
 <span class="c">[[provider]]</span>
 <span class="cy">id</span>      = <span class="p">"bedrock"</span>
 <span class="cy">dialect</span> = <span class="p">"anthropic"</span>
 <span class="cy">auth</span>    = <span class="p">"aws_sigv4"</span>
 <span class="cy">region</span>  = <span class="p">"us-east-1"</span>
+
+<span class="c"># Google Vertex (Claude on Vertex; OAuth, creds from GOOGLE_APPLICATION_CREDENTIALS)</span>
+<span class="c">[[provider]]</span>
+<span class="cy">id</span>      = <span class="p">"vertex"</span>
+<span class="cy">dialect</span> = <span class="p">"anthropic"</span>
+<span class="cy">auth</span>    = <span class="p">"gcp_oauth"</span>
+<span class="cy">region</span>  = <span class="p">"us-east5"</span>
+<span class="cy">project</span> = <span class="p">"my-gcp-project"</span>
 
 <span class="c"># open-source rung → frontier escalation on gate fail</span>
 <span class="c">[[route]]</span>
