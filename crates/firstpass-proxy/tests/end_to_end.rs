@@ -146,6 +146,7 @@ async fn spawn_proxy(
         gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
         traces,
         adaptive: None,
+        tenant_rate_limiter: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

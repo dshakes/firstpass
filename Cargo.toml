@@ -39,6 +39,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 bytes = "1"
 tower = { version = "0.5", features = ["limit", "util"] }
+# Per-tenant request rate limiting (ADR 0004 §D6): a vetted, keyed token-bucket limiter.
+governor = "0.8"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # Bespoke provider auth (ADR 0006 P2/P3): AWS SigV4 request signing (Bedrock), GCP OAuth (Vertex).

@@ -2,6 +2,7 @@
 //! by default — every knob has a sane local default and can be overridden by env var).
 
 use std::env;
+use std::num::NonZeroU32;
 
 use firstpass_core::{Config as RoutingConfig, Mode, PriceTable};
 
@@ -51,6 +52,10 @@ pub struct ProxyConfig {
     /// (`FIRSTPASS_MAX_CONCURRENCY`, default 512). A load-shed valve, not a timeout — it never
     /// severs an in-flight SSE stream.
     pub max_concurrency: usize,
+    /// Per-tenant request rate limit, requests/sec (ADR 0004 §D6). `None` (the default) means
+    /// unlimited — single-operator and existing deployments are unaffected. Set via
+    /// `FIRSTPASS_TENANT_RATE_PER_SEC`; only enforced when configured.
+    pub tenant_rate_per_sec: Option<NonZeroU32>,
 }
 
 /// Default for [`ProxyConfig::max_concurrency`] when `FIRSTPASS_MAX_CONCURRENCY` is unset.
@@ -171,6 +176,14 @@ impl ProxyConfig {
             );
         }
 
+        // Per-tenant rate limiting (ADR 0004 §D6) — default OFF (unlimited).
+        let tenant_rate_per_sec = match lookup("FIRSTPASS_TENANT_RATE_PER_SEC") {
+            Some(s) => Some(s.trim().parse::<NonZeroU32>().map_err(|e| {
+                ConfigError::Config(format!("FIRSTPASS_TENANT_RATE_PER_SEC={s:?}: {e}"))
+            })?),
+            None => None,
+        };
+
         Ok(Self {
             bind,
             upstream_anthropic,
@@ -184,6 +197,7 @@ impl ProxyConfig {
             routing,
             prices: PriceTable::defaults(),
             max_concurrency,
+            tenant_rate_per_sec,
         })
     }
 }
