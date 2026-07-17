@@ -1,0 +1,884 @@
+//! Off-policy evaluation (OPE) via direct-method replay over deterministic logs (SPEC §10.2).
+//!
+//! # Method
+//!
+//! Answers: "if I changed my ladder or serve threshold, what would my logged traffic have cost
+//! and how many failures would I have served?" — from the trace store, before enforcing anything.
+//!
+//! Because the logging policy is **deterministic** (firstpass always picks the cheapest passing
+//! rung with no random exploration), importance-sampling (IPS) and doubly-robust (DR) estimators
+//! are inapplicable: every logged trace was generated with probability 1 under the logging policy,
+//! so importance ratios are trivially 1 for covered traces and undefined (0/0) for uncovered ones.
+//! We use the **direct method** (logged-outcome replay) instead:
+//!
+//! For each trace, walk the CANDIDATE ladder cheapest-first. At each rung, if the logged trace
+//! has an attempt for that exact model string, reuse its logged gate verdicts and cost. The first
+//! rung whose outcome would SERVE under the candidate rule ends the replay. If any candidate rung
+//! has no logged attempt (the candidate tried a model the logging policy never called), the trace
+//! is UNEVALUABLE and excluded from all estimates — never guessed.
+//!
+//! Coverage < 1.0 is the principal limitation: a candidate that adds models never logged cannot
+//! be evaluated from this store. The report always surfaces coverage and n_correctness_known.
+//!
+//! IPS/DR are future work; they require stochastic logging (epsilon-greedy or similar), which
+//! this proxy does not yet implement.
+
+use std::path::Path;
+
+use firstpass_core::{Attempt, Config as RoutingConfig, DeferredVerdict, Trace, Verdict};
+
+use crate::calibrate::gate_score;
+use crate::store::{self, StoreError};
+
+// ── Candidate policy ──────────────────────────────────────────────────────────
+
+/// A candidate routing policy to evaluate against logged traffic.
+///
+/// Parsed from a standard `firstpass.toml` — the candidate is an ordinary config file; we
+/// extract the first route's ladder and `escalation.serve_threshold`.
+#[derive(Debug)]
+pub struct CandidatePolicy {
+    /// Model ladder, cheapest first (e.g. `"anthropic/claude-haiku-4-5"`).
+    pub ladder: Vec<String>,
+    /// Conformal serve threshold. `None` → serve when verdict is `Pass`.
+    pub serve_threshold: Option<f64>,
+}
+
+impl CandidatePolicy {
+    /// Parse a candidate policy from a TOML string (standard firstpass config format).
+    ///
+    /// Uses the first `[[route]]` section's `ladder` and the top-level
+    /// `[escalation].serve_threshold`.
+    ///
+    /// # Errors
+    /// Returns a human-readable string if the TOML is invalid.
+    pub fn from_toml(toml: &str) -> Result<Self, String> {
+        let config = RoutingConfig::parse(toml).map_err(|e| e.to_string())?;
+        let ladder = config
+            .routes
+            .into_iter()
+            .next()
+            .map(|r| r.ladder)
+            .unwrap_or_default();
+        Ok(Self {
+            ladder,
+            serve_threshold: config.escalation.serve_threshold,
+        })
+    }
+}
+
+// ── Per-trace replay ──────────────────────────────────────────────────────────
+
+/// Whether a logged attempt would SERVE under the candidate policy.
+fn would_serve(attempt: &Attempt, policy: &CandidatePolicy) -> bool {
+    match policy.serve_threshold {
+        Some(t) => gate_score(&attempt.gates, attempt.verdict) >= t,
+        None => attempt.verdict == Verdict::Pass,
+    }
+}
+
+/// USD cost of one attempt: model call + all gate costs.
+fn attempt_cost(a: &Attempt) -> f64 {
+    a.cost_usd + a.gates.iter().map(|g| g.cost_usd).sum::<f64>()
+}
+
+enum ReplayResult {
+    /// A candidate rung had no logged attempt — the trace cannot be evaluated.
+    Unevaluable,
+    Evaluated {
+        /// Sum of attempt costs for every replayed rung (up to and including the serving one).
+        cost: f64,
+        /// Model string of the candidate rung that served, or `None` if all rungs exhausted.
+        served_model: Option<String>,
+        /// Model string actually served by the logging policy.
+        logged_served_model: Option<String>,
+    },
+}
+
+fn replay_trace(trace: &Trace, policy: &CandidatePolicy) -> ReplayResult {
+    // What the logging policy actually served — used for correctness attribution.
+    let logged_served_model = trace.final_.served_rung.and_then(|rung| {
+        trace
+            .attempts
+            .iter()
+            .find(|a| a.rung == rung)
+            .map(|a| a.model.clone())
+    });
+
+    let mut total_cost = 0.0f64;
+    let mut served_model: Option<String> = None;
+
+    for model in &policy.ladder {
+        let Some(attempt) = trace.attempts.iter().find(|a| &a.model == model) else {
+            return ReplayResult::Unevaluable;
+        };
+        total_cost += attempt_cost(attempt);
+        if would_serve(attempt, policy) {
+            served_model = Some(model.clone());
+            break;
+        }
+    }
+
+    ReplayResult::Evaluated {
+        cost: total_cost,
+        served_model,
+        logged_served_model,
+    }
+}
+
+// ── Bootstrap CIs ─────────────────────────────────────────────────────────────
+
+// ponytail: inline SplitMix64 — same pattern as conformal.rs tests; no new deps.
+// Ceiling: not a general RNG. Replace with rand if OPE ever needs sampling beyond CI bootstrap.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+#[inline]
+fn rand_usize(rng: &mut u64, n: usize) -> usize {
+    (splitmix64(rng) % n as u64) as usize
+}
+
+/// Bootstrap 95% CI for the mean of `values` (2.5/97.5 percentiles, deterministic seed).
+fn bootstrap_mean_ci(values: &[f64], n_resamples: usize, seed: u64) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = values.len();
+    let mut rng = seed;
+    let mut means: Vec<f64> = (0..n_resamples)
+        .map(|_| {
+            let s: f64 = (0..n).map(|_| values[rand_usize(&mut rng, n)]).sum();
+            s / n as f64
+        })
+        .collect();
+    means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lo_idx = (n_resamples as f64 * 0.025) as usize;
+    let hi_idx = ((n_resamples as f64 * 0.975) as usize).min(n_resamples - 1);
+    (means[lo_idx], means[hi_idx])
+}
+
+/// Bootstrap 95% CI for a failure rate (2.5/97.5 percentiles, deterministic seed).
+fn bootstrap_failure_ci(correct: &[bool], n_resamples: usize, seed: u64) -> (f64, f64) {
+    if correct.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = correct.len();
+    let mut rng = seed;
+    let mut rates: Vec<f64> = (0..n_resamples)
+        .map(|_| {
+            let fails = (0..n).filter(|_| !correct[rand_usize(&mut rng, n)]).count();
+            fails as f64 / n as f64
+        })
+        .collect();
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lo_idx = (n_resamples as f64 * 0.025) as usize;
+    let hi_idx = ((n_resamples as f64 * 0.975) as usize).min(n_resamples - 1);
+    (rates[lo_idx], rates[hi_idx])
+}
+
+// ── Report ────────────────────────────────────────────────────────────────────
+
+/// The result of evaluating a candidate policy against logged traffic.
+#[derive(Debug, Clone)]
+pub struct OpeReport {
+    /// Total traces in the store for this tenant.
+    pub n_traces: usize,
+    /// Traces for which replay used only logged attempts (coverage numerator).
+    pub n_evaluable: usize,
+    /// `n_evaluable / n_traces` (1.0 when n_traces == 0).
+    pub coverage: f64,
+    /// Mean candidate cost per request, over evaluable traces.
+    pub est_cost_per_request: f64,
+    /// Mean actual (logged) cost per request, over the same evaluable traces.
+    pub logged_cost_per_request: f64,
+    /// Estimated served-failure rate over evaluable traces with known correctness.
+    /// `None` if no evaluable trace has deferred feedback on the same served rung.
+    pub est_served_failure: Option<f64>,
+    /// Number of evaluable traces where correctness is attributable from deferred feedback.
+    pub n_correctness_known: usize,
+    /// Fraction of evaluable traces where candidate escalated past the first ladder rung.
+    pub escalation_rate: f64,
+    /// Bootstrap 95% CI (2.5/97.5 pct) for `est_cost_per_request`.
+    pub ci_cost: (f64, f64),
+    /// Bootstrap 95% CI for `est_served_failure`. `None` when `est_served_failure` is `None`.
+    pub ci_served_failure: Option<(f64, f64)>,
+}
+
+impl OpeReport {
+    /// Render the report as human-readable lines, mirroring `calibrate`'s report style.
+    /// Coverage and `n_correctness_known` are always prominent.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "traces: {n_traces}  evaluable: {n_evaluable}  coverage: {cov:.3}\n\
+             n_correctness_known: {n_known}\n\
+             est cost/request:    ${est:.6}  (logged: ${logged:.6})\n\
+             cost CI [2.5%, 97.5%]: [${clo:.6}, ${chi:.6}]\n\
+             escalation rate: {esc:.4}\n",
+            n_traces = self.n_traces,
+            n_evaluable = self.n_evaluable,
+            cov = self.coverage,
+            n_known = self.n_correctness_known,
+            est = self.est_cost_per_request,
+            logged = self.logged_cost_per_request,
+            clo = self.ci_cost.0,
+            chi = self.ci_cost.1,
+            esc = self.escalation_rate,
+        );
+        match self.est_served_failure {
+            Some(f) => {
+                let (lo, hi) = self.ci_served_failure.unwrap_or((f, f));
+                out.push_str(&format!(
+                    "est served-failure: {f:.4}  CI [{lo:.4}, {hi:.4}]\n"
+                ));
+            }
+            None => {
+                out.push_str(
+                    "est served-failure: n/a (no deferred feedback on same-rung evaluable traces)\n",
+                );
+            }
+        }
+        out.push_str(
+            "\nreplay of logged outcomes (direct method); \
+             rungs never logged are not guessed — see coverage.\n",
+        );
+        out
+    }
+}
+
+// ── Store-backed OPE ──────────────────────────────────────────────────────────
+
+/// Internal per-trace summary for aggregation and bootstrap resampling.
+struct EvalPoint {
+    candidate_cost: f64,
+    logged_cost: f64,
+    /// `Some(true)` = correct, `Some(false)` = failure, `None` = unknown.
+    correctness: Option<bool>,
+    escalated: bool,
+}
+
+fn build_report(n_traces: usize, points: Vec<EvalPoint>) -> OpeReport {
+    let n_evaluable = points.len();
+    // ponytail: coverage = 1.0 for empty store (no uncovered traces, not a zero).
+    let coverage = if n_traces == 0 {
+        1.0
+    } else {
+        n_evaluable as f64 / n_traces as f64
+    };
+
+    if points.is_empty() {
+        return OpeReport {
+            n_traces,
+            n_evaluable: 0,
+            coverage,
+            est_cost_per_request: 0.0,
+            logged_cost_per_request: 0.0,
+            est_served_failure: None,
+            n_correctness_known: 0,
+            escalation_rate: 0.0,
+            ci_cost: (0.0, 0.0),
+            ci_served_failure: None,
+        };
+    }
+
+    let est_cost = mean(&points, |p| p.candidate_cost);
+    let logged_cost = mean(&points, |p| p.logged_cost);
+    let escalation_rate = points.iter().filter(|p| p.escalated).count() as f64 / n_evaluable as f64;
+
+    let known: Vec<bool> = points.iter().filter_map(|p| p.correctness).collect();
+    let n_correctness_known = known.len();
+    let est_served_failure = if known.is_empty() {
+        None
+    } else {
+        Some(known.iter().filter(|&&c| !c).count() as f64 / known.len() as f64)
+    };
+
+    let costs: Vec<f64> = points.iter().map(|p| p.candidate_cost).collect();
+    // ponytail: fixed seeds (42/43) for determinism; 1000 resamples is the spec floor.
+    let ci_cost = bootstrap_mean_ci(&costs, 1000, 42);
+    let ci_served_failure = if known.is_empty() {
+        None
+    } else {
+        Some(bootstrap_failure_ci(&known, 1000, 43))
+    };
+
+    OpeReport {
+        n_traces,
+        n_evaluable,
+        coverage,
+        est_cost_per_request: est_cost,
+        logged_cost_per_request: logged_cost,
+        est_served_failure,
+        n_correctness_known,
+        escalation_rate,
+        ci_cost,
+        ci_served_failure,
+    }
+}
+
+fn mean(points: &[EvalPoint], f: impl Fn(&EvalPoint) -> f64) -> f64 {
+    if points.is_empty() {
+        return 0.0;
+    }
+    points.iter().map(f).sum::<f64>() / points.len() as f64
+}
+
+/// Run OPE from the trace store.
+///
+/// Missing or unreadable store is treated as zero traces (returns a zero-trace report and exits
+/// 0), matching the forgiving behaviour of `firstpass calibrate` and `firstpass trace`.
+///
+/// # Errors
+/// Returns [`StoreError`] if a stored trace's deferred verdicts cannot be read (a genuine
+/// database error on an existing record, not a missing store).
+pub fn ope_from_store(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+    policy: &CandidatePolicy,
+) -> Result<OpeReport, StoreError> {
+    let traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    let n_traces = traces.len();
+    let mut points: Vec<EvalPoint> = Vec::with_capacity(n_traces);
+
+    for trace in &traces {
+        let deferred = store::load_deferred(&db_path, &trace.trace_id.to_string())?;
+        let replay = replay_trace(trace, policy);
+        let ReplayResult::Evaluated {
+            cost,
+            served_model,
+            logged_served_model,
+        } = replay
+        else {
+            continue; // unevaluable: some candidate rung had no logged attempt
+        };
+
+        // Correctness is attributable only when candidate and logging policy served the same
+        // model AND deferred feedback exists. A different model means the deferred verdict graded
+        // a different output — we never impute correctness across outputs.
+        let correctness = match (&served_model, &logged_served_model) {
+            (Some(cm), Some(lm)) if cm == lm => deferred
+                .last()
+                .map(|dv: &DeferredVerdict| dv.verdict == Verdict::Pass),
+            _ => None,
+        };
+
+        let first_model = policy.ladder.first();
+        let escalated = match (&served_model, first_model) {
+            (Some(m), Some(first)) => m != first,
+            (None, Some(_)) => true, // all rungs exhausted without serving
+            _ => false,
+        };
+
+        points.push(EvalPoint {
+            candidate_cost: cost,
+            logged_cost: trace.final_.total_cost_usd,
+            correctness,
+            escalated,
+        });
+    }
+
+    Ok(build_report(n_traces, points))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use firstpass_core::{
+        Features, FinalOutcome, GENESIS_HASH, GateResult, Mode, PolicyRef, RequestInfo, Score,
+        ServedFrom, TaskKind, Verdict,
+    };
+
+    use super::*;
+    use crate::store;
+
+    /// Minimal trace with one attempt at `rung`, model `model_str`, verdict and score set by
+    /// `pass_score` (>= 0.5 = Pass). Mirrors calibrate.rs's `trace_with_score`.
+    fn make_trace(tenant: &str, rung: u32, model: &str, pass_score: f64, cost_usd: f64) -> Trace {
+        let verdict = if pass_score >= 0.5 {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        };
+        let attempt = firstpass_core::Attempt {
+            rung,
+            model: model.to_owned(),
+            provider: "anthropic".to_owned(),
+            in_tokens: 10,
+            out_tokens: 5,
+            cost_usd,
+            latency_ms: 12,
+            gates: vec![GateResult {
+                gate_id: "gate@v1".to_owned(),
+                verdict,
+                score: Some(Score::clamped(pass_score)),
+                cost_usd: 0.0,
+                ms: 10,
+                reason: None,
+                evidence_ref: None,
+            }],
+            verdict,
+        };
+        let mut trace = Trace {
+            trace_id: uuid::Uuid::now_v7(),
+            prev_hash: GENESIS_HASH.to_owned(),
+            tenant_id: tenant.to_owned(),
+            session_id: "s1".to_owned(),
+            ts: jiff::Timestamp::now(),
+            mode: Mode::Enforce,
+            policy: PolicyRef {
+                id: "test@v0".to_owned(),
+                explore: false,
+            },
+            request: RequestInfo {
+                api: "anthropic.messages".to_owned(),
+                prompt_hash: "deadbeef".to_owned(),
+                features: Features::new(TaskKind::Other),
+            },
+            attempts: vec![attempt],
+            deferred: Vec::new(),
+            final_: FinalOutcome {
+                served_rung: Some(rung),
+                served_from: ServedFrom::Attempt,
+                total_cost_usd: cost_usd,
+                gate_cost_usd: 0.0,
+                total_latency_ms: 12,
+                escalations: 0,
+                counterfactual_baseline_usd: cost_usd,
+                savings_usd: 0.0,
+            },
+        };
+        trace.recompute_savings();
+        trace
+    }
+
+    /// Two-attempt trace: haiku (rung 0) fails, sonnet (rung 1) passes.
+    fn make_escalated_trace(tenant: &str, haiku_cost: f64, sonnet_cost: f64) -> Trace {
+        let haiku = firstpass_core::Attempt {
+            rung: 0,
+            model: "haiku".to_owned(),
+            provider: "anthropic".to_owned(),
+            in_tokens: 10,
+            out_tokens: 5,
+            cost_usd: haiku_cost,
+            latency_ms: 10,
+            gates: vec![GateResult {
+                gate_id: "g".to_owned(),
+                verdict: Verdict::Fail,
+                score: Some(Score::clamped(0.3)),
+                cost_usd: 0.0,
+                ms: 5,
+                reason: None,
+                evidence_ref: None,
+            }],
+            verdict: Verdict::Fail,
+        };
+        let sonnet = firstpass_core::Attempt {
+            rung: 1,
+            model: "sonnet".to_owned(),
+            provider: "anthropic".to_owned(),
+            in_tokens: 10,
+            out_tokens: 5,
+            cost_usd: sonnet_cost,
+            latency_ms: 20,
+            gates: vec![GateResult {
+                gate_id: "g".to_owned(),
+                verdict: Verdict::Pass,
+                score: Some(Score::clamped(0.9)),
+                cost_usd: 0.0,
+                ms: 5,
+                reason: None,
+                evidence_ref: None,
+            }],
+            verdict: Verdict::Pass,
+        };
+        let total = haiku_cost + sonnet_cost;
+        let mut trace = Trace {
+            trace_id: uuid::Uuid::now_v7(),
+            prev_hash: GENESIS_HASH.to_owned(),
+            tenant_id: tenant.to_owned(),
+            session_id: "s2".to_owned(),
+            ts: jiff::Timestamp::now(),
+            mode: Mode::Enforce,
+            policy: PolicyRef {
+                id: "test@v0".to_owned(),
+                explore: false,
+            },
+            request: RequestInfo {
+                api: "anthropic.messages".to_owned(),
+                prompt_hash: "beef".to_owned(),
+                features: Features::new(TaskKind::Other),
+            },
+            attempts: vec![haiku, sonnet],
+            deferred: Vec::new(),
+            final_: FinalOutcome {
+                served_rung: Some(1),
+                served_from: ServedFrom::Attempt,
+                total_cost_usd: total,
+                gate_cost_usd: 0.0,
+                total_latency_ms: 30,
+                escalations: 1,
+                counterfactual_baseline_usd: total,
+                savings_usd: 0.0,
+            },
+        };
+        trace.recompute_savings();
+        trace
+    }
+
+    fn deferred_pass(gate: &str) -> firstpass_core::DeferredVerdict {
+        firstpass_core::DeferredVerdict {
+            gate_id: gate.to_owned(),
+            verdict: Verdict::Pass,
+            score: None,
+            reported_at: jiff::Timestamp::now(),
+            reporter: "test".to_owned(),
+        }
+    }
+
+    fn deferred_fail(gate: &str) -> firstpass_core::DeferredVerdict {
+        firstpass_core::DeferredVerdict {
+            gate_id: gate.to_owned(),
+            verdict: Verdict::Fail,
+            score: None,
+            reported_at: jiff::Timestamp::now(),
+            reporter: "test".to_owned(),
+        }
+    }
+
+    fn tmp_db() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("fp-ope-{}.db", uuid::Uuid::now_v7()))
+    }
+
+    // ── 1. Pure replay: candidate == logged ladder ────────────────────────────
+
+    #[tokio::test]
+    async fn candidate_equals_logged_matches_exactly() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        // 10 traces, haiku passes at cost 0.001 each.
+        let mut ids = Vec::new();
+        for _ in 0..10 {
+            let t = make_trace("tenant-a", 0, "haiku", 0.8, 0.001);
+            ids.push(t.trace_id.to_string());
+            tx.try_send(t).unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        for id in &ids {
+            store::append_deferred(&db, id, &deferred_pass("out")).unwrap();
+        }
+
+        let policy = CandidatePolicy {
+            ladder: vec!["haiku".to_owned()],
+            serve_threshold: None,
+        };
+        let report = ope_from_store(&db, "tenant-a", &policy).unwrap();
+
+        assert_eq!(report.n_traces, 10);
+        assert_eq!(report.n_evaluable, 10);
+        assert!((report.coverage - 1.0).abs() < 1e-9);
+        // Cost must match exactly: candidate replays the same attempt.
+        assert!((report.est_cost_per_request - 0.001).abs() < 1e-9);
+        assert!((report.logged_cost_per_request - 0.001).abs() < 1e-9);
+        // All served same rung as logged, all deferred = Pass -> failure = 0.
+        assert_eq!(report.n_correctness_known, 10);
+        assert!((report.est_served_failure.unwrap() - 0.0).abs() < 1e-9);
+        // No escalation: haiku always served first.
+        assert!((report.escalation_rate - 0.0).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 2. Cheaper candidate (first rung only, drop sonnet) ────────────────────
+
+    #[tokio::test]
+    async fn cheaper_candidate_reduces_cost_and_escalation() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        // 5 traces logged: haiku (cost 0.001) fails -> sonnet (cost 0.01) passes.
+        // Logged total = 0.011 each.
+        for _ in 0..5 {
+            tx.try_send(make_escalated_trace("t", 0.001, 0.01)).unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        // Candidate: ladder = ["haiku"] only.
+        // Replay: haiku fails -> all candidate rungs exhausted. Cost = 0.001.
+        // Logged served sonnet; candidate served nothing -> correctness UNKNOWN.
+        let policy = CandidatePolicy {
+            ladder: vec!["haiku".to_owned()],
+            serve_threshold: None,
+        };
+        let report = ope_from_store(&db, "t", &policy).unwrap();
+
+        assert_eq!(report.n_evaluable, 5);
+        assert!((report.coverage - 1.0).abs() < 1e-9);
+        // Candidate cost = 0.001 (haiku only); logged = 0.011.
+        assert!(
+            (report.est_cost_per_request - 0.001).abs() < 1e-9,
+            "got {}",
+            report.est_cost_per_request
+        );
+        assert!((report.logged_cost_per_request - 0.011).abs() < 1e-9);
+        // Served nothing vs logged sonnet -> UNKNOWN for all.
+        assert_eq!(report.n_correctness_known, 0);
+        assert!(report.est_served_failure.is_none());
+        // Escalated: candidate exhausted past first rung (haiku didn't serve).
+        assert!((report.escalation_rate - 1.0).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 3. Candidate with an unlogged model -> unevaluable ────────────────────
+
+    #[tokio::test]
+    async fn unlogged_model_makes_trace_unevaluable() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        // 3 traces have haiku attempts; 3 traces have sonnet attempts.
+        for _ in 0..3 {
+            tx.try_send(make_trace("t", 0, "haiku", 0.8, 0.001))
+                .unwrap();
+        }
+        for _ in 0..3 {
+            tx.try_send(make_trace("t", 0, "sonnet", 0.8, 0.01))
+                .unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        // Candidate ladder: ["newmodel", "haiku"] — "newmodel" is never logged.
+        // Every trace is unevaluable (first candidate rung has no logged attempt).
+        let policy = CandidatePolicy {
+            ladder: vec!["newmodel".to_owned(), "haiku".to_owned()],
+            serve_threshold: None,
+        };
+        let report = ope_from_store(&db, "t", &policy).unwrap();
+
+        assert_eq!(report.n_traces, 6);
+        assert_eq!(report.n_evaluable, 0);
+        assert!((report.coverage - 0.0).abs() < 1e-9);
+        assert!(report.est_served_failure.is_none());
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 4. Different rung served → correctness UNKNOWN ────────────────────────
+
+    #[tokio::test]
+    async fn different_rung_served_correctness_unknown() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        // Logged: haiku at rung 0 fails, sonnet at rung 1 passes. Logged serves sonnet.
+        let t = make_escalated_trace("t", 0.001, 0.01);
+        let tid = t.trace_id.to_string();
+        tx.try_send(t).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        // Deferred feedback graded the sonnet output.
+        store::append_deferred(&db, &tid, &deferred_pass("out")).unwrap();
+
+        // Candidate: ladder = ["haiku", "sonnet"] with a very low threshold -> haiku serves.
+        // Candidate serves haiku, logged served sonnet -> DIFFERENT rung -> UNKNOWN.
+        let policy = CandidatePolicy {
+            ladder: vec!["haiku".to_owned(), "sonnet".to_owned()],
+            serve_threshold: Some(0.1), // haiku score=0.3 >= 0.1, so haiku would serve
+        };
+        let report = ope_from_store(&db, "t", &policy).unwrap();
+
+        assert_eq!(report.n_evaluable, 1);
+        assert_eq!(report.n_correctness_known, 0, "different rung => UNKNOWN");
+        assert!(report.est_served_failure.is_none());
+        // Candidate served on haiku (cost 0.001), logged served on haiku+sonnet (0.011).
+        assert!((report.est_cost_per_request - 0.001).abs() < 1e-9);
+        // No escalation: haiku served first.
+        assert!((report.escalation_rate - 0.0).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 5. Bootstrap CI: deterministic, contains point estimate ───────────────
+
+    #[tokio::test]
+    async fn bootstrap_ci_deterministic_and_sane() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        // 30 traces with varying costs: alternating 0.001 and 0.002. Mean = 0.0015.
+        let mut ids = Vec::new();
+        for i in 0..30u32 {
+            let cost = if i % 2 == 0 { 0.001 } else { 0.002 };
+            let t = make_trace("t", 0, "m", 0.9, cost);
+            ids.push(t.trace_id.to_string());
+            tx.try_send(t).unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        // Half pass, half fail (deferred).
+        for (i, id) in ids.iter().enumerate() {
+            let dv = if i < 15 {
+                deferred_pass("o")
+            } else {
+                deferred_fail("o")
+            };
+            store::append_deferred(&db, id, &dv).unwrap();
+        }
+
+        let policy = CandidatePolicy {
+            ladder: vec!["m".to_owned()],
+            serve_threshold: None,
+        };
+        let r1 = ope_from_store(&db, "t", &policy).unwrap();
+        let r2 = ope_from_store(&db, "t", &policy).unwrap();
+
+        // Deterministic: same CI both calls.
+        assert_eq!(r1.ci_cost, r2.ci_cost, "CI must be deterministic");
+        assert_eq!(r1.ci_served_failure, r2.ci_served_failure);
+
+        // CI ordering: lo <= point estimate <= hi.
+        let (lo, hi) = r1.ci_cost;
+        assert!(
+            lo <= r1.est_cost_per_request + 1e-9,
+            "CI lo {lo} > est {}",
+            r1.est_cost_per_request
+        );
+        assert!(
+            hi >= r1.est_cost_per_request - 1e-9,
+            "CI hi {hi} < est {}",
+            r1.est_cost_per_request
+        );
+        assert!(lo <= hi, "CI must be ordered");
+
+        if let Some((flo, fhi)) = r1.ci_served_failure {
+            let f = r1.est_served_failure.unwrap();
+            assert!(flo <= f + 1e-9, "failure CI lo {flo} > est {f}");
+            assert!(fhi >= f - 1e-9, "failure CI hi {fhi} < est {f}");
+            assert!(flo <= fhi);
+        }
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 6. Empty store → zero-trace report, exit-0 path ──────────────────────
+
+    #[test]
+    fn empty_store_returns_zero_trace_report() {
+        // Non-existent db: load_tenant_traces returns empty, should give a valid zero report.
+        let policy = CandidatePolicy {
+            ladder: vec!["m".to_owned()],
+            serve_threshold: None,
+        };
+        let db = std::path::Path::new("/nonexistent/fp-ope-empty.db");
+        let report = ope_from_store(db, "t", &policy).unwrap();
+        assert_eq!(report.n_traces, 0);
+        assert_eq!(report.n_evaluable, 0);
+        assert!((report.coverage - 1.0).abs() < 1e-9);
+        assert!(report.est_served_failure.is_none());
+    }
+
+    // ── 7. Same-rung with deferred: correctness flows through ─────────────────
+
+    #[tokio::test]
+    async fn same_rung_deferred_correctness_attributed() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        let t_pass = make_trace("t", 0, "m", 0.9, 0.001);
+        let t_fail = make_trace("t", 0, "m", 0.9, 0.001);
+        let (id_pass, id_fail) = (t_pass.trace_id.to_string(), t_fail.trace_id.to_string());
+        tx.try_send(t_pass).unwrap();
+        tx.try_send(t_fail).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        store::append_deferred(&db, &id_pass, &deferred_pass("out")).unwrap();
+        store::append_deferred(&db, &id_fail, &deferred_fail("out")).unwrap();
+
+        let policy = CandidatePolicy {
+            ladder: vec!["m".to_owned()],
+            serve_threshold: None,
+        };
+        let r = ope_from_store(&db, "t", &policy).unwrap();
+
+        assert_eq!(r.n_evaluable, 2);
+        assert_eq!(r.n_correctness_known, 2);
+        // 1 failure out of 2 known = 0.5.
+        assert!((r.est_served_failure.unwrap() - 0.5).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 8. Serve threshold raises cost (candidate needs more escalations) ──────
+
+    #[tokio::test]
+    async fn high_threshold_forces_escalation_and_higher_cost() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        // Logged: haiku (score=0.7, cost 0.001) passes under default rule (Pass verdict).
+        // Candidate uses serve_threshold=0.8 -> haiku score 0.7 < 0.8 -> fail -> escalate.
+        // Trace has no sonnet attempt -> trace is UNEVALUABLE (candidate needs sonnet, not logged).
+        let t = make_trace("t", 0, "haiku", 0.7, 0.001); // score 0.7, verdict Pass
+        tx.try_send(t).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let policy = CandidatePolicy {
+            ladder: vec!["haiku".to_owned()],
+            serve_threshold: Some(0.8), // haiku score 0.7 < 0.8 -> no serve
+        };
+        let r = ope_from_store(&db, "t", &policy).unwrap();
+
+        // Haiku is logged, candidate walks it (score 0.7 < 0.8, no serve), exhausts all
+        // candidate rungs — evaluable (all candidate rungs had logged data), no serve.
+        assert_eq!(r.n_evaluable, 1);
+        assert!((r.est_cost_per_request - 0.001).abs() < 1e-9); // haiku cost still counted
+        assert_eq!(r.n_correctness_known, 0); // candidate served nothing vs logged haiku
+        // Escalated: exhausted past first candidate rung.
+        assert!((r.escalation_rate - 1.0).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 9. CandidatePolicy::from_toml parses ladder and threshold ─────────────
+
+    #[test]
+    fn from_toml_extracts_first_route_and_threshold() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
+
+[escalation]
+serve_threshold = 0.75
+"#;
+        let p = CandidatePolicy::from_toml(toml).unwrap();
+        assert_eq!(
+            p.ladder,
+            ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
+        );
+        assert!((p.serve_threshold.unwrap() - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn from_toml_no_threshold_is_none() {
+        let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"m\"]\n";
+        let p = CandidatePolicy::from_toml(toml).unwrap();
+        assert!(p.serve_threshold.is_none());
+    }
+}
