@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.93"
 license = "Apache-2.0"
@@ -55,7 +55,7 @@ gcp_auth = "0.12"
 http = "1"
 
 # Internal crates
-firstpass-core = { path = "crates/firstpass-core", version = "0.1.6" }
+firstpass-core = { path = "crates/firstpass-core", version = "0.1.7" }
 
 [profile.release]
 lto = "thin"
