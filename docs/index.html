@@ -21,6 +21,7 @@
   <span class="sp"></span>
   <a class="nl" href="#decide">Watch it decide</a>
   <a class="nl" href="#vs">Why</a>
+  <a class="nl" href="#onramp">Onboarding</a>
   <a class="nl" href="#architecture">Architecture</a>
   <a class="nl" href="#install">Install</a>
   <a class="nl" href="usage.html">Docs</a>
@@ -42,13 +43,13 @@
 <main id="top">
 <section class="hero"><div class="hero-glow" id="heroGlow"></div><div class="wrap">
   <div class="tagpill"><b>◆ adaptive llm routing</b> · proof over prediction</div>
-  <h1><span class="grad-text">Cut your LLM bill ~65%.</span><span class="l2">Without shipping worse answers.</span></h1>
-  <p class="sub">Firstpass sends each request to the <b>cheapest model first</b>, <b>proves</b> the output clears your gate, and pays for a stronger model <b>only when it fails</b>. The one router with a mathematical guarantee on wrong answers served — <b>and it's adaptive</b>.</p>
+  <h1><span class="grad-text">Cut your LLM bill —</span><span class="l2">provably, not by guessing.</span></h1>
+  <p class="sub">Firstpass sends each request to the <b>cheapest model first</b>, <b>proves</b> the output clears your gate, and pays for a stronger model <b>only when it fails</b> — never on a guess. The one router with a <b>guaranteed ceiling on wrong answers served</b>, and it's <b>adaptive</b>.</p>
   <div class="cta">
     <a class="btn primary" href="#install">⚡ Run the demo — no keys</a>
     <a class="btn" href="https://github.com/dshakes/firstpass">★ Star on GitHub</a>
   </div>
-  <div class="trust"><span><b>~65%</b> cheaper</span><span><b>≤10%</b> served-fail @ 95%</span><span><b>every provider</b> + OSS</span><span><b>GA-ready</b> · v0.1.6</span></div>
+  <div class="trust"><span><b>cheapest-first</b> · gated</span><span><b>≤10%</b> served-fail @ 95%</span><span><b>every provider</b> + OSS</span><span><b>GA-ready</b> · v0.1.6</span></div>
 
   <!-- live agent decision stream -->
   <div class="term" id="decide" aria-label="Live agent routing decision">
@@ -104,6 +105,17 @@
     <div class="card"><div class="kicker">↑</div><h3>Escalate &amp; seal</h3><p>One rung up on failure, budget-capped; a provider 5xx fails over. The decision becomes a <b>tamper-evident hash-chain trace</b> anyone can re-derive.</p></div>
   </div>
   <div class="pipe"><img src="assets/how.svg" alt="Route to the cheapest model, gate its real output, escalate one rung only on failure, serve, and log every decision to a hash-chained audit trace." loading="lazy"></div>
+</div></section>
+
+<section id="onramp"><div class="wrap reveal stagger">
+  <p class="eyebrow">no heavy lift</p>
+  <h2>Onboards in one step. Tunes itself.</h2>
+  <p style="color:#8A97A6;max-width:660px;margin:6px 0 26px;font-size:16px;line-height:1.55">You don't have to write or babysit gates. Start with none, add one line when you're ready, and let the router keep itself calibrated.</p>
+  <div class="cards g3">
+    <div class="card"><div class="kicker">◷</div><h3>Start in observe mode</h3><p><b>Zero config, zero risk.</b> Point your agent at firstpass and change nothing. It watches every call and records what it <i>would</i> route and save — touching your traffic not at all. See the value before you switch anything on.</p></div>
+    <div class="card"><div class="kicker">✎</div><h3>Gate with no code</h3><p>Built-ins (<span class="mono c-mint">non-empty</span>, <span class="mono c-mint">json-valid</span>, schema) need zero setup. The <b>judge gate</b> is one plain-English sentence — a second model grades each answer. Bring your own tests only when you want the strongest gate.</p></div>
+    <div class="card"><div class="kicker">↻</div><h3>It learns on its own</h3><p>The serve threshold <b>self-tunes from live outcomes</b> (online conformal). The money-vs-accuracy balance holds as your traffic drifts — set it in front of your workload and it keeps itself calibrated. Accuracy is never what you trade for savings: the gate guarantees it.</p></div>
+  </div>
 </div></section>
 
 <section id="architecture"><div class="wrap reveal">

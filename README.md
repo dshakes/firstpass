@@ -4,9 +4,9 @@
 
 # Firstpass
 
-### Cut your LLM bill ~65% — without shipping worse answers.
+### Stop paying frontier prices for answers a cheap model could give you.
 
-**The adaptive router that sends each request to the _cheapest_ model first, proves the output passes your gate, and pays for a stronger model only when the cheap one can't do the job.**
+**The adaptive router that sends each request to the _cheapest_ model first, proves the output passes your gate, and pays for a stronger model only when the cheap one fails — never on a guess. The one router with a guaranteed ceiling on wrong answers served.**
 
 > **Cheapest-first. Proven before served.**
 
@@ -51,7 +51,17 @@ Firstpass is the only router that ships a **mathematical guarantee on how often 
 | Improve by | retraining a model | **editing a gate — zero retrain** |
 | Every provider + OSS | some | **Anthropic · OpenAI · Gemini · Bedrock · Vertex · Groq · DeepSeek · Ollama/vLLM** |
 
-_Honest scope: the ~65% savings is measured in the [proof harness](#proof-not-adjectives); the served-failure bound is earned live on real MBPP. The enforce path is live-verified against real Anthropic. Still ahead: a 30-day dogfood and the hosted control plane — see the [roadmap](#roadmap). Nothing here is claimed as measured that isn't._
+_Honest scope on savings: **~65% is our [proof-harness simulation](#proof-not-adjectives)**, not a promise about your bill. Live on 200 graded arithmetic tasks (real Anthropic) it was ~85% cheaper than always-Opus — but that's a narrow, cheap-friendly domain. **Your real number depends on how often your cheap model clears your gate**, which firstpass measures per request (every trace records the always-top counterfactual). The claim that does **not** depend on your workload is the guarantee above — earned live on 964 real MBPP tasks. The enforce path is live-verified against real Anthropic; still ahead: a 30-day dogfood and the hosted plane ([roadmap](#roadmap)). Nothing here is claimed as measured that isn't._
+
+## Onboards in one step — and tunes itself
+
+**You don't have to write or babysit gates.** Meet it where you are:
+
+- **Start in observe mode — zero config, zero risk.** Point your agent at firstpass and change nothing else. It watches every call, records what it *would* have routed and what you'd have saved, and touches your traffic not at all. See the value before you switch anything on.
+- **Turn on gating with no code.** The built-in gates (`non-empty`, `json-valid`, a JSON-schema check) need zero setup. The **judge gate** is one plain-English sentence — a second model grades each answer against your rubric (*"fully and correctly resolves the request"*). Bring your own test suite only when you want the strongest possible gate.
+- **It learns on its own.** The serve threshold **self-tunes from live outcomes** (online conformal / ACI), so the money-vs-accuracy balance holds as your traffic drifts — set it in front of your workload and it keeps itself calibrated. `firstpass calibrate` re-tightens it from real feedback anytime.
+
+Solo dev with one route or a fleet with per-tenant policies, the on-ramp is the same one line — `export ANTHROPIC_BASE_URL=…` — and the accuracy floor is never the thing you trade away for the savings: the gate is what *guarantees* it.
 
 ## Quickstart
 

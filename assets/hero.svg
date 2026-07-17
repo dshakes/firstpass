@@ -58,7 +58,7 @@
 
   <!-- payoff panel (right) -->
   <line x1="600" y1="30" x2="600" y2="240" stroke="#1B2636"/>
-  <text x="628" y="52" font-size="10.5" fill="#8A97A6" letter-spacing="1">YOUR LLM BILL</text>
+  <text x="628" y="52" font-size="10.5" fill="#8A97A6" letter-spacing="1">COST / SUCCESS · PROOF HARNESS</text>
   <rect x="632" y="66" width="150" height="24" rx="5" fill="#20262e"/>
   <text x="640" y="82" font-size="10" fill="#8A97A6">all-frontier</text>
   <text x="774" y="82" text-anchor="end" font-size="10" fill="#8A97A6">100%</text>
@@ -66,13 +66,13 @@
   <rect x="632" y="98" width="150" height="24" rx="5" fill="none" stroke="#1c4b40"/>
   <text x="640" y="114" font-size="10" font-weight="700" fill="#052019">firstpass</text>
   <text x="774" y="114" text-anchor="end" font-size="10" fill="#5EEACB" font-weight="700">≈35%</text>
-  <text x="628" y="146" font-size="16" font-weight="800" fill="#19E3B1" filter="url(#glow)">~65% cheaper</text>
-  <text x="752" y="146" font-size="10" fill="#8A97A6">at equal-or-higher success</text>
+  <text x="628" y="146" font-size="15" font-weight="800" fill="#19E3B1" filter="url(#glow)">~65% cheaper</text>
+  <text x="742" y="146" font-size="9.5" fill="#8A97A6">in harness · you measure yours</text>
 
-  <!-- guarantee chip -->
-  <rect x="628" y="160" width="336" height="44" rx="9" fill="#0c1614" stroke="#1c4b40"/>
-  <text x="644" y="180" font-size="12.5" font-weight="800" fill="#E6EDF3">≤10% wrong answers served</text>
-  <text x="644" y="196" font-size="9.5" fill="#8A97A6">at 95% confidence — distribution-free, earned live on 964 tasks</text>
+  <!-- guarantee chip: the validated, workload-independent claim -->
+  <rect x="628" y="160" width="336" height="44" rx="9" fill="#0c1614" stroke="#19E3B1"/>
+  <text x="644" y="180" font-size="12.5" font-weight="800" fill="#E6EDF3">Guaranteed: ≤10% wrong answers served</text>
+  <text x="644" y="196" font-size="9.5" fill="#8A97A6">at 95% confidence — earned live on 964 real coding tasks</text>
 
   <text x="628" y="226" font-size="10" fill="#8A97A6"><tspan fill="#19E3B1" font-weight="700">adaptive</tspan> — self-tunes as traffic drifts  ·  every provider + open-source</text>
 </svg>
