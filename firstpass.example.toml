@@ -89,6 +89,20 @@ cmd = ["your-test-runner", "--from-stdin"]
 id    = "judge"
 judge = { model = "anthropic/claude-opus-4-8", threshold = 0.7, rubric = "The response fully and correctly resolves the request, with no errors." }
 
+# A self-consistency uncertainty gate (Wang et al. 2022; Farquhar et al., Nature 2024): call the
+# same model k times and score the candidate by agreement with the fresh samples. Pass iff the
+# mean agreement score >= threshold. Unlike a judge gate, maker == checker is intentional here —
+# self-consistency is definitionally self-referential.
+#
+# Cost: k extra model calls per request — that is the honest price of measured confidence.
+# Suggested pairing: this gate on a cheap first-rung model + conformal `serve_threshold`
+# calibration, so the agreement score feeds the threshold machinery and the frontier model is
+# only reached when the cheap model disagrees with itself.
+#
+# [[gate]]
+# id          = "uncertainty"
+# consistency = { model = "anthropic/claude-haiku-4-5", k = 3, threshold = 0.6 }
+
 [budget]
 per_request_usd = 0.50
 per_session_usd = 10.00

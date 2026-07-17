@@ -26,6 +26,7 @@
 pub mod calibrate;
 pub mod cli;
 pub mod config;
+pub mod consistency;
 pub mod error;
 pub mod gate;
 pub mod judge;

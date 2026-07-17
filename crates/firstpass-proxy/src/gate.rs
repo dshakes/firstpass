@@ -7,6 +7,7 @@
 //! with an alarm, so a broken gate can neither silently fail closed (burns money) nor silently
 //! fail open (burns trust) (§7.2).
 
+use crate::consistency::ConsistencyGate;
 use crate::judge::JudgeGate;
 use crate::provider::{Auth, ModelRequest, ModelResponse, ProviderRegistry};
 use crate::subprocess::SubprocessGate;
@@ -302,6 +303,26 @@ pub fn resolve_gates(
                         }
                     }
                 }
+                Some(def) if def.consistency.is_some() => {
+                    // `Config::parse` guarantees exactly one kind, so this `if let` always binds.
+                    if let Some(cons) = def.consistency.as_ref() {
+                        let provider_id = cons.model.split('/').next().unwrap_or_default();
+                        match registry.get(provider_id) {
+                            Some(provider) => gates.push(Box::new(ConsistencyGate::new(
+                                def.id.clone(),
+                                provider,
+                                cons.model.clone(),
+                                auth.clone(),
+                                cons.k,
+                                cons.threshold,
+                            ))),
+                            None => tracing::warn!(
+                                gate = %other, provider = %provider_id,
+                                "consistency gate provider not registered — skipped"
+                            ),
+                        }
+                    }
+                }
                 Some(def) => {
                     let Some((program, args)) = def.cmd.split_first() else {
                         tracing::warn!(gate = %other, "configured gate has empty cmd — skipped");
@@ -453,6 +474,7 @@ mod tests {
             cmd: vec!["true".to_owned()],
             timeout_ms: 1000,
             judge: None,
+            consistency: None,
         }];
         let gates = resolve_gates(
             &["my-tests".to_owned(), "undefined".to_owned()],
@@ -478,6 +500,7 @@ mod tests {
             cmd: vec!["bash".to_owned(), "-c".to_owned(), script.to_owned()],
             timeout_ms: 5000,
             judge: None,
+            consistency: None,
         }];
         let gates = resolve_gates(
             &["no-bad".to_owned()],
@@ -507,6 +530,7 @@ mod tests {
                 threshold: 0.7,
                 rubric: None,
             }),
+            consistency: None,
         }];
 
         // Registry that serves `anthropic` → the judge gate is built.
@@ -536,6 +560,54 @@ mod tests {
         assert!(
             skipped.is_empty(),
             "judge with no registered provider is skipped"
+        );
+    }
+
+    #[test]
+    fn resolve_builds_configured_consistency_gate() {
+        use crate::provider::{MockProvider, Provider};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let defs = vec![GateDef {
+            id: "uncertainty".to_owned(),
+            cmd: vec![],
+            timeout_ms: 30_000,
+            judge: None,
+            consistency: Some(firstpass_core::ConsistencyDef {
+                model: "anthropic/claude-haiku-4-5".to_owned(),
+                k: 3,
+                threshold: 0.6,
+            }),
+        }];
+
+        // Registry that serves `anthropic` → the consistency gate is built.
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", HashMap::new())),
+        );
+        let gates = resolve_gates(
+            &["uncertainty".to_owned()],
+            &defs,
+            &ProviderRegistry::from_map(map),
+            &Auth::default(),
+        );
+        assert_eq!(
+            gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
+            ["uncertainty"]
+        );
+
+        // Registry without the provider → skipped, not a hard failure.
+        let skipped = resolve_gates(
+            &["uncertainty".to_owned()],
+            &defs,
+            &ProviderRegistry::from_map(HashMap::new()),
+            &Auth::default(),
+        );
+        assert!(
+            skipped.is_empty(),
+            "consistency gate with no registered provider is skipped"
         );
     }
 
