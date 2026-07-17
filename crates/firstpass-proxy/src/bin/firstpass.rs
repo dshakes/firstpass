@@ -3,6 +3,7 @@
 //! `base_url` swap and offboarding is one `unset`.
 
 use firstpass_proxy::calibrate::calibrate_from_store;
+use firstpass_proxy::ope::{CandidatePolicy, ope_from_store};
 use firstpass_proxy::{ProxyConfig, cli, run, store};
 
 const HELP: &str = "\
@@ -16,6 +17,8 @@ USAGE:
     firstpass trace [--limit N]   print recent audit traces as JSON lines (default 20)
     firstpass calibrate [--alpha A] [--delta D] [--min-n N]
                                    recalibrate the serving threshold from deferred feedback
+    firstpass ope --config <candidate.toml> [--db <path>] [--tenant <id>]
+                                   evaluate a candidate policy against logged traffic before enforcing
     firstpass mcp                 serve MCP over stdio (agent reads traces + submits feedback)
     firstpass --help | --version
 
@@ -40,6 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "doctor" => cmd_doctor(),
         "trace" => cmd_trace(&args),
         "calibrate" => cmd_calibrate(&args),
+        "ope" => cmd_ope(&args),
         "mcp" => {
             // Synchronous stdio server; run it off the async runtime so nothing else contends.
             // Scoped to a single tenant (ADR 0004 §D3): `--tenant <id>` or the configured default.
@@ -173,5 +177,43 @@ fn cmd_calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Infeasible is a valid finding (not enough clean feedback yet, or the gate is too weak), not a
     // failure — the report says `feasible: false`. Only a store read error (the `?` above) exits
     // non-zero, so scripting `firstpass calibrate` for its output stays reliable.
+    Ok(())
+}
+
+/// `firstpass ope --config <candidate.toml> [--db <path>] [--tenant <id>]` — off-policy
+/// evaluation: replay logged traffic under a candidate policy to estimate cost and served-failure
+/// before enforcing anything. `--config` is required (exit 1 with a clear error if missing or
+/// unreadable). Empty/missing store is treated as zero traces and exits 0, matching `calibrate`.
+fn cmd_ope(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // --config is required.
+    let config_path = args
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .ok_or_else(|| {
+            eprintln!("firstpass ope: --config <candidate.toml> is required");
+            std::process::exit(1);
+            // Unreachable, but satisfies the type: exit(1) never returns.
+            #[allow(unreachable_code)]
+            "unreachable"
+        })?;
+
+    let toml = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("firstpass ope: cannot read --config {config_path:?}: {e}"))?;
+    let policy = CandidatePolicy::from_toml(&toml)
+        .map_err(|e| format!("firstpass ope: invalid candidate config: {e}"))?;
+
+    // Env config provides defaults for db and tenant; --db / --tenant override them.
+    let env_config = ProxyConfig::from_env()?;
+    let db_path = args
+        .iter()
+        .position(|a| a == "--db")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| env_config.db_path.clone());
+    let tenant = tenant_arg(args, &env_config);
+
+    let report = ope_from_store(&db_path, &tenant, &policy)?;
+    print!("{}", report.render());
     Ok(())
 }
