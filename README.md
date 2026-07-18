@@ -7,7 +7,7 @@
 The adaptive LLM router that checks **every answer** with your gate, pays for a big model **only on proof of need**, and caps wrong answers with a **mathematical guarantee**.
 
 [![CI](https://github.com/dshakes/firstpass/actions/workflows/ci.yml/badge.svg)](https://github.com/dshakes/firstpass/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/firstpass-proxy)](https://crates.io/crates/firstpass-proxy)
+[![release](https://img.shields.io/github/v/release/dshakes/firstpass)](https://github.com/dshakes/firstpass/releases)
 [![PyPI](https://img.shields.io/pypi/v/firstpass)](https://pypi.org/project/firstpass/)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
@@ -38,15 +38,14 @@ No Rust, no toolchain — grab a binary and go:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh
 ```
 
-Or through your package manager — every channel publishes automatically on each release:
+Or through your package manager — each row below is live and republishes on every release:
 
 | | |
 |---|---|
 | 🐍 **pip / uvx** | `pip install firstpass` · `uvx --from firstpass firstpass-proxy` |
-| 🍺 **Homebrew** | `brew install dshakes/tap/firstpass` |
-| 📦 **npm** | `npx @dshakesnotbot/firstpass` |
+| 🍺 **Homebrew** | `brew install dshakes/tap/firstpass-proxy` |
 | 🐳 **Docker** | `docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest` |
-| 🦀 **Cargo** | `cargo install firstpass-proxy` |
+| 🦀 **Cargo** | `cargo install --git https://github.com/dshakes/firstpass firstpass-proxy` (needs a Rust toolchain; crates.io publish pending) |
 | ⬇️ **Binaries** | macOS · Linux · Windows, checksummed, self-updating (`firstpass-proxy-update`) — [Releases](https://github.com/dshakes/firstpass/releases) |
 
 ## Quickstart
