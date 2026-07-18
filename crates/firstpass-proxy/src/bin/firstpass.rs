@@ -3,7 +3,7 @@
 //! `base_url` swap and offboarding is one `unset`.
 
 use firstpass_proxy::calibrate::calibrate_from_store;
-use firstpass_proxy::ope::{CandidatePolicy, ope_from_store};
+use firstpass_proxy::ope::{CandidatePolicy, ips_from_store, ope_from_store};
 use firstpass_proxy::{ProxyConfig, cli, run, store};
 
 const HELP: &str = "\
@@ -19,6 +19,8 @@ USAGE:
                                    recalibrate the serving threshold from deferred feedback
     firstpass ope --config <candidate.toml> [--db <path>] [--tenant <id>]
                                    evaluate a candidate policy against logged traffic before enforcing
+    firstpass ope --start-rung N [--db <path>] [--tenant <id>]
+                                   IPS/SNIPS estimate for a fixed start-rung (requires propensity-logged traffic)
     firstpass mcp                 serve MCP over stdio (agent reads traces + submits feedback)
     firstpass --help | --version
 
@@ -180,18 +182,47 @@ fn cmd_calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `firstpass ope --config <candidate.toml> [--db <path>] [--tenant <id>]` — off-policy
-/// evaluation: replay logged traffic under a candidate policy to estimate cost and served-failure
-/// before enforcing anything. `--config` is required (exit 1 with a clear error if missing or
-/// unreadable). Empty/missing store is treated as zero traces and exits 0, matching `calibrate`.
+/// `firstpass ope` — off-policy evaluation in two modes:
+///
+/// - `--config <candidate.toml>`: direct-method replay (ladder / threshold changes).
+/// - `--start-rung N`: IPS/SNIPS estimate for a fixed start rung (requires propensity-logged
+///   traffic from `[escalation.exploration]`). Mutually exclusive with `--config`.
+///
+/// Empty/missing store is treated as zero traces and exits 0, matching `calibrate`.
 fn cmd_ope(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    // --config is required.
+    // Env config provides defaults for db and tenant; --db / --tenant override them.
+    let env_config = ProxyConfig::from_env()?;
+    let db_path = args
+        .iter()
+        .position(|a| a == "--db")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| env_config.db_path.clone());
+    let tenant = tenant_arg(args, &env_config);
+
+    // --start-rung N: IPS/SNIPS path (takes precedence over --config when both given).
+    if let Some(n_str) = args
+        .iter()
+        .position(|a| a == "--start-rung")
+        .and_then(|i| args.get(i + 1))
+    {
+        let start_rung: u32 = n_str.parse().map_err(|e| {
+            format!("firstpass ope: --start-rung must be a non-negative integer: {e}")
+        })?;
+        let report = ips_from_store(&db_path, &tenant, start_rung)?;
+        print!("{}", report.render());
+        return Ok(());
+    }
+
+    // --config <candidate.toml>: direct-method replay path (required if no --start-rung).
     let config_path = args
         .iter()
         .position(|a| a == "--config")
         .and_then(|i| args.get(i + 1))
         .ok_or_else(|| {
-            eprintln!("firstpass ope: --config <candidate.toml> is required");
+            eprintln!(
+                "firstpass ope: one of --config <candidate.toml> or --start-rung N is required"
+            );
             std::process::exit(1);
             // Unreachable, but satisfies the type: exit(1) never returns.
             #[allow(unreachable_code)]
@@ -202,16 +233,6 @@ fn cmd_ope(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("firstpass ope: cannot read --config {config_path:?}: {e}"))?;
     let policy = CandidatePolicy::from_toml(&toml)
         .map_err(|e| format!("firstpass ope: invalid candidate config: {e}"))?;
-
-    // Env config provides defaults for db and tenant; --db / --tenant override them.
-    let env_config = ProxyConfig::from_env()?;
-    let db_path = args
-        .iter()
-        .position(|a| a == "--db")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| env_config.db_path.clone());
-    let tenant = tenant_arg(args, &env_config);
 
     let report = ope_from_store(&db_path, &tenant, &policy)?;
     print!("{}", report.render());

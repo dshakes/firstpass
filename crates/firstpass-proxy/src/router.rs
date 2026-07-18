@@ -143,6 +143,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
         policy: PolicyRef {
             id: ctx.policy_id,
             explore: false,
+            propensity: None, // patched by handle_enforce when exploration is configured
         },
         request: RequestInfo {
             api: ctx.api,

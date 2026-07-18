@@ -146,6 +146,42 @@ fn record_trace_metrics(trace: &Trace) {
 /// oversized body can't exhaust memory.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+// ── Epsilon-greedy helpers ────────────────────────────────────────────────────
+
+/// Map a `u128` seed to a uniform float in `[0, 1)` via two SplitMix64 finalizer rounds.
+///
+/// Used to derive the per-request epsilon-greedy draw from `Uuid::now_v7().as_u128()` — no
+/// new dependencies needed. The two 64-bit halves are finalised separately then XOR-folded
+/// to a single u64 to mix time and random UUID bits.
+///
+/// ponytail: not a general-purpose RNG; replace with `rand` if more draws per request
+/// are ever needed.
+pub(crate) fn u01(seed: u128) -> f64 {
+    let lo = splitmix64_finalise(seed as u64);
+    let hi = splitmix64_finalise((seed >> 64) as u64);
+    // 53-bit mantissa of f64 → uniform on [0, 1).
+    ((lo ^ hi) >> 11) as f64 * (1.0_f64 / (1u64 << 53) as f64)
+}
+
+fn splitmix64_finalise(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Propensity of the logging policy choosing `chosen` under epsilon-greedy over `k` rungs
+/// where `greedy` is the deterministic choice.
+///
+/// `p = (1 − ε) · 𝟙[chosen == greedy] + ε / K`
+///
+/// Both terms apply when the epsilon branch fires and coincidentally lands on the greedy rung.
+#[must_use]
+pub(crate) fn epsilon_propensity(chosen: u32, greedy: u32, epsilon: f64, k: usize) -> f64 {
+    let greedy_term = if chosen == greedy { 1.0 - epsilon } else { 0.0 };
+    greedy_term + epsilon / k as f64
+}
+
 /// Build the axum router: `POST /v1/messages`, `GET /v1/capabilities`, `GET /healthz`,
 /// `GET /metrics`.
 ///
@@ -519,7 +555,9 @@ async fn handle_enforce(
     // The gate still verifies the chosen rung's output before serving — prediction errors cost
     // money/latency but can never cause a wrong answer to be served.
     let bandit_ctx = crate::bandit::ContextBucket::from_features(&features);
-    let (start_rung, policy_id) = {
+
+    // Step 1: greedy start — bandit prediction or rung 0 (cold-start / no bandit).
+    let (greedy_rung, base_policy_id) = {
         let chosen = state
             .bandit
             .as_ref()
@@ -532,6 +570,36 @@ async fn handle_enforce(
             (0u32, "static-ladder@v0".to_owned())
         }
     };
+
+    // Step 2: epsilon-greedy overlay — randomise a fraction of start-rung choices so the
+    // logging policy is stochastic and IPS/SNIPS off-policy estimates are valid
+    // (Horvitz-Thompson 1952). Propensity p = (1−ε)·𝟙[chosen==greedy] + ε/K is recorded on
+    // every trace; the bandit still observes all gate verdicts (learning is uninterrupted).
+    let exploration_epsilon = state
+        .config
+        .routing
+        .as_ref()
+        .and_then(|cfg| cfg.escalation.exploration.as_ref())
+        .map(|e| e.epsilon);
+
+    let (start_rung, policy_id, explore_flag, propensity) =
+        if let Some(epsilon) = exploration_epsilon {
+            let k = route.ladder.len().max(1);
+            // Derive a per-request uniform draw from a fresh UUIDv7's bits — no new deps.
+            let u = u01(Uuid::now_v7().as_u128());
+            let (chosen, eps_branch) = if u < epsilon {
+                // Epsilon branch: uniform over 0..k
+                let idx = ((u / epsilon) * k as f64) as u32;
+                (idx.min(k as u32 - 1), true)
+            } else {
+                (greedy_rung, false)
+            };
+            let p = epsilon_propensity(chosen, greedy_rung, epsilon, k);
+            (chosen, format!("{base_policy_id}+eps"), eps_branch, Some(p))
+        } else {
+            (greedy_rung, base_policy_id, false, None)
+        };
+
     // Emit metric whenever the bandit is configured (includes cold-start rung-0 choices).
     if state.bandit.is_some() {
         metrics::counter!(
@@ -564,7 +632,12 @@ async fn handle_enforce(
         policy_id,
     };
 
-    let (outcome, trace) = route_enforce(ctx).await;
+    let (outcome, mut trace) = route_enforce(ctx).await;
+
+    // Patch explore/propensity onto the trace now that we know whether the epsilon branch fired.
+    // route_enforce leaves these at (false, None); we own the trace before it's hashed+stored.
+    trace.policy.explore = explore_flag;
+    trace.policy.propensity = propensity;
 
     // Online bandit learning: feed back every gate verdict from this request so the bandit
     // refines its start-rung estimates. Cheap in-memory update; done before offer_trace so the
@@ -1111,6 +1184,7 @@ fn base_trace(
         policy: PolicyRef {
             id: "observe-passthrough@v0".to_owned(),
             explore: false,
+            propensity: None,
         },
         request: RequestInfo {
             api: "anthropic.messages".to_owned(),
@@ -2105,5 +2179,99 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), axum::http::StatusCode::OK);
         }
+    }
+
+    // ── epsilon-greedy helper unit tests ──────────────────────────────────────
+
+    #[test]
+    fn u01_is_deterministic_and_in_range() {
+        let s1 = u01(0xDEAD_BEEF_CAFE_1234_u128);
+        let s2 = u01(0xDEAD_BEEF_CAFE_1234_u128);
+        assert_eq!(s1, s2, "u01 must be deterministic for the same seed");
+        assert!((0.0..1.0).contains(&s1), "u01 must return [0, 1), got {s1}");
+
+        // Different seeds produce different values (highly likely with SM64).
+        let s3 = u01(0x1234_5678_9ABC_DEF0_u128);
+        assert_ne!(s1, s3, "different seeds should give different values");
+
+        // Verify range across a spread of seeds.
+        for i in 0u64..256 {
+            let v = u01(i as u128);
+            assert!((0.0..1.0).contains(&v), "seed {i}: u01={v} out of [0,1)");
+        }
+    }
+
+    #[test]
+    fn epsilon_propensity_formula() {
+        let epsilon = 0.2_f64;
+        let k = 3_usize;
+        let greedy = 1_u32;
+
+        // Greedy rung chosen: both (1-ε) and ε/K terms apply.
+        let p_greedy = epsilon_propensity(greedy, greedy, epsilon, k);
+        let expected_greedy = (1.0 - epsilon) + epsilon / k as f64;
+        assert!(
+            (p_greedy - expected_greedy).abs() < 1e-12,
+            "{p_greedy} != {expected_greedy}"
+        );
+
+        // Non-greedy rung: only ε/K term.
+        let p_other = epsilon_propensity(0, greedy, epsilon, k);
+        let expected_other = epsilon / k as f64;
+        assert!(
+            (p_other - expected_other).abs() < 1e-12,
+            "{p_other} != {expected_other}"
+        );
+
+        // All propensities are in (0, 1].
+        for chosen in 0..k as u32 {
+            let p = epsilon_propensity(chosen, greedy, epsilon, k);
+            assert!(
+                p > 0.0 && p <= 1.0,
+                "propensity {p} out of (0,1] for chosen={chosen}"
+            );
+        }
+    }
+
+    #[test]
+    fn epsilon_branch_and_greedy_branch_both_occur_over_many_seeds() {
+        // With epsilon=0.3 over 200 sequential seeds, both branches must fire.
+        let epsilon = 0.3_f64;
+        let mut saw_explore = false;
+        let mut saw_greedy = false;
+        for i in 0u64..200 {
+            let u = u01(i as u128);
+            if u < epsilon {
+                saw_explore = true;
+            } else {
+                saw_greedy = true;
+            }
+            if saw_explore && saw_greedy {
+                break;
+            }
+        }
+        assert!(
+            saw_explore,
+            "epsilon branch must fire with epsilon=0.3 over 200 seeds"
+        );
+        assert!(
+            saw_greedy,
+            "greedy branch must occur with epsilon=0.3 over 200 seeds"
+        );
+    }
+
+    #[test]
+    fn epsilon_propensity_sums_to_one_over_all_rungs() {
+        // Sum of propensities over all K rungs equals 1 (it is a valid probability distribution).
+        let epsilon = 0.15_f64;
+        let k = 4_usize;
+        let greedy = 2_u32;
+        let total: f64 = (0..k as u32)
+            .map(|r| epsilon_propensity(r, greedy, epsilon, k))
+            .sum();
+        assert!(
+            (total - 1.0).abs() < 1e-12,
+            "propensities must sum to 1, got {total}"
+        );
     }
 }

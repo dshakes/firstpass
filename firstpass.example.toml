@@ -141,3 +141,19 @@ speculation = 0
 # [escalation.bandit]
 # min_observations = 50    # observations before prediction kicks in (cold-start guard)
 # exploration = 1.0        # UCB1 exploration constant c (Auer et al. 2002); 0 = pure exploitation
+#
+# Epsilon-greedy start-rung exploration: deliberately start a small fraction of requests at a
+# uniformly-random rung instead of the greedy choice. This does two things:
+#   1. Records a `propensity` field on every trace — the probability the logging policy had of
+#      choosing the start rung it chose. Propensities are what make IPS/SNIPS off-policy
+#      estimates valid (Horvitz-Thompson 1952): without them, importance ratios are undefined.
+#   2. Feeds the bandit gate-verdict observations for rungs it would never visit greedily,
+#      breaking the cold-start / exploitation trap for under-explored rungs.
+#
+# The honest trade: `epsilon` fraction of requests pay extra (start off-greedy), buying you
+# valid off-policy evaluation via `firstpass ope --start-rung N` and better bandit warm-up.
+# A small value (0.05–0.10) is usually enough. Absent = deterministic policy, no propensity
+# recorded, byte-identical to today. `epsilon` must be in (0, 0.5]; values > 0.5 are rejected.
+#
+# [escalation.exploration]
+# epsilon = 0.05   # 5 % of requests start at a random rung; receipts record propensity
