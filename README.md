@@ -23,6 +23,8 @@ The adaptive LLM router that checks **every answer** with your gate, pays for a 
 - 🛡️ **A guarantee, not a vibe** — ≤10% wrong answers served at 95% confidence, earned live on 964 real coding tasks.
 - 🧠 **Self-tuning** — the serve threshold recalibrates from live outcomes as your traffic drifts. No retraining, ever.
 - 🎯 **Predict-to-start, verify-to-serve** — a UCB1 bandit learns which rung to *start* on per context; the gate still checks the output before it ships.
+- 🔬 **Measured confidence** — the self-consistency gate resamples the model k times; agreement on the *actual output* is a calibrated confidence score, not a guess about the prompt.
+- 🧪 **Rehearse before you enforce** — `firstpass ope` replays your logged receipts against a candidate ladder: estimated cost and served-failure, with confidence intervals, before anything changes.
 - 🔍 **Proof, not prediction** — the gate checks the *actual output*; a wrong answer is caught, never shipped on a guess.
 - 🧾 **A receipt per decision** — hash-chained, tamper-evident, auditable: *why this model, what did it cost, what did it save*.
 - 🌐 **Every provider** — Anthropic, OpenAI, Gemini, Bedrock, Vertex, Groq, DeepSeek, OpenRouter, Azure, local Ollama/vLLM.
@@ -109,6 +111,7 @@ No. Meet it where you are:
 |---|---|
 | **None** — observe mode | Firstpass reports what it *would* route and save. Nothing changes. |
 | **One sentence** — judge gate | A second model grades every answer against your plain-English rubric. |
+| **One config line** — consistency gate | The model answers k times; agreement is measured confidence (self-consistency, Wang et al. 2022). |
 | **Your existing tests** | The strongest gate: generated code ships only if your suite actually passes. |
 
 Flaky gates auto-disable on an error budget — one bad check can't take down a route.
@@ -178,10 +181,13 @@ Multi-tenant deployments add per-tenant auth (Argon2id), rate limits, gate-healt
 | Quality guarantee | none | **≤10% served-failure @ 95%, earned live** |
 | Adapts by | retraining a policy model | **self-tuning threshold + edit a gate** |
 | Audit trail | a dashboard number | **hash-chained receipt per decision** |
+| Policy changes | deploy and hope | **rehearsed first: `firstpass ope` replays your logs with CIs** |
+
+And the one good idea predictive routers had — starting on the right model — is *inside* firstpass now: the bandit picks the starting rung, prediction errors cost only latency, and the gate still decides what ships.
 
 ## Status
 
-**v0.1.6 — GA-ready core, shipped in the open.** Enforce + observe over real HTTP, cross-provider failover, LLM-judge gates, speculative escalation (~2× p95), the earned conformal guarantee, self-tuning threshold, tool/multimodal/streaming enforce, every provider, every install channel auto-published. Tracked honestly on the [roadmap](https://dshakes.github.io/firstpass/#roadmap): 30-day soak, external security audit, live-verifying Bedrock/Vertex, hosted multi-tenant plane.
+**v0.1.7 — GA-ready core, shipped in the open.** Enforce + observe over real HTTP, cross-provider failover, LLM-judge + self-consistency gates, bandit start-rung selection, speculative escalation (~2× p95), the earned conformal guarantee, self-tuning threshold, offline policy replay (`firstpass ope`), tool/multimodal/streaming enforce, every provider, every install channel auto-published. Tracked honestly on the [roadmap](https://dshakes.github.io/firstpass/#roadmap): 30-day soak, external security audit, live-verifying Bedrock/Vertex, hosted multi-tenant plane.
 
 ## Links
 

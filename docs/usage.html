@@ -230,10 +230,12 @@ ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]'>copy</bu
     <div class="callout"><b>Live status.</b> Anthropic is live-verified; OpenAI-compatible and Gemini are wire-tested against spec-accurate servers; Bedrock and Vertex are offline-tested (shape + signed headers) and <b>live-unverified</b> — verify against real AWS/GCP credentials before production.</div>
 
     <h2 id="gates">Gates</h2>
-    <p>A gate reads the candidate output and returns a verdict. Two kinds:</p>
+    <p>A gate reads the candidate output and returns a verdict. Four kinds:</p>
     <ul>
       <li><b>Inline</b> — <code>non-empty</code>, <code>json-valid</code>, and a minimal JSON-Schema gate (<code>type</code> / <code>required</code> / <code>properties</code>). No process spawn.</li>
       <li><b>Subprocess plugin</b> — your own command (tests, linter, a judge). The candidate is passed on <b>stdin, never argv</b> (injection-resistant); a JSON verdict comes back on stdout. Non-zero exit or timeout → abstain.</li>
+      <li><b>Native judge</b> — <code>judge = { model, threshold, rubric }</code>: a second model grades the answer against your rubric. Maker ≠ checker is enforced structurally, and the candidate is fenced as data under an anti-injection system prompt.</li>
+      <li><b>Self-consistency</b> — <code>consistency = { model, k, threshold }</code>: resample the request k times and score the candidate by agreement (self-consistency, Wang et&nbsp;al.&nbsp;2022; semantic-entropy family). A continuous confidence score, measured on the actual output, that the conformal threshold can calibrate. Honest cost: k extra calls on the sampling model.</li>
     </ul>
     <div class="callout warn"><b>Error budgets.</b> Each gate carries a rolling budget. A gate whose abstain rate exceeds its threshold is auto-disabled for subsequent requests (with an alarm), so one flaky gate can't take down a route.</div>
 
@@ -252,6 +254,7 @@ ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]'>copy</bu
   <span class="cy">"verdict"</span>:  <span class="p">"pass"</span>, <span class="cy">"reporter"</span>: <span class="p">"ci"</span>
 <span class="c">}</span>'</pre></div>
     <div class="callout"><b>Chain-preserving.</b> Deferred verdicts live in a separate table keyed by trace id — they are merged on read for display but <b>never</b> folded into the sealed, hashed record. The chain stays re-derivable.</div>
+    <p>Those receipts are also an evaluation dataset. <code>firstpass calibrate</code> turns deferred feedback into a conformal serve threshold, and <code>firstpass ope --config candidate.toml</code> <b>rehearses a policy change</b> — replaying logged traffic against a candidate ladder/threshold and reporting estimated cost and served-failure with bootstrap confidence intervals (coverage-honest: rungs never logged are counted, not guessed) — before you enforce anything.</p>
 
     <h2 id="offboard">Offboarding</h2>
     <p>Leaving is always one environment variable — an invariant of the design:</p>
