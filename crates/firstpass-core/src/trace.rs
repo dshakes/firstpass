@@ -55,6 +55,14 @@ pub struct PolicyRef {
     /// Whether this decision was a deliberate exploration draw (bounded, §, only in enforce).
     #[serde(default)]
     pub explore: bool,
+    /// The probability the logging policy assigned to the start rung it chose — the
+    /// Horvitz-Thompson denominator for IPS / SNIPS off-policy evaluation.
+    ///
+    /// `None` for deterministic (non-exploring) policies. `skip_serializing_if` keeps old
+    /// trace bytes byte-identical when `None`, preserving hash-chain compatibility with
+    /// existing logs. Only populated when `[escalation.exploration]` is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub propensity: Option<f64>,
 }
 
 /// The routed request, described without its raw content.
@@ -198,6 +206,7 @@ mod tests {
             policy: PolicyRef {
                 id: "static@v0".into(),
                 explore: false,
+                propensity: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".into(),
@@ -288,5 +297,49 @@ mod tests {
         let j = serde_json::to_string(&t).unwrap();
         let back: Trace = serde_json::from_str(&j).unwrap();
         assert_eq!(t, back);
+    }
+
+    // ── propensity backward-compat ────────────────────────────────────────────
+
+    /// Traces where propensity is None must serialize byte-identically to pre-field traces:
+    /// the field must be absent from the JSON, not serialized as `null`.
+    #[test]
+    fn propensity_none_absent_from_json() {
+        let pr = PolicyRef {
+            id: "static@v0".into(),
+            explore: false,
+            propensity: None,
+        };
+        let j = serde_json::to_string(&pr).unwrap();
+        assert!(
+            !j.contains("propensity"),
+            "propensity=None must be omitted (skip_serializing_if): {j}"
+        );
+    }
+
+    /// Old JSON without a `propensity` field must deserialize to `propensity: None`
+    /// (via `#[serde(default)]`), keeping old traces readable without schema migration.
+    #[test]
+    fn old_trace_without_propensity_deserializes_to_none() {
+        let old_json = r#"{"id":"static@v0","explore":false}"#;
+        let pr: PolicyRef = serde_json::from_str(old_json).unwrap();
+        assert_eq!(pr.propensity, None);
+    }
+
+    /// New JSON with a propensity value round-trips correctly.
+    #[test]
+    fn propensity_some_roundtrips() {
+        let pr = PolicyRef {
+            id: "bandit@v1+eps".into(),
+            explore: true,
+            propensity: Some(0.3),
+        };
+        let j = serde_json::to_string(&pr).unwrap();
+        assert!(
+            j.contains("\"propensity\":0.3"),
+            "expected propensity in: {j}"
+        );
+        let back: PolicyRef = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, pr);
     }
 }

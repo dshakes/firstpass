@@ -185,6 +185,7 @@ mod tests {
             policy: PolicyRef {
                 id: "test@v0".to_owned(),
                 explore: false,
+                propensity: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),

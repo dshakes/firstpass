@@ -1,27 +1,35 @@
-//! Off-policy evaluation (OPE) via direct-method replay over deterministic logs (SPEC §10.2).
+//! Off-policy evaluation (OPE): direct-method replay and IPS/SNIPS for start-rung policies.
 //!
-//! # Method
+//! # Direct method (ladder/threshold changes)
 //!
 //! Answers: "if I changed my ladder or serve threshold, what would my logged traffic have cost
 //! and how many failures would I have served?" — from the trace store, before enforcing anything.
 //!
-//! Because the logging policy is **deterministic** (firstpass always picks the cheapest passing
-//! rung with no random exploration), importance-sampling (IPS) and doubly-robust (DR) estimators
-//! are inapplicable: every logged trace was generated with probability 1 under the logging policy,
-//! so importance ratios are trivially 1 for covered traces and undefined (0/0) for uncovered ones.
-//! We use the **direct method** (logged-outcome replay) instead:
-//!
 //! For each trace, walk the CANDIDATE ladder cheapest-first. At each rung, if the logged trace
 //! has an attempt for that exact model string, reuse its logged gate verdicts and cost. The first
 //! rung whose outcome would SERVE under the candidate rule ends the replay. If any candidate rung
-//! has no logged attempt (the candidate tried a model the logging policy never called), the trace
-//! is UNEVALUABLE and excluded from all estimates — never guessed.
+//! has no logged attempt the trace is UNEVALUABLE and excluded — never guessed.
 //!
 //! Coverage < 1.0 is the principal limitation: a candidate that adds models never logged cannot
-//! be evaluated from this store. The report always surfaces coverage and n_correctness_known.
+//! be evaluated. The report always surfaces coverage and n_correctness_known.
 //!
-//! IPS/DR are future work; they require stochastic logging (epsilon-greedy or similar), which
-//! this proxy does not yet implement.
+//! # IPS / SNIPS for start-rung policies (requires exploration)
+//!
+//! Answers: "what would mean cost be if I always started at rung N?" — using importance-sampling
+//! on traffic logged under an epsilon-greedy policy that recorded propensities.
+//!
+//! Estimators (Horvitz-Thompson 1952 / Swaminathan-Joachims 2015):
+//! ```text
+//! wᵢ = 𝟙[logged_start == N] / pᵢ          (importance weight)
+//! IPS  = (1/n) Σᵢ wᵢ · costᵢ              (unbiased, higher variance)
+//! SNIPS = Σ(wᵢ·costᵢ) / Σwᵢ              (self-normalised, lower variance)
+//! ESS  = (Σwᵢ)² / Σwᵢ²                   (effective sample size)
+//! ```
+//!
+//! Valid only when the candidate start rung N is in the logging policy's support (guaranteed
+//! under ε-greedy since p = ε/K > 0 for every rung). Traces without propensity are excluded
+//! and counted in `n_with_propensity`. DR (direct + IPS correction) is a follow-on; the
+//! direct-method path remains for ladder-structure changes.
 
 use std::path::Path;
 
@@ -385,6 +393,199 @@ pub fn ope_from_store(
     Ok(build_report(n_traces, points))
 }
 
+// ── IPS / SNIPS start-rung estimator ─────────────────────────────────────────
+
+/// IPS and SNIPS estimates for evaluating a fixed candidate start-rung policy.
+///
+/// Valid only for traffic logged under a stochastic policy that recorded propensities via
+/// `[escalation.exploration]`. Traces without a `propensity` field are excluded and reported
+/// in `n_with_propensity`. DR (doubly-robust = direct + IPS correction) is a follow-on.
+///
+/// ponytail: per-context greedy identification is not exploited here (uniform-weight IPS
+/// suffices for population-level estimates). DR is the upgrade path when direct-method
+/// coverage and IPS coverage are both needed simultaneously.
+#[derive(Debug, Clone)]
+pub struct IpsReport {
+    /// Total traces in the store for this tenant.
+    pub n_traces: usize,
+    /// Traces with `propensity: Some(p > 0)` — the IPS population.
+    pub n_with_propensity: usize,
+    /// Candidate start rung being evaluated.
+    pub candidate_start_rung: u32,
+    /// IPS (Horvitz-Thompson) estimate of mean cost under "always start at rung N".
+    pub ips_cost: f64,
+    /// SNIPS (self-normalised IPS) estimate — lower variance, slightly biased.
+    pub snips_cost: f64,
+    /// Effective sample size ESS = (Σwᵢ)² / Σwᵢ².
+    pub ess: f64,
+    /// Bootstrap 95% CI (2.5/97.5 pct) for the IPS cost estimate.
+    pub ci_ips_cost: (f64, f64),
+    /// IPS estimate of served-failure rate (traces with deferred feedback on logged rung N).
+    pub ips_served_failure: Option<f64>,
+    /// SNIPS estimate of served-failure rate.
+    pub snips_served_failure: Option<f64>,
+    /// Traces contributing to the failure-rate IPS estimate.
+    pub n_correctness_known: usize,
+    /// Bootstrap 95% CI for the IPS served-failure estimate.
+    pub ci_ips_served_failure: Option<(f64, f64)>,
+}
+
+impl IpsReport {
+    /// Render the report as human-readable lines.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "traces: {n}  n_with_propensity: {nwp}  candidate_start_rung: {sr}\n\
+             IPS cost/request:   ${ips:.6}\n\
+             SNIPS cost/request: ${snips:.6}\n\
+             IPS cost CI [2.5%, 97.5%]: [${clo:.6}, ${chi:.6}]\n\
+             effective sample size (ESS): {ess:.1}\n\
+             n_correctness_known: {nck}\n",
+            n = self.n_traces,
+            nwp = self.n_with_propensity,
+            sr = self.candidate_start_rung,
+            ips = self.ips_cost,
+            snips = self.snips_cost,
+            clo = self.ci_ips_cost.0,
+            chi = self.ci_ips_cost.1,
+            ess = self.ess,
+            nck = self.n_correctness_known,
+        );
+        match self.ips_served_failure {
+            Some(f) => {
+                let sf_snips = self.snips_served_failure.unwrap_or(f);
+                let (lo, hi) = self.ci_ips_served_failure.unwrap_or((f, f));
+                out.push_str(&format!(
+                    "IPS served-failure: {f:.4}  SNIPS: {sf_snips:.4}  CI [{lo:.4}, {hi:.4}]\n"
+                ));
+            }
+            None => {
+                out.push_str(
+                    "IPS served-failure: n/a (no deferred feedback on matched-start traces)\n",
+                );
+            }
+        }
+        out.push_str(
+            "\nIPS/SNIPS valid only for candidates over the same logged ladder with \
+             propensity-logged traffic. Traces without propensity excluded. \
+             Direct-method replay remains for ladder/threshold changes.\n",
+        );
+        out
+    }
+}
+
+/// Run IPS/SNIPS OPE from the trace store for a fixed candidate start-rung policy.
+///
+/// Traces without `propensity` are excluded from IPS and counted in `n_with_propensity`.
+/// Missing or unreadable store is treated as zero traces (same forgiving behaviour as
+/// [`ope_from_store`]).
+///
+/// # Errors
+/// Returns [`StoreError`] on a genuine database read error on an existing record.
+pub fn ips_from_store(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+    candidate_start_rung: u32,
+) -> Result<IpsReport, StoreError> {
+    let traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    let n_traces = traces.len();
+
+    struct IpsPoint {
+        weight: f64,
+        cost: f64,
+        /// `Some(true)` correct, `Some(false)` failure, `None` unknown.
+        correctness: Option<bool>,
+    }
+
+    let mut points: Vec<IpsPoint> = Vec::with_capacity(n_traces);
+    let mut n_with_propensity = 0usize;
+
+    for trace in &traces {
+        let Some(p) = trace.policy.propensity else {
+            continue; // no propensity → excluded from IPS
+        };
+        if p <= 0.0 {
+            continue; // defensive: zero propensity → undefined ratio
+        }
+        n_with_propensity += 1;
+
+        let logged_start = trace.attempts.first().map(|a| a.rung);
+        let indicator = f64::from(logged_start == Some(candidate_start_rung));
+        let w = indicator / p;
+
+        // Correctness from deferred feedback, but only for traces that matched the candidate
+        // start rung (w > 0). A deferred verdict on a different rung doesn't grade rung N's output.
+        let correctness = if w > 0.0 {
+            let deferred = store::load_deferred(&db_path, &trace.trace_id.to_string())?;
+            deferred
+                .last()
+                .map(|dv: &DeferredVerdict| dv.verdict == Verdict::Pass)
+        } else {
+            None
+        };
+
+        points.push(IpsPoint {
+            weight: w,
+            cost: trace.final_.total_cost_usd,
+            correctness,
+        });
+    }
+
+    let n = n_with_propensity as f64;
+    let sum_w: f64 = points.iter().map(|p| p.weight).sum();
+    let sum_w2: f64 = points.iter().map(|p| p.weight * p.weight).sum();
+    let sum_wc: f64 = points.iter().map(|p| p.weight * p.cost).sum();
+
+    let ips_cost = if n > 0.0 { sum_wc / n } else { 0.0 };
+    let snips_cost = if sum_w > 0.0 { sum_wc / sum_w } else { 0.0 };
+    let ess = if sum_w2 > 0.0 {
+        sum_w * sum_w / sum_w2
+    } else {
+        0.0
+    };
+
+    // Bootstrap CI for IPS cost: resample the per-trace wᵢ·costᵢ values.
+    let wc_values: Vec<f64> = points.iter().map(|p| p.weight * p.cost).collect();
+    let ci_ips_cost = bootstrap_mean_ci(&wc_values, 1000, 42);
+
+    // Failure-rate IPS over traces with deferred feedback at the matched start rung (w > 0).
+    let known: Vec<(f64, bool)> = points
+        .iter()
+        .filter_map(|p| p.correctness.map(|c| (p.weight, c)))
+        .collect();
+    let n_correctness_known = known.len();
+
+    let (ips_served_failure, snips_served_failure, ci_ips_served_failure) = if known.is_empty() {
+        (None, None, None)
+    } else {
+        let n_known = known.len() as f64;
+        let sum_wf: f64 = known.iter().filter(|(_, c)| !c).map(|(w, _)| w).sum();
+        let sum_wk: f64 = known.iter().map(|(w, _)| w).sum();
+        let ips_f = sum_wf / n_known;
+        let snips_f = if sum_wk > 0.0 { sum_wf / sum_wk } else { 0.0 };
+        let wf_vals: Vec<f64> = known
+            .iter()
+            .map(|(w, c)| if !c { *w } else { 0.0 })
+            .collect();
+        let ci = bootstrap_mean_ci(&wf_vals, 1000, 43);
+        (Some(ips_f), Some(snips_f), Some(ci))
+    };
+
+    Ok(IpsReport {
+        n_traces,
+        n_with_propensity,
+        candidate_start_rung,
+        ips_cost,
+        snips_cost,
+        ess,
+        ci_ips_cost,
+        ips_served_failure,
+        snips_served_failure,
+        n_correctness_known,
+        ci_ips_served_failure,
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -434,6 +635,7 @@ mod tests {
             policy: PolicyRef {
                 id: "test@v0".to_owned(),
                 explore: false,
+                propensity: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),
@@ -508,6 +710,7 @@ mod tests {
             policy: PolicyRef {
                 id: "test@v0".to_owned(),
                 explore: false,
+                propensity: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),
@@ -880,5 +1083,179 @@ serve_threshold = 0.75
         let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"m\"]\n";
         let p = CandidatePolicy::from_toml(toml).unwrap();
         assert!(p.serve_threshold.is_none());
+    }
+
+    // ── IPS / SNIPS tests ─────────────────────────────────────────────────────
+
+    /// Build a trace with a single attempt at `rung`, `total_cost_usd`, and a given logging
+    /// propensity set on `policy.propensity`. Used to construct a known-distribution sample for
+    /// IPS correctness assertions.
+    fn make_propensity_trace(
+        tenant: &str,
+        rung: u32,
+        cost_usd: f64,
+        propensity: Option<f64>,
+    ) -> Trace {
+        let attempt = firstpass_core::Attempt {
+            rung,
+            model: "m".to_owned(),
+            provider: "anthropic".to_owned(),
+            in_tokens: 10,
+            out_tokens: 5,
+            cost_usd,
+            latency_ms: 5,
+            gates: vec![],
+            verdict: Verdict::Pass,
+        };
+        let mut trace = Trace {
+            trace_id: uuid::Uuid::now_v7(),
+            prev_hash: GENESIS_HASH.to_owned(),
+            tenant_id: tenant.to_owned(),
+            session_id: "s".to_owned(),
+            ts: jiff::Timestamp::now(),
+            mode: Mode::Enforce,
+            policy: PolicyRef {
+                id: "bandit@v1+eps".to_owned(),
+                explore: rung != 0,
+                propensity,
+            },
+            request: RequestInfo {
+                api: "anthropic.messages".to_owned(),
+                prompt_hash: "ph".to_owned(),
+                features: Features::new(TaskKind::Other),
+            },
+            attempts: vec![attempt],
+            deferred: Vec::new(),
+            final_: FinalOutcome {
+                served_rung: Some(rung),
+                served_from: ServedFrom::Attempt,
+                total_cost_usd: cost_usd,
+                gate_cost_usd: 0.0,
+                total_latency_ms: 5,
+                escalations: 0,
+                counterfactual_baseline_usd: cost_usd,
+                savings_usd: 0.0,
+            },
+        };
+        trace.recompute_savings();
+        trace
+    }
+
+    // ── 10. IPS correctness from a known logging policy ───────────────────────
+    //
+    // Logging policy: epsilon-greedy, K=2 rungs, greedy=rung 0, epsilon=0.2
+    //   p(start==0) = (1-0.2)*1 + 0.2/2 = 0.9
+    //   p(start==1) = (1-0.2)*0 + 0.2/2 = 0.1
+    //
+    // Trace set representative of the logging policy:
+    //   45 traces at rung 0 (cost $0.001, propensity 0.9)
+    //    5 traces at rung 1 (cost $0.010, propensity 0.1)
+    //
+    // Candidate: always start at rung 1 (start_rung = 1).
+    //   w_i = 1(start==1) / p_i
+    //   Rung-0 traces: w = 0/0.9 = 0
+    //   Rung-1 traces: w = 1/0.1 = 10
+    //
+    //   sum_wc = 5 * 10 * 0.010 = 0.5
+    //   IPS  = sum_wc / n = 0.5 / 50 = 0.010  ✓  (equals true mean cost of rung-1 traces)
+    //   SNIPS = sum_wc / sum_w = 0.5 / (5*10) = 0.010 ✓
+    //   ESS   = (5*10)^2 / (5*10^2) = 2500/500 = 5
+    #[tokio::test]
+    async fn ips_correctness_from_known_logging_policy() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        for _ in 0..45 {
+            tx.try_send(make_propensity_trace("t", 0, 0.001, Some(0.9)))
+                .unwrap();
+        }
+        for _ in 0..5 {
+            tx.try_send(make_propensity_trace("t", 1, 0.010, Some(0.1)))
+                .unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let report = ips_from_store(&db, "t", 1).unwrap();
+
+        assert_eq!(report.n_traces, 50);
+        assert_eq!(report.n_with_propensity, 50);
+        // IPS = SNIPS = true mean cost of rung-1-start traces = $0.010.
+        assert!(
+            (report.ips_cost - 0.010).abs() < 1e-9,
+            "IPS cost={} expected 0.010",
+            report.ips_cost
+        );
+        assert!(
+            (report.snips_cost - 0.010).abs() < 1e-9,
+            "SNIPS cost={} expected 0.010",
+            report.snips_cost
+        );
+        assert!(
+            report.ess.is_finite() && report.ess > 0.0,
+            "ESS must be positive"
+        );
+        assert!(
+            (report.ess - 5.0).abs() < 1e-9,
+            "ESS={} expected 5.0",
+            report.ess
+        );
+        // No deferred feedback → no correctness signal.
+        assert_eq!(report.n_correctness_known, 0);
+        assert!(report.ips_served_failure.is_none());
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 11. Traces without propensity are excluded from IPS ───────────────────
+
+    #[tokio::test]
+    async fn ips_excludes_traces_without_propensity() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        // 5 traces with propensity, 5 without.
+        for _ in 0..5 {
+            tx.try_send(make_propensity_trace("t", 0, 0.001, Some(0.9)))
+                .unwrap();
+        }
+        for _ in 0..5 {
+            tx.try_send(make_propensity_trace("t", 0, 0.001, None))
+                .unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let report = ips_from_store(&db, "t", 0).unwrap();
+
+        assert_eq!(report.n_traces, 10);
+        assert_eq!(
+            report.n_with_propensity, 5,
+            "only traces with propensity count"
+        );
+        // All 5 propensity traces start at rung 0 (candidate rung 0): w = 1/0.9 each.
+        // IPS = sum_wc / n = 5 * (1/0.9) * 0.001 / 5 ≈ 0.001/0.9 ≈ 0.001111
+        let expected_ips = 0.001_f64 / 0.9;
+        assert!(
+            (report.ips_cost - expected_ips).abs() < 1e-9,
+            "IPS={} expected {expected_ips}",
+            report.ips_cost
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 12. Empty store / no propensity traces → zero report ─────────────────
+
+    #[test]
+    fn ips_empty_store_returns_zero_report() {
+        let db = std::path::Path::new("/nonexistent/fp-ips-empty.db");
+        let report = ips_from_store(db, "t", 0).unwrap();
+        assert_eq!(report.n_traces, 0);
+        assert_eq!(report.n_with_propensity, 0);
+        assert_eq!(report.ips_cost, 0.0);
+        assert_eq!(report.snips_cost, 0.0);
+        assert_eq!(report.ess, 0.0);
+        assert!(report.ips_served_failure.is_none());
     }
 }

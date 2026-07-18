@@ -348,6 +348,11 @@ pub struct Escalation {
     /// choose where the ladder STARTS; gating, escalation, and serving are untouched.
     #[serde(default)]
     pub bandit: Option<BanditConfig>,
+    /// Epsilon-greedy start-rung exploration: randomise a fraction of start-rung choices and
+    /// record propensities so IPS/SNIPS off-policy estimates are valid. `None` (default) →
+    /// deterministic policy — byte-identical to today. See [`ExplorationConfig`].
+    #[serde(default)]
+    pub exploration: Option<ExplorationConfig>,
 }
 
 /// Config for online/adaptive conformal serving ([`crate::conformal::AdaptiveConformal`]).
@@ -363,6 +368,27 @@ pub struct AdaptiveConfig {
 
 fn default_adaptive_gamma() -> f64 {
     0.02
+}
+
+/// Epsilon-greedy start-rung exploration: a fraction `epsilon` of requests start at a
+/// uniformly-random rung so that propensities are logged and IPS/SNIPS off-policy estimates
+/// are valid (Horvitz-Thompson 1952; SNIPS: Swaminathan & Joachims 2015). The bandit still
+/// observes all gate verdicts — including from exploration draws — so learning is uninterrupted.
+///
+/// Every request under this policy records `policy.propensity` in the trace: the probability the
+/// logging policy had of choosing the start rung it actually chose. Old traces (before this field
+/// was added) serialize byte-identically (propensity is omitted when `None`).
+///
+/// Absent (default) → deterministic policy — no exploration, no propensity recorded,
+/// byte-identical to today.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExplorationConfig {
+    /// Fraction of requests routed to a uniformly-random start rung instead of the greedy
+    /// choice. Must be finite and in `(0, 0.5]`; validated by [`Config::parse`].
+    /// A small `epsilon` (0.05–0.1) is usually enough: it keeps learning alive and makes
+    /// IPS/SNIPS estimates valid at low cost in exploration waste.
+    pub epsilon: f64,
 }
 
 /// Config for the UCB1 start-rung bandit (`firstpass_proxy::bandit::StartRungBandit`).
@@ -403,6 +429,7 @@ impl Default for Escalation {
             adaptive: None,
             enforce_structured: false,
             bandit: None,
+            exploration: None,
         }
     }
 }
@@ -537,6 +564,14 @@ impl Config {
             return Err(Error::InvalidConfig(format!(
                 "bandit.exploration must be finite and >= 0, got {}",
                 b.exploration
+            )));
+        }
+        if let Some(exp) = &config.escalation.exploration
+            && (!exp.epsilon.is_finite() || exp.epsilon <= 0.0 || exp.epsilon > 0.5)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "escalation.exploration.epsilon must be finite and in (0, 0.5], got {}",
+                exp.epsilon
             )));
         }
         Ok(config)
@@ -895,5 +930,53 @@ project = "my-gcp-project"
         assert!(c.routes.is_empty());
         assert_eq!(c.escalation.max_rungs_per_request, 3);
         assert_eq!(c.budget.on_exhausted, OnExhausted::ServeBestAttempt);
+    }
+
+    // ── ExplorationConfig parse / validation ──────────────────────────────────
+
+    #[test]
+    fn parses_exploration_config() {
+        let c = Config::parse("[escalation.exploration]\nepsilon = 0.1\n").unwrap();
+        let exp = c
+            .escalation
+            .exploration
+            .expect("[escalation.exploration] should parse");
+        assert!((exp.epsilon - 0.1).abs() < 1e-12);
+        // Absent => None (deterministic policy, byte-identical behavior).
+        assert!(Config::parse("").unwrap().escalation.exploration.is_none());
+    }
+
+    #[test]
+    fn exploration_epsilon_boundary_valid() {
+        // Upper bound 0.5 is allowed.
+        let c = Config::parse("[escalation.exploration]\nepsilon = 0.5\n").unwrap();
+        assert!((c.escalation.exploration.unwrap().epsilon - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn exploration_epsilon_above_half_rejected() {
+        let bad = "[escalation.exploration]\nepsilon = 0.51\n";
+        assert!(
+            matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
+            "epsilon > 0.5 must be rejected"
+        );
+    }
+
+    #[test]
+    fn exploration_epsilon_zero_rejected() {
+        let bad = "[escalation.exploration]\nepsilon = 0.0\n";
+        assert!(
+            matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
+            "epsilon = 0 must be rejected (must be strictly positive)"
+        );
+    }
+
+    #[test]
+    fn exploration_epsilon_negative_rejected() {
+        let bad = "[escalation.exploration]\nepsilon = -0.1\n";
+        assert!(
+            matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
+            "epsilon < 0 must be rejected"
+        );
     }
 }
