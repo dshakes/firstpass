@@ -18,6 +18,6 @@ What is genuinely new (the cascade mechanism itself is prior art in the model-ca
 - Config (SPEC §8.4): declarative routing — routes, ladders, gates, budgets, escalation.
 
 ## Distribution
-- Single static binary, no runtime dependencies. Install in seconds: `uvx firstpass` / `pip install firstpass`, `brew install dshakes/tap/firstpass`, `npx @dshakesnotbot/firstpass`, `curl | sh`, `docker run`, or `cargo install`. Upgrade in place with `firstpass-proxy-update`.
+- Single static binary, no runtime dependencies. Install in seconds: `curl | sh` (recommended), `pip install firstpass` / `uvx --from firstpass firstpass-proxy`, `brew install dshakes/tap/firstpass-proxy`, `docker run ghcr.io/dshakes/firstpass`, or `cargo install --git` (needs a Rust toolchain). npm and crates.io publishing are wired but not yet live. Upgrade in place with `firstpass-proxy-update`.
 - Multi-provider: Anthropic, OpenAI, Google, and any OpenAI-compatible endpoint (hosted aggregators or local models).
 - BYOK (bring your own keys); zero token markup; no lock-in at the data plane.
