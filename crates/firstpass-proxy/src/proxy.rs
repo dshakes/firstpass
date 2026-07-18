@@ -320,6 +320,9 @@ async fn feedback(
                 && let Ok(mut g) = a.lock()
             {
                 g.observe_served(correct);
+                metrics::gauge!("firstpass_serve_threshold").set(g.threshold());
+                metrics::gauge!("firstpass_realized_served_failure")
+                    .set(g.realized_served_failure());
             }
             (
                 axum::http::StatusCode::ACCEPTED,
