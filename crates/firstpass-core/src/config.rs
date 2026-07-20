@@ -38,6 +38,11 @@ pub struct Config {
     /// `deferred_gates`. Declared as `[[gate]]` sections in TOML.
     #[serde(rename = "gate", default)]
     pub gate_defs: Vec<GateDef>,
+    /// Per-deployment price overrides, replacing the built-in defaults for the named models.
+    /// List prices drift and enterprise contracts differ — savings math is only honest when the
+    /// operator can pin THEIR prices. Declared as `[[price]]` sections in TOML.
+    #[serde(rename = "price", default)]
+    pub price_defs: Vec<PriceDef>,
     /// Extra model providers a ladder can route to, beyond the built-in `anthropic` / `openai`.
     /// Any OpenAI-compatible endpoint (Groq, Together, Fireworks, DeepSeek, Mistral, xAI,
     /// OpenRouter, Ollama, vLLM, Azure, …) is one `[[provider]]` entry — no rebuild. Declared as
@@ -108,6 +113,18 @@ pub struct ProviderDef {
     /// GCP project id — required for `gcp_oauth` (Vertex).
     #[serde(default)]
     pub project: Option<String>,
+}
+
+/// A per-deployment price override for one model (`provider/model`), USD per 1M tokens.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceDef {
+    /// The ladder id this price applies to, e.g. `"anthropic/claude-haiku-4-5"`.
+    pub model: String,
+    /// USD per 1M input (prompt) tokens.
+    pub input_per_mtok: f64,
+    /// USD per 1M output (completion) tokens.
+    pub output_per_mtok: f64,
 }
 
 /// A user-defined gate (SPEC §8.1). Exactly one kind per definition:
@@ -590,6 +607,20 @@ impl Config {
                 )));
             }
         }
+        for price in &config.price_defs {
+            if price.model.trim().is_empty() {
+                return Err(Error::InvalidConfig(
+                    "price model must not be empty".to_owned(),
+                ));
+            }
+            let ok = |v: f64| v.is_finite() && v >= 0.0;
+            if !ok(price.input_per_mtok) || !ok(price.output_per_mtok) {
+                return Err(Error::InvalidConfig(format!(
+                    "price for {:?} must be finite and >= 0",
+                    price.model
+                )));
+            }
+        }
         if let Some(b) = &config.escalation.bandit
             && (!b.exploration.is_finite() || b.exploration < 0.0)
         {
@@ -1068,5 +1099,26 @@ schema = { type = "object" }
             err.to_string().contains("exactly one"),
             "two kinds must be rejected: {err}"
         );
+    }
+
+    #[test]
+    fn price_overrides_parse_and_validate() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "observe"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[[price]]
+model = "anthropic/claude-haiku-4-5"
+input_per_mtok = 0.8
+output_per_mtok = 4.0
+"#;
+        let config = Config::parse(toml).expect("price override must parse");
+        assert_eq!(config.price_defs[0].model, "anthropic/claude-haiku-4-5");
+        assert!((config.price_defs[0].input_per_mtok - 0.8).abs() < 1e-12);
+
+        let bad = toml.replace("input_per_mtok = 0.8", "input_per_mtok = -1.0");
+        assert!(Config::parse(&bad).is_err(), "negative price rejected");
     }
 }
