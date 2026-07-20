@@ -46,6 +46,29 @@ fn tool_schemas() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "explain_route",
+            "description": "Explain one routing decision from its sealed receipt — served model, per-rung verdicts, escalations, cost vs the always-top baseline, and the savings.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "trace_id": { "type": "string" } },
+                "required": ["trace_id"]
+            }
+        },
+        {
+            "name": "rehearse_policy",
+            "description": "Rehearse a candidate routing policy against this deployment's logged traffic BEFORE enforcing it: estimated cost and served-failure with coverage, from a policy TOML (ladder + gates + serve_threshold). Off-policy replay, never a live change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "policy_toml": { "type": "string", "description": "A candidate policy in the firstpass.toml route/escalation dialect." } },
+                "required": ["policy_toml"]
+            }
+        },
+        {
+            "name": "verify_receipts",
+            "description": "Independently re-derive the receipt hash chain from genesis over this deployment's log; reports whether it is intact (tamper-evident self-audit).",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "submit_feedback",
             "description": "Attach a downstream outcome (deferred verdict) to a past decision, closing the feedback loop.",
             "inputSchema": {
@@ -109,6 +132,9 @@ fn handle_tool_call(id: Value, params: Option<&Value>, db_path: &str, tenant: &s
         "list_traces" => tool_list_traces(&args, db_path, tenant),
         "get_savings" => tool_get_savings(db_path, tenant),
         "get_evals" => tool_get_evals(db_path, tenant),
+        "explain_route" => tool_explain_route(&args, db_path, tenant),
+        "rehearse_policy" => tool_rehearse_policy(&args, db_path, tenant),
+        "verify_receipts" => tool_verify_receipts(db_path),
         "get_trace" => tool_get_trace(&args, db_path, tenant),
         "submit_feedback" => tool_submit_feedback(&args, db_path, tenant),
         other => Err(format!("unknown tool: {other}")),
@@ -147,6 +173,38 @@ fn tool_get_savings(db_path: &str, tenant: &str) -> Result<String, String> {
 fn tool_get_evals(db_path: &str, tenant: &str) -> Result<String, String> {
     let traces = store::load_tenant_traces(db_path, tenant).unwrap_or_default();
     serde_json::to_string(&crate::cli::summarize_evals(&traces))
+        .map_err(|e| format!("encode error: {e}"))
+}
+
+fn tool_explain_route(args: &Value, db_path: &str, tenant: &str) -> Result<String, String> {
+    let trace_id = args
+        .get("trace_id")
+        .and_then(Value::as_str)
+        .ok_or("missing `trace_id`")?;
+    match store::load_trace_view(db_path, tenant, trace_id)
+        .map_err(|e| format!("store error: {e}"))?
+    {
+        Some(trace) => serde_json::to_string(&crate::cli::explain_trace(&trace))
+            .map_err(|e| format!("encode error: {e}")),
+        None => Err(format!("unknown trace_id {trace_id:?}")),
+    }
+}
+
+fn tool_rehearse_policy(args: &Value, db_path: &str, tenant: &str) -> Result<String, String> {
+    let toml = args
+        .get("policy_toml")
+        .and_then(Value::as_str)
+        .ok_or("missing `policy_toml`")?;
+    let policy = crate::ope::CandidatePolicy::from_toml(toml)?;
+    let report = crate::ope::ope_from_store(db_path, tenant, &policy)
+        .map_err(|e| format!("store error: {e}"))?;
+    Ok(report.render())
+}
+
+fn tool_verify_receipts(db_path: &str) -> Result<String, String> {
+    // Operator-wide: the hash chain spans every tenant, so verification is not tenant-scoped.
+    let traces = store::load_all_traces(db_path).unwrap_or_default();
+    serde_json::to_string(&crate::cli::verify_receipts(&traces))
         .map_err(|e| format!("encode error: {e}"))
 }
 
@@ -281,6 +339,9 @@ mod tests {
                 "get_trace",
                 "get_savings",
                 "get_evals",
+                "explain_route",
+                "rehearse_policy",
+                "verify_receipts",
                 "submit_feedback"
             ]
         );

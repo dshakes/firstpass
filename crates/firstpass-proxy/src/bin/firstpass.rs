@@ -17,6 +17,7 @@ USAGE:
     firstpass trace [--limit N]   print recent audit traces as JSON lines (default 20)
     firstpass savings [--json]    spend vs the always-top counterfactual, from your own receipts
     firstpass evals [--json]      per-gate verdict rates + escalation + serve-by-rung, from receipts
+    firstpass explain <trace-id>  [--json]  why one routing decision went the way it did
     firstpass export [--out F]    write the sealed receipt log as JSONL (hand to an auditor)
     firstpass verify [--file F] [--json]
                                    independently re-derive the receipt hash chain; exit 1 if broken
@@ -52,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "trace" => cmd_trace(&args),
         "savings" => cmd_savings(&args),
         "evals" => cmd_evals(&args),
+        "explain" => cmd_explain(&args),
         "export" => cmd_export(&args),
         "verify" => cmd_verify(&args),
         "calibrate" => cmd_calibrate(&args),
@@ -198,6 +200,44 @@ fn cmd_evals(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", cli::format_evals(&summary));
     }
     Ok(())
+}
+
+/// `firstpass explain <trace-id> [--json] [--tenant ID]` — explain a single routing decision
+/// from its sealed receipt: served model, per-rung verdicts, escalations, cost vs the always-top
+/// baseline, and the savings. Unknown id exits 1.
+fn cmd_explain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let trace_id = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .ok_or("usage: firstpass explain <trace-id> [--json]")?;
+    let config = ProxyConfig::from_env()?;
+    let tenant = tenant_arg(args, &config);
+    match store::load_trace_view(std::path::Path::new(&config.db_path), &tenant, trace_id)? {
+        Some(trace) => {
+            let ex = cli::explain_trace(&trace);
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", serde_json::to_string_pretty(&ex)?);
+            } else {
+                println!("{}", ex.summary);
+                for a in &ex.attempts {
+                    let gates: Vec<String> =
+                        a.gates.iter().map(|(g, v)| format!("{g}={v}")).collect();
+                    println!(
+                        "  rung {} {} → {} [{}]",
+                        a.rung,
+                        a.model,
+                        a.verdict,
+                        gates.join(", ")
+                    );
+                }
+            }
+            Ok(())
+        }
+        None => {
+            eprintln!("unknown trace_id {trace_id:?}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `firstpass export [--out FILE]` — write the operator-wide sealed receipt log as JSONL

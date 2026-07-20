@@ -255,6 +255,97 @@ pub fn format_evals(s: &EvalsSummary) -> String {
     out.trim_end().to_owned()
 }
 
+/// A structured, agent-readable explanation of a single routing decision — why the ladder
+/// went where it did, built purely from a sealed [`Trace`].
+#[derive(Debug, serde::Serialize)]
+pub struct RouteExplanation {
+    pub trace_id: String,
+    pub mode: String,
+    pub policy: String,
+    /// The model actually served, if any.
+    pub served_model: Option<String>,
+    pub served_rung: Option<u32>,
+    pub escalations: u32,
+    pub total_cost_usd: f64,
+    pub baseline_usd: f64,
+    pub savings_usd: f64,
+    /// Per attempt, in ladder order: what was tried and how it was judged.
+    pub attempts: Vec<AttemptExplanation>,
+    /// One-line human summary.
+    pub summary: String,
+}
+
+/// Per-attempt slice of a [`RouteExplanation`].
+#[derive(Debug, serde::Serialize)]
+pub struct AttemptExplanation {
+    pub rung: u32,
+    pub model: String,
+    pub verdict: String,
+    /// gate_id → verdict, for every gate that ran on this attempt.
+    pub gates: Vec<(String, String)>,
+}
+
+fn verdict_str(v: firstpass_core::Verdict) -> &'static str {
+    match v {
+        firstpass_core::Verdict::Pass => "pass",
+        firstpass_core::Verdict::Fail => "fail",
+        firstpass_core::Verdict::Abstain => "abstain",
+    }
+}
+
+/// Explain one routing decision from its sealed receipt — the "why this model" answer, as
+/// structured data an agent can act on (and the backing for the MCP `explain_route` tool).
+#[must_use]
+pub fn explain_trace(t: &Trace) -> RouteExplanation {
+    let attempts: Vec<AttemptExplanation> = t
+        .attempts
+        .iter()
+        .map(|a| AttemptExplanation {
+            rung: a.rung,
+            model: a.model.clone(),
+            verdict: verdict_str(a.verdict).to_owned(),
+            gates: a
+                .gates
+                .iter()
+                .map(|g| (g.gate_id.clone(), verdict_str(g.verdict).to_owned()))
+                .collect(),
+        })
+        .collect();
+    let served_model = t
+        .final_
+        .served_rung
+        .and_then(|r| t.attempts.iter().find(|a| a.rung == r))
+        .map(|a| a.model.clone());
+    let summary = match &served_model {
+        Some(m) => format!(
+            "served {m} at rung {} after {} escalation(s); spent ${:.4} vs ${:.4} always-top (saved ${:.4})",
+            t.final_.served_rung.unwrap_or(0),
+            t.final_.escalations,
+            t.final_.total_cost_usd,
+            t.final_.counterfactual_baseline_usd,
+            t.final_.savings_usd
+        ),
+        None => "no rung served (all attempts failed the gate or errored)".to_owned(),
+    };
+    RouteExplanation {
+        trace_id: t.trace_id.to_string(),
+        mode: match t.mode {
+            Mode::Enforce => "enforce",
+            Mode::Observe => "observe",
+        }
+        .to_owned(),
+        policy: t.policy.id.clone(),
+        served_model,
+        served_rung: t.final_.served_rung,
+        escalations: t.final_.escalations,
+        total_cost_usd: t.final_.total_cost_usd,
+        baseline_usd: t.final_.counterfactual_baseline_usd,
+        savings_usd: t.final_.savings_usd,
+        attempts,
+        summary,
+    }
+}
+
 /// Outcome of an independent receipt-chain verification — the compliance artifact.
 #[derive(Debug, serde::Serialize)]
 pub struct VerifyReport {
@@ -594,5 +685,79 @@ mod tests {
             parse_receipt_jsonl("\n\n").unwrap().is_empty(),
             "blank lines skipped"
         );
+    }
+
+    #[test]
+    fn explain_trace_summarizes_served_and_escalation() {
+        use firstpass_core::{
+            Attempt, Features, FinalOutcome, GENESIS_HASH, GateResult, PolicyRef, RequestInfo,
+            ServedFrom, TaskKind, Verdict,
+        };
+        let t = Trace {
+            trace_id: uuid::Uuid::now_v7(),
+            prev_hash: GENESIS_HASH.to_owned(),
+            tenant_id: "default".to_owned(),
+            session_id: "s".to_owned(),
+            ts: jiff::Timestamp::UNIX_EPOCH,
+            mode: Mode::Enforce,
+            policy: PolicyRef {
+                id: "static-ladder@v0".to_owned(),
+                explore: false,
+                propensity: None,
+            },
+            request: RequestInfo {
+                api: "anthropic.messages".to_owned(),
+                prompt_hash: "x".to_owned(),
+                features: Features::new(TaskKind::Other),
+            },
+            attempts: vec![
+                Attempt {
+                    rung: 0,
+                    model: "anthropic/claude-haiku-4-5".to_owned(),
+                    provider: "anthropic".to_owned(),
+                    in_tokens: 1,
+                    out_tokens: 1,
+                    cost_usd: 0.001,
+                    latency_ms: 5,
+                    gates: vec![GateResult::deterministic("non-empty", Verdict::Fail, 0)],
+                    verdict: Verdict::Fail,
+                },
+                Attempt {
+                    rung: 1,
+                    model: "anthropic/claude-sonnet-5".to_owned(),
+                    provider: "anthropic".to_owned(),
+                    in_tokens: 1,
+                    out_tokens: 1,
+                    cost_usd: 0.01,
+                    latency_ms: 9,
+                    gates: vec![GateResult::deterministic("non-empty", Verdict::Pass, 0)],
+                    verdict: Verdict::Pass,
+                },
+            ],
+            deferred: Vec::new(),
+            final_: FinalOutcome {
+                served_rung: Some(1),
+                served_from: ServedFrom::Attempt,
+                total_cost_usd: 0.011,
+                gate_cost_usd: 0.0,
+                total_latency_ms: 14,
+                escalations: 1,
+                counterfactual_baseline_usd: 0.02,
+                savings_usd: 0.009,
+            },
+        };
+        let ex = explain_trace(&t);
+        assert_eq!(
+            ex.served_model.as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        assert_eq!(ex.escalations, 1);
+        assert_eq!(ex.attempts.len(), 2);
+        assert_eq!(ex.attempts[0].verdict, "fail");
+        assert_eq!(
+            ex.attempts[1].gates[0],
+            ("non-empty".to_owned(), "pass".to_owned())
+        );
+        assert!(ex.summary.contains("served anthropic/claude-sonnet-5"));
     }
 }

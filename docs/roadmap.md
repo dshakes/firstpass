@@ -103,13 +103,16 @@ GA is an audit + soak + process stamp, not a code stamp (ADR 0003).
 ## Phase 4 — Hosted plane & compounding moats
 
 - [ ] Hosted control plane (ADR 0004, post-review) with team dashboards.
-- [ ] Policy rehearsal as a product surface: replay a candidate policy over your own logged
-      traffic before enforcing it.
+- [x] Policy rehearsal as a product surface: `firstpass ope` (CLI) plus the MCP
+      `rehearse_policy` tool — an agent replays a candidate policy over its own logged traffic
+      and reads back estimated cost + served-failure before enforcing anything.
 - [x] Receipts as a compliance artifact: `firstpass export` (sealed JSONL) + `firstpass verify`
       re-derive the hash chain from genesis with no proxy/DB in the loop — tamper and reorder
       break the chain at their index and exit non-zero. Live-proven end-to-end.
-- [ ] SLO-backed guarantee language.
-- [ ] MCP tools for savings, rehearsal, and route explanation.
+- [x] SLO-backed guarantee language: [docs/compliance/slo.md](compliance/slo.md) states the
+      served-failure SLO contractually and ties it to the same receipts an auditor verifies.
+- [x] MCP tools for savings, rehearsal, and route explanation: `get_savings`, `get_evals`,
+      `rehearse_policy`, `explain_route`, `verify_receipts` (plus trace read + feedback).
 
 **Exit gate:** first external design partner running the hosted plane with the guarantee in
 their contract.

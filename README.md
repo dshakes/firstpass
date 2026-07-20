@@ -83,7 +83,7 @@ detected: shell=zsh · proxy_running=false · routed=false · claude_cli=true
 
 It auto-detects your shell (zsh/bash/fish), whether the proxy is running, whether you're already routed, and which agents you have — then does only what's missing. **Idempotent** (re-run any time), **transparent** (`firstpass onboard` alone is a dry run showing the exact plan), and **reversible**: `firstpass offboard` strips the shell line, stops the proxy, and prints the unset — the whole exit in one command.
 
-For agents onboarding *themselves*: [`llms.txt`](llms.txt) + [`AGENTS.md`](AGENTS.md) ship machine-readable setup, `GET /v1/capabilities` gives runtime discovery, and `firstpass mcp` exposes traces and savings as tools.
+For agents onboarding *themselves*: [`llms.txt`](llms.txt) + [`AGENTS.md`](AGENTS.md) ship machine-readable setup, `GET /v1/capabilities` gives runtime discovery, and `firstpass mcp` exposes traces, savings, evals, policy rehearsal, route explanation, and receipt verification as tools.
 
 ## Benchmarks
 
