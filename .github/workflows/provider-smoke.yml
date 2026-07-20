@@ -1,0 +1,104 @@
+# Provider live-smoke matrix: drive the REAL proxy, per provider, against the REAL endpoint.
+#
+# This is the evidence behind every "verified" provider badge: a provider row only counts as
+# wire-verified when its job here goes green (tiny request, ~cents). Jobs self-skip when the
+# secret isn't configured, so the workflow is safe to run on any fork — a skipped provider is
+# reported as skipped, never as verified.
+#
+# Nightly + manual. Never runs on PRs (secrets + spend).
+name: provider-smoke
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: anthropic
+            model: anthropic/claude-haiku-4-5
+            secret: ANTHROPIC_API_KEY
+            toml: ""
+          - provider: openai
+            model: openai/gpt-4.1-mini
+            secret: OPENAI_API_KEY
+            toml: ""
+          - provider: groq
+            model: groq/llama-3.3-70b-versatile
+            secret: GROQ_API_KEY
+            toml: |
+              [[provider]]
+              id = "groq"
+              dialect = "openai"
+              base_url = "https://api.groq.com/openai"
+              api_key_env = "GROQ_API_KEY"
+          - provider: deepseek
+            model: deepseek/deepseek-chat
+            secret: DEEPSEEK_API_KEY
+            toml: |
+              [[provider]]
+              id = "deepseek"
+              dialect = "openai"
+              base_url = "https://api.deepseek.com"
+              api_key_env = "DEEPSEEK_API_KEY"
+          - provider: openrouter
+            model: openrouter/openai/gpt-4.1-mini
+            secret: OPENROUTER_API_KEY
+            toml: |
+              [[provider]]
+              id = "openrouter"
+              dialect = "openai"
+              base_url = "https://openrouter.ai/api"
+              api_key_env = "OPENROUTER_API_KEY"
+          - provider: gemini
+            model: gemini/gemini-3.1-flash
+            secret: GEMINI_API_KEY
+            toml: |
+              [[provider]]
+              id = "gemini"
+              dialect = "gemini"
+              base_url = "https://generativelanguage.googleapis.com"
+              api_key_env = "GEMINI_API_KEY"
+    name: ${{ matrix.provider }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secret
+        id: gate
+        env:
+          KEY: ${{ secrets[matrix.secret] }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ matrix.provider }}: secret ${{ matrix.secret }} not configured — skipped (NOT verified)"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.skip == 'false'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.gate.outputs.skip == 'false'
+
+      - name: Build proxy
+        if: steps.gate.outputs.skip == 'false'
+        run: cargo build -p firstpass-proxy --bins
+
+      - name: Smoke ${{ matrix.provider }} through the enforcing proxy
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          PROVIDER_KEY: ${{ secrets[matrix.secret] }}
+          KEY_ENV_NAME: ${{ matrix.secret }}
+          MODEL: ${{ matrix.model }}
+          EXTRA_TOML: ${{ matrix.toml }}
+        run: |
+          set -euo pipefail
+          bash scripts/provider-smoke.sh
