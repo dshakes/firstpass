@@ -228,6 +228,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "What is 6 * 7?")],
             max_tokens: 64,
             tools: Value::Null,
+            raw: Value::Null,
         }
     }
 
