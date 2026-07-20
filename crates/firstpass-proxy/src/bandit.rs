@@ -74,12 +74,12 @@ impl ContextBucket {
 /// Per-(context, rung) gate-verdict counts. Abstain is excluded (see module doc).
 #[derive(Debug, Default, Clone)]
 struct ArmCounts {
-    pass: u64,
-    fail: u64,
+    pass: f64,
+    fail: f64,
 }
 
 impl ArmCounts {
-    fn n(&self) -> u64 {
+    fn n(&self) -> f64 {
         self.pass + self.fail
     }
 }
@@ -91,23 +91,180 @@ impl ArmCounts {
 /// `AdaptiveConformal` — both are per-process, in-memory, low-contention).
 #[derive(Debug)]
 pub struct StartRungBandit {
-    /// UCB1 exploration constant `c` ≥ 0.
+    /// UCB1 exploration constant `c` ≥ 0 (used by [`Algorithm::Ucb1`]).
     exploration: f64,
     /// Cold-start threshold: contexts with fewer total observations return rung 0.
     min_observations: usize,
+    /// Selection algorithm: deterministic UCB1 (auditable) or Thompson sampling (stochastic,
+    /// native propensities, better under non-stationarity with `discount < 1`).
+    algorithm: Algorithm,
+    /// Per-observation multiplicative decay of a context's counts, in `(0, 1]`. `1.0` = no
+    /// forgetting (stationary). Applied on every observe, so a context that stops matching
+    /// reality fades at rate `discount^n` (discounted Thompson sampling).
+    discount: f64,
+    /// xorshift64* PRNG state for Thompson draws (seeded once; deterministic in tests).
+    rng: u64,
     /// context → (rung index → counts).
     data: HashMap<ContextBucket, HashMap<u32, ArmCounts>>,
 }
 
+/// Start-rung selection algorithm.
+/// Monte-Carlo repetitions for the Thompson propensity estimate.
+const PROPENSITY_SAMPLES: usize = 64;
+
+/// The expected-cost argmin over candidate start rungs, shared by UCB1 and Thompson: walk the
+/// ladder from each candidate start, accumulating `P(reach r) · price(r)` with
+/// `P(reach r+1) = P(reach r) · (1 − p_pass(r))`. Ties prefer the lower start (conservative).
+fn argmin_expected_cost(
+    ladder: &[String],
+    prices: &PriceTable,
+    mut p_pass: impl FnMut(u32) -> f64,
+) -> u32 {
+    // ponytail: nominal 1 000 in / 500 out — relative prices are what matters for start-rung
+    // selection; absolute spend is immaterial here.
+    const NOMINAL_IN: u64 = 1_000;
+    const NOMINAL_OUT: u64 = 500;
+
+    let mut best_s = 0u32;
+    let mut best_cost = f64::MAX;
+    for s in 0..ladder.len() {
+        let mut expected_cost = 0.0_f64;
+        let mut p_reach = 1.0_f64;
+        for (r, model) in ladder.iter().enumerate().skip(s) {
+            let price = prices
+                .get(model)
+                .map(|p| p.cost(NOMINAL_IN, NOMINAL_OUT))
+                .unwrap_or(0.0);
+            expected_cost += p_reach * price;
+            p_reach *= 1.0 - p_pass(r as u32);
+            if p_reach < 1e-10 {
+                break;
+            }
+        }
+        if expected_cost < best_cost {
+            best_cost = expected_cost;
+            best_s = s as u32;
+        }
+    }
+    best_s
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Algorithm {
+    /// Deterministic optimism (Auer et al. 2002): auditable, but propensities are degenerate
+    /// (0/1) — off-policy estimates then need the epsilon-greedy overlay.
+    #[default]
+    Ucb1,
+    /// Thompson sampling over Beta posteriors of gate-pass: stochastic by nature, so every
+    /// decision carries a non-degenerate propensity (Monte-Carlo estimated), and `discount`
+    /// handles model churn (Chapelle & Li 2011; discounted TS for non-stationarity).
+    Thompson,
+}
+
 impl StartRungBandit {
-    /// Create a new bandit with the given cold-start and exploration settings.
+    /// Create a new UCB1 bandit with the given cold-start and exploration settings.
     #[must_use]
     pub fn new(min_observations: usize, exploration: f64) -> Self {
+        Self::with_algorithm(min_observations, exploration, Algorithm::Ucb1, 1.0, 0x9E37)
+    }
+
+    /// Create a bandit with an explicit algorithm, discount, and PRNG seed (seed matters only
+    /// for [`Algorithm::Thompson`]; pass anything non-zero).
+    #[must_use]
+    pub fn with_algorithm(
+        min_observations: usize,
+        exploration: f64,
+        algorithm: Algorithm,
+        discount: f64,
+        seed: u64,
+    ) -> Self {
         Self {
             exploration,
             min_observations,
+            algorithm,
+            discount: discount.clamp(f64::MIN_POSITIVE, 1.0),
+            rng: seed.max(1),
             data: HashMap::new(),
         }
+    }
+
+    /// Apply one step of multiplicative forgetting to every arm in `ctx` (no-op at 1.0).
+    fn discount_context(&mut self, ctx: &ContextBucket) {
+        if self.discount >= 1.0 {
+            return;
+        }
+        if let Some(arms) = self.data.get_mut(ctx) {
+            for c in arms.values_mut() {
+                c.pass *= self.discount;
+                c.fail *= self.discount;
+            }
+        }
+    }
+
+    /// Next xorshift64* draw as a uniform in `[0, 1)`.
+    fn next_u01(&mut self) -> f64 {
+        let mut x = self.rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng = x;
+        let v = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        (v >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Standard normal via Box–Muller on the internal PRNG.
+    fn next_normal(&mut self) -> f64 {
+        let u1 = self.next_u01().max(f64::MIN_POSITIVE);
+        let u2 = self.next_u01();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    /// Gamma(shape ≥ 1, scale 1) sample — Marsaglia–Tsang squeeze method.
+    fn next_gamma(&mut self, shape: f64) -> f64 {
+        debug_assert!(shape >= 1.0, "Beta(+1 prior) keeps shapes >= 1");
+        let d = shape - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+        loop {
+            let x = self.next_normal();
+            let v = (1.0 + c * x).powi(3);
+            if v <= 0.0 {
+                continue;
+            }
+            let u = self.next_u01();
+            if u < 1.0 - 0.0331 * x.powi(4) || u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+                return d * v;
+            }
+        }
+    }
+
+    /// One Beta(pass+1, fail+1) posterior draw of the gate-pass probability for `(ctx, rung)`.
+    /// Unobserved arms draw from the uniform prior Beta(1, 1).
+    fn thompson_pass(&mut self, ctx: &ContextBucket, rung: u32) -> f64 {
+        let (a, b) = self
+            .data
+            .get(ctx)
+            .and_then(|arms| arms.get(&rung))
+            .map_or((1.0, 1.0), |c| (c.pass + 1.0, c.fail + 1.0));
+        let x = self.next_gamma(a);
+        let y = self.next_gamma(b);
+        x / (x + y)
+    }
+
+    /// Posterior-mean gate-pass estimate for `(ctx, rung)` — `None` when the context is cold
+    /// (below `min_observations`) or the arm is unobserved. Deterministic; used by the
+    /// speculative-deferral band, never for serving decisions.
+    #[must_use]
+    pub fn pass_estimate(&self, ctx: &ContextBucket, rung: u32) -> Option<f64> {
+        let arms = self.data.get(ctx)?;
+        let total: f64 = arms.values().map(ArmCounts::n).sum();
+        if total < self.min_observations as f64 {
+            return None;
+        }
+        let c = arms.get(&rung)?;
+        if c.n() == 0.0 {
+            return None;
+        }
+        Some((c.pass + 1.0) / (c.n() + 2.0))
     }
 
     /// Record a gate verdict for `(context, rung)`.
@@ -117,20 +274,22 @@ impl StartRungBandit {
         match verdict {
             Verdict::Abstain => {} // not counted
             Verdict::Pass => {
+                self.discount_context(ctx);
                 self.data
                     .entry(ctx.clone())
                     .or_default()
                     .entry(rung)
                     .or_default()
-                    .pass += 1;
+                    .pass += 1.0;
             }
             Verdict::Fail => {
+                self.discount_context(ctx);
                 self.data
                     .entry(ctx.clone())
                     .or_default()
                     .entry(rung)
                     .or_default()
-                    .fail += 1;
+                    .fail += 1.0;
             }
         }
     }
@@ -145,11 +304,11 @@ impl StartRungBandit {
         let Some(counts) = arms.get(&rung) else {
             return 1.0; // rung unobserved for this context: fully optimistic
         };
-        let n = counts.n() as f64;
+        let n = counts.n();
         if n == 0.0 {
             return 1.0;
         }
-        let p_hat = counts.pass as f64 / n;
+        let p_hat = counts.pass / n;
         (p_hat + self.exploration * (ln_n / n).sqrt()).clamp(0.0, 1.0)
     }
 
@@ -168,54 +327,68 @@ impl StartRungBandit {
         }
 
         // Cold-start guard: total gate observations in this context.
-        let n_total: u64 = self
+        let n_total: f64 = self
             .data
             .get(ctx)
             .map(|arms| arms.values().map(ArmCounts::n).sum())
-            .unwrap_or(0);
-        if (n_total as usize) < self.min_observations {
+            .unwrap_or(0.0);
+        if n_total < self.min_observations as f64 {
             return 0;
         }
 
-        // ponytail: nominal 1 000 in / 500 out — relative prices are what matters for start-rung
-        // selection; absolute spend is immaterial here.
-        const NOMINAL_IN: u64 = 1_000;
-        const NOMINAL_OUT: u64 = 500;
+        let ln_n = n_total.ln();
+        argmin_expected_cost(ladder, prices, |r| self.ucb_pass(ctx, r, ln_n))
+    }
 
-        let ln_n = (n_total as f64).ln();
-
-        let mut best_s = 0u32;
-        let mut best_cost = f64::MAX;
-
-        for s in 0..top {
-            let mut expected_cost = 0.0_f64;
-            let mut p_reach = 1.0_f64; // probability of reaching rung r given start s
-
-            for (r, model) in ladder.iter().enumerate().skip(s) {
-                let price = prices
-                    .get(model)
-                    .map(|p| p.cost(NOMINAL_IN, NOMINAL_OUT))
-                    .unwrap_or(0.0);
-
-                expected_cost += p_reach * price;
-
-                let p_pass = self.ucb_pass(ctx, r as u32, ln_n);
-                p_reach *= 1.0 - p_pass;
-
-                // Early exit: negligible reach probability — cost contribution < floating noise.
-                if p_reach < 1e-10 {
-                    break;
-                }
-            }
-
-            // Tie → lower s (conservative: prefer rung 0 on equal expected cost).
-            if expected_cost < best_cost {
-                best_cost = expected_cost;
-                best_s = s as u32;
-            }
+    /// Choose the start rung and its selection propensity.
+    ///
+    /// - [`Algorithm::Ucb1`]: deterministic — returns `(choice, None)`; the epsilon-greedy
+    ///   overlay (if configured) supplies the logged propensity, exactly as before.
+    /// - [`Algorithm::Thompson`]: one posterior draw per rung drives the same expected-cost
+    ///   argmin as UCB1 (the decision), and the propensity is Monte-Carlo estimated by
+    ///   re-running the draw `PROPENSITY_SAMPLES` times — the standard estimator for TS
+    ///   selection probabilities (exact computation is analytically intractable). Cold-start
+    ///   contexts return `(0, None)` (deterministic, no propensity to log).
+    #[must_use]
+    pub fn choose_start_with_propensity(
+        &mut self,
+        ctx: &ContextBucket,
+        ladder: &[String],
+        prices: &PriceTable,
+    ) -> (u32, Option<f64>) {
+        if self.algorithm == Algorithm::Ucb1 {
+            return (self.choose_start(ctx, ladder, prices), None);
+        }
+        let top = ladder.len();
+        if top == 0 {
+            return (0, None);
+        }
+        let n_total: f64 = self
+            .data
+            .get(ctx)
+            .map(|arms| arms.values().map(ArmCounts::n).sum())
+            .unwrap_or(0.0);
+        if n_total < self.min_observations as f64 {
+            return (0, None);
         }
 
-        best_s
+        let draw = |this: &mut Self| {
+            // One full posterior draw per rung, then the shared cost argmin.
+            let samples: Vec<f64> = (0..top)
+                .map(|r| this.thompson_pass(ctx, r as u32))
+                .collect();
+            argmin_expected_cost(ladder, prices, |r| samples[r as usize])
+        };
+
+        let choice = draw(self);
+        let matches = (0..PROPENSITY_SAMPLES)
+            .filter(|_| draw(self) == choice)
+            .count();
+        // Clamp away 0: the MC estimate can miss a genuinely-possible arm in finite samples,
+        // and a zero propensity would blow up IPS. 1/(2·M) is the standard floor.
+        let p = (matches as f64 / PROPENSITY_SAMPLES as f64)
+            .max(1.0 / (2.0 * PROPENSITY_SAMPLES as f64));
+        (choice, Some(p))
     }
 
     /// Feed all attempts from a stored trace into this bandit — used for warm-start at startup.
@@ -481,5 +654,129 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn beta_sampler_mean_matches_posterior_mean() {
+        let mut b = StartRungBandit::with_algorithm(0, 1.0, Algorithm::Thompson, 1.0, 0xDEADBEEF);
+        // Beta(8, 2): mean 0.8. 4000 draws give a tight empirical mean.
+        let ctx = ctx_code();
+        for _ in 0..7 {
+            b.observe(&ctx, 0, Verdict::Pass);
+        }
+        b.observe(&ctx, 0, Verdict::Fail);
+        // counts: pass 7, fail 1 → Beta(8, 2), mean 0.8.
+        let mean: f64 = (0..4000).map(|_| b.thompson_pass(&ctx, 0)).sum::<f64>() / 4000.0;
+        assert!(
+            (mean - 0.8).abs() < 0.03,
+            "Beta(8,2) sample mean should be ~0.8, got {mean}"
+        );
+        // Unobserved arm = Beta(1,1) uniform, mean 0.5.
+        let mean_u: f64 = (0..4000).map(|_| b.thompson_pass(&ctx, 5)).sum::<f64>() / 4000.0;
+        assert!(
+            (mean_u - 0.5).abs() < 0.03,
+            "uniform prior mean ~0.5, got {mean_u}"
+        );
+    }
+
+    #[test]
+    fn thompson_converges_to_skipping_a_hopeless_cheap_rung() {
+        let mut b = StartRungBandit::with_algorithm(10, 1.0, Algorithm::Thompson, 1.0, 42);
+        let ctx = ctx_code();
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let prices = PriceTable::defaults();
+        // Rung 0 always fails, rung 1 always passes → starting at 1 is cheaper in expectation.
+        for _ in 0..80 {
+            b.observe(&ctx, 0, Verdict::Fail);
+            b.observe(&ctx, 1, Verdict::Pass);
+        }
+        let picks_rung1 = (0..100)
+            .filter(|_| b.choose_start_with_propensity(&ctx, &ladder, &prices).0 == 1)
+            .count();
+        assert!(
+            picks_rung1 >= 90,
+            "TS should overwhelmingly skip the hopeless cheap rung, picked rung 1 {picks_rung1}/100"
+        );
+    }
+
+    #[test]
+    fn discounting_adapts_after_a_distribution_flip() {
+        let ctx = ctx_code();
+        // History: rung 0 failed 200 times. Then the world flips: 40 recent passes.
+        let feed = |b: &mut StartRungBandit| {
+            for _ in 0..200 {
+                b.observe(&ctx, 0, Verdict::Fail);
+            }
+            for _ in 0..40 {
+                b.observe(&ctx, 0, Verdict::Pass);
+            }
+        };
+        let mut discounted = StartRungBandit::with_algorithm(10, 1.0, Algorithm::Thompson, 0.95, 7);
+        let mut undiscounted =
+            StartRungBandit::with_algorithm(10, 1.0, Algorithm::Thompson, 1.0, 7);
+        feed(&mut discounted);
+        feed(&mut undiscounted);
+        let p_disc = discounted.pass_estimate(&ctx, 0).unwrap();
+        let p_flat = undiscounted.pass_estimate(&ctx, 0).unwrap();
+        assert!(
+            p_disc > 0.7 && p_flat < 0.25,
+            "discounted tracks the flip (got {p_disc:.2}), undiscounted lags (got {p_flat:.2})"
+        );
+    }
+
+    #[test]
+    fn thompson_propensity_matches_empirical_selection_frequency() {
+        let mut b = StartRungBandit::with_algorithm(10, 1.0, Algorithm::Thompson, 1.0, 99);
+        let ctx = ctx_code();
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let prices = PriceTable::defaults();
+        // Ambiguous data: rung 0 passes ~half the time → genuinely stochastic selection.
+        for _ in 0..20 {
+            b.observe(&ctx, 0, Verdict::Pass);
+            b.observe(&ctx, 0, Verdict::Fail);
+            b.observe(&ctx, 1, Verdict::Pass);
+        }
+        // Empirical frequency of each choice over many decisions vs the logged propensity.
+        let mut freq = std::collections::HashMap::new();
+        let mut props: Vec<(u32, f64)> = Vec::new();
+        for _ in 0..400 {
+            let (c, p) = b.choose_start_with_propensity(&ctx, &ladder, &prices);
+            *freq.entry(c).or_insert(0u32) += 1;
+            props.push((c, p.expect("thompson always logs a propensity")));
+        }
+        for (arm, count) in freq {
+            let empirical = f64::from(count) / 400.0;
+            let mean_logged: f64 = {
+                let logged: Vec<f64> = props
+                    .iter()
+                    .filter(|(c, _)| *c == arm)
+                    .map(|(_, p)| *p)
+                    .collect();
+                logged.iter().sum::<f64>() / logged.len() as f64
+            };
+            assert!(
+                (empirical - mean_logged).abs() < 0.15,
+                "arm {arm}: empirical {empirical:.2} vs logged propensity {mean_logged:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn pass_estimate_cold_and_warm() {
+        let mut b = StartRungBandit::with_algorithm(10, 1.0, Algorithm::Thompson, 1.0, 5);
+        let ctx = ctx_code();
+        assert!(
+            b.pass_estimate(&ctx, 0).is_none(),
+            "cold context: no estimate"
+        );
+        for _ in 0..12 {
+            b.observe(&ctx, 0, Verdict::Pass);
+        }
+        let p = b.pass_estimate(&ctx, 0).expect("warm");
+        assert!(p > 0.85, "12/12 passes: posterior mean high, got {p}");
+        assert!(
+            b.pass_estimate(&ctx, 3).is_none(),
+            "unobserved arm: no estimate"
+        );
     }
 }

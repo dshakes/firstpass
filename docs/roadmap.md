@@ -59,9 +59,10 @@ streaming — receipts intact, zero fidelity loss, measured not asserted.
 Adopt the strongest published techniques, then benchmark against the strongest published
 baseline.
 
-- [ ] Contextual Thompson sampling (with discounting) for the start-rung: native
-      non-degenerate propensities (clean off-policy estimates), non-stationarity handling
-      under model churn, persistent state keyed by ladder identity.
+- [x] Thompson sampling (with discounting) for the start-rung (`algorithm = "thompson"`,
+      ADR 0007): native Monte-Carlo propensities (clean off-policy estimates without the
+      epsilon overlay), geometric forgetting for model churn. Receipts remain the durable
+      state (warm-start on boot). Default stays `ucb1` until a live A/B promotes it.
 - [ ] Per-rung P(gate-pass | features) prediction rather than a single difficulty scalar.
 - [x] Learn-then-Test threshold calibration (`--method ltt` in `firstpass calibrate`):
       distribution-free finite-sample risk control via fixed-sequence exact-binomial testing
@@ -74,8 +75,9 @@ baseline.
       (an imperfect verifier inverse-scales — bounded use is a feature, not a limit).
 - [ ] Joint (rung, sample-count) routing: cheap model + k-sample agreement often dominates
       escalation on the easy/medium slice, and the gate makes exploiting that safe.
-- [ ] Speculative deferral: prefetch the next rung only in the marginal serve-probability
-      band, under a latency SLA.
+- [x] Speculative deferral: `speculation_band = [low, high]` — prefetch fires only when the
+      bandit's gate-pass estimate is in the marginal zone; confident requests run serial and
+      keep the tokens (`firstpass_speculation_skipped_total`).
 - [x] Doubly-robust estimator alongside IPS/SNIPS in `firstpass ope`.
 - [ ] Reproducible benchmark vs the unified routing+cascading policy from the literature,
       including a drift scenario in which the bound must hold.
