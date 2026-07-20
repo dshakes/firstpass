@@ -3,6 +3,13 @@
 #   FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml \
 #   cargo run -p firstpass-proxy
 #
+# Inbound endpoints (SPEC §M1):
+#   POST /v1/messages            — Anthropic-compatible (Claude API clients)
+#   POST /v1/chat/completions    — OpenAI-compatible (OpenAI SDK clients, any tool that speaks Chat Completions)
+# Both endpoints share the same routing config, escalation engine, and gates. Observe mode
+# forwards byte-identical to the matching upstream; enforce mode translates as needed and
+# renders the result back in the caller's wire dialect.
+#
 # Routes are matched top-to-bottom; the first match wins. Each route binds a slice
 # of traffic to a mode, a model ladder (cheapest first), and the gates that must pass.
 

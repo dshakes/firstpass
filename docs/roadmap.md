@@ -44,7 +44,7 @@ must route that traffic, not fall back around it.
 - [ ] Full tool/multimodal round-trip through the ladder; `enforce_structured` default-on
       once fidelity-tested.
 - [ ] True SSE streaming on the enforce path (stream the winning rung; no buffer-then-replay).
-- [ ] OpenAI-compatible inbound endpoint (`/v1/chat/completions`) alongside the Anthropic
+- [x] OpenAI-compatible inbound endpoint (`/v1/chat/completions`) alongside the Anthropic
       one (SPEC §M1).
 - [ ] Per-provider live smoke tests in CI (key-gated, cents/day); provider badges flip to
       verified only on CI green.

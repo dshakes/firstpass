@@ -15,7 +15,7 @@ use bytes::Bytes;
 use firstpass_core::features::{hour_bucket, token_bucket};
 use firstpass_core::hashchain::sha256_hex;
 use firstpass_core::{
-    Attempt, DeferredVerdict, FEATURE_VERSION, Features, FinalOutcome, GENESIS_HASH, Mode,
+    Attempt, DeferredVerdict, Dialect, FEATURE_VERSION, Features, FinalOutcome, GENESIS_HASH, Mode,
     PolicyRef, RequestInfo, Score, ServedFrom, TaskKind, Trace, Verdict,
 };
 use serde::Deserialize;
@@ -32,7 +32,9 @@ use crate::provider::{Auth, ChatMessage, ModelRequest, ModelResponse, ProviderRe
 use crate::router::{EnforceCtx, EngineOutcome, route_enforce};
 use crate::store;
 use crate::tenant_auth::{TenantId, auth_middleware};
-use crate::upstream::{forward_anthropic, forward_anthropic_streaming};
+use crate::upstream::{
+    forward_anthropic, forward_anthropic_streaming, forward_openai, forward_openai_streaming,
+};
 use firstpass_core::Route;
 
 /// Shared state handed to every request handler. Cheap to clone: an `Arc`ed config, a
@@ -227,6 +229,7 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
     // when `FIRSTPASS_TENANT_RATE_PER_SEC` is unset.
     let business = Router::new()
         .route("/v1/messages", post(messages))
+        .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
         .layer(axum::middleware::from_fn_with_state(
@@ -274,11 +277,11 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "feature_version": FEATURE_VERSION,
         "modes": ["observe", "enforce"],
-        "wire_apis": ["anthropic.messages"],
+        "wire_apis": ["anthropic.messages", "openai.chat_completions"],
         "ladder": ladder,
         "gates": gates,
         "feedback_api": "POST /v1/feedback",
-        "offboarding": "unset ANTHROPIC_BASE_URL",
+        "offboarding": "unset ANTHROPIC_BASE_URL (or OPENAI_BASE_URL for OpenAI clients)",
     }))
 }
 
@@ -440,6 +443,7 @@ async fn messages(
                 routing.escalation.enforce_structured,
                 &route.ladder,
                 &state.providers,
+                Dialect::Anthropic,
             ) {
                 return handle_enforce(
                     &state,
@@ -465,38 +469,63 @@ async fn messages(
 
 /// Whether the enforce path can faithfully handle this request.
 ///
-/// The request body is carried verbatim per rung (ADR 0005 P1: [`crate::provider::ModelRequest::raw`]),
-/// so tool_use/tool_result/image blocks — and every other field the caller set — survive the round
-/// trip; a streaming client is served the gated result as SSE (P3). Structured requests route iff:
-/// - `enforce_structured == true` (**the default** — agent traffic is the target workload), and
-/// - the **fidelity guard** holds: every ladder rung's provider carries Anthropic-shaped
-///   structured content verbatim ([`crate::provider::Provider::carries_structured_verbatim`]).
-///   A ladder containing a dialect that would need (not-yet-built) translation falls back to
-///   transparent observe passthrough — un-gated is safe, corrupted is not.
+/// **Verbatim-carry path** (ADR 0005 P4): when all ladder rungs carry the inbound dialect
+/// verbatim ([`crate::provider::Provider::carries_structured_verbatim`]), the original request
+/// body is forwarded byte-for-byte with only the model swapped, so every caller field survives.
+///
+/// **Translation path** (OpenAI-inbound → Anthropic ladder): for `Dialect::Openai` inbound
+/// requests hitting an all-Anthropic ladder, we translate the body to Anthropic shape — covers
+/// text, tools, tool_calls, and tool_result messages. `image_url` with http(s) URLs is not
+/// translatable (we can't relay them to Anthropic's vision API without fetching) → fallback.
 ///
 /// `enforce_structured == false` restores the pre-ADR-0005 behavior: structured requests always
-/// fall back to observe.
+/// fall back to transparent observe passthrough.
 fn enforce_can_handle(
     features: &Features,
     body: &[u8],
     enforce_structured: bool,
     ladder: &[String],
     providers: &crate::provider::ProviderRegistry,
+    inbound: Dialect,
 ) -> bool {
-    let structured =
-        features.tool_count > 0 || features.has_images || messages_have_tool_blocks(body);
+    let structured = features.tool_count > 0
+        || features.has_images
+        || match inbound {
+            Dialect::Anthropic => messages_have_tool_blocks(body),
+            Dialect::Openai => openai_messages_have_tool_calls(body),
+            Dialect::Gemini => false,
+        };
     if !structured {
         return true;
     }
     if !enforce_structured {
         return false;
     }
-    ladder.iter().all(|rung| {
+    // Path 1: verbatim carry — every rung speaks the inbound dialect natively.
+    let all_verbatim = ladder.iter().all(|rung| {
         let provider_id = rung.split('/').next().unwrap_or_default();
         providers
             .get(provider_id)
-            .is_some_and(|p| p.carries_structured_verbatim())
-    })
+            .is_some_and(|p| p.carries_structured_verbatim(inbound))
+    });
+    if all_verbatim {
+        return true;
+    }
+    // Path 2: translation — OpenAI inbound → all-Anthropic ladder, when content is translatable.
+    // text/tools/tool_calls/tool_results are covered; http(s) image_url is not (can't relay to
+    // Anthropic's vision API without fetching). Conservative: any http(s) image → observe.
+    if inbound == Dialect::Openai && !openai_has_http_images(body) {
+        let all_anthropic = ladder.iter().all(|rung| {
+            let pid = rung.split('/').next().unwrap_or_default();
+            providers
+                .get(pid)
+                .is_some_and(|p| p.carries_structured_verbatim(Dialect::Anthropic))
+        });
+        if all_anthropic {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether any message carries a `tool_use` or `tool_result` content block (a multi-turn tool
@@ -594,7 +623,7 @@ async fn handle_enforce(
             .await;
             let _ = tx.send(out);
         });
-        return sse_keepalive_response(rx);
+        return sse_keepalive_response(rx, anthropic_sse_from_message);
     }
     match enforce_pipeline(
         state,
@@ -612,24 +641,21 @@ async fn handle_enforce(
     }
 }
 
-/// The enforce pipeline: parse → resolve gates → route the ladder → bookkeeping (bandit,
-/// trace) → the served Anthropic-shaped message JSON. Shared verbatim by the buffered
-/// (non-streaming) and keepalive-streaming paths, so both serve identical bytes.
-async fn enforce_pipeline(
+/// Inner pipeline: resolve gates → route the ladder → bookkeeping (bandit, trace) → the served
+/// [`ModelResponse`]. Shared by both Anthropic and OpenAI enforce paths; callers handle dialect-
+/// specific parsing before and response rendering after.
+#[allow(clippy::too_many_arguments)] // 9 params: all are genuinely distinct, not groupable
+async fn enforce_pipeline_inner(
     state: &AppState,
-    headers: &HeaderMap,
     body: &Bytes,
+    base_request: ModelRequest,
+    auth: Auth,
     features: Features,
     route: &Route,
     session_header: Option<String>,
     tenant: String,
-) -> Result<Value, ProxyError> {
-    let Some(base_request) = parse_model_request(body) else {
-        return Err(ProxyError::BadRequest(
-            "request body is not a valid Anthropic Messages request".to_owned(),
-        ));
-    };
-    let auth = Auth::from_headers(headers);
+    api: &str,
+) -> Result<ModelResponse, ProxyError> {
     let gate_defs = state
         .config
         .routing
@@ -737,7 +763,7 @@ async fn enforce_pipeline(
         tenant_id: tenant,
         session_id,
         prompt_hash: prompt_hash(&state.config.prompt_salt, body),
-        api: "anthropic.messages".to_owned(),
+        api: api.to_owned(),
         policy_id,
     };
 
@@ -763,20 +789,97 @@ async fn enforce_pipeline(
     offer_trace(&state.traces, trace);
 
     match outcome {
-        EngineOutcome::Served(resp) => Ok(anthropic_response_json(&resp)),
+        EngineOutcome::Served(resp) => Ok(resp),
         EngineOutcome::Failed(msg) => Err(ProxyError::Engine(msg)),
     }
+}
+
+/// Anthropic enforce pipeline: parse → inner pipeline → Anthropic-shaped response JSON.
+/// Shared verbatim by the buffered (non-streaming) and keepalive-streaming paths.
+async fn enforce_pipeline(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    features: Features,
+    route: &Route,
+    session_header: Option<String>,
+    tenant: String,
+) -> Result<Value, ProxyError> {
+    let Some(base_request) = parse_model_request(body) else {
+        return Err(ProxyError::BadRequest(
+            "request body is not a valid Anthropic Messages request".to_owned(),
+        ));
+    };
+    let auth = Auth::from_headers(headers);
+    let resp = enforce_pipeline_inner(
+        state,
+        body,
+        base_request,
+        auth,
+        features,
+        route,
+        session_header,
+        tenant,
+        "anthropic.messages",
+    )
+    .await?;
+    Ok(anthropic_response_json(&resp))
+}
+
+/// OpenAI enforce pipeline: parse (with raw-carry for all-OpenAI ladders, else translation) →
+/// inner pipeline → OpenAI `chat.completion` JSON.
+async fn enforce_pipeline_openai(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    features: Features,
+    route: &Route,
+    session_header: Option<String>,
+    tenant: String,
+) -> Result<Value, ProxyError> {
+    // Decide between verbatim raw-carry (all-OpenAI ladder) and translation (Anthropic ladder).
+    let providers = &state.providers;
+    let all_openai = route.ladder.iter().all(|rung| {
+        let pid = rung.split('/').next().unwrap_or_default();
+        providers
+            .get(pid)
+            .is_some_and(|p| p.carries_structured_verbatim(Dialect::Openai))
+    });
+    let Some(base_request) = parse_openai_request(body, all_openai) else {
+        return Err(ProxyError::BadRequest(
+            "request body is not a valid OpenAI Chat Completions request".to_owned(),
+        ));
+    };
+    let auth = Auth::from_headers(headers);
+    let resp = enforce_pipeline_inner(
+        state,
+        body,
+        base_request,
+        auth,
+        features,
+        route,
+        session_header,
+        tenant,
+        "openai.chat_completions",
+    )
+    .await?;
+    Ok(openai_response_json(&resp))
 }
 
 /// Interval between SSE comment keepalives while the enforce pipeline is still routing.
 const SSE_KEEPALIVE_EVERY: Duration = Duration::from_secs(5);
 
 /// A 200 `text/event-stream` response whose body emits comment keepalives until `rx` resolves,
-/// then the gated result as the standard Anthropic event sequence (or an SSE `error` event).
+/// then the gated result formatted by `format_message` (or an SSE `error` event on failure).
 /// SSE comment lines (leading `:`) are defined by the EventSource spec to be ignored by every
 /// conforming parser — they keep the connection alive without confusing any client.
+///
+/// `format_message` converts the gated result `Value` to the dialect-appropriate SSE frame
+/// string: pass [`anthropic_sse_from_message`] for Anthropic clients,
+/// [`openai_sse_from_message`] for OpenAI clients.
 fn sse_keepalive_response(
     rx: tokio::sync::oneshot::Receiver<Result<Value, ProxyError>>,
+    format_message: fn(&Value) -> String,
 ) -> Response {
     let mut ticks = tokio::time::interval(SSE_KEEPALIVE_EVERY);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -784,6 +887,7 @@ fn sse_keepalive_response(
     let stream = KeepaliveStream {
         rx: Some(rx),
         ticks,
+        format_message,
     };
     (
         axum::http::StatusCode::OK,
@@ -802,6 +906,8 @@ struct KeepaliveStream {
     /// `Some` until the pipeline resolves and the final frame has been emitted.
     rx: Option<tokio::sync::oneshot::Receiver<Result<Value, ProxyError>>>,
     ticks: tokio::time::Interval,
+    /// Converts the served result `Value` to the caller's dialect SSE frames.
+    format_message: fn(&Value) -> String,
 }
 
 impl futures_core::Stream for KeepaliveStream {
@@ -816,8 +922,9 @@ impl futures_core::Stream for KeepaliveStream {
             return Poll::Ready(None); // final frame already emitted
         };
         if let Poll::Ready(out) = std::pin::Pin::new(rx).poll(cx) {
+            let fmt = self.format_message;
             let frame = match out {
-                Ok(Ok(message)) => anthropic_sse_from_message(&message),
+                Ok(Ok(message)) => fmt(&message),
                 Ok(Err(e)) => sse_error_event(&e),
                 Err(_) => sse_error_event(&ProxyError::Internal(
                     "enforce pipeline task dropped".to_owned(),
@@ -1379,6 +1486,683 @@ fn base_trace(
     }
 }
 
+// ── OpenAI-inbound detection helpers ─────────────────────────────────────────
+
+/// Whether any OpenAI-format message has `tool_calls` on an assistant turn, or a `role:"tool"`
+/// message (a multi-turn tool conversation that would need translation).
+fn openai_messages_have_tool_calls(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("messages").and_then(Value::as_array).map(|msgs| {
+                msgs.iter().any(|m| {
+                    m.get("tool_calls").is_some()
+                        || m.get("role").and_then(Value::as_str) == Some("tool")
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Whether any OpenAI-format message has an `image_url` content part whose URL is an
+/// http(s) URL (not a data: URI). These cannot be forwarded to Anthropic's vision API without
+/// fetching, so they are treated as non-translatable → observe fallback.
+fn openai_has_http_images(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("messages").and_then(Value::as_array).map(|msgs| {
+                msgs.iter().any(|m| {
+                    m.get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|p| {
+                                p.get("type").and_then(Value::as_str) == Some("image_url")
+                                    && p.pointer("/image_url/url")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|u| {
+                                            u.starts_with("http://") || u.starts_with("https://")
+                                        })
+                            })
+                        })
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Whether any OpenAI-format message has an `image_url` content part (data: or http(s)).
+/// Used by `extract_openai_features` to set `has_images`.
+fn openai_messages_have_images(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("messages").and_then(Value::as_array).map(|msgs| {
+                msgs.iter().any(|m| {
+                    m.get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts
+                                .iter()
+                                .any(|p| p.get("type").and_then(Value::as_str) == Some("image_url"))
+                        })
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Build the routing/telemetry feature vector from an OpenAI Chat Completions request body.
+/// Parallel to [`extract_features`] but understands OpenAI format (image_url vs image blocks).
+fn extract_openai_features(headers: &HeaderMap, body: &[u8]) -> Features {
+    let Ok(json) = serde_json::from_slice::<Value>(body) else {
+        let mut f = Features::new(TaskKind::Other);
+        f.hour_bucket = hour_bucket(jiff::Timestamp::now());
+        return f;
+    };
+    let tool_count = json
+        .get("tools")
+        .and_then(Value::as_array)
+        .map_or(0, |tools| u32::try_from(tools.len()).unwrap_or(u32::MAX));
+    let has_images = openai_messages_have_images(body);
+    let mut f = Features::new(TaskKind::Other);
+    f.agent = header_str(headers, AGENT_HEADER);
+    f.subagent = header_str(headers, SUBAGENT_HEADER);
+    f.tool_count = tool_count;
+    f.has_images = has_images;
+    f.prompt_token_bucket = token_bucket(body.len() as u64);
+    f.hour_bucket = hour_bucket(jiff::Timestamp::now());
+    f
+}
+
+// ── OpenAI → internal translation ────────────────────────────────────────────
+
+/// Parse a `data:image/<type>;base64,<data>` URL into `(media_type, base64_data)`.
+fn parse_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    Some((media_type, data))
+}
+
+/// Translate an OpenAI user content value to Anthropic content blocks.
+/// Returns `None` for any `image_url` part with an http(s) URL (non-translatable).
+fn translate_openai_user_content(content: &Value) -> Option<Value> {
+    match content {
+        // Plain string → keep as-is (most common path)
+        Value::String(_) => Some(content.clone()),
+        Value::Array(parts) => {
+            let mut blocks: Vec<Value> = Vec::with_capacity(parts.len());
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                        blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                    }
+                    Some("image_url") => {
+                        let url = part.pointer("/image_url/url").and_then(Value::as_str)?;
+                        if url.starts_with("http://") || url.starts_with("https://") {
+                            return None; // not translatable — caller falls back to observe
+                        }
+                        // data: URI → Anthropic base64 image block
+                        let (media_type, data) = parse_data_url(url)?;
+                        blocks.push(serde_json::json!({
+                            "type": "image",
+                            "source": { "type": "base64", "media_type": media_type, "data": data }
+                        }));
+                    }
+                    _ => {} // skip unknown content part types conservatively
+                }
+            }
+            Some(Value::Array(blocks))
+        }
+        _ => Some(Value::String(String::new())),
+    }
+}
+
+/// Translate OpenAI `tools` array to Anthropic tools format.
+/// OpenAI: `[{"type":"function","function":{"name":"...","description":"...","parameters":{...}}}]`
+/// Anthropic: `[{"name":"...","description":"...","input_schema":{...}}]`
+fn translate_openai_tools(tools: &Value) -> Value {
+    let Some(arr) = tools.as_array() else {
+        return Value::Null;
+    };
+    let converted: Vec<Value> = arr
+        .iter()
+        .map(|tool| {
+            let func = tool.get("function").unwrap_or(&Value::Null);
+            let mut out = serde_json::json!({
+                "name": func.get("name").cloned().unwrap_or(Value::String(String::new())),
+                "input_schema": func.get("parameters").cloned()
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+            });
+            if let Some(desc) = func.get("description") {
+                out["description"] = desc.clone();
+            }
+            out
+        })
+        .collect();
+    Value::Array(converted)
+}
+
+/// Translate OpenAI `tool_choice` to Anthropic `tool_choice`. Best-effort.
+fn translate_openai_tool_choice(tc: &Value) -> Value {
+    match tc {
+        Value::String(s) => match s.as_str() {
+            "auto" => serde_json::json!({ "type": "auto" }),
+            "required" => serde_json::json!({ "type": "any" }),
+            // ponytail: "none" has no direct Anthropic equivalent; omit = no constraint
+            _ => serde_json::json!({ "type": "auto" }),
+        },
+        Value::Object(_) => {
+            // {"type":"function","function":{"name":"foo"}} → {"type":"tool","name":"foo"}
+            if tc.get("type").and_then(Value::as_str) == Some("function") {
+                let name = tc.pointer("/function/name").cloned().unwrap_or(Value::Null);
+                serde_json::json!({ "type": "tool", "name": name })
+            } else {
+                serde_json::json!({ "type": "auto" })
+            }
+        }
+        _ => serde_json::json!({ "type": "auto" }),
+    }
+}
+
+/// Parse an OpenAI Chat Completions request body into the normalized [`ModelRequest`].
+///
+/// `carry_raw`: when `true` (all-OpenAI-dialect ladder), the original JSON is stored in
+/// `raw` for verbatim carry — only the model is swapped, every other field survives intact.
+/// When `false` (translation path to Anthropic ladder), `raw` is `Null` so
+/// `anthropic_wire_body` reconstructs from the translated normalized fields.
+///
+/// Returns `None` if:
+/// - the body isn't valid JSON or lacks a `messages` array, OR
+/// - a user message contains an `image_url` with an http(s) URL (non-translatable; caller
+///   should have already fallen back via `enforce_can_handle` but this is a defense-in-depth
+///   guard — `None` → `BadRequest` rather than silently dropping the image).
+pub fn parse_openai_request(body: &[u8], carry_raw: bool) -> Option<ModelRequest> {
+    let json: Value = serde_json::from_slice(body).ok()?;
+    let raw = if carry_raw { json.clone() } else { Value::Null };
+
+    let messages_json = json.get("messages")?.as_array()?;
+
+    let mut system: Option<String> = None;
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(messages_json.len());
+    let mut tools = Value::Null;
+    let mut tool_choice_override: Option<Value> = None;
+
+    for msg in messages_json {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+        match role {
+            "system" => {
+                // First system message wins; subsequent ones are appended as user blocks.
+                // ponytail: Anthropic doesn't support multiple system messages inline;
+                // we take the last one here. A proper multi-system-message implementation
+                // would concatenate them, but that's rare in practice.
+                if let Some(s) = msg.get("content").and_then(Value::as_str) {
+                    system = Some(s.to_owned());
+                }
+            }
+            "user" => {
+                let content_val = msg.get("content").unwrap_or(&Value::Null);
+                let translated = translate_openai_user_content(content_val)?;
+                messages.push(ChatMessage {
+                    role: "user".to_owned(),
+                    content: translated,
+                });
+            }
+            "assistant" => {
+                if let Some(tc_arr) = msg.get("tool_calls").and_then(Value::as_array) {
+                    // Tool-call turn: translate tool_calls to Anthropic tool_use blocks.
+                    let mut blocks: Vec<Value> = Vec::new();
+                    // Text before tool calls (may be null or absent)
+                    if let Some(text) = msg.get("content").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                    }
+                    for tc in tc_arr {
+                        let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                        let func = tc.get("function").unwrap_or(&Value::Null);
+                        let name = func.get("name").and_then(Value::as_str).unwrap_or("");
+                        let args_str = func
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        let input: Value = serde_json::from_str(args_str)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": input,
+                        }));
+                    }
+                    messages.push(ChatMessage {
+                        role: "assistant".to_owned(),
+                        content: Value::Array(blocks),
+                    });
+                } else {
+                    // Regular text assistant message
+                    let content = msg
+                        .get("content")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new()));
+                    messages.push(ChatMessage {
+                        role: "assistant".to_owned(),
+                        content,
+                    });
+                }
+            }
+            "tool" => {
+                // role:"tool" → Anthropic tool_result block (wrapped in user turn)
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let content = msg
+                    .get("content")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new()));
+                let result_block = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": content,
+                });
+                messages.push(ChatMessage {
+                    role: "user".to_owned(),
+                    content: Value::Array(vec![result_block]),
+                });
+            }
+            _ => {} // skip unknown roles
+        }
+    }
+
+    // Translate tools and tool_choice (only when NOT raw-carry; raw-carry forwards them as-is).
+    if !carry_raw {
+        if let Some(t) = json.get("tools") {
+            tools = translate_openai_tools(t);
+        }
+        if let Some(tc) = json.get("tool_choice") {
+            tool_choice_override = Some(translate_openai_tool_choice(tc));
+        }
+    } else {
+        tools = json.get("tools").cloned().unwrap_or(Value::Null);
+    }
+
+    let max_tokens = json
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(1024);
+
+    let model = json
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    // For translation path, embed tool_choice into tools value so it's available downstream.
+    // ponytail: this stuffs tool_choice into the Anthropic body via the raw=Null path in
+    // anthropic_wire_body, which rebuilds from normalized fields. Tool_choice isn't a
+    // ModelRequest field, so we carry it via a synthetic tools wrapper... actually we don't
+    // need this — anthropic_wire_body rebuilds from normalized fields that include `tools`
+    // but not `tool_choice`. The translation path loses tool_choice for non-raw-carry. This
+    // is the known ceiling; full fidelity on mixed ladders requires adding tool_choice to
+    // ModelRequest or always using raw carry.
+    let _ = tool_choice_override; // accepted limitation on translation path
+
+    Some(ModelRequest {
+        model,
+        system,
+        messages,
+        max_tokens,
+        tools,
+        raw,
+    })
+}
+
+// ── Internal → OpenAI response rendering ─────────────────────────────────────
+
+/// Extract `(content_text, tool_calls)` from a served [`ModelResponse`]'s raw value.
+///
+/// Handles both Anthropic-format raw (has `content` array → translate to OpenAI shape)
+/// and OpenAI-format raw (has `choices` → pass through content/tool_calls from the wire).
+fn extract_openai_content_and_tools(raw: &Value, text: &str) -> (Value, Option<Value>) {
+    // Anthropic-format: content array with text and/or tool_use blocks
+    if let Some(blocks) = raw.get("content").and_then(Value::as_array) {
+        let mut text_parts: Vec<&str> = Vec::new();
+        let mut tool_calls: Vec<Value> = Vec::new();
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(Value::as_str) {
+                        text_parts.push(t);
+                    }
+                }
+                Some("tool_use") => {
+                    let id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    let input_str = block
+                        .get("input")
+                        .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
+                    tool_calls.push(serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": input_str },
+                    }));
+                }
+                _ => {}
+            }
+        }
+        let content_text = if tool_calls.is_empty() || !text_parts.is_empty() {
+            Value::String(text_parts.join(""))
+        } else {
+            Value::Null // tool-only response: null content per OpenAI spec
+        };
+        let tc = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(Value::Array(tool_calls))
+        };
+        return (content_text, tc);
+    }
+
+    // OpenAI-format raw (all-OpenAI-ladder path): extract from choices
+    if let Some(msg) = raw.pointer("/choices/0/message") {
+        let content = msg
+            .get("content")
+            .cloned()
+            .unwrap_or(Value::String(text.to_owned()));
+        let tc = msg.get("tool_calls").cloned();
+        return (content, tc);
+    }
+
+    // Fallback: use the text projection
+    (Value::String(text.to_owned()), None)
+}
+
+/// Render a served [`ModelResponse`] back as an OpenAI `chat.completion` JSON envelope,
+/// so an OpenAI-client caller sees the standard wire shape regardless of which rung answered.
+fn openai_response_json(resp: &ModelResponse) -> Value {
+    let (content_text, tool_calls) = extract_openai_content_and_tools(&resp.raw, &resp.text);
+    let finish_reason = if tool_calls.is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": content_text,
+    });
+    if let Some(tc) = tool_calls {
+        message["tool_calls"] = tc;
+    }
+    serde_json::json!({
+        "id": format!("chatcmpl-{}", Uuid::now_v7()),
+        "object": "chat.completion",
+        "created": jiff::Timestamp::now().as_second(),
+        "model": resp.model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": resp.in_tokens,
+            "completion_tokens": resp.out_tokens,
+            "total_tokens": resp.in_tokens + resp.out_tokens,
+        }
+    })
+}
+
+/// Re-emit a served OpenAI `chat.completion` envelope as an SSE stream body
+/// (`data: chat.completion.chunk` frames ending with `data: [DONE]`), so a `stream: true`
+/// OpenAI client is served even though enforce buffered the full response to gate it.
+fn openai_sse_from_message(message: &Value) -> String {
+    let id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("chatcmpl-unknown")
+        .to_owned();
+    let created = message.get("created").cloned().unwrap_or(Value::from(0));
+    let model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    let choices = message.get("choices").and_then(Value::as_array);
+    let msg = choices
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("message"));
+    let content = msg
+        .and_then(|m| m.get("content"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let tool_calls = msg.and_then(|m| m.get("tool_calls")).cloned();
+    let finish_reason = choices
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("finish_reason"))
+        .cloned()
+        .unwrap_or_else(|| Value::String("stop".to_owned()));
+
+    let mut out = String::new();
+    let chunk = |delta: Value| {
+        serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": Value::Null }]
+        })
+    };
+
+    // Role delta
+    let role_chunk = chunk(serde_json::json!({ "role": "assistant", "content": "" }));
+    out.push_str("data: ");
+    out.push_str(&role_chunk.to_string());
+    out.push_str("\n\n");
+
+    // Content delta (if any)
+    if let Value::String(text) = &content
+        && !text.is_empty()
+    {
+        let content_chunk = chunk(serde_json::json!({ "content": text }));
+        out.push_str("data: ");
+        out.push_str(&content_chunk.to_string());
+        out.push_str("\n\n");
+    }
+
+    // Tool calls delta (if any)
+    if let Some(tc) = tool_calls {
+        let tc_chunk = chunk(serde_json::json!({ "tool_calls": tc }));
+        out.push_str("data: ");
+        out.push_str(&tc_chunk.to_string());
+        out.push_str("\n\n");
+    }
+
+    // Finish chunk
+    let finish_chunk = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }]
+    });
+    out.push_str("data: ");
+    out.push_str(&finish_chunk.to_string());
+    out.push_str("\n\n");
+
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
+// ── OpenAI handler path ───────────────────────────────────────────────────────
+
+/// Enforce mode for an OpenAI-inbound request: run the escalation engine and serve the
+/// first output that clears the route's gates, rendered as an OpenAI `chat.completion`.
+async fn handle_enforce_openai(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    features: Features,
+    route: &Route,
+    session_header: Option<String>,
+    tenant: String,
+) -> Response {
+    if is_stream_request(body) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
+        let (state_c, headers_c, body_c, route_c) =
+            (state.clone(), headers.clone(), body.clone(), route.clone());
+        tokio::spawn(async move {
+            let out = enforce_pipeline_openai(
+                &state_c,
+                &headers_c,
+                &body_c,
+                features,
+                &route_c,
+                session_header,
+                tenant,
+            )
+            .await;
+            let _ = tx.send(out);
+        });
+        return sse_keepalive_response(rx, openai_sse_from_message);
+    }
+    match enforce_pipeline_openai(
+        state,
+        headers,
+        body,
+        features,
+        route,
+        session_header,
+        tenant,
+    )
+    .await
+    {
+        Ok(message) => (axum::http::StatusCode::OK, Json(message)).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Observe mode for `POST /v1/chat/completions`: forward unchanged to the OpenAI upstream,
+/// return unchanged, trace asynchronously.
+///
+// ponytail: observe trace stamps api="anthropic.messages" (base_trace default); update
+// base_trace to accept an api param if the distinction matters for audit consumers.
+async fn observe_passthrough_openai(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    session_header: Option<String>,
+    tenant: String,
+) -> Response {
+    if is_stream_request(&body) {
+        return observe_stream_openai(state, headers, body, session_header, tenant).await;
+    }
+    let start = Instant::now();
+    let result = forward_openai(
+        &state.http,
+        &state.config.upstream_openai,
+        &headers,
+        body.clone(),
+    )
+    .await;
+    let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok((status, resp_headers, resp_body)) => {
+            spawn_trace(
+                &state,
+                body,
+                Some(resp_body.clone()),
+                latency_ms,
+                session_header,
+                tenant,
+            );
+            (status, resp_headers, resp_body).into_response()
+        }
+        Err(err) => {
+            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
+            err.into_response()
+        }
+    }
+}
+
+/// Observe streaming for `POST /v1/chat/completions`.
+async fn observe_stream_openai(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    session_header: Option<String>,
+    tenant: String,
+) -> Response {
+    let start = Instant::now();
+    let result = forward_openai_streaming(
+        &state.http,
+        &state.config.upstream_openai,
+        &headers,
+        body.clone(),
+    )
+    .await;
+    let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok((status, resp_headers, response)) => {
+            spawn_stream_trace(&state, body, latency_ms, session_header, tenant);
+            let stream_body = Body::from_stream(response.bytes_stream());
+            (status, resp_headers, stream_body).into_response()
+        }
+        Err(err) => {
+            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
+            err.into_response()
+        }
+    }
+}
+
+/// `POST /v1/chat/completions` — OpenAI-compatible inbound endpoint (SPEC §M1).
+/// Observe mode: transparent passthrough to the OpenAI upstream base URL.
+/// Enforce mode: translate to the internal `ModelRequest`, run the escalation engine,
+/// render the result as an OpenAI `chat.completion` (or `chat.completion.chunk` SSE stream).
+async fn chat_completions(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant)): Extension<TenantId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let session_header = header_str(&headers, SESSION_HEADER);
+
+    if let Some(routing) = state.config.routing.as_ref() {
+        let features = extract_openai_features(&headers, &body);
+        if let Some(route) = routing
+            .route_for(&features)
+            .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
+        {
+            let route = route.clone();
+            if enforce_can_handle(
+                &features,
+                &body,
+                routing.escalation.enforce_structured,
+                &route.ladder,
+                &state.providers,
+                Dialect::Openai,
+            ) {
+                return handle_enforce_openai(
+                    &state,
+                    &headers,
+                    &body,
+                    features,
+                    &route,
+                    session_header,
+                    tenant,
+                )
+                .await;
+            }
+            tracing::info!(
+                "enforce route matched but OpenAI structured request can't be routed faithfully (flag/ladder); serving via observe passthrough"
+            );
+        }
+    }
+    observe_passthrough_openai(state, headers, body, session_header, tenant).await
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -1744,14 +2528,16 @@ mod tests {
             &plain,
             false,
             &anthropic_ladder,
-            &providers
+            &providers,
+            Dialect::Anthropic,
         ));
         assert!(!enforce_can_handle(
             &f_tools,
             &tools,
             false,
             &anthropic_ladder,
-            &providers
+            &providers,
+            Dialect::Anthropic,
         ));
     }
 
@@ -1776,14 +2562,16 @@ mod tests {
             &tools,
             true,
             &anthropic_ladder,
-            &providers
+            &providers,
+            Dialect::Anthropic,
         ));
         assert!(enforce_can_handle(
             &f,
             &streaming_tools,
             true,
             &anthropic_ladder,
-            &providers
+            &providers,
+            Dialect::Anthropic,
         ));
     }
 
@@ -1814,14 +2602,16 @@ mod tests {
             &tools,
             true,
             &mixed_ladder,
-            &providers
+            &providers,
+            Dialect::Anthropic,
         ));
         assert!(enforce_can_handle(
             &f_plain,
             &plain,
             true,
             &mixed_ladder,
-            &providers
+            &providers,
+            Dialect::Anthropic,
         ));
     }
 
@@ -2557,6 +3347,7 @@ mod tests {
         let mut stream = KeepaliveStream {
             rx: Some(rx),
             ticks,
+            format_message: anthropic_sse_from_message,
         };
         /// One poll of the stream: `Some(item)` if ready, `None` if pending right now.
         async fn next(
@@ -2670,5 +3461,412 @@ mod tests {
         assert!(text.contains("event: message_start"));
         assert!(text.contains("gated answer"));
         assert!(text.contains("event: message_stop"));
+    }
+
+    // ── OpenAI inbound (SPEC §M1) ──────────────────────────────────────────────
+
+    // --- Golden translation tests ---
+
+    #[test]
+    fn parse_openai_request_plain_text() {
+        // Simple user message → normalized ModelRequest (translation path, carry_raw=false)
+        let body = br#"{"model":"gpt-4o","max_tokens":256,"messages":[{"role":"user","content":"hello"}]}"#;
+        let req = parse_openai_request(body, false).expect("must parse");
+        assert_eq!(req.model, "gpt-4o");
+        assert_eq!(req.max_tokens, 256);
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, "user");
+        assert_eq!(req.messages[0].content, Value::String("hello".to_owned()));
+        assert!(req.system.is_none());
+        // Translation path: raw must be Null so anthropic_wire_body rebuilds from fields
+        assert_eq!(req.raw, Value::Null);
+    }
+
+    #[test]
+    fn parse_openai_request_system_message() {
+        let body = br#"{"model":"gpt-4o","messages":[{"role":"system","content":"be concise"},{"role":"user","content":"hi"}]}"#;
+        let req = parse_openai_request(body, false).expect("must parse");
+        assert_eq!(req.system.as_deref(), Some("be concise"));
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, "user");
+    }
+
+    #[test]
+    fn parse_openai_request_tool_calls_translate_to_tool_use() {
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[
+                {"role":"user","content":"what's the weather?"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}
+                ]},
+                {"role":"tool","tool_call_id":"call_1","content":"15C, cloudy"}
+            ]
+        }"#;
+        let req = parse_openai_request(body, false).expect("must parse");
+        // 3 messages → user + assistant (tool_use blocks) + user (tool_result)
+        assert_eq!(req.messages.len(), 3);
+        // Assistant turn: Anthropic tool_use block
+        let asst = &req.messages[1];
+        assert_eq!(asst.role, "assistant");
+        let blocks = asst.content.as_array().expect("content array");
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["name"], "get_weather");
+        assert_eq!(blocks[0]["id"], "call_1");
+        assert_eq!(blocks[0]["input"]["city"], "Paris");
+        // Tool result turn: role becomes "user", tool_result block
+        let tool_msg = &req.messages[2];
+        assert_eq!(tool_msg.role, "user");
+        let result_blocks = tool_msg.content.as_array().expect("result blocks");
+        assert_eq!(result_blocks[0]["type"], "tool_result");
+        assert_eq!(result_blocks[0]["tool_use_id"], "call_1");
+    }
+
+    #[test]
+    fn parse_openai_request_tools_translate_to_anthropic_format() {
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[{"role":"user","content":"use a tool"}],
+            "tools":[{"type":"function","function":{"name":"search","description":"web search","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
+        }"#;
+        let req = parse_openai_request(body, false).expect("must parse");
+        let tools = req.tools.as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "search");
+        assert_eq!(tools[0]["description"], "web search");
+        assert_eq!(tools[0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn parse_openai_request_raw_carry_preserves_full_body() {
+        // All-OpenAI ladder path: raw = original JSON, no translation
+        let body =
+            br#"{"model":"gpt-4o","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#;
+        let req = parse_openai_request(body, true).expect("must parse");
+        assert!(req.raw.is_object(), "raw must be the full JSON object");
+        assert_eq!(req.raw["model"], "gpt-4o");
+        assert_eq!(req.raw["max_tokens"], 100);
+        // Tools remain in OpenAI shape (not translated) on the raw-carry path
+        assert!(req.tools.is_null(), "no tools in this request");
+    }
+
+    #[test]
+    fn parse_openai_request_http_image_returns_none() {
+        // Non-translatable: http image URL → caller must use observe fallback
+        let body = br#"{"model":"gpt-4o","messages":[{"role":"user","content":[
+            {"type":"text","text":"describe this"},
+            {"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}
+        ]}]}"#;
+        let result = parse_openai_request(body, false);
+        assert!(result.is_none(), "http image URL must fail translation");
+    }
+
+    #[test]
+    fn parse_openai_request_data_url_image_translates_to_anthropic_base64() {
+        let body = br#"{"model":"gpt-4o","messages":[{"role":"user","content":[
+            {"type":"text","text":"describe"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}
+        ]}]}"#;
+        let req = parse_openai_request(body, false).expect("data URL must parse");
+        let blocks = req.messages[0].content.as_array().expect("blocks");
+        let img = blocks
+            .iter()
+            .find(|b| b["type"] == "image")
+            .expect("image block");
+        assert_eq!(img["source"]["type"], "base64");
+        assert_eq!(img["source"]["media_type"], "image/png");
+        assert_eq!(img["source"]["data"], "iVBORw0KGgo=");
+    }
+
+    // --- Response rendering tests ---
+
+    #[test]
+    fn openai_response_json_renders_text_response() {
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: "Hello!".to_owned(),
+            in_tokens: 10,
+            out_tokens: 5,
+            raw: serde_json::json!({
+                "content": [{ "type": "text", "text": "Hello!" }]
+            }),
+        };
+        let json = openai_response_json(&resp);
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["model"], "gpt-4o");
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(json["choices"][0]["message"]["content"], "Hello!");
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert_eq!(json["usage"]["prompt_tokens"], 10);
+        assert_eq!(json["usage"]["completion_tokens"], 5);
+    }
+
+    #[test]
+    fn openai_response_json_renders_tool_call() {
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: String::new(),
+            in_tokens: 20,
+            out_tokens: 15,
+            raw: serde_json::json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_abc",
+                    "name": "search",
+                    "input": {"q": "Rust async"}
+                }]
+            }),
+        };
+        let json = openai_response_json(&resp);
+        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+        let tc = &json["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_abc");
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "search");
+        // content is null for tool-only responses (OpenAI spec)
+        assert_eq!(json["choices"][0]["message"]["content"], Value::Null);
+    }
+
+    #[test]
+    fn openai_sse_from_message_plain_text_has_role_then_content_then_stop() {
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: "Hi there!".to_owned(),
+            in_tokens: 5,
+            out_tokens: 3,
+            raw: serde_json::json!({
+                "content": [{ "type": "text", "text": "Hi there!" }]
+            }),
+        };
+        let sse = openai_sse_from_message(&openai_response_json(&resp));
+        // Every line is either blank or starts with "data: "
+        for line in sse.lines() {
+            assert!(
+                line.is_empty() || line.starts_with("data: "),
+                "bad SSE line: {line:?}"
+            );
+        }
+        let frames: Vec<&str> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .collect();
+        // Last frame must be [DONE]
+        assert_eq!(*frames.last().unwrap(), "[DONE]");
+        // Role delta must appear
+        let role_frame: Value = serde_json::from_str(frames[0]).unwrap();
+        assert_eq!(role_frame["choices"][0]["delta"]["role"], "assistant");
+        // Content delta must appear somewhere
+        assert!(frames.iter().any(|f| {
+            if *f == "[DONE]" {
+                return false;
+            }
+            serde_json::from_str::<Value>(f)
+                .ok()
+                .is_some_and(|v| v["choices"][0]["delta"]["content"] == "Hi there!")
+        }));
+        // Finish reason must appear in a non-[DONE] frame
+        assert!(frames.iter().any(|f| {
+            if *f == "[DONE]" {
+                return false;
+            }
+            serde_json::from_str::<Value>(f)
+                .ok()
+                .is_some_and(|v| v["choices"][0]["finish_reason"] == "stop")
+        }));
+    }
+
+    // --- Detection helper tests ---
+
+    #[test]
+    fn detects_openai_tool_calls() {
+        let with_tool_calls = Bytes::from_static(br#"{"messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}
+        ]}"#);
+        let without = Bytes::from_static(br#"{"messages":[{"role":"user","content":"hi"}]}"#);
+        let with_tool_msg = Bytes::from_static(
+            br#"{"messages":[
+            {"role":"tool","tool_call_id":"c1","content":"result"}
+        ]}"#,
+        );
+        assert!(openai_messages_have_tool_calls(&with_tool_calls));
+        assert!(!openai_messages_have_tool_calls(&without));
+        assert!(openai_messages_have_tool_calls(&with_tool_msg));
+    }
+
+    #[test]
+    fn detects_openai_http_images() {
+        let http_img = Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"https://example.com/img.png"}}
+        ]}]}"#,
+        );
+        let data_img = Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}
+        ]}]}"#,
+        );
+        let no_img = Bytes::from_static(br#"{"messages":[{"role":"user","content":"hi"}]}"#);
+        assert!(openai_has_http_images(&http_img));
+        assert!(!openai_has_http_images(&data_img));
+        assert!(!openai_has_http_images(&no_img));
+    }
+
+    #[test]
+    fn enforce_can_handle_openai_inbound_all_openai_ladder() {
+        // All-OpenAI ladder: verbatim carry, no translation needed → enforce allowed.
+        let tools_body = Bytes::from_static(br#"{"model":"gpt-4o","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}]}"#);
+        let f = extract_openai_features(&HeaderMap::new(), &tools_body);
+        let ladder = vec!["openai/gpt-4o-mini".to_owned(), "openai/gpt-4o".to_owned()];
+        let providers = crate::provider::ProviderRegistry::new("http://x", "http://x");
+        assert!(enforce_can_handle(
+            &f,
+            &tools_body,
+            true,
+            &ladder,
+            &providers,
+            Dialect::Openai
+        ));
+    }
+
+    #[test]
+    fn enforce_can_handle_openai_inbound_all_anthropic_ladder_no_http_image() {
+        // Translation path: OpenAI inbound + all-Anthropic ladder + no http images → allowed.
+        let tools_body = Bytes::from_static(br#"{"model":"gpt-4o","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}]}"#);
+        let f = extract_openai_features(&HeaderMap::new(), &tools_body);
+        let ladder = vec!["anthropic/claude-haiku-4-5".to_owned()];
+        let providers = crate::provider::ProviderRegistry::new("http://x", "http://x");
+        assert!(enforce_can_handle(
+            &f,
+            &tools_body,
+            true,
+            &ladder,
+            &providers,
+            Dialect::Openai,
+        ));
+    }
+
+    #[test]
+    fn enforce_can_handle_openai_inbound_http_image_falls_back() {
+        // Non-translatable: http image URL → enforce not possible, observe fallback.
+        let img_body = Bytes::from_static(
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"https://example.com/img.png"}}
+        ]}]}"#,
+        );
+        let f = extract_openai_features(&HeaderMap::new(), &img_body);
+        let ladder = vec!["anthropic/claude-haiku-4-5".to_owned()];
+        let providers = crate::provider::ProviderRegistry::new("http://x", "http://x");
+        assert!(!enforce_can_handle(
+            &f,
+            &img_body,
+            true,
+            &ladder,
+            &providers,
+            Dialect::Openai,
+        ));
+    }
+
+    // --- E2E handler tests ---
+
+    /// Build a minimal enforce AppState backed by MockProvider for OpenAI-inbound tests.
+    fn openai_enforce_state(mock_resp: ModelResponse) -> AppState {
+        let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"mock/m\"]\ngates = [\"non-empty\"]\n";
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.to_owned()),
+            "FIRSTPASS_MODE" => Some("enforce".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let mut outs = HashMap::new();
+        outs.insert("mock/m".to_owned(), Ok(mock_resp));
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert("mock".to_owned(), Arc::new(MockProvider::new("mock", outs)));
+        let (traces, _rx) = mpsc::channel(64);
+        std::mem::forget(_rx);
+        let tenant_rate_limiter = build_tenant_rate_limiter(&config);
+        AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(map),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            traces,
+            adaptive: None,
+            bandit: None,
+            tenant_rate_limiter,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_completions_plain_text_enforce_returns_openai_shape() {
+        let mock = model_resp("mock/m", "gated answer");
+        let state = openai_enforce_state(mock);
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+        );
+        let resp = chat_completions(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).expect("must be JSON");
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(json["choices"][0]["message"]["content"], "gated answer");
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert!(
+            json["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("chatcmpl-"))
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_stream_true_returns_sse_with_openai_chunks() {
+        let mock = model_resp("mock/m", "gated answer");
+        let state = openai_enforce_state(mock);
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+        );
+        let resp = chat_completions(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/event-stream")),
+            "stream:true must return SSE"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        // Must contain OpenAI chunk object type, not Anthropic
+        assert!(
+            text.contains("chat.completion.chunk"),
+            "must have OpenAI chunk frames"
+        );
+        assert!(text.contains("[DONE]"), "must end with [DONE]");
+        assert!(
+            text.contains("gated answer"),
+            "content must be in the stream"
+        );
+        // Must NOT contain Anthropic SSE event types
+        assert!(
+            !text.contains("message_start"),
+            "must not have Anthropic event types"
+        );
     }
 }

@@ -187,13 +187,21 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// Provider identity, e.g. `"anthropic"`.
     fn id(&self) -> &str;
 
-    /// Whether this provider carries Anthropic-shaped structured content (tool_use / tool_result /
-    /// image blocks and top-level `tools`) **verbatim** on the wire. The enforce path's fidelity
-    /// guard (ADR 0005) only routes structured requests through ladders where every rung's
-    /// provider returns `true`; a dialect that would need translation returns `false` until that
-    /// translation exists — falling back to transparent passthrough is always safe, corrupting a
-    /// tool turn never is.
-    fn carries_structured_verbatim(&self) -> bool {
+    /// Whether this provider carries structured content (tool_use / tool_result / image blocks
+    /// and top-level `tools`) **verbatim** on the wire for the given *inbound* dialect.
+    ///
+    /// - Anthropic-dialect providers (Anthropic / Bedrock / Vertex) return `true` iff
+    ///   `inbound == Dialect::Anthropic`: the raw inbound body is forwarded with only the model
+    ///   swapped, so every caller field — `tools`, `tool_choice`, `thinking`, … — survives
+    ///   intact (ADR 0005 P4).
+    /// - `OpenAiProvider` returns `true` iff `inbound == Dialect::Openai`: same verbatim-carry
+    ///   rule for all-OpenAI-dialect ladders.
+    /// - All other providers (Gemini, unknown) return `false` — no verbatim-carry built yet.
+    ///
+    /// The enforce path's fidelity guard uses this to decide: verbatim-carry path (all rungs
+    /// return `true` for the inbound dialect), translation path (OpenAI → Anthropic when
+    /// content is translatable), or transparent observe passthrough (safe fallback).
+    fn carries_structured_verbatim(&self, _inbound: firstpass_core::Dialect) -> bool {
         false
     }
 }
@@ -274,8 +282,8 @@ impl Provider for AnthropicProvider {
         &self.id
     }
 
-    fn carries_structured_verbatim(&self) -> bool {
-        true
+    fn carries_structured_verbatim(&self, inbound: firstpass_core::Dialect) -> bool {
+        inbound == firstpass_core::Dialect::Anthropic
     }
 
     async fn complete(
@@ -388,17 +396,41 @@ fn anthropic_messages_body(req: &ModelRequest, anthropic_version: &str) -> Value
     body
 }
 
-#[derive(Serialize)]
-struct OpenAiWireMessage<'a> {
-    role: &'a str,
-    content: Value,
-}
-
-#[derive(Serialize)]
-struct OpenAiWireRequest<'a> {
-    model: &'a str,
-    max_tokens: u32,
-    messages: Vec<OpenAiWireMessage<'a>>,
+/// Build the OpenAI Chat Completions wire body for `req`: the original inbound JSON **verbatim**
+/// with only `model` swapped to the rung's wire id and `stream` stripped (analogous to
+/// [`anthropic_wire_body`] for all-OpenAI-dialect ladders). Falls back to the normalized fields
+/// when there is no raw body (synthesized judge/consistency requests, or translation path).
+/// Pure, so fidelity is unit-testable.
+#[must_use]
+pub fn openai_wire_body(req: &ModelRequest) -> Value {
+    if let Value::Object(raw) = &req.raw {
+        let mut body = raw.clone();
+        body.insert(
+            "model".to_owned(),
+            Value::String(wire_model(&req.model).to_owned()),
+        );
+        body.remove("stream");
+        return Value::Object(body);
+    }
+    // Fallback: reconstruct from normalized fields (translation path or synthesized requests).
+    let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
+    if let Some(system) = req.system.as_deref() {
+        messages.push(serde_json::json!({ "role": "system", "content": system }));
+    }
+    messages.extend(
+        req.messages
+            .iter()
+            .map(|m| serde_json::json!({ "role": m.role, "content": m.content })),
+    );
+    let mut body = serde_json::json!({
+        "model": wire_model(&req.model),
+        "max_tokens": req.max_tokens,
+        "messages": messages,
+    });
+    if !req.tools.is_null() {
+        body["tools"] = req.tools.clone();
+    }
+    body
 }
 
 /// Speaks `POST {base}/v1/chat/completions` (OpenAI Chat Completions API).
@@ -426,28 +458,17 @@ impl Provider for OpenAiProvider {
         &self.id
     }
 
+    fn carries_structured_verbatim(&self, inbound: firstpass_core::Dialect) -> bool {
+        inbound == firstpass_core::Dialect::Openai
+    }
+
     async fn complete(
         &self,
         req: &ModelRequest,
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
         let key = resolve_api_key(self.api_key_env.as_deref(), auth.openai_key.as_deref());
-        let mut messages = Vec::with_capacity(req.messages.len() + 1);
-        if let Some(system) = req.system.as_deref() {
-            messages.push(OpenAiWireMessage {
-                role: "system",
-                content: Value::String(system.to_owned()),
-            });
-        }
-        messages.extend(req.messages.iter().map(|m| OpenAiWireMessage {
-            role: &m.role,
-            content: m.content.clone(),
-        }));
-        let body = OpenAiWireRequest {
-            model: wire_model(&req.model),
-            max_tokens: req.max_tokens,
-            messages,
-        };
+        let body = openai_wire_body(req);
 
         let url = format!(
             "{}/v1/chat/completions",
@@ -478,10 +499,11 @@ impl Provider for OpenAiProvider {
         let json: Value =
             serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
 
+        // `content` is null for tool-call-only responses; treat as empty text rather than an error.
         let text = json
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
-            .ok_or_else(|| ProviderError::Decode("missing choices[0].message.content".to_owned()))?
+            .unwrap_or("")
             .to_owned();
 
         let in_tokens = json
@@ -749,8 +771,8 @@ impl Provider for BedrockProvider {
         &self.id
     }
 
-    fn carries_structured_verbatim(&self) -> bool {
-        true
+    fn carries_structured_verbatim(&self, inbound: firstpass_core::Dialect) -> bool {
+        inbound == firstpass_core::Dialect::Anthropic
     }
 
     async fn complete(
@@ -837,8 +859,8 @@ impl Provider for VertexProvider {
         &self.id
     }
 
-    fn carries_structured_verbatim(&self) -> bool {
-        true
+    fn carries_structured_verbatim(&self, inbound: firstpass_core::Dialect) -> bool {
+        inbound == firstpass_core::Dialect::Anthropic
     }
 
     async fn complete(
@@ -1074,7 +1096,9 @@ impl Provider for MockProvider {
         &self.id
     }
 
-    fn carries_structured_verbatim(&self) -> bool {
+    // ponytail: returns true for all dialects — test-only mock needs to pass the fidelity guard
+    // for both Anthropic and OpenAI inbound tests without a real dialect-split implementation.
+    fn carries_structured_verbatim(&self, _inbound: firstpass_core::Dialect) -> bool {
         true
     }
 
@@ -1545,9 +1569,92 @@ mod tests {
     }
 
     #[test]
-    fn verbatim_carriers_are_anthropic_shaped_dialects_only() {
+    fn verbatim_carriers_are_dialect_aware() {
+        use firstpass_core::Dialect;
         let reg = ProviderRegistry::new("http://localhost", "http://localhost");
-        assert!(reg.get("anthropic").unwrap().carries_structured_verbatim());
-        assert!(!reg.get("openai").unwrap().carries_structured_verbatim());
+        // Anthropic provider: verbatim for Anthropic inbound, not for OpenAI
+        assert!(
+            reg.get("anthropic")
+                .unwrap()
+                .carries_structured_verbatim(Dialect::Anthropic)
+        );
+        assert!(
+            !reg.get("anthropic")
+                .unwrap()
+                .carries_structured_verbatim(Dialect::Openai)
+        );
+        // OpenAI provider: verbatim for OpenAI inbound, not for Anthropic
+        assert!(
+            reg.get("openai")
+                .unwrap()
+                .carries_structured_verbatim(Dialect::Openai)
+        );
+        assert!(
+            !reg.get("openai")
+                .unwrap()
+                .carries_structured_verbatim(Dialect::Anthropic)
+        );
+    }
+
+    #[test]
+    fn openai_wire_body_carries_raw_request_verbatim() {
+        // All-OpenAI-ladder raw carry: same semantics as anthropic_wire_body_carries_raw_request_verbatim.
+        let raw = serde_json::json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "max_tokens": 256,
+            "temperature": 0.7,
+            "response_format": { "type": "json_object" },
+            "tool_choice": "auto",
+            "tools": [{ "type": "function", "function": { "name": "get_weather", "parameters": {} } }],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let req = ModelRequest {
+            model: "openai/gpt-4.1-mini".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 256,
+            tools: Value::Null,
+            raw: raw.clone(),
+        };
+        let wire = openai_wire_body(&req);
+        assert_eq!(wire["model"], "gpt-4.1-mini", "rung model swapped in");
+        assert!(wire.get("stream").is_none(), "stream stripped");
+        for field in [
+            "temperature",
+            "tool_choice",
+            "tools",
+            "response_format",
+            "messages",
+            "max_tokens",
+        ] {
+            assert_eq!(
+                wire[field], raw[field],
+                "field {field} must survive verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_wire_body_falls_back_to_normalized_fields() {
+        // Translation path (raw = Null): reconstruct from normalized fields.
+        let req = ModelRequest {
+            model: "openai/gpt-4.1-mini".to_owned(),
+            system: Some("be terse".to_owned()),
+            messages: vec![
+                ChatMessage::text("user", "hello"),
+                ChatMessage::text("assistant", "hi"),
+            ],
+            max_tokens: 128,
+            tools: Value::Null,
+            raw: Value::Null,
+        };
+        let wire = openai_wire_body(&req);
+        assert_eq!(wire["model"], "gpt-4.1-mini");
+        // System → injected as first message with role="system"
+        assert_eq!(wire["messages"][0]["role"], "system");
+        assert_eq!(wire["messages"][0]["content"], "be terse");
+        assert_eq!(wire["messages"][1]["role"], "user");
+        assert_eq!(wire["messages"][2]["role"], "assistant");
     }
 }
