@@ -1,0 +1,30 @@
+# firstpass-bench --coding-live · MBPP · base (test) gate
+# date: 2026-07-20 · candidate: live Anthropic solver · sandbox: docker (runc tier)
+# dataset: mbpp.jsonl (974 rows, google-research/mbpp) · alpha=0.10 delta=0.05
+# command: FIRSTPASS_CODING_DATASET=./mbpp.jsonl cargo run --release -p firstpass-bench -- --coding-live
+
+WARNING: gVisor (runsc) not found; falling back to the default OCI runtime (shared-kernel, weaker isolation). Install gVisor for microVM-grade isolation.
+# Coding-with-tests benchmark (Batch 3b/3c)
+
+- sandbox runtime tier: runc
+- tasks: 974
+- candidate oracle pass-rate: 77.0%
+- gate false-accept rate (P(full visible pass | incorrect)): 14.7%  <- real gate error (arithmetic had 0)
+- gate false-reject rate (P(not full pass | correct)):       0.0%
+- served-failure if you serve every full-visible-pass:       4.2%
+- conformal (continuous score): threshold 0.500, served 82%, calib-risk 5.5%, feasible=true
+- served-failure at the conformal threshold:                 7.7%
+
+per-task (gate_score / oracle_correct), first 12:
+  mbpp-1                 score=0.00 oracle=false
+  mbpp-2                 score=1.00 oracle=true
+  mbpp-3                 score=1.00 oracle=true
+  mbpp-4                 score=1.00 oracle=true
+  mbpp-5                 score=0.00 oracle=false
+  mbpp-6                 score=1.00 oracle=true
+  mbpp-7                 score=1.00 oracle=true
+  mbpp-8                 score=1.00 oracle=true
+  mbpp-9                 score=1.00 oracle=true
+  mbpp-10                score=1.00 oracle=true
+  mbpp-11                score=1.00 oracle=true
+  mbpp-12                score=1.00 oracle=true
