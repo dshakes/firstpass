@@ -12,7 +12,7 @@ use crate::judge::JudgeGate;
 use crate::provider::{Auth, ModelRequest, ModelResponse, ProviderRegistry};
 use crate::subprocess::SubprocessGate;
 use async_trait::async_trait;
-use firstpass_core::{GateDef, GateResult, Verdict};
+use firstpass_core::{AbstainPolicy, GateDef, GateResult, Verdict, cost::PriceTable};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -24,6 +24,13 @@ pub trait Gate: Send + Sync + std::fmt::Debug {
     fn id(&self) -> &str;
     /// Evaluate the candidate response, producing a verdict + evidence.
     async fn evaluate(&self, req: &ModelRequest, resp: &ModelResponse) -> GateResult;
+    /// Whether an **abstain** from this gate blocks serving like a `Fail` (§7.2,
+    /// `on_abstain = "fail_closed"`). Default `false` = fail-open, the historical behavior.
+    /// The abstain verdict itself is still recorded honestly on the receipt; only the
+    /// aggregation treats it as blocking.
+    fn abstain_fails_closed(&self) -> bool {
+        false
+    }
 }
 
 /// Fails an empty (whitespace-only) completion. The cheapest possible sanity gate.
@@ -67,14 +74,18 @@ impl Gate for JsonValidGate {
 // structured-output routes need. Swap for the `jsonschema` crate if nested/`$ref` schemas appear.
 #[derive(Debug, Clone)]
 pub struct SchemaGate {
+    id: String,
     schema: serde_json::Value,
 }
 
 impl SchemaGate {
-    /// Build a schema gate from a JSON Schema value.
+    /// Build a schema gate from a JSON Schema value, under the id a route references it by.
     #[must_use]
-    pub fn new(schema: serde_json::Value) -> Self {
-        Self { schema }
+    pub fn new(id: impl Into<String>, schema: serde_json::Value) -> Self {
+        Self {
+            id: id.into(),
+            schema,
+        }
     }
 
     /// Check `value` against the minimal schema subset; returns the first violation, if any.
@@ -120,7 +131,7 @@ impl SchemaGate {
 #[async_trait]
 impl Gate for SchemaGate {
     fn id(&self) -> &str {
-        "schema"
+        &self.id
     }
     async fn evaluate(&self, _req: &ModelRequest, resp: &ModelResponse) -> GateResult {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(resp.text.trim()) else {
@@ -264,38 +275,71 @@ impl GateHealthRegistry {
     }
 }
 
+/// Wraps any gate to make its abstains block serving (`on_abstain = "fail_closed"`, §7.2).
+/// Pure delegation except [`Gate::abstain_fails_closed`]; the underlying gate's verdicts —
+/// including the abstain itself — are recorded unchanged, so the receipt stays honest.
+#[derive(Debug)]
+struct FailClosed(Box<dyn Gate>);
+
+#[async_trait]
+impl Gate for FailClosed {
+    fn id(&self) -> &str {
+        self.0.id()
+    }
+    async fn evaluate(&self, req: &ModelRequest, resp: &ModelResponse) -> GateResult {
+        self.0.evaluate(req, resp).await
+    }
+    fn abstain_fails_closed(&self) -> bool {
+        true
+    }
+}
+
 /// Resolve a route's gate ids into runnable gates. Built-in ids (`non-empty`, `json-valid`) map to
-/// inline gates; any other id is looked up among the config's `[[gate]]` definitions and built as
-/// either a [`SubprocessGate`] (a `cmd` gate, SPEC §8.1) or a [`JudgeGate`] (a `judge` gate, §8.3).
-/// The judge needs a provider (from `registry`) and the caller's credentials (`auth`, BYOK). An id
-/// that is neither built-in nor defined — or a judge whose provider isn't registered — is skipped
-/// with a warning rather than failing the request.
+/// inline gates; any other id is looked up among the config's `[[gate]]` definitions and built as a
+/// [`SubprocessGate`] (`cmd`, SPEC §8.1), a [`JudgeGate`] (`judge`, §8.3), a [`ConsistencyGate`]
+/// (`consistency`), or a [`SchemaGate`] (`schema`). Model-backed gates (judge/consistency) need a
+/// provider (from `registry`), the caller's credentials (`auth`, BYOK), and `prices` so their
+/// sample-call cost lands on the receipt. An id that is neither built-in nor defined — or a
+/// model gate whose provider isn't registered — is skipped with a warning rather than failing the
+/// request. A def with `on_abstain = "fail_closed"` is wrapped so its abstains block serving.
 #[must_use]
 pub fn resolve_gates(
     names: &[String],
     defs: &[GateDef],
     registry: &ProviderRegistry,
     auth: &Auth,
+    prices: &PriceTable,
 ) -> Vec<Box<dyn Gate>> {
     let mut gates: Vec<Box<dyn Gate>> = Vec::new();
+    let mut push = |gate: Box<dyn Gate>, def: Option<&GateDef>| {
+        if def.is_some_and(|d| d.on_abstain == AbstainPolicy::FailClosed) {
+            gates.push(Box::new(FailClosed(gate)));
+        } else {
+            gates.push(gate);
+        }
+    };
     for name in names {
         match name.as_str() {
-            "non-empty" => gates.push(Box::new(NonEmptyGate)),
-            "json-valid" => gates.push(Box::new(JsonValidGate)),
+            "non-empty" => push(Box::new(NonEmptyGate), None),
+            "json-valid" => push(Box::new(JsonValidGate), None),
             other => match defs.iter().find(|d| d.id == other) {
                 Some(def) if def.judge.is_some() => {
                     // `Config::parse` guarantees exactly one kind, so this `if let` always binds.
                     if let Some(judge) = def.judge.as_ref() {
                         let provider_id = judge.model.split('/').next().unwrap_or_default();
                         match registry.get(provider_id) {
-                            Some(provider) => gates.push(Box::new(JudgeGate::new(
-                                def.id.clone(),
-                                provider,
-                                judge.model.clone(),
-                                auth.clone(),
-                                judge.threshold,
-                                judge.rubric.clone().unwrap_or_default(),
-                            ))),
+                            Some(provider) => push(
+                                Box::new(JudgeGate::new(
+                                    def.id.clone(),
+                                    provider,
+                                    judge.model.clone(),
+                                    auth.clone(),
+                                    judge.threshold,
+                                    judge.rubric.clone().unwrap_or_default(),
+                                    prices.clone(),
+                                )),
+                                Some(def),
+                            ),
                             None => tracing::warn!(
                                 gate = %other, provider = %provider_id,
                                 "judge gate provider not registered — skipped"
@@ -308,14 +352,18 @@ pub fn resolve_gates(
                     if let Some(cons) = def.consistency.as_ref() {
                         let provider_id = cons.model.split('/').next().unwrap_or_default();
                         match registry.get(provider_id) {
-                            Some(provider) => gates.push(Box::new(ConsistencyGate::new(
-                                def.id.clone(),
-                                provider,
-                                cons.model.clone(),
-                                auth.clone(),
-                                cons.k,
-                                cons.threshold,
-                            ))),
+                            Some(provider) => push(
+                                Box::new(ConsistencyGate::new(
+                                    def.id.clone(),
+                                    provider,
+                                    cons.model.clone(),
+                                    auth.clone(),
+                                    cons.k,
+                                    cons.threshold,
+                                    prices.clone(),
+                                )),
+                                Some(def),
+                            ),
                             None => tracing::warn!(
                                 gate = %other, provider = %provider_id,
                                 "consistency gate provider not registered — skipped"
@@ -323,17 +371,29 @@ pub fn resolve_gates(
                         }
                     }
                 }
+                Some(def) if def.schema.is_some() => {
+                    // `Config::parse` guarantees exactly one kind, so this `if let` always binds.
+                    if let Some(schema) = def.schema.as_ref() {
+                        push(
+                            Box::new(SchemaGate::new(def.id.clone(), schema.clone())),
+                            Some(def),
+                        );
+                    }
+                }
                 Some(def) => {
                     let Some((program, args)) = def.cmd.split_first() else {
                         tracing::warn!(gate = %other, "configured gate has empty cmd — skipped");
                         continue;
                     };
-                    gates.push(Box::new(SubprocessGate::new(
-                        def.id.clone(),
-                        program.clone(),
-                        args.to_vec(),
-                        Duration::from_millis(def.timeout_ms),
-                    )));
+                    push(
+                        Box::new(SubprocessGate::new(
+                            def.id.clone(),
+                            program.clone(),
+                            args.to_vec(),
+                            Duration::from_millis(def.timeout_ms),
+                        )),
+                        Some(def),
+                    );
                 }
                 None => tracing::warn!(
                     gate = %other,
@@ -345,19 +405,31 @@ pub fn resolve_gates(
     gates
 }
 
-/// Aggregate per-gate verdicts into the attempt's overall verdict.
-///
-/// `Fail` if any gate fails; otherwise `Pass`. An empty gate set passes.
-///
-// ponytail: `Abstain` is treated as pass (fail-open). Per-gate fail-open/closed policy is a
-// follow-up; until then an abstaining/disabled gate never blocks serving.
+/// Aggregate per-gate verdicts into the attempt's overall verdict, honoring each gate's
+/// abstain policy (§7.2): `Fail` if any gate fails **or** a `fail_closed` gate abstains;
+/// otherwise `Pass`. An empty gate set passes. `fail_closed_ids` is the set of gate ids whose
+/// abstains block serving (from [`Gate::abstain_fails_closed`]); a fail-open gate's abstain
+/// never blocks (the historical behavior).
 #[must_use]
-pub fn aggregate(results: &[GateResult]) -> Verdict {
-    if results.iter().any(|r| r.verdict == Verdict::Fail) {
+pub fn aggregate_with_policy(
+    results: &[GateResult],
+    fail_closed_ids: &std::collections::HashSet<&str>,
+) -> Verdict {
+    let blocking = |r: &GateResult| {
+        r.verdict == Verdict::Fail
+            || (r.verdict == Verdict::Abstain && fail_closed_ids.contains(r.gate_id.as_str()))
+    };
+    if results.iter().any(blocking) {
         Verdict::Fail
     } else {
         Verdict::Pass
     }
+}
+
+/// Aggregate per-gate verdicts with every gate fail-open — `Fail` iff any gate fails.
+#[must_use]
+pub fn aggregate(results: &[GateResult]) -> Verdict {
+    aggregate_with_policy(results, &std::collections::HashSet::new())
 }
 
 #[cfg(test)]
@@ -414,11 +486,14 @@ mod tests {
 
     #[tokio::test]
     async fn schema_gate_type_and_required() {
-        let g = SchemaGate::new(json!({
-            "type": "object",
-            "required": ["name", "age"],
-            "properties": { "name": {"type": "string"}, "age": {"type": "integer"} }
-        }));
+        let g = SchemaGate::new(
+            "schema",
+            json!({
+                "type": "object",
+                "required": ["name", "age"],
+                "properties": { "name": {"type": "string"}, "age": {"type": "integer"} }
+            }),
+        );
         assert_eq!(
             g.evaluate(&req(), &resp(r#"{"name":"a","age":3}"#))
                 .await
@@ -461,6 +536,7 @@ mod tests {
             &[],
             &empty_registry(),
             &Auth::default(),
+            &PriceTable::default(),
         );
         let ids: Vec<_> = gates.iter().map(|g| g.id()).collect();
         assert_eq!(ids, ["non-empty", "json-valid"]);
@@ -475,12 +551,15 @@ mod tests {
             timeout_ms: 1000,
             judge: None,
             consistency: None,
+            schema: None,
+            on_abstain: AbstainPolicy::FailOpen,
         }];
         let gates = resolve_gates(
             &["my-tests".to_owned(), "undefined".to_owned()],
             &defs,
             &empty_registry(),
             &Auth::default(),
+            &PriceTable::default(),
         );
         let ids: Vec<_> = gates.iter().map(|g| g.id()).collect();
         assert_eq!(
@@ -501,12 +580,15 @@ mod tests {
             timeout_ms: 5000,
             judge: None,
             consistency: None,
+            schema: None,
+            on_abstain: AbstainPolicy::FailOpen,
         }];
         let gates = resolve_gates(
             &["no-bad".to_owned()],
             &defs,
             &empty_registry(),
             &Auth::default(),
+            &PriceTable::default(),
         );
         assert_eq!(gates.len(), 1);
         let good = gates[0].evaluate(&req(), &resp("all good")).await;
@@ -531,6 +613,8 @@ mod tests {
                 rubric: None,
             }),
             consistency: None,
+            schema: None,
+            on_abstain: AbstainPolicy::FailOpen,
         }];
 
         // Registry that serves `anthropic` → the judge gate is built.
@@ -544,6 +628,7 @@ mod tests {
             &defs,
             &ProviderRegistry::from_map(map),
             &Auth::default(),
+            &PriceTable::default(),
         );
         assert_eq!(
             gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
@@ -556,6 +641,7 @@ mod tests {
             &defs,
             &ProviderRegistry::from_map(HashMap::new()),
             &Auth::default(),
+            &PriceTable::default(),
         );
         assert!(
             skipped.is_empty(),
@@ -579,6 +665,8 @@ mod tests {
                 k: 3,
                 threshold: 0.6,
             }),
+            schema: None,
+            on_abstain: AbstainPolicy::FailOpen,
         }];
 
         // Registry that serves `anthropic` → the consistency gate is built.
@@ -592,6 +680,7 @@ mod tests {
             &defs,
             &ProviderRegistry::from_map(map),
             &Auth::default(),
+            &PriceTable::default(),
         );
         assert_eq!(
             gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
@@ -604,6 +693,7 @@ mod tests {
             &defs,
             &ProviderRegistry::from_map(HashMap::new()),
             &Auth::default(),
+            &PriceTable::default(),
         );
         assert!(
             skipped.is_empty(),
@@ -680,5 +770,87 @@ mod tests {
         assert!(registry.enabled("tenant-a", "unknown-gate"));
         registry.record("tenant-a", "unknown-gate", true); // no-op, must not panic
         assert!(registry.enabled("tenant-a", "unknown-gate"));
+    }
+
+    #[tokio::test]
+    async fn resolve_builds_configured_schema_gate() {
+        let defs = vec![GateDef {
+            id: "extract-shape".to_owned(),
+            cmd: vec![],
+            timeout_ms: 30_000,
+            judge: None,
+            consistency: None,
+            schema: Some(json!({"type": "object", "required": ["name"]})),
+            on_abstain: firstpass_core::AbstainPolicy::FailOpen,
+        }];
+        let gates = resolve_gates(
+            &["extract-shape".to_owned()],
+            &defs,
+            &empty_registry(),
+            &Auth::default(),
+            &PriceTable::default(),
+        );
+        assert_eq!(
+            gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
+            ["extract-shape"],
+            "a [[gate]] def with `schema` resolves to a runnable SchemaGate"
+        );
+        let ok = gates[0].evaluate(&req(), &resp(r#"{"name":"a"}"#)).await;
+        assert_eq!(ok.verdict, Verdict::Pass);
+        let missing = gates[0].evaluate(&req(), &resp(r#"{}"#)).await;
+        assert_eq!(missing.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn resolve_wraps_fail_closed_gate() {
+        let mk = |on_abstain| {
+            vec![GateDef {
+                id: "tests".to_owned(),
+                cmd: vec!["true".to_owned()],
+                timeout_ms: 1000,
+                judge: None,
+                consistency: None,
+                schema: None,
+                on_abstain,
+            }]
+        };
+        let open = resolve_gates(
+            &["tests".to_owned()],
+            &mk(firstpass_core::AbstainPolicy::FailOpen),
+            &empty_registry(),
+            &Auth::default(),
+            &PriceTable::default(),
+        );
+        assert!(!open[0].abstain_fails_closed(), "default stays fail-open");
+        let closed = resolve_gates(
+            &["tests".to_owned()],
+            &mk(firstpass_core::AbstainPolicy::FailClosed),
+            &empty_registry(),
+            &Auth::default(),
+            &PriceTable::default(),
+        );
+        assert!(
+            closed[0].abstain_fails_closed(),
+            "on_abstain = fail_closed wraps the gate"
+        );
+        assert_eq!(closed[0].id(), "tests", "wrapper preserves the id");
+    }
+
+    #[test]
+    fn aggregate_with_policy_fail_closed_abstain_blocks() {
+        use std::collections::HashSet;
+        let pass = GateResult::deterministic("a", Verdict::Pass, 0);
+        let abstain = GateResult::abstain("c", "timeout", 0);
+        // Fail-open (empty set): abstain never blocks — historical behavior.
+        assert_eq!(
+            aggregate_with_policy(&[pass.clone(), abstain.clone()], &HashSet::new()),
+            Verdict::Pass
+        );
+        // Fail-closed: the same abstain blocks serving like a Fail.
+        let closed: HashSet<&str> = ["c"].into_iter().collect();
+        assert_eq!(
+            aggregate_with_policy(&[pass, abstain], &closed),
+            Verdict::Fail
+        );
     }
 }

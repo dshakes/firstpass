@@ -89,7 +89,19 @@ For agents onboarding *themselves*: [`llms.txt`](llms.txt) + [`AGENTS.md`](AGENT
 
 <div align="center"><img src="assets/bench.svg" alt="Cost per successful task, live on 200 graded tasks: always-top $0.0023 at 0.98 success; predictive router $0.0007 at 0.88 success while silently serving wrong answers 12% of the time; always-cheap $0.0001 but 0.62 success; firstpass $0.0003 at 1.00 success with zero wrong answers served" width="900"></div>
 
-And the claim no other router makes: on **964 real MBPP coding tasks** (fail-closed sandbox, real test gates), firstpass earned a **distribution-free bound of ≤10% wrong answers served at 95% confidence** — empirically 7.6%, tightening to 5.9% with an LLM judge on the gate, while serving 82% of requests from the cheap tier. Your savings depend on your workload — which is why every trace records the always-top counterfactual, **so you measure your number instead of trusting ours.** Reproduce everything: `cargo run -p firstpass-bench` ([methodology](https://dshakes.github.io/firstpass/#proof), pre-registered kill criterion included).
+And the claim no other router makes: on **964 real MBPP coding tasks** (fail-closed sandbox, real test gates), firstpass earned a **distribution-free bound of ≤10% wrong answers served at 95% confidence** — empirically 7.6%, tightening to 5.9% with an LLM judge on the gate, while serving 82% of requests from the cheap tier. Your savings depend on your workload — which is why every trace records the always-top counterfactual, **so you measure your number instead of trusting ours.**
+
+Reproduce it — each command labels itself and states what it costs:
+
+```bash
+cargo run -p firstpass-bench                    # simulation harness (free, self-labeled SIMULATION)
+cargo run -p firstpass-bench -- --live          # the 200-task live benchmark (your key, ~a few $)
+curl -sLO https://raw.githubusercontent.com/google-research/google-research/master/mbpp/mbpp.jsonl
+FIRSTPASS_CODING_DATASET=./mbpp.jsonl \
+  cargo run --release -p firstpass-bench -- --coding-live   # the MBPP bound (your key + Docker, ~$5)
+```
+
+Result artifacts for the published numbers live in [`docs/benchmarks/`](docs/benchmarks/) ([methodology](https://dshakes.github.io/firstpass/#proof), pre-registered kill criterion included).
 
 ## How it works
 
@@ -134,6 +146,8 @@ gates  = ["unit-tests"]
 ```
 
 `anthropic` and `openai` are built in; Gemini (`dialect = "gemini"`), AWS Bedrock (`auth = "aws_sigv4"`), and Google Vertex (`auth = "gcp_oauth"`) use the same shape. Every variant ships in [`firstpass.example.toml`](firstpass.example.toml), guarded by a parse test — full walkthrough on the [usage page](https://dshakes.github.io/firstpass/usage.html#providers).
+
+**Verification status, stated plainly:** the Anthropic path is **live-verified end-to-end** (real traffic through the running proxy). The OpenAI-compatible, Gemini, Bedrock, and Vertex adapters are **implemented and offline-tested against recorded wire shapes, pending live verification** — each flips to *verified* only when a key-gated CI smoke test exercises it against the real endpoint ([roadmap](docs/roadmap.md), Phase 1). If an unverified path misbehaves on your account, that's a bug we want: open an issue with the receipt.
 
 <details>
 <summary><b>🧾 The receipt</b> — every decision is a hash-chained trace an auditor can re-derive</summary>
@@ -186,7 +200,7 @@ And the one good idea predictive routers had — starting on the right model —
 
 ## Status
 
-**v0.1.7 — GA-ready core, shipped in the open.** Enforce + observe over real HTTP, cross-provider failover, LLM-judge + self-consistency gates, bandit start-rung selection, speculative escalation (~2× p95), the earned conformal guarantee, self-tuning threshold, offline policy replay (`firstpass ope`), tool/multimodal/streaming enforce, every provider, every install channel auto-published. Tracked honestly on the [roadmap](https://dshakes.github.io/firstpass/#roadmap): 30-day soak, external security audit, live-verifying Bedrock/Vertex, hosted multi-tenant plane.
+**v0.1.7 — pre-GA, shipped in the open.** Working today: enforce + observe over real HTTP (Anthropic path live-verified), cross-provider failover, schema + subprocess + LLM-judge + self-consistency gates with per-gate `on_abstain` policy, bandit start-rung selection, speculative escalation (~2× p95 offline-proven), the earned conformal guarantee, self-tuning threshold, offline policy replay (`firstpass ope`), `firstpass savings` from your own receipts. Honest limits, tracked on the [roadmap](docs/roadmap.md): structured (tools/images) enforce is **opt-in** (`enforce_structured`, ADR 0005) and streams buffered, not incrementally; four of five provider dialects await live wire verification; 30-day soak, external security audit, and the hosted multi-tenant plane are ahead of us, not behind us. GA is a checklist we publish ([ADR 0003](docs/adr/0003-ga-readiness.md)), not an adjective.
 
 ## Links
 

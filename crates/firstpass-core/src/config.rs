@@ -116,25 +116,48 @@ pub struct ProviderDef {
 /// - **judge** (`judge`): a native LLM-judge gate that grades the candidate against a rubric.
 /// - **consistency** (`consistency`): a self-consistency uncertainty gate that scores the
 ///   candidate by agreement with k fresh samples of the same model (Wang et al. 2022).
+/// - **schema** (`schema`): validates the candidate (parsed as JSON) against a JSON-Schema
+///   subset (top-level `type` / `required` / per-property `type`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GateDef {
     /// The id a route references this gate by (must be unique and not shadow a built-in gate id).
     pub id: String,
     /// Subprocess command: program first, then its args — e.g. `["pytest", "-q"]`. Set this **or**
-    /// `judge` / `consistency`, not both.
+    /// `judge` / `consistency` / `schema`, not both.
     #[serde(default)]
     pub cmd: Vec<String>,
     /// Hard timeout in milliseconds for a subprocess gate; it abstains (`timeout`) if the process
     /// runs longer.
     #[serde(default = "default_gate_timeout_ms")]
     pub timeout_ms: u64,
-    /// LLM-judge configuration. Set this **or** `cmd` / `consistency`, not both.
+    /// LLM-judge configuration. Set this **or** `cmd` / `consistency` / `schema`, not both.
     #[serde(default)]
     pub judge: Option<JudgeDef>,
-    /// Self-consistency configuration. Set this **or** `cmd` / `judge`, not both.
+    /// Self-consistency configuration. Set this **or** `cmd` / `judge` / `schema`, not both.
     #[serde(default)]
     pub consistency: Option<ConsistencyDef>,
+    /// JSON-Schema (subset) the candidate must satisfy. Set this **or** `cmd` / `judge` /
+    /// `consistency`, not both.
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
+    /// What an **abstain** from this gate means for serving (§7.2). `fail_open` (default): an
+    /// abstaining gate never blocks serving — availability over strictness, today's behavior.
+    /// `fail_closed`: an abstain blocks serving exactly like a `Fail` — strictness over
+    /// availability, for gates whose silence must never be mistaken for approval.
+    #[serde(default)]
+    pub on_abstain: AbstainPolicy,
+}
+
+/// Per-gate abstain policy (§7.2): what happens to serving when the gate can't produce a verdict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AbstainPolicy {
+    /// An abstain never blocks serving (the historical behavior).
+    #[default]
+    FailOpen,
+    /// An abstain blocks serving exactly like a `Fail`.
+    FailClosed,
 }
 
 /// Configuration for a native LLM-judge gate (SPEC §8.3): a separate model grades the candidate
@@ -514,18 +537,19 @@ impl Config {
             if def.id.trim().is_empty() {
                 return Err(Error::InvalidConfig("gate id must not be empty".to_owned()));
             }
-            // Exactly one kind: subprocess `cmd`, `judge`, or `consistency` — never more, never none.
+            // Exactly one kind: `cmd`, `judge`, `consistency`, or `schema` — never more, never none.
             let kinds_set = [
                 !def.cmd.is_empty(),
                 def.judge.is_some(),
                 def.consistency.is_some(),
+                def.schema.is_some(),
             ]
             .iter()
             .filter(|&&b| b)
             .count();
             if kinds_set != 1 {
                 return Err(Error::InvalidConfig(format!(
-                    "gate {:?} must set exactly one of `cmd`, `judge`, or `consistency`",
+                    "gate {:?} must set exactly one of `cmd`, `judge`, `consistency`, or `schema`",
                     def.id
                 )));
             }
@@ -977,6 +1001,64 @@ project = "my-gcp-project"
         assert!(
             matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
             "epsilon < 0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn gate_def_schema_and_on_abstain_parse() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+gates = ["extract-shape"]
+
+[[gate]]
+id = "extract-shape"
+schema = { type = "object", required = ["name"] }
+on_abstain = "fail_closed"
+"#;
+        let config = Config::parse(toml).expect("schema gate def must parse");
+        let def = &config.gate_defs[0];
+        assert_eq!(def.id, "extract-shape");
+        let schema = def.schema.as_ref().expect("schema captured");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(def.on_abstain, AbstainPolicy::FailClosed);
+    }
+
+    #[test]
+    fn gate_def_on_abstain_defaults_fail_open() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[[gate]]
+id = "tests"
+cmd = ["true"]
+"#;
+        let config = Config::parse(toml).expect("parse");
+        assert_eq!(config.gate_defs[0].on_abstain, AbstainPolicy::FailOpen);
+    }
+
+    #[test]
+    fn gate_def_rejects_schema_plus_cmd() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[[gate]]
+id = "both"
+cmd = ["true"]
+schema = { type = "object" }
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("exactly one"),
+            "two kinds must be rejected: {err}"
         );
     }
 }

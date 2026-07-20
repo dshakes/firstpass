@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use firstpass_core::{GateResult, Score, Verdict};
+use firstpass_core::{GateResult, Score, Verdict, cost::PriceTable};
 use serde_json::Value;
 
 use crate::gate::Gate;
@@ -41,10 +41,13 @@ pub struct JudgeGate {
     auth: Auth,
     threshold: f64,
     rubric: String,
+    /// Prices the judge call so its cost lands on the receipt ([`GateResult::cost_usd`]).
+    prices: PriceTable,
 }
 
 impl JudgeGate {
-    /// Build a judge gate. `provider` serves `judge_model`; `auth` carries the (BYOK) credentials.
+    /// Build a judge gate. `provider` serves `judge_model`; `auth` carries the (BYOK) credentials;
+    /// `prices` prices the judge's own model call onto the receipt.
     #[must_use]
     pub fn new(
         id: impl Into<String>,
@@ -53,6 +56,7 @@ impl JudgeGate {
         auth: Auth,
         threshold: f64,
         rubric: impl Into<String>,
+        prices: PriceTable,
     ) -> Self {
         Self {
             id: id.into(),
@@ -61,6 +65,7 @@ impl JudgeGate {
             auth,
             threshold,
             rubric: rubric.into(),
+            prices,
         }
     }
 }
@@ -86,7 +91,15 @@ impl Gate for JudgeGate {
         let request = build_judge_request(&self.judge_model, &self.rubric, &resp.text);
         match self.provider.complete(&request, &self.auth).await {
             Ok(judgment) => {
-                parse_judgment(&self.id, &judgment.text, self.threshold, elapsed_ms(start))
+                let mut r =
+                    parse_judgment(&self.id, &judgment.text, self.threshold, elapsed_ms(start));
+                // The judge's own model call is real spend — price it onto the receipt so the
+                // router's budget/savings math sees the true cost of measured quality.
+                r.cost_usd = self
+                    .prices
+                    .cost_usd(&self.judge_model, judgment.in_tokens, judgment.out_tokens)
+                    .unwrap_or(0.0);
+                r
             }
             Err(e) => {
                 // A broken judge abstains (fail-open here; the error budget auto-disables a
@@ -200,6 +213,7 @@ mod tests {
             Auth::default(),
             threshold,
             "must be correct",
+            PriceTable::default(),
         )
     }
 
@@ -291,6 +305,7 @@ mod tests {
             Auth::default(),
             0.7,
             "r",
+            PriceTable::default(),
         );
         let out = g
             .evaluate(
@@ -300,5 +315,39 @@ mod tests {
             .await;
         assert_eq!(out.verdict, Verdict::Abstain);
         assert_eq!(out.reason.as_deref(), Some("judge_error"));
+    }
+
+    #[tokio::test]
+    async fn judge_call_cost_lands_on_the_receipt() {
+        use firstpass_core::cost::ModelPrice;
+        let prices = PriceTable::new().with_override(
+            "anthropic/judge",
+            ModelPrice {
+                input_per_mtok: 1.0,
+                output_per_mtok: 5.0,
+            },
+        );
+        let g = JudgeGate::new(
+            "quality",
+            judge_serving(r#"{"score": 0.9, "pass": true}"#),
+            "anthropic/judge",
+            Auth::default(),
+            0.7,
+            "must be correct",
+            prices,
+        );
+        let out = g
+            .evaluate(
+                &build_judge_request("x", "r", "c"),
+                &resp("anthropic/candidate", "hi"),
+            )
+            .await;
+        assert_eq!(out.verdict, Verdict::Pass);
+        let expected = 10.0 / 1e6 * 1.0 + 10.0 / 1e6 * 5.0; // 10 in + 10 out tokens
+        assert!(
+            (out.cost_usd - expected).abs() < 1e-12,
+            "judge call priced onto the receipt: got {}, want {expected}",
+            out.cost_usd
+        );
     }
 }
