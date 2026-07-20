@@ -16,6 +16,7 @@ USAGE:
     firstpass doctor              validate config, provider key, and gate binaries
     firstpass trace [--limit N]   print recent audit traces as JSON lines (default 20)
     firstpass savings [--json]    spend vs the always-top counterfactual, from your own receipts
+    firstpass evals [--json]      per-gate verdict rates + escalation + serve-by-rung, from receipts
     firstpass calibrate [--alpha A] [--delta D] [--min-n N]
                                    recalibrate the serving threshold from deferred feedback
     firstpass ope --config <candidate.toml> [--db <path>] [--tenant <id>]
@@ -46,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "doctor" => cmd_doctor(),
         "trace" => cmd_trace(&args),
         "savings" => cmd_savings(&args),
+        "evals" => cmd_evals(&args),
         "calibrate" => cmd_calibrate(&args),
         "ope" => cmd_ope(&args),
         "mcp" => {
@@ -171,6 +173,23 @@ fn cmd_savings(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
         println!("{}", cli::format_savings(&summary));
+    }
+    Ok(())
+}
+
+/// `firstpass evals [--json] [--tenant ID]` — the live eval suite computed from receipts:
+/// per-gate pass/fail/abstain, escalation count, and which rung serves. Empty store → zero
+/// state, exit 0, like `savings`.
+fn cmd_evals(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ProxyConfig::from_env()?;
+    let tenant = tenant_arg(args, &config);
+    let traces = store::load_tenant_traces(std::path::Path::new(&config.db_path), &tenant)
+        .unwrap_or_default();
+    let summary = cli::summarize_evals(&traces);
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!("{}", cli::format_evals(&summary));
     }
     Ok(())
 }

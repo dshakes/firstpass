@@ -36,6 +36,16 @@ fn tool_schemas() -> Value {
             }
         },
         {
+            "name": "get_savings",
+            "description": "Aggregate spend vs the always-top counterfactual from this deployment's own receipts — measured savings, not a marketing number.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "get_evals",
+            "description": "Per-gate verdict rates, escalation count, and serve-by-rung distribution computed from receipts — the live eval suite.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "submit_feedback",
             "description": "Attach a downstream outcome (deferred verdict) to a past decision, closing the feedback loop.",
             "inputSchema": {
@@ -97,6 +107,8 @@ fn handle_tool_call(id: Value, params: Option<&Value>, db_path: &str, tenant: &s
 
     let result = match name {
         "list_traces" => tool_list_traces(&args, db_path, tenant),
+        "get_savings" => tool_get_savings(db_path, tenant),
+        "get_evals" => tool_get_evals(db_path, tenant),
         "get_trace" => tool_get_trace(&args, db_path, tenant),
         "submit_feedback" => tool_submit_feedback(&args, db_path, tenant),
         other => Err(format!("unknown tool: {other}")),
@@ -123,6 +135,19 @@ fn tool_list_traces(args: &Value, db_path: &str, tenant: &str) -> Result<String,
     let start = all.len().saturating_sub(limit);
     let recent = &all[start..];
     serde_json::to_string(recent).map_err(|e| format!("encode error: {e}"))
+}
+
+fn tool_get_savings(db_path: &str, tenant: &str) -> Result<String, String> {
+    // Absent/unreadable store mirrors list_traces: a zero summary, not an error.
+    let traces = store::load_tenant_traces(db_path, tenant).unwrap_or_default();
+    serde_json::to_string(&crate::cli::summarize_savings(&traces))
+        .map_err(|e| format!("encode error: {e}"))
+}
+
+fn tool_get_evals(db_path: &str, tenant: &str) -> Result<String, String> {
+    let traces = store::load_tenant_traces(db_path, tenant).unwrap_or_default();
+    serde_json::to_string(&crate::cli::summarize_evals(&traces))
+        .map_err(|e| format!("encode error: {e}"))
 }
 
 fn tool_get_trace(args: &Value, db_path: &str, tenant: &str) -> Result<String, String> {
@@ -322,5 +347,41 @@ mod tests {
                           "params": { "name": "no_such_tool", "arguments": {} } });
         let resp = handle_rpc(&req, "unused.db", "default").unwrap();
         assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[test]
+    fn savings_and_evals_tools_are_listed_and_zero_state_on_fresh_store() {
+        let db = tmp_db();
+        let db_str = db.as_str();
+
+        let listed = handle_rpc(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            db_str,
+            "default",
+        )
+        .unwrap();
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"get_savings") && names.contains(&"get_evals"));
+
+        for tool in ["get_savings", "get_evals"] {
+            let out = handle_rpc(
+                &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": { "name": tool, "arguments": {} } }),
+                db_str,
+                "default",
+            )
+            .unwrap();
+            let text = out["result"]["content"][0]["text"].as_str().unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert!(
+                parsed.is_object(),
+                "{tool} must return a JSON summary even on a fresh store"
+            );
+        }
     }
 }
