@@ -28,12 +28,26 @@
 //!
 //! Valid only when the candidate start rung N is in the logging policy's support (guaranteed
 //! under ε-greedy since p = ε/K > 0 for every rung). Traces without propensity are excluded
-//! and counted in `n_with_propensity`. DR (direct + IPS correction) is a follow-on; the
-//! direct-method path remains for ladder-structure changes.
+//! and counted in `n_with_propensity`. The direct-method path remains for ladder-structure
+//! changes.
+//!
+//! # Doubly-robust (DR) estimator
+//!
+//! DR combines the direct-method baseline with an IPS residual correction:
+//! ```text
+//! DRᵢ = DM(xᵢ, a) + wᵢ · (rᵢ − DM(xᵢ, aᵢ))
+//! DR  = (1/n) Σᵢ DRᵢ
+//! ```
+//! where `DM(x, rung)` is the per-(task-kind, start-rung) empirical mean cost built from
+//! logged receipts. DR is unbiased when **either** the propensities **or** the reward model
+//! is correctly specified (double robustness). In practice, both are coarse approximations;
+//! DR tends to have lower variance than IPS while inheriting IPS's unbiasedness under
+//! correct propensities.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use firstpass_core::{Attempt, Config as RoutingConfig, DeferredVerdict, Trace, Verdict};
+use firstpass_core::{Attempt, Config as RoutingConfig, DeferredVerdict, TaskKind, Trace, Verdict};
 
 use crate::calibrate::gate_score;
 use crate::store::{self, StoreError};
@@ -395,15 +409,14 @@ pub fn ope_from_store(
 
 // ── IPS / SNIPS start-rung estimator ─────────────────────────────────────────
 
-/// IPS and SNIPS estimates for evaluating a fixed candidate start-rung policy.
+/// IPS, SNIPS, and doubly-robust (DR) estimates for evaluating a fixed candidate start-rung policy.
 ///
 /// Valid only for traffic logged under a stochastic policy that recorded propensities via
 /// `[escalation.exploration]`. Traces without a `propensity` field are excluded and reported
-/// in `n_with_propensity`. DR (doubly-robust = direct + IPS correction) is a follow-on.
+/// in `n_with_propensity`.
 ///
 /// ponytail: per-context greedy identification is not exploited here (uniform-weight IPS
-/// suffices for population-level estimates). DR is the upgrade path when direct-method
-/// coverage and IPS coverage are both needed simultaneously.
+/// suffices for population-level estimates).
 #[derive(Debug, Clone)]
 pub struct IpsReport {
     /// Total traces in the store for this tenant.
@@ -428,6 +441,13 @@ pub struct IpsReport {
     pub n_correctness_known: usize,
     /// Bootstrap 95% CI for the IPS served-failure estimate.
     pub ci_ips_served_failure: Option<(f64, f64)>,
+    /// Doubly-robust (DR) cost estimate: DM baseline + IPS residual correction.
+    ///
+    /// `DRᵢ = DM(xᵢ, N) + wᵢ · (rᵢ − DM(xᵢ, aᵢ))`, mean over all propensity traces.
+    /// Unbiased when either propensities or the reward model is correctly specified.
+    pub dr_cost: f64,
+    /// Bootstrap 95% CI (2.5/97.5 pct) for the DR cost estimate.
+    pub ci_dr_cost: (f64, f64),
 }
 
 impl IpsReport {
@@ -451,6 +471,13 @@ impl IpsReport {
             ess = self.ess,
             nck = self.n_correctness_known,
         );
+        out.push_str(&format!(
+            "DR cost/request:    ${dr:.6}\n\
+             DR cost CI [2.5%, 97.5%]: [${drlo:.6}, ${drhi:.6}]\n",
+            dr = self.dr_cost,
+            drlo = self.ci_dr_cost.0,
+            drhi = self.ci_dr_cost.1,
+        ));
         match self.ips_served_failure {
             Some(f) => {
                 let sf_snips = self.snips_served_failure.unwrap_or(f);
@@ -466,11 +493,95 @@ impl IpsReport {
             }
         }
         out.push_str(
-            "\nIPS/SNIPS valid only for candidates over the same logged ladder with \
+            "\nIPS/SNIPS/DR valid only for candidates over the same logged ladder with \
              propensity-logged traffic. Traces without propensity excluded. \
+             DR reward model: per-(task-kind, rung) empirical mean — coarse; see ponytail comment. \
              Direct-method replay remains for ladder/threshold changes.\n",
         );
         out
+    }
+}
+
+// ── DR reward model ───────────────────────────────────────────────────────────
+
+/// Per-(task-kind, start-rung) empirical mean cost, used as the DM baseline in DR.
+///
+/// Built from propensity-logged traces only (same population as IPS). Falls back to the
+/// per-rung mean, then the global mean, so `predict` never returns NaN even for (context,
+/// rung) pairs that were never explored.
+///
+/// ponytail: coarse empirical bucket mean — zero new deps, same reward definition as IPS.
+/// Ceiling: cannot extrapolate to (context, rung) pairs with zero logged observations; those
+/// fall back to the rung mean (or global mean), which may be biased if costs vary by context.
+/// Upgrade path: a richer feature regression (e.g. prompt-token bucket × task kind × rung)
+/// once the feature vector grows and sample sizes support it.
+struct DmModel {
+    /// Mean cost keyed by `(TaskKind, start_rung)`.
+    bucket: HashMap<(TaskKind, u32), f64>,
+    /// Per-rung mean cost (fallback when the context bucket is unobserved).
+    rung_mean: HashMap<u32, f64>,
+    /// Grand mean (ultimate fallback when even the rung has no observations).
+    global_mean: f64,
+}
+
+impl DmModel {
+    fn build(traces: &[Trace]) -> Self {
+        let mut bucket_acc: HashMap<(TaskKind, u32), (f64, u32)> = HashMap::new();
+        let mut rung_acc: HashMap<u32, (f64, u32)> = HashMap::new();
+        let mut global_sum = 0.0f64;
+        let mut global_n = 0u32;
+
+        for trace in traces {
+            if trace.policy.propensity.is_none() {
+                continue; // same filter as IPS — use only the propensity-logged population
+            }
+            let Some(first) = trace.attempts.first() else {
+                continue;
+            };
+            let rung = first.rung;
+            let cost = trace.final_.total_cost_usd;
+            let ctx = trace.request.features.task_kind;
+
+            let be = bucket_acc.entry((ctx, rung)).or_default();
+            be.0 += cost;
+            be.1 += 1;
+
+            let re = rung_acc.entry(rung).or_default();
+            re.0 += cost;
+            re.1 += 1;
+
+            global_sum += cost;
+            global_n += 1;
+        }
+
+        let bucket = bucket_acc
+            .into_iter()
+            .map(|(k, (s, n))| (k, s / n as f64))
+            .collect();
+        let rung_mean = rung_acc
+            .into_iter()
+            .map(|(k, (s, n))| (k, s / n as f64))
+            .collect();
+        let global_mean = if global_n > 0 {
+            global_sum / global_n as f64
+        } else {
+            0.0
+        };
+
+        Self {
+            bucket,
+            rung_mean,
+            global_mean,
+        }
+    }
+
+    /// Predicted cost for `(task_kind, rung)`, with graceful fallback.
+    fn predict(&self, task_kind: TaskKind, rung: u32) -> f64 {
+        self.bucket
+            .get(&(task_kind, rung))
+            .copied()
+            .or_else(|| self.rung_mean.get(&rung).copied())
+            .unwrap_or(self.global_mean)
     }
 }
 
@@ -495,6 +606,10 @@ pub fn ips_from_store(
         cost: f64,
         /// `Some(true)` correct, `Some(false)` failure, `None` unknown.
         correctness: Option<bool>,
+        // Needed for DR DM-term lookups.
+        task_kind: TaskKind,
+        /// Logged start rung; 0 when the trace has no attempts (w=0 so correction is 0).
+        logged_rung: u32,
     }
 
     let mut points: Vec<IpsPoint> = Vec::with_capacity(n_traces);
@@ -528,6 +643,8 @@ pub fn ips_from_store(
             weight: w,
             cost: trace.final_.total_cost_usd,
             correctness,
+            task_kind: trace.request.features.task_kind,
+            logged_rung: logged_start.unwrap_or(0),
         });
     }
 
@@ -571,6 +688,27 @@ pub fn ips_from_store(
         (Some(ips_f), Some(snips_f), Some(ci))
     };
 
+    // ── DR estimator ──────────────────────────────────────────────────────────
+    // DRᵢ = DM(xᵢ, N) + wᵢ · (rᵢ − DM(xᵢ, aᵢ))
+    // Averaged over ALL propensity-positive traces (including w=0 ones, which contribute
+    // only the DM baseline term). This is what reduces DR's variance relative to IPS.
+    let dm = DmModel::build(&traces);
+    let dr_vals: Vec<f64> = points
+        .iter()
+        .map(|pt| {
+            let dm_cand = dm.predict(pt.task_kind, candidate_start_rung);
+            let dm_logged = dm.predict(pt.task_kind, pt.logged_rung);
+            dm_cand + pt.weight * (pt.cost - dm_logged)
+        })
+        .collect();
+    let dr_cost = if dr_vals.is_empty() {
+        0.0
+    } else {
+        dr_vals.iter().sum::<f64>() / dr_vals.len() as f64
+    };
+    // ponytail: seed 44 — unique from IPS seeds 42/43 for determinism.
+    let ci_dr_cost = bootstrap_mean_ci(&dr_vals, 1000, 44);
+
     Ok(IpsReport {
         n_traces,
         n_with_propensity,
@@ -583,6 +721,8 @@ pub fn ips_from_store(
         snips_served_failure,
         n_correctness_known,
         ci_ips_served_failure,
+        dr_cost,
+        ci_dr_cost,
     })
 }
 
@@ -1257,5 +1397,193 @@ serve_threshold = 0.75
         assert_eq!(report.snips_cost, 0.0);
         assert_eq!(report.ess, 0.0);
         assert!(report.ips_served_failure.is_none());
+        // DR zero-trace case.
+        assert_eq!(report.dr_cost, 0.0);
+        assert_eq!(report.ci_dr_cost, (0.0, 0.0));
+    }
+
+    // ── DR estimator tests ────────────────────────────────────────────────────
+
+    /// Helper: like `make_propensity_trace` but with `TaskKind::CodeEdit` so tests can build
+    /// a two-context population for the sparse-bucket fallback test.
+    fn make_propensity_trace_ce(rung: u32, cost: f64, p: Option<f64>) -> Trace {
+        let mut t = make_propensity_trace("t", rung, cost, p);
+        t.request.features.task_kind = TaskKind::CodeEdit;
+        t
+    }
+
+    // ── 13. DR = DM = IPS when all traces are at the candidate rung (p=1.0) ──
+    //
+    // Degenerate logging policy: always start at rung 1, propensity = 1.0.
+    //   wᵢ = 1/1.0 = 1 for every trace.
+    //   DM(Other, 1) = mean(costs) = 0.010.
+    //   DRᵢ = DM + 1·(costᵢ − DM) = costᵢ  →  DR = mean(cost) = DM = IPS.
+    #[tokio::test]
+    async fn dr_degenerate_propensities_equals_dm_and_ips() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        for _ in 0..5 {
+            tx.try_send(make_propensity_trace("t", 1, 0.010, Some(1.0)))
+                .unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let r = ips_from_store(&db, "t", 1).unwrap();
+
+        // All three estimators agree when the logging policy is degenerate-correct.
+        assert!(
+            (r.dr_cost - 0.010).abs() < 1e-9,
+            "DR={} expected 0.010",
+            r.dr_cost
+        );
+        assert!(
+            (r.dr_cost - r.ips_cost).abs() < 1e-9,
+            "DR should equal IPS; DR={} IPS={}",
+            r.dr_cost,
+            r.ips_cost
+        );
+        assert!(
+            (r.dr_cost - r.snips_cost).abs() < 1e-9,
+            "DR should equal SNIPS; DR={} SNIPS={}",
+            r.dr_cost,
+            r.snips_cost
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 14. DR correction toward truth under correct propensities ─────────────
+    //
+    // Logging policy: ε-greedy, K=2, greedy=rung 0, ε=0.2:
+    //   p(start=0) = 0.9,  p(start=1) = 0.1
+    //
+    // Data: 9 traces at rung 0 (cost $0.001, p=0.9), 1 trace at rung 1 (cost $0.010, p=0.1).
+    //
+    // Naive mean of ALL logged costs: (9·0.001 + 1·0.010)/10 = 0.0019  ← biased for
+    // "always rung 1".  DM(Other, 1) = 0.010 (correct bucket mean from the one observation).
+    //
+    // IPS  = (1/0.1)·0.010 / 10 = 0.010  ✓
+    // DR:
+    //   9 rung-0 traces: DRᵢ = DM(Other,1) + 0·(…) = 0.010
+    //   1 rung-1 trace:  DRᵢ = DM(Other,1) + 10·(0.010 − 0.010) = 0.010
+    //   DR = 0.010 ✓   (not the biased 0.0019)
+    #[tokio::test]
+    async fn dr_correction_recovers_true_cost_under_correct_propensities() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        for _ in 0..9 {
+            tx.try_send(make_propensity_trace("t", 0, 0.001, Some(0.9)))
+                .unwrap();
+        }
+        tx.try_send(make_propensity_trace("t", 1, 0.010, Some(0.1)))
+            .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let r = ips_from_store(&db, "t", 1).unwrap();
+
+        // Naive logged mean = 0.0019; both DR and IPS correctly recover 0.010.
+        assert!(
+            (r.dr_cost - 0.010).abs() < 1e-9,
+            "DR={} expected 0.010 (not the naive logged mean 0.0019)",
+            r.dr_cost
+        );
+        assert!(
+            (r.dr_cost - r.ips_cost).abs() < 1e-9,
+            "DR should equal IPS under correct propensities; DR={} IPS={}",
+            r.dr_cost,
+            r.ips_cost
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 15. Sparse-bucket fallback — no NaN ───────────────────────────────────
+    //
+    // Two task kinds create a cross-context sparse-bucket scenario:
+    //   • CodeEdit traces are only logged at rung 0  → DM(CE, 1) falls back to rung_mean[1]
+    //   • Other traces are only logged at rung 1     → DM(Other, 0) falls back to rung_mean[0]
+    //
+    // DM fallback values must not NaN; DR must be finite.
+    //
+    // Candidate rung = 1.
+    //   CE  rung-0 (5): w=0; DRᵢ = DM(CE,1) = rung_mean[1] = 0.020
+    //   Other rung-1 (5): w=2; DRᵢ = 0.020 + 2·(0.020−0.020) = 0.020
+    //   DR = 0.020
+    #[tokio::test]
+    async fn dr_sparse_bucket_fallback_no_nan() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        for _ in 0..5 {
+            tx.try_send(make_propensity_trace_ce(0, 0.001, Some(0.5)))
+                .unwrap();
+        }
+        for _ in 0..5 {
+            tx.try_send(make_propensity_trace("t", 1, 0.020, Some(0.5)))
+                .unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let r = ips_from_store(&db, "t", 1).unwrap();
+
+        assert!(
+            r.dr_cost.is_finite(),
+            "DR must be finite even when a context bucket is empty (got NaN/inf)"
+        );
+        assert!(
+            (r.dr_cost - 0.020).abs() < 1e-9,
+            "DR={} expected 0.020",
+            r.dr_cost
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 16. DR bootstrap CI is present, finite, and sane ─────────────────────
+    //
+    // Verifies that the CI brackets the point estimate and is deterministic.
+    #[tokio::test]
+    async fn dr_ci_present_and_sane() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+
+        // 20 traces at rung 1, alternating cost 0.001 / 0.002, propensity 0.5.
+        for i in 0..20u32 {
+            let cost = if i % 2 == 0 { 0.001 } else { 0.002 };
+            tx.try_send(make_propensity_trace("t", 1, cost, Some(0.5)))
+                .unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let r1 = ips_from_store(&db, "t", 1).unwrap();
+        let r2 = ips_from_store(&db, "t", 1).unwrap();
+
+        // Deterministic.
+        assert_eq!(r1.ci_dr_cost, r2.ci_dr_cost, "DR CI must be deterministic");
+
+        // CI must be ordered and finite.
+        let (lo, hi) = r1.ci_dr_cost;
+        assert!(lo.is_finite() && hi.is_finite(), "DR CI must be finite");
+        assert!(lo <= hi, "DR CI must be ordered: lo={lo} hi={hi}");
+
+        // CI must bracket the point estimate (within floating-point tolerance).
+        assert!(
+            lo <= r1.dr_cost + 1e-9,
+            "DR CI lo {lo} > dr_cost {}",
+            r1.dr_cost
+        );
+        assert!(
+            hi >= r1.dr_cost - 1e-9,
+            "DR CI hi {hi} < dr_cost {}",
+            r1.dr_cost
+        );
+
+        let _ = std::fs::remove_file(&db);
     }
 }
