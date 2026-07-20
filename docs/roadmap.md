@@ -67,9 +67,9 @@ baseline.
       false-accept rate (verifier ROC point) at the chosen threshold.
 - [ ] Live adaptive-conformal loop closing the guarantee under drift: ACI wired to the
       realized-served-failure gauge so the bound holds as the workload shifts.
-- [ ] Verifier-imperfection rails: cap samples per rung; feed each gate's observed
-      error profile into calibration (an imperfect verifier inverse-scales — bounded use is
-      a feature, not a limit).
+- [x] Verifier-imperfection rails: sample counts are hard-capped (consistency k &le; 8) and
+      LTT calibration reports the gate's observed false-accept rate at the chosen threshold
+      (an imperfect verifier inverse-scales — bounded use is a feature, not a limit).
 - [ ] Joint (rung, sample-count) routing: cheap model + k-sample agreement often dominates
       escalation on the easy/medium slice, and the gate makes exploiting that safe.
 - [ ] Speculative deferral: prefetch the next rung only in the marginal serve-probability
