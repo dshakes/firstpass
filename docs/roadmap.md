@@ -105,7 +105,9 @@ GA is an audit + soak + process stamp, not a code stamp (ADR 0003).
 - [ ] Hosted control plane (ADR 0004, post-review) with team dashboards.
 - [ ] Policy rehearsal as a product surface: replay a candidate policy over your own logged
       traffic before enforcing it.
-- [ ] Receipts as a compliance artifact: export/verify tooling an external auditor can run.
+- [x] Receipts as a compliance artifact: `firstpass export` (sealed JSONL) + `firstpass verify`
+      re-derive the hash chain from genesis with no proxy/DB in the loop — tamper and reorder
+      break the chain at their index and exit non-zero. Live-proven end-to-end.
 - [ ] SLO-backed guarantee language.
 - [ ] MCP tools for savings, rehearsal, and route explanation.
 

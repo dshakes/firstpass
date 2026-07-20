@@ -168,6 +168,8 @@ gates  = ["unit-tests"]
 ```
 
 Downstream outcomes flow back via `POST /v1/feedback` onto a deferred-verdict side table that never alters the sealed record.
+
+**Independently auditable.** `firstpass export` writes the sealed receipt log as JSONL; anyone — an auditor, a regulator, you — runs `firstpass verify --file receipts.jsonl` on their own machine to re-derive the hash chain from genesis with no proxy and no database in the loop. A single altered or reordered receipt breaks the chain at its index and exits non-zero. Black-box routers can't produce this artifact; it's the EU-AI-Act-style logging story built in.
 </details>
 
 <details>

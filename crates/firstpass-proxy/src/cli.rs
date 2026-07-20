@@ -255,6 +255,79 @@ pub fn format_evals(s: &EvalsSummary) -> String {
     out.trim_end().to_owned()
 }
 
+/// Outcome of an independent receipt-chain verification — the compliance artifact.
+#[derive(Debug, serde::Serialize)]
+pub struct VerifyReport {
+    /// Receipts checked.
+    pub receipts: usize,
+    /// `true` iff the hash chain re-derives cleanly from genesis (tamper-evident proof).
+    pub valid: bool,
+    /// On failure, the 0-based index of the first broken link and why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broken_at: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Independently re-derive the hash chain over `traces` from genesis — the same computation an
+/// external auditor runs, with no trust in the proxy or the database. A single altered or
+/// reordered receipt breaks the chain at its index.
+#[must_use]
+pub fn verify_receipts(traces: &[Trace]) -> VerifyReport {
+    match firstpass_core::verify_chain(traces, firstpass_core::GENESIS_HASH) {
+        Ok(()) => VerifyReport {
+            receipts: traces.len(),
+            valid: true,
+            broken_at: None,
+            detail: None,
+        },
+        Err(firstpass_core::Error::ChainBroken { index, detail }) => VerifyReport {
+            receipts: traces.len(),
+            valid: false,
+            broken_at: Some(index),
+            detail: Some(detail),
+        },
+        Err(e) => VerifyReport {
+            receipts: traces.len(),
+            valid: false,
+            broken_at: None,
+            detail: Some(e.to_string()),
+        },
+    }
+}
+
+/// Parse a JSONL receipt export (one [`Trace`] per line) back into traces, for offline
+/// verification. Blank lines are skipped; a malformed line fails loudly with its line number.
+///
+/// # Errors
+/// Returns the 1-based line number and parse error of the first unparseable line.
+pub fn parse_receipt_jsonl(text: &str) -> Result<Vec<Trace>, String> {
+    let mut traces = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let t: Trace = serde_json::from_str(line).map_err(|e| format!("line {}: {e}", i + 1))?;
+        traces.push(t);
+    }
+    Ok(traces)
+}
+
+/// Render `traces` as a JSONL receipt export — one sealed receipt per line, in chain order.
+/// This is the artifact an operator hands an auditor; the deferred-verdict side table is never
+/// included (it is not part of the hashed body).
+#[must_use]
+pub fn export_receipts_jsonl(traces: &[Trace]) -> String {
+    let mut out = String::new();
+    for t in traces {
+        if let Ok(line) = serde_json::to_string(t) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Aggregated spend/savings over a set of traces — the number the operator screenshots.
 /// Pure so it's unit-testable; `firstpass savings` feeds it the trace store.
 #[derive(Debug, serde::Serialize)]
@@ -424,5 +497,102 @@ mod tests {
         let s = summarize_evals(&[]);
         assert_eq!(s.enforce_traces, 0);
         assert!(format_evals(&s).contains("no enforce traces"));
+    }
+
+    #[test]
+    fn verify_and_export_round_trip_detects_tampering() {
+        use firstpass_core::{
+            Attempt, Features, FinalOutcome, GENESIS_HASH, PolicyRef, RequestInfo, ServedFrom,
+            TaskKind, Verdict,
+        };
+
+        // Build a valid 3-link chain: each prev_hash = the previous record's hash.
+        let mk = |prev: &str, session: &str| Trace {
+            trace_id: uuid::Uuid::now_v7(),
+            prev_hash: prev.to_owned(),
+            tenant_id: "default".to_owned(),
+            session_id: session.to_owned(),
+            ts: jiff::Timestamp::UNIX_EPOCH,
+            mode: Mode::Observe,
+            policy: PolicyRef {
+                id: "observe-passthrough@v0".to_owned(),
+                explore: false,
+                propensity: None,
+            },
+            request: RequestInfo {
+                api: "anthropic.messages".to_owned(),
+                prompt_hash: "deadbeef".to_owned(),
+                features: Features::new(TaskKind::Other),
+            },
+            attempts: vec![Attempt {
+                rung: 0,
+                model: "anthropic/claude-haiku-4-5".to_owned(),
+                provider: "anthropic".to_owned(),
+                in_tokens: 10,
+                out_tokens: 5,
+                cost_usd: 0.001,
+                latency_ms: 12,
+                gates: vec![],
+                verdict: Verdict::Pass,
+            }],
+            deferred: Vec::new(),
+            final_: FinalOutcome {
+                served_rung: Some(0),
+                served_from: ServedFrom::Attempt,
+                total_cost_usd: 0.001,
+                gate_cost_usd: 0.0,
+                total_latency_ms: 12,
+                escalations: 0,
+                counterfactual_baseline_usd: 0.001,
+                savings_usd: 0.0,
+            },
+        };
+        let t0 = mk(GENESIS_HASH, "s0");
+        let t1 = mk(&t0.hash().unwrap(), "s1");
+        let t2 = mk(&t1.hash().unwrap(), "s2");
+        let chain = vec![t0, t1, t2];
+
+        // Clean chain verifies.
+        let report = verify_receipts(&chain);
+        assert!(report.valid, "intact chain must verify: {report:?}");
+        assert_eq!(report.receipts, 3);
+
+        // Export → parse round-trips and still verifies (the auditor's offline path).
+        let jsonl = export_receipts_jsonl(&chain);
+        assert_eq!(jsonl.lines().count(), 3);
+        let reparsed = parse_receipt_jsonl(&jsonl).expect("export must re-parse");
+        assert!(
+            verify_receipts(&reparsed).valid,
+            "round-tripped chain must verify"
+        );
+
+        // Tamper with a middle receipt's body → verification catches it at that index.
+        let mut tampered = reparsed;
+        tampered[1].final_.total_cost_usd = 999.0; // alter a sealed field
+        let bad = verify_receipts(&tampered);
+        assert!(!bad.valid, "a mutated receipt must break the chain");
+        assert_eq!(
+            bad.broken_at,
+            Some(2),
+            "the break surfaces at the next link"
+        );
+
+        // Reordering is also caught.
+        let mut reordered = parse_receipt_jsonl(&jsonl).unwrap();
+        reordered.swap(0, 1);
+        assert!(
+            !verify_receipts(&reordered).valid,
+            "reordering breaks the chain"
+        );
+    }
+
+    #[test]
+    fn parse_receipt_jsonl_reports_bad_line() {
+        let err = parse_receipt_jsonl("not json\n").unwrap_err();
+        assert!(err.starts_with("line 1:"), "must name the bad line: {err}");
+        assert!(
+            parse_receipt_jsonl("\n\n").unwrap().is_empty(),
+            "blank lines skipped"
+        );
     }
 }
