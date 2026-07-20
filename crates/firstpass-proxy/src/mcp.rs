@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_the_three_tools() {
+    fn tools_list_exposes_every_tool() {
         let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
         let resp = handle_rpc(&req, "unused.db", "default").unwrap();
         let names: Vec<&str> = resp["result"]["tools"]
@@ -274,7 +274,16 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        assert_eq!(names, ["list_traces", "get_trace", "submit_feedback"]);
+        assert_eq!(
+            names,
+            [
+                "list_traces",
+                "get_trace",
+                "get_savings",
+                "get_evals",
+                "submit_feedback"
+            ]
+        );
     }
 
     #[test]
