@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use firstpass_core::{GateResult, Score, Verdict};
+use firstpass_core::{GateResult, Score, Verdict, cost::PriceTable};
 
 use crate::gate::Gate;
 use crate::provider::{Auth, ModelRequest, ModelResponse, Provider};
@@ -48,10 +48,13 @@ pub struct ConsistencyGate {
     auth: Auth,
     k: u32,
     threshold: f64,
+    /// Prices the k sample calls so their cost lands on the receipt ([`GateResult::cost_usd`]).
+    prices: PriceTable,
 }
 
 impl ConsistencyGate {
-    /// Build a consistency gate. `provider` serves `sample_model`; `auth` carries credentials.
+    /// Build a consistency gate. `provider` serves `sample_model`; `auth` carries credentials;
+    /// `prices` prices the k sample calls onto the receipt.
     #[must_use]
     pub fn new(
         id: impl Into<String>,
@@ -60,6 +63,7 @@ impl ConsistencyGate {
         auth: Auth,
         k: u32,
         threshold: f64,
+        prices: PriceTable,
     ) -> Self {
         Self {
             id: id.into(),
@@ -68,6 +72,7 @@ impl ConsistencyGate {
             auth,
             k,
             threshold,
+            prices,
         }
     }
 }
@@ -95,9 +100,16 @@ impl Gate for ConsistencyGate {
         }
 
         let mut samples: Vec<String> = Vec::new();
+        let mut sample_cost = 0.0_f64;
         while let Some(res) = set.join_next().await {
             // Provider error or task panic → drop this sample, score over the rest.
             if let Ok(Ok(sample)) = res {
+                // Each sample is a real model call — price it onto the receipt so the router's
+                // budget/savings math sees the true cost of measured confidence.
+                sample_cost += self
+                    .prices
+                    .cost_usd(&self.sample_model, sample.in_tokens, sample.out_tokens)
+                    .unwrap_or(0.0);
                 samples.push(sample.text);
             }
         }
@@ -108,6 +120,7 @@ impl Gate for ConsistencyGate {
         if samples.is_empty() {
             let mut r = GateResult::abstain(&self.id, "no_usable_samples", ms);
             r.evidence_ref = Some(format!("all {} sample calls failed", self.k));
+            r.cost_usd = sample_cost;
             return r;
         }
 
@@ -139,10 +152,7 @@ impl Gate for ConsistencyGate {
 
         let mut r = GateResult::deterministic(&self.id, verdict, ms);
         r.score = Score::new(score_val).ok();
-        // ponytail: cost_usd for the k sample calls is not accounted here (JudgeGate also
-        // leaves cost_usd = 0.0 — the gate's model-call cost flows to the route budget via
-        // the router, not the GateResult). Add sample token counts here if per-gate cost
-        // breakdowns are needed.
+        r.cost_usd = sample_cost;
         r
     }
 }
@@ -264,6 +274,7 @@ mod tests {
             Auth::default(),
             3,
             0.6,
+            PriceTable::default(),
         );
         let candidate = make_resp("anthropic/claude-haiku-4-5", "Therefore the answer is 42.");
         let result = gate.evaluate(&make_req(), &candidate).await;
@@ -290,6 +301,7 @@ mod tests {
             Auth::default(),
             3,
             0.6,
+            PriceTable::default(),
         );
         let candidate = make_resp("anthropic/claude-haiku-4-5", "The answer is 42");
         let result = gate.evaluate(&make_req(), &candidate).await;
@@ -318,6 +330,7 @@ mod tests {
             Auth::default(),
             k,
             0.5,
+            PriceTable::default(),
         );
         gate.evaluate(&make_req(), &make_resp("anthropic/claude-haiku-4-5", "42"))
             .await;
@@ -339,6 +352,7 @@ mod tests {
             Auth::default(),
             3,
             0.6,
+            PriceTable::default(),
         );
         let candidate = make_resp("anthropic/claude-haiku-4-5", "42");
         let result = gate.evaluate(&make_req(), &candidate).await;
@@ -384,5 +398,37 @@ mod tests {
         assert!((jaccard("", "") - 1.0).abs() < 1e-9);
         // One empty → 0.0.
         assert!((jaccard("a b", "") - 0.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn sample_cost_lands_on_the_receipt() {
+        use firstpass_core::cost::ModelPrice;
+        // k=3 samples at 10 in / 10 out tokens each, priced 1.0/5.0 per Mtok.
+        let prices = PriceTable::new().with_override(
+            "anthropic/sampler",
+            ModelPrice {
+                input_per_mtok: 1.0,
+                output_per_mtok: 5.0,
+            },
+        );
+        let gate = ConsistencyGate::new(
+            "uncertainty",
+            provider_returning("anthropic/sampler", "42"),
+            "anthropic/sampler",
+            Auth::default(),
+            3,
+            0.5,
+            prices,
+        );
+        let r = gate
+            .evaluate(&make_req(), &make_resp("anthropic/sampler", "42"))
+            .await;
+        // 3 samples x (10/1e6*1.0 + 10/1e6*5.0) = 3 x 6e-5 = 1.8e-4.
+        let expected = 3.0 * (10.0 / 1e6 * 1.0 + 10.0 / 1e6 * 5.0);
+        assert!(
+            (r.cost_usd - expected).abs() < 1e-12,
+            "k sample calls priced onto the receipt: got {}, want {expected}",
+            r.cost_usd
+        );
     }
 }

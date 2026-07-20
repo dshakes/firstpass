@@ -7,7 +7,7 @@
 //! version of the `Firstpass` policy proven in `firstpass-bench`; the semantics are identical.
 
 use crate::calibrate::gate_score;
-use crate::gate::{Gate, GateHealthRegistry, aggregate};
+use crate::gate::{Gate, GateHealthRegistry, aggregate_with_policy};
 use crate::provider::{Auth, ModelRequest, ModelResponse, ProviderError, ProviderRegistry};
 use firstpass_core::verdict::reason;
 use firstpass_core::{
@@ -285,7 +285,13 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                 gate_cost_total += gc;
                 spent += gc;
 
-                let verdict = aggregate(&gate_results);
+                let fail_closed: std::collections::HashSet<&str> = ctx
+                    .gates
+                    .iter()
+                    .filter(|g| g.abstain_fails_closed())
+                    .map(|g| g.id())
+                    .collect();
+                let verdict = aggregate_with_policy(&gate_results, &fail_closed);
                 let serve = should_serve(ctx.serve_threshold, &gate_results, verdict);
                 attempts.push(Attempt {
                     rung: idx,
@@ -453,7 +459,13 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                 gate_cost_total += gc;
                 spent += gc;
 
-                let verdict = aggregate(&gate_results);
+                let fail_closed: std::collections::HashSet<&str> = ctx
+                    .gates
+                    .iter()
+                    .filter(|g| g.abstain_fails_closed())
+                    .map(|g| g.id())
+                    .collect();
+                let verdict = aggregate_with_policy(&gate_results, &fail_closed);
                 let serve = should_serve(ctx.serve_threshold, &gate_results, verdict);
                 attempts.push(Attempt {
                     rung: idx as u32,
@@ -1414,5 +1426,67 @@ mod tests {
         // The whitespace-only answer from rung 1 must never have been served.
         assert_eq!(trace.attempts[0].rung, 1);
         assert_eq!(trace.attempts[0].verdict, Verdict::Fail);
+    }
+
+    /// A gate that always abstains; `fail_closed` controls its §7.2 abstain policy.
+    #[derive(Debug)]
+    struct AbstainGate {
+        fail_closed: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Gate for AbstainGate {
+        fn id(&self) -> &str {
+            "flaky"
+        }
+        async fn evaluate(&self, _req: &ModelRequest, _resp: &ModelResponse) -> GateResult {
+            GateResult::abstain(self.id(), "timeout", 0)
+        }
+        fn abstain_fails_closed(&self) -> bool {
+            self.fail_closed
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_open_abstain_serves_fail_closed_abstain_escalates() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+
+        // Fail-open (default): the abstain never blocks — rung 0 serves.
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(AbstainGate { fail_closed: false })];
+        let providers = registry(vec![
+            ("anthropic", HAIKU, Ok(resp(HAIKU, "cheap answer"))),
+            ("anthropic", SONNET, Ok(resp(SONNET, "expensive answer"))),
+        ]);
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == HAIKU));
+        assert_eq!(trace.final_.served_rung, Some(0));
+
+        // Fail-closed: the same abstain blocks serving like a Fail — escalate to rung 1. The
+        // receipt still records the *abstain* (honest), only the aggregate verdict fails.
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(AbstainGate { fail_closed: true })];
+        let providers = registry(vec![
+            ("anthropic", HAIKU, Ok(resp(HAIKU, "cheap answer"))),
+            ("anthropic", SONNET, Ok(resp(SONNET, "expensive answer"))),
+        ]);
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+        // Both rungs abstain under fail-closed, so nothing passes: best-attempt fallback serves
+        // the last rung after full escalation — the point is the escalation happened.
+        assert_eq!(trace.attempts.len(), 2, "fail-closed abstain must escalate");
+        assert_eq!(trace.final_.escalations, 1);
+        assert_eq!(
+            trace.attempts[0].gates[0].verdict,
+            Verdict::Abstain,
+            "receipt records the honest abstain, not a rewritten Fail"
+        );
+        assert!(matches!(out, EngineOutcome::Served(_)));
     }
 }

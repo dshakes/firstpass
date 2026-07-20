@@ -139,6 +139,29 @@ fn record_trace_metrics(trace: &Trace) {
     if trace.final_.served_from == ServedFrom::Error {
         metrics::counter!("firstpass_upstream_failures_total").increment(1);
     }
+    // The value signals: what was spent, what proof cost, and what routing saved vs always-top
+    // (§9.1 counterfactual). Monotonic gauges because `metrics` counters are integer-only and
+    // these are USD floats; scrape-side `rate()`/`increase()` work the same.
+    metrics::gauge!("firstpass_cost_usd_total").increment(trace.final_.total_cost_usd);
+    metrics::gauge!("firstpass_gate_cost_usd_total").increment(trace.final_.gate_cost_usd);
+    metrics::gauge!("firstpass_baseline_usd_total")
+        .increment(trace.final_.counterfactual_baseline_usd);
+    metrics::gauge!("firstpass_savings_usd_total").increment(trace.final_.savings_usd);
+    // Which rung actually served, labeled by model — the shape of the ladder in production.
+    if let Some(rung) = trace.final_.served_rung {
+        let model = trace
+            .attempts
+            .iter()
+            .find(|a| a.rung == rung)
+            .map(|a| a.model.clone())
+            .unwrap_or_else(|| "unknown".to_owned());
+        metrics::counter!(
+            "firstpass_served_rung_total",
+            "rung" => rung.to_string(),
+            "model" => model
+        )
+        .increment(1);
+    }
 }
 
 /// Max accepted request body. Explicit (not axum's ~2 MB default) so it's an intentional ceiling:
@@ -532,7 +555,13 @@ async fn handle_enforce(
         .routing
         .as_ref()
         .map_or(&[][..], |cfg| &cfg.gate_defs);
-    let gates = resolve_gates(&route.gates, gate_defs, &state.providers, &auth);
+    let gates = resolve_gates(
+        &route.gates,
+        gate_defs,
+        &state.providers,
+        &auth,
+        &state.config.prices,
+    );
     let session_id = session_header.unwrap_or_else(|| Uuid::now_v7().to_string());
     let (budget, max_rungs, speculation, serve_threshold) = match state.config.routing.as_ref() {
         Some(cfg) => (

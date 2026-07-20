@@ -103,6 +103,20 @@ judge = { model = "anthropic/claude-opus-4-8", threshold = 0.7, rubric = "The re
 # id          = "uncertainty"
 # consistency = { model = "anthropic/claude-haiku-4-5", k = 3, threshold = 0.6 }
 
+# A JSON-Schema gate: the candidate must parse as JSON and satisfy a schema subset (top-level
+# `type`, `required`, per-property `type`) — the cheapest structural gate for extraction and
+# tool-argument routes.
+#
+# `on_abstain` (any gate kind): what an *abstain* means for serving (§7.2).
+#   "fail_open"   (default) — an abstaining gate never blocks serving.
+#   "fail_closed"           — an abstain blocks serving exactly like a fail, for gates whose
+#                             silence must never be mistaken for approval.
+#
+# [[gate]]
+# id         = "extract-shape"
+# schema     = { type = "object", required = ["name", "amount"] }
+# on_abstain = "fail_closed"
+
 [budget]
 per_request_usd = 0.50
 per_session_usd = 10.00

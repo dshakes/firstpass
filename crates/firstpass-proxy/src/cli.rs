@@ -188,6 +188,71 @@ fn can_write_db(db_path: &str) -> bool {
     }
 }
 
+/// Aggregated spend/savings over a set of traces — the number the operator screenshots.
+/// Pure so it's unit-testable; `firstpass savings` feeds it the trace store.
+#[derive(Debug, serde::Serialize)]
+pub struct SavingsSummary {
+    /// Traces aggregated.
+    pub traces: usize,
+    /// Enforce-mode traces (the ones where routing actually decided).
+    pub enforce_traces: usize,
+    /// USD actually spent (model + gate calls), summed over all traces.
+    pub spent_usd: f64,
+    /// USD spent on gates alone (the price of proof).
+    pub gate_usd: f64,
+    /// What always calling the top rung would have cost (§9.1 counterfactual), summed.
+    pub baseline_usd: f64,
+    /// `baseline - spent` — the savings the receipts prove.
+    pub savings_usd: f64,
+    /// Savings as a fraction of baseline, `0.0` when there is no baseline.
+    pub savings_pct: f64,
+}
+
+/// Aggregate spend vs the always-top counterfactual over `traces`.
+#[must_use]
+pub fn summarize_savings(traces: &[Trace]) -> SavingsSummary {
+    let mut s = SavingsSummary {
+        traces: traces.len(),
+        enforce_traces: 0,
+        spent_usd: 0.0,
+        gate_usd: 0.0,
+        baseline_usd: 0.0,
+        savings_usd: 0.0,
+        savings_pct: 0.0,
+    };
+    for t in traces {
+        if t.mode == Mode::Enforce {
+            s.enforce_traces += 1;
+        }
+        s.spent_usd += t.final_.total_cost_usd;
+        s.gate_usd += t.final_.gate_cost_usd;
+        s.baseline_usd += t.final_.counterfactual_baseline_usd;
+    }
+    s.savings_usd = s.baseline_usd - s.spent_usd;
+    if s.baseline_usd > 0.0 {
+        s.savings_pct = s.savings_usd / s.baseline_usd;
+    }
+    s
+}
+
+/// Render a [`SavingsSummary`] for humans (`--json` callers serialize the struct instead).
+#[must_use]
+pub fn format_savings(s: &SavingsSummary) -> String {
+    if s.traces == 0 {
+        return "no traces recorded yet — route some traffic through the proxy first".to_owned();
+    }
+    format!(
+        "traces: {} ({} enforce)\nspent:    ${:.4}  (gates ${:.4})\nbaseline: ${:.4}  (always top rung)\nsavings:  ${:.4}  ({:.1}%)",
+        s.traces,
+        s.enforce_traces,
+        s.spent_usd,
+        s.gate_usd,
+        s.baseline_usd,
+        s.savings_usd,
+        s.savings_pct * 100.0
+    )
+}
+
 /// Render the most recent `limit` traces as JSON lines — machine-first (SPEC §0.2): each line is a
 /// full [`Trace`], newest last.
 #[must_use]
@@ -278,5 +343,12 @@ mod tests {
     #[test]
     fn format_traces_handles_empty() {
         assert_eq!(format_traces(&[], 10), "no traces recorded yet");
+    }
+
+    #[test]
+    fn savings_summary_empty_and_nonempty() {
+        let empty = summarize_savings(&[]);
+        assert_eq!(empty.traces, 0);
+        assert!(format_savings(&empty).contains("no traces"));
     }
 }
