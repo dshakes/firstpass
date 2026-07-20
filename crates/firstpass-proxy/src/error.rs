@@ -76,7 +76,7 @@ impl ProxyError {
     /// their real message; upstream / engine / internal detail is generalized so the response never
     /// leaks the upstream's identity, an internal error string, or server state (the full detail is
     /// logged server-side instead — see [`IntoResponse`]).
-    fn client_message(&self) -> String {
+    pub(crate) fn client_message(&self) -> String {
         match self {
             ProxyError::BadRequest(m) | ProxyError::NotFound(m) => m.clone(),
             ProxyError::BadRequestBody => "failed to read request body".to_owned(),

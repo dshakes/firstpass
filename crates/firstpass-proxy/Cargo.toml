@@ -22,6 +22,7 @@ name = "firstpass"
 path = "src/bin/firstpass.rs"
 
 [dependencies]
+futures-core = "0.3"
 firstpass-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

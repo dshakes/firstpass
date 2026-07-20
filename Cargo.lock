@@ -680,6 +680,7 @@ dependencies = [
  "axum",
  "bytes",
  "firstpass-core",
+ "futures-core",
  "gcp_auth",
  "governor",
  "hex",

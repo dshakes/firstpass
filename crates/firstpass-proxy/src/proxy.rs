@@ -20,6 +20,8 @@ use firstpass_core::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use std::future::Future;
+use std::time::Duration;
 use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
@@ -568,11 +570,64 @@ async fn handle_enforce(
     session_header: Option<String>,
     tenant: String,
 ) -> Response {
+    // A streaming client gets its SSE connection opened IMMEDIATELY: the routing pipeline
+    // (model call + gates + possible escalation) runs in a spawned task while the response body
+    // emits standards-compliant SSE comment keepalives (`: firstpass routing`) every few seconds,
+    // so no client or proxy idle-timeout fires during a long escalation. When the pipeline
+    // resolves, the gated result streams out as the usual Anthropic event sequence (ADR 0005 P3);
+    // a pipeline error becomes an SSE `error` event (status is already 200 by then — the SSE
+    // error frame is the in-band channel the protocol defines for exactly this).
+    if is_stream_request(body) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
+        let (state_c, headers_c, body_c, route_c) =
+            (state.clone(), headers.clone(), body.clone(), route.clone());
+        tokio::spawn(async move {
+            let out = enforce_pipeline(
+                &state_c,
+                &headers_c,
+                &body_c,
+                features,
+                &route_c,
+                session_header,
+                tenant,
+            )
+            .await;
+            let _ = tx.send(out);
+        });
+        return sse_keepalive_response(rx);
+    }
+    match enforce_pipeline(
+        state,
+        headers,
+        body,
+        features,
+        route,
+        session_header,
+        tenant,
+    )
+    .await
+    {
+        Ok(message) => (axum::http::StatusCode::OK, Json(message)).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The enforce pipeline: parse → resolve gates → route the ladder → bookkeeping (bandit,
+/// trace) → the served Anthropic-shaped message JSON. Shared verbatim by the buffered
+/// (non-streaming) and keepalive-streaming paths, so both serve identical bytes.
+async fn enforce_pipeline(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    features: Features,
+    route: &Route,
+    session_header: Option<String>,
+    tenant: String,
+) -> Result<Value, ProxyError> {
     let Some(base_request) = parse_model_request(body) else {
-        return ProxyError::BadRequest(
+        return Err(ProxyError::BadRequest(
             "request body is not a valid Anthropic Messages request".to_owned(),
-        )
-        .into_response();
+        ));
     };
     let auth = Auth::from_headers(headers);
     let gate_defs = state
@@ -708,27 +763,89 @@ async fn handle_enforce(
     offer_trace(&state.traces, trace);
 
     match outcome {
-        EngineOutcome::Served(resp) => {
-            let message = anthropic_response_json(&resp);
-            // A streaming client gets the gated result re-emitted as SSE (ADR 0005 P3): the gate
-            // needs the whole candidate, so enforce can't stream token-by-token from the model — it
-            // buffers to gate, then streams the served blocks out. tool_use blocks are preserved.
-            if is_stream_request(body) {
-                (
-                    axum::http::StatusCode::OK,
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        "text/event-stream; charset=utf-8",
-                    )],
-                    anthropic_sse_from_message(&message),
-                )
-                    .into_response()
-            } else {
-                (axum::http::StatusCode::OK, Json(message)).into_response()
-            }
-        }
-        EngineOutcome::Failed(msg) => ProxyError::Engine(msg).into_response(),
+        EngineOutcome::Served(resp) => Ok(anthropic_response_json(&resp)),
+        EngineOutcome::Failed(msg) => Err(ProxyError::Engine(msg)),
     }
+}
+
+/// Interval between SSE comment keepalives while the enforce pipeline is still routing.
+const SSE_KEEPALIVE_EVERY: Duration = Duration::from_secs(5);
+
+/// A 200 `text/event-stream` response whose body emits comment keepalives until `rx` resolves,
+/// then the gated result as the standard Anthropic event sequence (or an SSE `error` event).
+/// SSE comment lines (leading `:`) are defined by the EventSource spec to be ignored by every
+/// conforming parser — they keep the connection alive without confusing any client.
+fn sse_keepalive_response(
+    rx: tokio::sync::oneshot::Receiver<Result<Value, ProxyError>>,
+) -> Response {
+    let mut ticks = tokio::time::interval(SSE_KEEPALIVE_EVERY);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticks.reset(); // skip the immediate first tick — the first keepalive fires after one period
+    let stream = KeepaliveStream {
+        rx: Some(rx),
+        ticks,
+    };
+    (
+        axum::http::StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/event-stream; charset=utf-8",
+        )],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+/// Hand-rolled [`futures_core::Stream`]-shaped body (no new dependency): comment keepalives
+/// while the pipeline runs, then the final SSE frame, then end-of-stream.
+struct KeepaliveStream {
+    /// `Some` until the pipeline resolves and the final frame has been emitted.
+    rx: Option<tokio::sync::oneshot::Receiver<Result<Value, ProxyError>>>,
+    ticks: tokio::time::Interval,
+}
+
+impl futures_core::Stream for KeepaliveStream {
+    type Item = Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let Some(rx) = self.rx.as_mut() else {
+            return Poll::Ready(None); // final frame already emitted
+        };
+        if let Poll::Ready(out) = std::pin::Pin::new(rx).poll(cx) {
+            let frame = match out {
+                Ok(Ok(message)) => anthropic_sse_from_message(&message),
+                Ok(Err(e)) => sse_error_event(&e),
+                Err(_) => sse_error_event(&ProxyError::Internal(
+                    "enforce pipeline task dropped".to_owned(),
+                )),
+            };
+            self.rx = None;
+            return Poll::Ready(Some(Ok(Bytes::from(frame))));
+        }
+        if self.ticks.poll_tick(cx).is_ready() {
+            return Poll::Ready(Some(Ok(Bytes::from_static(b": firstpass routing\n\n"))));
+        }
+        Poll::Pending
+    }
+}
+
+/// Render a pipeline error as the Anthropic SSE `error` event (client-safe message only —
+/// internal detail is logged by the error type, never sent).
+fn sse_error_event(e: &ProxyError) -> String {
+    let mut out = String::new();
+    sse_event(
+        &mut out,
+        "error",
+        &serde_json::json!({
+            "type": "error",
+            "error": { "type": "api_error", "message": e.client_message() }
+        }),
+    );
+    out
 }
 
 /// Parse an Anthropic Messages request body into the normalized [`ModelRequest`]. Returns
@@ -2427,5 +2544,131 @@ mod tests {
             (total - 1.0).abs() < 1e-12,
             "propensities must sum to 1, got {total}"
         );
+    }
+
+    /// Poll the hand-rolled keepalive stream directly under paused tokio time: one keepalive
+    /// per idle interval while the pipeline runs, then the final SSE frame, then end-of-stream.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_stream_ticks_then_emits_final_frame() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
+        let mut ticks = tokio::time::interval(SSE_KEEPALIVE_EVERY);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticks.reset();
+        let mut stream = KeepaliveStream {
+            rx: Some(rx),
+            ticks,
+        };
+        /// One poll of the stream: `Some(item)` if ready, `None` if pending right now.
+        async fn next(
+            stream: &mut KeepaliveStream,
+        ) -> Option<Option<Result<Bytes, std::convert::Infallible>>> {
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(
+                    match futures_core::Stream::poll_next(std::pin::Pin::new(&mut *stream), cx) {
+                        std::task::Poll::Ready(item) => Some(item),
+                        std::task::Poll::Pending => None,
+                    },
+                )
+            })
+            .await
+        }
+
+        // Pipeline still running, no interval elapsed: nothing to emit yet.
+        assert!(
+            next(&mut stream).await.is_none(),
+            "no frame before an interval"
+        );
+
+        // Advance past one keepalive interval: a comment frame is emitted.
+        tokio::time::advance(SSE_KEEPALIVE_EVERY + Duration::from_millis(1)).await;
+        let frame = next(&mut stream)
+            .await
+            .expect("keepalive due")
+            .unwrap()
+            .unwrap();
+        assert!(
+            frame.starts_with(b": "),
+            "keepalive must be an SSE comment (ignored by every conforming parser)"
+        );
+
+        // Pipeline resolves: the final frame is the full Anthropic event sequence, then EOS.
+        let message = serde_json::json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{ "type": "text", "text": "done" }],
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        });
+        tx.send(Ok(message)).unwrap();
+        let frame = next(&mut stream)
+            .await
+            .expect("final frame")
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(frame.to_vec()).unwrap();
+        assert!(text.contains("event: message_start"));
+        assert!(text.contains("event: message_stop"));
+        let eos = next(&mut stream)
+            .await
+            .expect("stream must end after the final frame");
+        assert!(eos.is_none(), "end-of-stream after the final frame");
+    }
+
+    /// E2E: a `stream: true` enforce request (default-on structured) is answered 200
+    /// `text/event-stream` whose body carries the full gated event sequence.
+    #[tokio::test]
+    async fn streaming_enforce_serves_full_sse_sequence() {
+        let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n";
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.to_owned()),
+            "FIRSTPASS_MODE" => Some("enforce".to_owned()),
+            "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some("http://127.0.0.1:1".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let mut outs = HashMap::new();
+        outs.insert(
+            "anthropic/m".to_owned(),
+            Ok(model_resp("anthropic/m", "gated answer")),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        let (traces, _rx) = mpsc::channel(64);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(map),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            traces,
+            adaptive: None,
+            bandit: None,
+            tenant_rate_limiter: None,
+        };
+        let body = Bytes::from_static(
+            br#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let resp = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/event-stream")),
+            "streaming client must get SSE"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("event: message_start"));
+        assert!(text.contains("gated answer"));
+        assert!(text.contains("event: message_stop"));
     }
 }
