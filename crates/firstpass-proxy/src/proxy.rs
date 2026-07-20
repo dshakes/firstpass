@@ -720,18 +720,25 @@ async fn enforce_pipeline_inner(
     let bandit_ctx = crate::bandit::ContextBucket::from_features(&features);
 
     // Step 1: greedy start — bandit prediction or rung 0 (cold-start / no bandit).
-    let (greedy_rung, base_policy_id) = {
-        let chosen = state
+    // Thompson sampling returns its own Monte-Carlo selection propensity (the policy is
+    // stochastic by nature); UCB1 returns None and relies on the epsilon overlay as before.
+    let (greedy_rung, base_policy_id, ts_propensity) = {
+        let (chosen, ts_p) = state
             .bandit
             .as_ref()
             .and_then(|b| b.lock().ok())
-            .map(|b| b.choose_start(&bandit_ctx, &route.ladder, &state.config.prices))
-            .unwrap_or(0);
-        if chosen > 0 {
-            (chosen, "bandit@v1".to_owned())
+            .map(|mut b| {
+                b.choose_start_with_propensity(&bandit_ctx, &route.ladder, &state.config.prices)
+            })
+            .unwrap_or((0, None));
+        let policy = if ts_p.is_some() {
+            "bandit@v2-ts".to_owned()
+        } else if chosen > 0 {
+            "bandit@v1".to_owned()
         } else {
-            (0u32, "static-ladder@v0".to_owned())
-        }
+            "static-ladder@v0".to_owned()
+        };
+        (chosen, policy, ts_p)
     };
 
     // Step 2: epsilon-greedy overlay — randomise a fraction of start-rung choices so the
@@ -745,23 +752,60 @@ async fn enforce_pipeline_inner(
         .and_then(|cfg| cfg.escalation.exploration.as_ref())
         .map(|e| e.epsilon);
 
-    let (start_rung, policy_id, explore_flag, propensity) =
-        if let Some(epsilon) = exploration_epsilon {
-            let k = route.ladder.len().max(1);
-            // Derive a per-request uniform draw from a fresh UUIDv7's bits — no new deps.
-            let u = u01(Uuid::now_v7().as_u128());
-            let (chosen, eps_branch) = if u < epsilon {
-                // Epsilon branch: uniform over 0..k
-                let idx = ((u / epsilon) * k as f64) as u32;
-                (idx.min(k as u32 - 1), true)
-            } else {
-                (greedy_rung, false)
-            };
-            let p = epsilon_propensity(chosen, greedy_rung, epsilon, k);
-            (chosen, format!("{base_policy_id}+eps"), eps_branch, Some(p))
+    let (start_rung, policy_id, explore_flag, propensity) = if ts_propensity.is_some() {
+        // Thompson IS the stochastic logging policy — its MC propensity is logged directly and
+        // the epsilon overlay is redundant (warn once if both are configured).
+        if exploration_epsilon.is_some() {
+            tracing::warn!(
+                "bandit.algorithm = thompson already logs propensities; \
+                 [escalation.exploration] epsilon is ignored"
+            );
+        }
+        (greedy_rung, base_policy_id, false, ts_propensity)
+    } else if let Some(epsilon) = exploration_epsilon {
+        let k = route.ladder.len().max(1);
+        // Derive a per-request uniform draw from a fresh UUIDv7's bits — no new deps.
+        let u = u01(Uuid::now_v7().as_u128());
+        let (chosen, eps_branch) = if u < epsilon {
+            // Epsilon branch: uniform over 0..k
+            let idx = ((u / epsilon) * k as f64) as u32;
+            (idx.min(k as u32 - 1), true)
         } else {
-            (greedy_rung, base_policy_id, false, None)
+            (greedy_rung, false)
         };
+        let p = epsilon_propensity(chosen, greedy_rung, epsilon, k);
+        (chosen, format!("{base_policy_id}+eps"), eps_branch, Some(p))
+    } else {
+        (greedy_rung, base_policy_id, false, None)
+    };
+
+    // Speculative-deferral band: prefetch only when the bandit's gate-pass estimate for the
+    // chosen start rung is in the configured marginal zone — where the next rung is *probably
+    // but not certainly* needed, the only place parallel spend reliably buys latency
+    // (speculative cascades). Confident-pass or confident-fail contexts run serial and keep
+    // the speculative tokens. No band / no bandit / cold context ⇒ configured behavior.
+    let speculation = match state
+        .config
+        .routing
+        .as_ref()
+        .and_then(|cfg| cfg.escalation.speculation_band)
+    {
+        Some([lo, hi]) if speculation > 0 => {
+            let estimate = state
+                .bandit
+                .as_ref()
+                .and_then(|b| b.lock().ok())
+                .and_then(|b| b.pass_estimate(&bandit_ctx, start_rung));
+            match estimate {
+                Some(p) if p < lo || p > hi => {
+                    metrics::counter!("firstpass_speculation_skipped_total").increment(1);
+                    0
+                }
+                _ => speculation,
+            }
+        }
+        _ => speculation,
+    };
 
     // Emit metric whenever the bandit is configured (includes cold-start rung-0 choices).
     if state.bandit.is_some() {

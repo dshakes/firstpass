@@ -390,6 +390,16 @@ pub struct Escalation {
     /// choose where the ladder STARTS; gating, escalation, and serving are untouched.
     #[serde(default)]
     pub bandit: Option<BanditConfig>,
+    /// Speculative-deferral band: when set (and the bandit has a warm gate-pass estimate for
+    /// the chosen start rung), speculative prefetch fires **only** when that estimate falls
+    /// inside `[low, high]` — the marginal zone where the next rung is *probably but not
+    /// certainly* needed, which is where parallel spend buys the most latency (speculative
+    /// cascades). Outside the band (confident pass or confident fail-through) requests run
+    /// serial and the speculative tokens are saved. `None` (default) = `speculation` applies
+    /// unconditionally, byte-identical to today. No bandit / cold context ⇒ band inapplicable
+    /// ⇒ configured `speculation` applies.
+    #[serde(default)]
+    pub speculation_band: Option<[f64; 2]>,
     /// Epsilon-greedy start-rung exploration: randomise a fraction of start-rung choices and
     /// record propensities so IPS/SNIPS off-policy estimates are valid. `None` (default) →
     /// deterministic policy — byte-identical to today. See [`ExplorationConfig`].
@@ -447,6 +457,32 @@ pub struct BanditConfig {
     /// theoretical default. Must be finite and `>= 0`; validated by [`Config::parse`].
     #[serde(default = "default_bandit_exploration")]
     pub exploration: f64,
+    /// Selection algorithm. `"ucb1"` (default) is deterministic and auditable; `"thompson"`
+    /// samples Beta posteriors — stochastic by nature, so every decision logs a non-degenerate
+    /// propensity (clean IPS/SNIPS/DR off-policy estimates without the epsilon overlay) and
+    /// pairs with `discount` for non-stationary traffic.
+    #[serde(default)]
+    pub algorithm: BanditAlgorithm,
+    /// Per-observation multiplicative decay of a context's counts, in `(0, 1]`. `1.0`
+    /// (default) = no forgetting. `0.99` adapts to model churn / workload drift at the cost
+    /// of a slightly noisier estimate. Validated by [`Config::parse`].
+    #[serde(default = "default_bandit_discount")]
+    pub discount: f64,
+}
+
+/// Start-rung bandit selection algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BanditAlgorithm {
+    /// Deterministic UCB1 (Auer et al. 2002).
+    #[default]
+    Ucb1,
+    /// Thompson sampling with Beta posteriors (Chapelle & Li 2011).
+    Thompson,
+}
+
+fn default_bandit_discount() -> f64 {
+    1.0
 }
 
 fn default_bandit_min_observations() -> usize {
@@ -476,6 +512,7 @@ impl Default for Escalation {
             serve_threshold: None,
             adaptive: None,
             enforce_structured: default_enforce_structured(),
+            speculation_band: None,
             bandit: None,
             exploration: None,
         }
@@ -621,13 +658,27 @@ impl Config {
                 )));
             }
         }
-        if let Some(b) = &config.escalation.bandit
-            && (!b.exploration.is_finite() || b.exploration < 0.0)
-        {
-            return Err(Error::InvalidConfig(format!(
-                "bandit.exploration must be finite and >= 0, got {}",
-                b.exploration
-            )));
+        if let Some(b) = &config.escalation.bandit {
+            if !b.exploration.is_finite() || b.exploration < 0.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "bandit.exploration must be finite and >= 0, got {}",
+                    b.exploration
+                )));
+            }
+            if !b.discount.is_finite() || b.discount <= 0.0 || b.discount > 1.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "bandit.discount must be in (0, 1], got {}",
+                    b.discount
+                )));
+            }
+        }
+        if let Some([lo, hi]) = config.escalation.speculation_band {
+            let ok = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
+            if !ok(lo) || !ok(hi) || lo > hi {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.speculation_band must satisfy 0 <= low <= high <= 1, got [{lo}, {hi}]"
+                )));
+            }
         }
         if let Some(exp) = &config.escalation.exploration
             && (!exp.epsilon.is_finite() || exp.epsilon <= 0.0 || exp.epsilon > 0.5)
@@ -1120,5 +1171,47 @@ output_per_mtok = 4.0
 
         let bad = toml.replace("input_per_mtok = 0.8", "input_per_mtok = -1.0");
         assert!(Config::parse(&bad).is_err(), "negative price rejected");
+    }
+
+    #[test]
+    fn bandit_thompson_and_band_parse_and_validate() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[escalation]
+speculation = 1
+speculation_band = [0.3, 0.7]
+
+[escalation.bandit]
+algorithm = "thompson"
+discount = 0.98
+"#;
+        let config = Config::parse(toml).expect("thompson + band must parse");
+        let b = config.escalation.bandit.as_ref().unwrap();
+        assert_eq!(b.algorithm, BanditAlgorithm::Thompson);
+        assert!((b.discount - 0.98).abs() < 1e-12);
+        assert_eq!(config.escalation.speculation_band, Some([0.3, 0.7]));
+
+        // Defaults: ucb1, discount 1.0, no band.
+        let plain = Config::parse(
+            "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n[escalation.bandit]\n",
+        )
+        .unwrap();
+        let b = plain.escalation.bandit.as_ref().unwrap();
+        assert_eq!(b.algorithm, BanditAlgorithm::Ucb1);
+        assert!((b.discount - 1.0).abs() < 1e-12);
+
+        // Bad discount and bad band are rejected.
+        assert!(Config::parse(&toml.replace("discount = 0.98", "discount = 0.0")).is_err());
+        assert!(
+            Config::parse(&toml.replace(
+                "speculation_band = [0.3, 0.7]",
+                "speculation_band = [0.9, 0.2]"
+            ))
+            .is_err()
+        );
     }
 }

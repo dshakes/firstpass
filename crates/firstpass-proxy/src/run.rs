@@ -86,7 +86,19 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         .as_ref()
         .and_then(|r| r.escalation.bandit.as_ref())
         .map(|bc| {
-            let mut b = StartRungBandit::new(bc.min_observations, bc.exploration);
+            let algorithm = match bc.algorithm {
+                firstpass_core::BanditAlgorithm::Ucb1 => crate::bandit::Algorithm::Ucb1,
+                firstpass_core::BanditAlgorithm::Thompson => crate::bandit::Algorithm::Thompson,
+            };
+            // Seed from a fresh UUID: per-process randomness, no new deps (tests seed explicitly).
+            let seed = uuid::Uuid::now_v7().as_u128() as u64;
+            let mut b = StartRungBandit::with_algorithm(
+                bc.min_observations,
+                bc.exploration,
+                algorithm,
+                bc.discount,
+                seed,
+            );
             if let Ok(traces_history) = store::load_all_traces(&config.db_path) {
                 for trace in &traces_history {
                     let ctx = ContextBucket::from_features(&trace.request.features);

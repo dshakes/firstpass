@@ -138,6 +138,11 @@ session_promotion = { after_failures = 3, window = "30m" }
 # calls are paid for). 0 = serial (default). Raise it to cut worst-case escalation latency when the
 # extra spend is acceptable.
 speculation = 0
+# Speculative-deferral band: with speculation > 0 AND a warm bandit, prefetch fires only when
+# the bandit's gate-pass estimate for the chosen start rung is INSIDE [low, high] — the marginal
+# zone where the next rung is probably-but-not-certainly needed (that's where parallel spend
+# buys the most latency per wasted token). Outside the band requests run serial.
+# speculation_band = [0.3, 0.7]
 # Route tool-calling / multimodal / streaming requests through enforce (ADR 0005). ON by default —
 # agent traffic is the target workload. The request body is carried verbatim per rung (every field
 # survives; only the model is swapped), and a fidelity guard applies: structured requests route
@@ -161,7 +166,12 @@ speculation = 0
 # serving — a wrong prediction costs latency/money, never correctness. Cold-start safety:
 # below `min_observations` per context the bandit returns rung 0 (today's behavior). Learning
 # survives restarts via trace-store replay. Absent = every request starts at rung 0 (default).
+# algorithm: "ucb1" (default — deterministic, auditable) or "thompson" (Beta-posterior
+# sampling: stochastic, so every decision logs a real propensity for `firstpass ope`, and
+# `discount` < 1 adapts to model churn by forgetting old evidence geometrically).
 # [escalation.bandit]
+# algorithm = "thompson"
+# discount  = 0.99
 # min_observations = 50    # observations before prediction kicks in (cold-start guard)
 # exploration = 1.0        # UCB1 exploration constant c (Auer et al. 2002); 0 = pure exploitation
 #
