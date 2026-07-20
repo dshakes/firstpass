@@ -16,6 +16,7 @@
 //! - [`config`] — declarative routing [`Config`] (SPEC §8.4).
 //! - [`cost`] — model pricing and the counterfactual baseline.
 //! - [`conformal`] — split-conformal risk control on the gate threshold (SPEC §10.1).
+//! - [`ltt`] — Learn-then-Test threshold calibration (RCPS, Angelopoulos et al. 2021).
 //! - [`error`] — the crate [`Error`] type.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -27,6 +28,7 @@ pub mod cost;
 pub mod error;
 pub mod features;
 pub mod hashchain;
+pub mod ltt;
 pub mod trace;
 pub mod verdict;
 
@@ -39,6 +41,7 @@ pub use cost::{ModelPrice, PriceTable};
 pub use error::{Error, Result};
 pub use features::{FEATURE_VERSION, Features, TaskKind};
 pub use hashchain::{Chained, GENESIS_HASH, canonical_json, record_hash, verify_chain};
+pub use ltt::{LttDiagnostic, LttResult};
 pub use trace::{
     Attempt, DeferredVerdict, FinalOutcome, PolicyRef, RequestInfo, ServedFrom, Trace,
 };

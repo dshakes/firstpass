@@ -2,7 +2,7 @@
 //! audit trail. Every subcommand reads the same environment as the server, so onboarding is one
 //! `base_url` swap and offboarding is one `unset`.
 
-use firstpass_proxy::calibrate::calibrate_from_store;
+use firstpass_proxy::calibrate::{calibrate_from_store, calibrate_from_store_ltt};
 use firstpass_proxy::ope::{CandidatePolicy, ips_from_store, ope_from_store};
 use firstpass_proxy::{ProxyConfig, cli, run, store};
 
@@ -17,8 +17,9 @@ USAGE:
     firstpass trace [--limit N]   print recent audit traces as JSON lines (default 20)
     firstpass savings [--json]    spend vs the always-top counterfactual, from your own receipts
     firstpass evals [--json]      per-gate verdict rates + escalation + serve-by-rung, from receipts
-    firstpass calibrate [--alpha A] [--delta D] [--min-n N]
+    firstpass calibrate [--alpha A] [--delta D] [--min-n N] [--method conformal|ltt]
                                    recalibrate the serving threshold from deferred feedback
+                                   (default method: conformal; ltt = Learn-then-Test / RCPS)
     firstpass ope --config <candidate.toml> [--db <path>] [--tenant <id>]
                                    evaluate a candidate policy against logged traffic before enforcing
     firstpass ope --start-rung N [--db <path>] [--tenant <id>]
@@ -194,10 +195,10 @@ fn cmd_evals(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `firstpass calibrate [--alpha A] [--delta D] [--min-n N]` — recalibrate the conformal serving
-/// threshold from real deferred feedback recorded in the trace store. An empty or not-yet-created
-/// store reports 0 pairs (feasible: false) and exits 0, like `trace`; only a genuine read error on
-/// an existing trace's feedback bubbles up non-zero.
+/// `firstpass calibrate [--alpha A] [--delta D] [--min-n N] [--method conformal|ltt]` —
+/// recalibrate the serving threshold from real deferred feedback recorded in the trace store.
+/// An empty or not-yet-created store reports 0 pairs (feasible: false) and exits 0, like
+/// `trace`; only a genuine store read error exits non-zero.
 fn cmd_calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let flag = |name: &str, default: f64| -> f64 {
         args.iter()
@@ -209,14 +210,28 @@ fn cmd_calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let alpha = flag("--alpha", 0.1);
     let delta = flag("--delta", 0.05);
     let min_n = flag("--min-n", 30.0) as usize;
+    let method = args
+        .iter()
+        .position(|a| a == "--method")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+        .unwrap_or("conformal");
 
     let config = ProxyConfig::from_env()?;
     let tenant = tenant_arg(args, &config);
-    let report = calibrate_from_store(&config.db_path, &tenant, alpha, delta, min_n)?;
-    print!("{}", report.render());
-    // Infeasible is a valid finding (not enough clean feedback yet, or the gate is too weak), not a
-    // failure — the report says `feasible: false`. Only a store read error (the `?` above) exits
-    // non-zero, so scripting `firstpass calibrate` for its output stays reliable.
+
+    // Infeasible is a valid finding (not enough clean feedback yet, or a weak gate) — the
+    // report says `feasible: false`. Only a store read error bubbles up as non-zero exit.
+    match method {
+        "ltt" => {
+            let report = calibrate_from_store_ltt(&config.db_path, &tenant, alpha, delta, min_n)?;
+            print!("{}", report.render());
+        }
+        _ => {
+            let report = calibrate_from_store(&config.db_path, &tenant, alpha, delta, min_n)?;
+            print!("{}", report.render());
+        }
+    }
     Ok(())
 }
 

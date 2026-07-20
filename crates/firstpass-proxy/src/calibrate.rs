@@ -1,15 +1,20 @@
-//! Recalibrate the conformal serving threshold from real deferred feedback (SPEC §10.1, run
-//! against live traffic instead of a static benchmark suite) — the "learns your quality bar"
-//! loop.
+//! Recalibrate the serving threshold from real deferred feedback (SPEC §10.1, run against live
+//! traffic instead of a static benchmark suite) — the "learns your quality bar" loop.
 //!
-//! Enumerates stored traces, pairs each trace that has a deferred outcome with the score of the
-//! attempt actually served, and hands the pairs to [`firstpass_core::conformal`]. This produces
-//! a recommended threshold and its feasibility; it does not (yet) feed back into the request hot
-//! path — that wiring is a deliberate follow-on once an operator has reviewed a report.
+//! Two calibration methods are available:
+//! - **conformal** (default): split-conformal with Hoeffding bound — [`calibrate_from_store`].
+//! - **ltt**: Learn-then-Test / RCPS with exact-binomial fixed-sequence testing —
+//!   [`calibrate_from_store_ltt`].
+//!
+//! Both enumerate stored traces, pair each trace that has a deferred outcome with the score of
+//! the attempt actually served, and hand the pairs to the respective core module. Neither feeds
+//! back into the request hot path — that wiring is a deliberate follow-on once an operator has
+//! reviewed a report.
 
 use std::path::Path;
 
 use firstpass_core::conformal::{self, ConformalResult};
+use firstpass_core::ltt::{self, LttResult};
 use firstpass_core::{Attempt, DeferredVerdict, GateResult, Score, Trace, Verdict};
 
 use crate::store::{self, StoreError};
@@ -107,6 +112,82 @@ fn trace_pair(trace: &Trace, deferred: &[DeferredVerdict]) -> Option<(f64, bool)
     let served_rung = trace.final_.served_rung?;
     let attempt = trace.attempts.iter().find(|a| a.rung == served_rung)?;
     Some((attempt_score(attempt), last.verdict == Verdict::Pass))
+}
+
+/// The result of LTT calibration against real deferred feedback.
+#[derive(Debug, Clone)]
+pub struct LttReport {
+    /// Number of `(score, correct)` pairs — one per trace with a deferred verdict.
+    pub n_pairs: usize,
+    /// The LTT calibration result (threshold, feasibility, empirical risk, diagnostics).
+    pub ltt: LttResult,
+}
+
+impl LttReport {
+    /// Render the report as human-readable lines for `firstpass calibrate --method ltt`.
+    /// Format mirrors [`CalibrationReport::render`] with an added verifier ROC note.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let far = match self.ltt.false_accept_rate {
+            Some(r) => format!("{r:.4}"),
+            None => "N/A (no incorrect items in calibration set)".to_owned(),
+        };
+        format!(
+            "method: ltt\n\
+             pairs: {n_pairs} ({n_served} served at threshold)\n\
+             threshold: {threshold:.4}\n\
+             feasible: {feasible}\n\
+             target alpha: {alpha:.4} (delta {delta:.4})\n\
+             empirical risk: {risk:.4}\n\
+             false-accept rate: {far}  (P(score >= lambda | incorrect); verifier ROC point)\n",
+            n_pairs = self.n_pairs,
+            n_served = self.ltt.n_served,
+            threshold = self.ltt.threshold,
+            feasible = self.ltt.feasible,
+            alpha = self.ltt.alpha,
+            delta = self.ltt.delta,
+            risk = self.ltt.empirical_risk,
+        )
+    }
+}
+
+/// Calibrate an LTT threshold from `(score, correct)` pairs — thin wrapper over
+/// [`firstpass_core::ltt`].
+#[must_use]
+pub fn calibrate_pairs_ltt(
+    pairs: &[(f64, bool)],
+    alpha: f64,
+    delta: f64,
+    min_n: usize,
+) -> LttReport {
+    LttReport {
+        n_pairs: pairs.len(),
+        ltt: ltt::calibrate(pairs, alpha, delta, min_n),
+    }
+}
+
+/// Calibrate an LTT threshold from every trace in the store that has a deferred outcome.
+///
+/// Error handling and tenant scoping match [`calibrate_from_store`] exactly.
+///
+/// # Errors
+/// Returns [`StoreError`] if a stored trace's deferred verdicts cannot be read.
+pub fn calibrate_from_store_ltt(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+    alpha: f64,
+    delta: f64,
+    min_n: usize,
+) -> Result<LttReport, StoreError> {
+    let traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    let mut pairs = Vec::with_capacity(traces.len());
+    for trace in &traces {
+        let deferred = store::load_deferred(&db_path, &trace.trace_id.to_string())?;
+        if let Some(pair) = trace_pair(trace, &deferred) {
+            pairs.push(pair);
+        }
+    }
+    Ok(calibrate_pairs_ltt(&pairs, alpha, delta, min_n))
 }
 
 /// Calibrate a conformal threshold from every trace in the store that has a deferred outcome
@@ -322,5 +403,74 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ── LTT wiring tests ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn calibrate_pairs_ltt_feasible_on_clean_pairs() {
+        // Same synthetic data as the conformal test — clean score separation, alpha=0.2.
+        let mut pairs = Vec::new();
+        for i in 0..60u32 {
+            pairs.push((0.7 + f64::from(i % 10) * 0.01, true));
+        }
+        for i in 0..60u32 {
+            pairs.push((0.2 + f64::from(i % 10) * 0.01, false));
+        }
+        let report = calibrate_pairs_ltt(&pairs, 0.2, 0.1, 30);
+        assert!(
+            report.ltt.feasible,
+            "clean separation must be feasible with LTT"
+        );
+        assert!(
+            report.ltt.threshold >= 0.2 && report.ltt.threshold <= 0.79,
+            "threshold {} must land inside the observed score range",
+            report.ltt.threshold
+        );
+        assert_eq!(report.n_pairs, 120);
+        assert!(
+            report.ltt.empirical_risk <= 0.2 + 1e-9,
+            "empirical risk {} must respect alpha",
+            report.ltt.empirical_risk
+        );
+    }
+
+    #[test]
+    fn calibrate_pairs_ltt_infeasible_below_min_n() {
+        let pairs = vec![(0.9, true), (0.9, true), (0.1, false)];
+        let report = calibrate_pairs_ltt(&pairs, 0.1, 0.05, 30);
+        assert!(
+            !report.ltt.feasible,
+            "too few pairs must be infeasible with LTT"
+        );
+    }
+
+    #[test]
+    fn ltt_report_render_includes_method_and_far() {
+        // Smoke-test that render() produces the expected key fields without panicking.
+        let mut pairs: Vec<(f64, bool)> = Vec::new();
+        for _ in 0..200 {
+            pairs.push((0.9, true));
+        }
+        for _ in 0..5 {
+            pairs.push((0.9, false));
+        }
+        for _ in 0..15 {
+            pairs.push((0.2, false));
+        }
+        let report = calibrate_pairs_ltt(&pairs, 0.10, 0.05, 30);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("method: ltt"),
+            "render must tag the method"
+        );
+        assert!(
+            rendered.contains("false-accept rate:"),
+            "render must include verifier ROC note"
+        );
+        assert!(
+            rendered.contains("feasible:"),
+            "render must include feasibility"
+        );
     }
 }
