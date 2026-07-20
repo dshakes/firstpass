@@ -1,6 +1,6 @@
 # ADR 0005 — Enforce through tool-calling and multimodal requests
 
-- Status: Accepted — P1+P2+P3 implemented (default-off); live-verify is the operator's final gate
+- Status: Accepted — P1+P2+P3 implemented (default-off); P4+P5 default-on + fidelity guard; M1 OpenAI inbound
 - Date: 2026-07-15
 - Supersedes: —
 - Related: SPEC §7.1 (enforce), §7.4 (pluggable), ADR 0001 (hosted plane)
@@ -127,3 +127,25 @@ code and correctness. The flag still ships **off** by default.
   `enforce_falls_back_to_observe_for_tool_requests`.
 - I1 is superseded for defaults (default behavior is now route-structured) but preserved
   under `enforce_structured = false`.
+
+## Addendum (M1, post-P5): OpenAI-compatible inbound endpoint
+
+- **POST /v1/chat/completions** added alongside the existing `POST /v1/messages`. The
+  endpoint stamps `api: "openai.chat_completions"` on `EnforceCtx` and then runs the
+  same escalation engine.
+- **Fidelity guard extended.** `enforce_can_handle` now receives `inbound: Dialect` and
+  evaluates two gating paths for OpenAI inbound:
+  - *All-OpenAI ladder*: every rung's provider returns `carries_structured_verbatim(Dialect::Openai)`;
+    the raw body is forwarded verbatim (only `model` swapped, `stream` stripped). Proven by
+    `enforce_can_handle_openai_inbound_all_openai_ladder`.
+  - *Translation path*: OpenAI inbound + all-Anthropic ladder + no http image URLs; the body is
+    translated to the internal `ModelRequest` shape (tool_calls → tool_use blocks; role:"tool" →
+    tool_result blocks; data: URI images → Anthropic base64 blocks). Proven by
+    `enforce_can_handle_openai_inbound_all_anthropic_ladder_no_http_image`.
+- **HTTP-image fallback.** `image_url` content with an `http(s)://` URL is non-translatable
+  (Anthropic Vision needs base64 or a managed fetch). Those requests fall back to observe
+  passthrough. Proven by `enforce_can_handle_openai_inbound_http_image_falls_back`.
+- **Response rendering.** `openai_response_json` renders the served `ModelResponse` as a
+  `chat.completion` envelope. `openai_sse_from_message` re-emits it as `chat.completion.chunk`
+  SSE frames ending with `data: [DONE]` for `stream: true` clients.
+- Existing `POST /v1/messages` behavior is unchanged.

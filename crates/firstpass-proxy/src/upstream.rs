@@ -19,15 +19,17 @@ const FORWARDED_REQUEST_HEADERS: &[&str] = &[
     "content-type",
 ];
 
-/// Build the upstream `POST /v1/messages` request, forwarding the allow-listed headers and the
-/// caller's body byte-for-byte. Shared by the buffered and streaming paths.
+/// Build an upstream POST request to `{base}{path}`, forwarding the allow-listed headers and the
+/// caller's body byte-for-byte. Shared by the buffered and streaming paths, and by both the
+/// Anthropic (`/v1/messages`) and OpenAI (`/v1/chat/completions`) observe-passthrough paths.
 fn build_request(
     client: &reqwest::Client,
     base: &str,
+    path: &str,
     headers: &HeaderMap,
     body: Bytes,
 ) -> reqwest::RequestBuilder {
-    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+    let url = format!("{}{path}", base.trim_end_matches('/'));
     let mut req = client.post(url);
     for name in FORWARDED_REQUEST_HEADERS {
         if let Some(value) = headers.get(*name) {
@@ -61,7 +63,9 @@ pub async fn forward_anthropic(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
-    let response = build_request(client, base, headers, body).send().await?;
+    let response = build_request(client, base, "/v1/messages", headers, body)
+        .send()
+        .await?;
     let status = response.status();
     let out_headers = passthrough_headers(&response);
     let body = response.bytes().await?;
@@ -80,7 +84,47 @@ pub async fn forward_anthropic_streaming(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, reqwest::Response), ProxyError> {
-    let response = build_request(client, base, headers, body).send().await?;
+    let response = build_request(client, base, "/v1/messages", headers, body)
+        .send()
+        .await?;
+    let status = response.status();
+    let out_headers = passthrough_headers(&response);
+    Ok((status, out_headers, response))
+}
+
+/// Forward one `POST /v1/chat/completions` request and return its response **buffered**.
+/// Observe-mode passthrough for the OpenAI-compatible inbound endpoint — byte-identical relay.
+///
+/// # Errors
+/// Returns [`ProxyError::Upstream`] on a transport-level failure.
+pub async fn forward_openai(
+    client: &reqwest::Client,
+    base: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
+    let response = build_request(client, base, "/v1/chat/completions", headers, body)
+        .send()
+        .await?;
+    let status = response.status();
+    let out_headers = passthrough_headers(&response);
+    let body = response.bytes().await?;
+    Ok((status, out_headers, body))
+}
+
+/// Forward one `POST /v1/chat/completions` request and return the raw response for streaming relay.
+///
+/// # Errors
+/// Returns [`ProxyError::Upstream`] on a transport-level failure.
+pub async fn forward_openai_streaming(
+    client: &reqwest::Client,
+    base: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, reqwest::Response), ProxyError> {
+    let response = build_request(client, base, "/v1/chat/completions", headers, body)
+        .send()
+        .await?;
     let status = response.status();
     let out_headers = passthrough_headers(&response);
     Ok((status, out_headers, response))
