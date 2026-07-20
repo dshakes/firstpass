@@ -233,12 +233,12 @@
   <p class="eyebrow">proof, not adjectives</p>
   <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between">
     <h2>Error bars and a kill switch.</h2>
-    <span class="simchip">◆ harness ~65% cheaper · live n=200 + 964-task earned bound</span>
+    <span class="simchip">◆ harness ~65% cheaper · live n=200 + 974-task earned bound (artifact committed)</span>
   </div>
   <div class="stats">
     <div class="stat"><div class="n grad-text" data-to="65" data-suffix="%" data-prefix="~">~0%</div><div class="k">cheaper at equal-or-higher success vs a predictive router (harness; live arithmetic hit ~85% — measure yours per request)</div></div>
     <div class="stat"><div class="n grad-text" data-to="0.16" data-dec="2">0.00</div><div class="k">served-failure rate <span class="vs-tag">vs 0.46</span> for prediction — verification catches what guessing serves</div></div>
-    <div class="stat"><div class="n grad-text" data-to="10" data-prefix="≤" data-suffix="%">≤0%</div><div class="k">conformal served-failure @ 95% confidence — <b>earned live on 964 real MBPP tasks</b>, and adaptive under drift</div></div>
+    <div class="stat"><div class="n grad-text" data-to="10" data-prefix="≤" data-suffix="%">≤0%</div><div class="k">conformal served-failure @ 95% confidence — <b>earned live on 974 real MBPP tasks — artifact in the repo</b>, and adaptive under drift</div></div>
   </div>
   <div class="killbar">
     <span style="color:var(--mut);font-size:14.5px"><b style="color:var(--ink)">Pre-registered kill criterion</b> — bootstrap CIs + split-conformal guarantee + a published go/no-go gate.</span>
@@ -287,7 +287,7 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
     <div class="step done"><div class="dot"></div><h4><span>M2 ✓</span> Gate framework</h4><p>Subprocess plugins, schema gates, budgets, feedback API.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>M3 ✓</span> Live proof</h4><p>Real-provider numbers (n=200) and a real LLM-judge gate — both done, against real Anthropic.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Speculative escalation</h4><p>Cheap and next-rung run in parallel. Measured p95: ~84ms serial → ~42ms speculative (~2× faster), byte-identical served result.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Fail-closed sandbox + coding-with-tests conformal</h4><p>gVisor-first, network-isolated code execution. Run live on 964 real MBPP tasks: a feasible distribution-free ≤10%@95% served-failure bound — the guarantee arithmetic couldn't earn.</p></div>
+    <div class="step done"><div class="dot"></div><h4><span>✓</span> Fail-closed sandbox + coding-with-tests conformal</h4><p>gVisor-first, network-isolated code execution. Run live on 974 real MBPP tasks (result artifact committed in docs/benchmarks/): a feasible distribution-free ≤10%@95% served-failure bound — the guarantee arithmetic couldn't earn.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Learning loop</h4><p><code>firstpass calibrate</code> recalibrates the serving threshold from real deferred feedback — plus online/adaptive conformal (ACI) that tracks the bound under distribution shift.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Prod hardening + GA readiness</h4><p>Timeouts, load-shedding, opaque errors, body caps — ADR 0003 gap analysis.</p></div>
     <div class="step done"><div class="dot"></div><h4><span>✓</span> Packaging</h4><p>Published on every channel — pip · uvx · Homebrew · npm · crates.io · Docker · binaries · self-updater. Each release auto-publishes all of them via a hands-off pipeline (npm + PyPI via OIDC, no tokens).</p></div>
