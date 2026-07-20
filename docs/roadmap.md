@@ -61,9 +61,12 @@ baseline.
       non-degenerate propensities (clean off-policy estimates), non-stationarity handling
       under model churn, persistent state keyed by ladder identity.
 - [ ] Per-rung P(gate-pass | features) prediction rather than a single difficulty scalar.
-- [ ] Learn-then-Test threshold calibration + the live adaptive-conformal loop, closing the
-      guarantee with the realized-served-failure gauge: a served-failure bound that holds
-      under drift.
+- [x] Learn-then-Test threshold calibration (`--method ltt` in `firstpass calibrate`):
+      distribution-free finite-sample risk control via fixed-sequence exact-binomial testing
+      (Angelopoulos et al. 2021 / RCPS). Includes per-λ diagnostics and the gate's empirical
+      false-accept rate (verifier ROC point) at the chosen threshold.
+- [ ] Live adaptive-conformal loop closing the guarantee under drift: ACI wired to the
+      realized-served-failure gauge so the bound holds as the workload shifts.
 - [ ] Verifier-imperfection rails: cap samples per rung; feed each gate's observed
       error profile into calibration (an imperfect verifier inverse-scales — bounded use is
       a feature, not a limit).
