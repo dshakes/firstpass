@@ -179,6 +179,7 @@ Downstream outcomes flow back via `POST /v1/feedback` onto a deferred-verdict si
 | `FIRSTPASS_BIND` | listen address | `127.0.0.1:8080` |
 | `FIRSTPASS_CONFIG` | path to `firstpass.toml` (routes, ladders, gates, providers) | — |
 | `FIRSTPASS_DB` | trace store path | `firstpass.db` |
+| `FIRSTPASS_RECEIPTS` | `best_effort` \| `durable` — durable spills receipts to disk under backpressure instead of dropping, and drains them back on boot (audit chain stays valid) | `best_effort` |
 
 **Endpoints:** `POST /v1/messages` (Anthropic drop-in) · `POST /v1/chat/completions` (OpenAI drop-in) · `POST /v1/feedback` · `GET /v1/capabilities` · `GET /healthz` · `GET /metrics`.
 

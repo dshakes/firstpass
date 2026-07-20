@@ -27,10 +27,10 @@ Make every public claim reproducible or remove it.
       `firstpass_served_rung_total{rung,model}`.
 - [x] `firstpass savings [--json]` — spend vs the always-top counterfactual, measured from
       the operator's own receipts.
-- [ ] Benchmark result artifacts committed alongside the numbers the docs cite; the repro
-      command for each number stated next to it.
-- [ ] Provider table labeled honestly: **wire-verified** vs **implemented, awaiting live
-      verification** — labels flip only via CI evidence.
+- [x] Benchmark result artifacts committed alongside the numbers the docs cite
+      (`docs/benchmarks/`); the repro command for each number stated next to it.
+- [x] Provider table labeled honestly: **wire-verified** vs **implemented, awaiting live
+      verification** — labels flip only via CI evidence (provider-smoke workflow).
 - [ ] crates.io publish (token-gated release step).
 
 **Exit gate:** every number and provider named in public surfaces regenerates from a
@@ -41,13 +41,15 @@ committed command; no "unverified" code path sits behind a "live" claim.
 The target workload is agents, and agents send tools on nearly every call. Enforce mode
 must route that traffic, not fall back around it.
 
-- [ ] Full tool/multimodal round-trip through the ladder; `enforce_structured` default-on
-      once fidelity-tested.
-- [ ] True SSE streaming on the enforce path (stream the winning rung; no buffer-then-replay).
+- [x] Full tool/multimodal round-trip through the ladder — verbatim raw-body carry per rung;
+      `enforce_structured` default-on behind the fidelity guard (ADR 0005 P4/P5).
+- [x] Enforce SSE: connection opens immediately with spec-compliant keepalives while the
+      ladder routes; the gated result then streams as the full event sequence. (Token-level
+      pass-through streaming is impossible under verify-before-serve — by design.)
 - [x] OpenAI-compatible inbound endpoint (`/v1/chat/completions`) alongside the Anthropic
       one (SPEC §M1).
-- [ ] Per-provider live smoke tests in CI (key-gated, cents/day); provider badges flip to
-      verified only on CI green.
+- [x] Per-provider live smoke tests in CI (`provider-smoke.yml`, key-gated); badges flip to
+      verified only on CI green. Anthropic proven; others await repo secrets (human gate).
 
 **Exit gate:** a real coding agent completes a full session through enforce with tools and
 streaming — receipts intact, zero fidelity loss, measured not asserted.
@@ -86,11 +88,13 @@ holding under induced drift.
 GA is an audit + soak + process stamp, not a code stamp (ADR 0003).
 
 - [ ] External security review of tenant auth + key custody (ADR 0004 §D7) — human gate.
-- [ ] Durable receipts: never-drop mode (block or spill) and a Postgres store option.
+- [x] Durable receipts: `FIRSTPASS_RECEIPTS=durable` spills to `<db>.spill.jsonl` under
+      backpressure (synced, ordered) and drains on boot with the hash chain verified valid —
+      no receipt is ever silently dropped. (Postgres store option remains open.)
 - [ ] Observability suite: per-provider/per-rung/per-gate latency + failure + cost series,
       committed dashboards, false-pass SLO alarm (SPEC §M3).
 - [ ] 30-day soak on real agent traffic — calendar gate.
-- [ ] Price-table refresh mechanism (prices drift; savings math must not).
+- [x] Price-table refresh mechanism: `[[price]]` per-deployment overrides.
 
 **Exit gate:** ADR 0003 checklist green.
 

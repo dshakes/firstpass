@@ -60,6 +60,7 @@ async fn spawn_proxy(upstream: &str) -> (String, std::path::PathBuf) {
         adaptive: None,
         bandit: None,
         tenant_rate_limiter: None,
+        spill: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

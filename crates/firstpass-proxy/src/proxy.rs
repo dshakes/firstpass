@@ -64,6 +64,10 @@ pub struct AppState {
     /// limiting entirely — set via [`build_tenant_rate_limiter`] from
     /// [`ProxyConfig::tenant_rate_per_sec`].
     pub tenant_rate_limiter: Option<Arc<governor::DefaultKeyedRateLimiter<String>>>,
+    /// Durable-receipts spill handle (`FIRSTPASS_RECEIPTS=durable`). `None` in best-effort mode
+    /// (the default) — behavior is byte-identical to before. When `Some`, `offer_trace` appends
+    /// to `<db_path>.spill.jsonl` on channel-full instead of dropping.
+    pub spill: Option<store::SpillHandle>,
 }
 
 /// Build the per-tenant keyed rate limiter from config (ADR 0004 §D6). Returns `None` when
@@ -104,17 +108,41 @@ impl std::fmt::Debug for AppState {
     }
 }
 
-/// Fire-and-forget a trace at the background writer: non-blocking, and bounded. If the writer has
-/// fallen behind enough to fill the buffer, or is gone, the trace is dropped with a warning rather
-/// than blocking the hot path or growing memory without limit (the audit chain over persisted
-/// traces stays valid; a dropped trace is simply absent).
-fn offer_trace(traces: &store::TraceSender, trace: Trace) {
+/// Fire-and-forget a trace at the background writer: non-blocking, and bounded.
+///
+/// **Best-effort mode** (`spill` is `None`): if the writer has fallen behind enough to fill the
+/// buffer, the trace is dropped with a warning rather than blocking the hot path or growing memory
+/// without limit (the audit chain over persisted traces stays valid; a dropped trace is simply
+/// absent).
+///
+/// **Durable mode** (`spill` is `Some`): on `TrySendError::Full` the trace is serialised as a
+/// JSON line and appended (with `sync_data`) to the spill file. This blocks the calling task on a
+/// disk write — the deliberate tradeoff of durable mode; it only fires under sustained
+/// backpressure. The writer drains the spill file at startup and on channel-empty so the chain
+/// stays valid.
+///
+/// ponytail: the spill write holds `Mutex<File>` across a `sync_data` call on the calling tokio
+/// task — fine for the slow backpressure path; use `spawn_blocking` if disk latency at p99 under
+/// sustained overload is measurable.
+fn offer_trace(traces: &store::TraceSender, spill: Option<&store::SpillHandle>, trace: Trace) {
     record_trace_metrics(&trace);
     match traces.try_send(trace) {
         Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            tracing::warn!("trace channel full; dropping trace (writer behind under load)");
-            metrics::counter!("firstpass_traces_dropped_total").increment(1);
+        Err(TrySendError::Full(t)) => {
+            if let Some(handle) = spill {
+                match store::append_to_spill(handle, &t) {
+                    Ok(()) => {
+                        metrics::counter!("firstpass_receipts_spilled_total").increment(1);
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "durable mode: spill write failed; trace lost");
+                        metrics::counter!("firstpass_traces_dropped_total").increment(1);
+                    }
+                }
+            } else {
+                tracing::warn!("trace channel full; dropping trace (writer behind under load)");
+                metrics::counter!("firstpass_traces_dropped_total").increment(1);
+            }
         }
         Err(TrySendError::Closed(_)) => {
             tracing::warn!("trace writer is gone; dropping trace");
@@ -786,7 +814,7 @@ async fn enforce_pipeline_inner(
     }
 
     // The trace is already built; enqueue it off-path (non-blocking `try_send`, so no spawn needed).
-    offer_trace(&state.traces, trace);
+    offer_trace(&state.traces, state.spill.as_ref(), trace);
 
     match outcome {
         EngineOutcome::Served(resp) => Ok(resp),
@@ -1218,12 +1246,13 @@ fn spawn_stream_trace(
 ) {
     let config = state.config.clone();
     let traces = state.traces.clone();
+    let spill = state.spill.clone();
     tokio::spawn(async move {
         let mut trace =
             build_stream_trace(&config, &req_body, latency_ms, session_header.as_deref());
         // Stamp the resolved tenant identity — never the config default nor anything request-borne.
         trace.tenant_id = tenant;
-        offer_trace(&traces, trace);
+        offer_trace(&traces, spill.as_ref(), trace);
     });
 }
 
@@ -1241,6 +1270,7 @@ fn spawn_trace(
 ) {
     let config = state.config.clone();
     let traces = state.traces.clone();
+    let spill = state.spill.clone();
     tokio::spawn(async move {
         let mut trace = match resp_body {
             Some(resp) => build_trace(
@@ -1254,7 +1284,7 @@ fn spawn_trace(
         };
         // Stamp the resolved tenant identity — never the config default nor anything request-borne.
         trace.tenant_id = tenant;
-        offer_trace(&traces, trace);
+        offer_trace(&traces, spill.as_ref(), trace);
     });
 }
 
@@ -2362,6 +2392,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             tenant_rate_limiter: None,
+            spill: None,
         };
         (state, rx)
     }
@@ -2482,6 +2513,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             tenant_rate_limiter: None,
+            spill: None,
         };
         let resp = messages(
             State(state),
@@ -2697,6 +2729,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             tenant_rate_limiter: None,
+            spill: None,
         };
 
         // Plain text enforces: the mock serves 200.
@@ -2823,6 +2856,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             tenant_rate_limiter: None,
+            spill: None,
         };
         (state, db, trace_id)
     }
@@ -3071,6 +3105,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             tenant_rate_limiter,
+            spill: None,
         }
     }
 
@@ -3435,6 +3470,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             tenant_rate_limiter: None,
+            spill: None,
         };
         let body = Bytes::from_static(
             br#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
@@ -3794,6 +3830,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             tenant_rate_limiter,
+            spill: None,
         }
     }
 

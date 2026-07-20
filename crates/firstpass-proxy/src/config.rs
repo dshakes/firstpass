@@ -11,6 +11,28 @@ use firstpass_core::{Config as RoutingConfig, Mode, PriceTable};
 /// shared default salt makes `prompt_hash` comparable/guessable across installs.
 const DEFAULT_PROMPT_SALT: &str = "firstpass-dev-salt";
 
+/// Controls what happens to audit traces when the background writer channel is full.
+///
+/// - [`BestEffort`](ReceiptsMode::BestEffort) — `try_send` drops the trace and increments
+///   `firstpass_traces_dropped_total`; bounded memory, zero added latency. The hash chain over
+///   persisted traces stays valid; a dropped trace is simply absent.
+/// - [`Durable`](ReceiptsMode::Durable) — on `TrySendError::Full` the trace is serialised as a
+///   JSON line and appended (with `sync_data`) to `<db_path>.spill.jsonl`. The background writer
+///   drains the spill file at startup and whenever the channel empties, inserting spilled traces
+///   BEFORE new channel arrivals so the hash chain remains append-only and valid.
+///   The blocking fs append on the hot path is the DELIBERATE tradeoff of durable mode —
+///   it only fires under sustained backpressure; switch to `best_effort` if disk latency
+///   under load is unacceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReceiptsMode {
+    /// Drop traces when the writer channel is full (default — bounded memory, zero latency impact).
+    #[default]
+    BestEffort,
+    /// Spill traces to disk when the writer channel is full; drain and recover on the next boot
+    /// or whenever the channel empties.
+    Durable,
+}
+
 /// Runtime configuration for the proxy.
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -56,6 +78,9 @@ pub struct ProxyConfig {
     /// unlimited — single-operator and existing deployments are unaffected. Set via
     /// `FIRSTPASS_TENANT_RATE_PER_SEC`; only enforced when configured.
     pub tenant_rate_per_sec: Option<NonZeroU32>,
+    /// Whether to guarantee audit-trace durability under backpressure (`FIRSTPASS_RECEIPTS`).
+    /// Default [`ReceiptsMode::BestEffort`] is byte-identical to the previous behavior.
+    pub receipts_mode: ReceiptsMode,
 }
 
 /// Default for [`ProxyConfig::max_concurrency`] when `FIRSTPASS_MAX_CONCURRENCY` is unset.
@@ -69,6 +94,10 @@ pub enum ConfigError {
         "FIRSTPASS_MODE={0:?} is not a known mode; set `observe` or `enforce`, or leave it unset"
     )]
     UnsupportedMode(String),
+
+    /// `FIRSTPASS_RECEIPTS` named an unknown mode (valid: `best_effort`, `durable`).
+    #[error("FIRSTPASS_RECEIPTS={0:?} is not valid; set `best_effort` (default) or `durable`")]
+    UnsupportedReceiptsMode(String),
 
     /// The routing config file could not be read or parsed.
     #[error("routing config error: {0}")]
@@ -184,6 +213,15 @@ impl ProxyConfig {
             None => None,
         };
 
+        // Receipts durability mode — default BestEffort (byte-identical to pre-Phase-3 behavior).
+        let receipts_mode = match lookup("FIRSTPASS_RECEIPTS").as_deref() {
+            None | Some("best_effort") => ReceiptsMode::BestEffort,
+            Some("durable") => ReceiptsMode::Durable,
+            Some(other) => {
+                return Err(ConfigError::UnsupportedReceiptsMode(other.to_owned()));
+            }
+        };
+
         Ok(Self {
             bind,
             upstream_anthropic,
@@ -214,6 +252,7 @@ impl ProxyConfig {
             routing,
             max_concurrency,
             tenant_rate_per_sec,
+            receipts_mode,
         })
     }
 }
@@ -304,6 +343,39 @@ gates = ["non-empty"]
             _ => None,
         });
         assert!(matches!(result, Err(ConfigError::Config(_))));
+    }
+
+    #[test]
+    fn receipts_mode_defaults_to_best_effort() {
+        let cfg = ProxyConfig::from_lookup(|_| None).unwrap();
+        assert_eq!(cfg.receipts_mode, ReceiptsMode::BestEffort);
+    }
+
+    #[test]
+    fn receipts_mode_durable_is_accepted() {
+        let cfg =
+            ProxyConfig::from_lookup(|k| (k == "FIRSTPASS_RECEIPTS").then(|| "durable".to_owned()))
+                .unwrap();
+        assert_eq!(cfg.receipts_mode, ReceiptsMode::Durable);
+    }
+
+    #[test]
+    fn receipts_mode_best_effort_explicit_is_accepted() {
+        let cfg = ProxyConfig::from_lookup(|k| {
+            (k == "FIRSTPASS_RECEIPTS").then(|| "best_effort".to_owned())
+        })
+        .unwrap();
+        assert_eq!(cfg.receipts_mode, ReceiptsMode::BestEffort);
+    }
+
+    #[test]
+    fn receipts_mode_unknown_is_rejected() {
+        let result = ProxyConfig::from_lookup(|k| {
+            (k == "FIRSTPASS_RECEIPTS").then(|| "never_drop".to_owned())
+        });
+        assert!(
+            matches!(result, Err(ConfigError::UnsupportedReceiptsMode(m)) if m == "never_drop")
+        );
     }
 
     #[test]

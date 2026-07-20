@@ -3,18 +3,26 @@
 //! The hot request path never blocks on disk: it `try_send`s a [`Trace`] down a bounded channel
 //! and returns immediately (dropping the trace if the writer has fallen far enough behind to fill
 //! the buffer — bounded memory over a guaranteed write). A single background task owns the SQLite
-//! connection, assigns
-//! each trace's `prev_hash` from the current chain head, computes its `hash`, and appends it
-//! (SPEC §9: the hash chain is only meaningful if every writer agrees on chain order, which a
-//! single writer task guarantees for free).
+//! connection, assigns each trace's `prev_hash` from the current chain head, computes its `hash`,
+//! and appends it (SPEC §9: the hash chain is only meaningful if every writer agrees on chain
+//! order, which a single writer task guarantees for free).
+//!
+//! In [`crate::config::ReceiptsMode::Durable`] mode the channel-full path spills traces to
+//! `<db_path>.spill.jsonl` (one JSON line per trace, synced to disk) instead of dropping them.
+//! The writer drains the spill file at startup and whenever the channel empties, inserting spilled
+//! traces BEFORE new channel arrivals so the hash chain stays append-only and valid.
 
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use firstpass_core::{DeferredVerdict, GENESIS_HASH, Score, Trace, Verdict};
 use rusqlite::Connection;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+use crate::config::ReceiptsMode;
 
 /// Open a connection with WAL + a busy timeout, so the background writer and short-lived
 /// feedback/read connections can share the file without "database is locked" errors.
@@ -36,6 +44,44 @@ pub enum StoreError {
     /// A stored row was not valid trace JSON.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    /// An I/O error from the spill file.
+    #[error("spill I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// A shared, mutex-guarded handle to the spill file used in durable mode.
+///
+/// Multiple async tasks may hit a full channel simultaneously; the `Mutex` serialises their
+/// appends without data loss.
+///
+/// ponytail: global Mutex over the file — upgrade to a dedicated spill-writer task if append
+/// throughput under sustained backpressure becomes the bottleneck.
+pub type SpillHandle = Arc<std::sync::Mutex<std::fs::File>>;
+
+/// Derive the spill-file path from the main DB path: `<db_path>.spill.jsonl`.
+pub(crate) fn spill_path(db_path: &Path) -> std::path::PathBuf {
+    let mut s = db_path.as_os_str().to_owned();
+    s.push(".spill.jsonl");
+    std::path::PathBuf::from(s)
+}
+
+/// Serialize `trace` as one JSON line and append it to the spill file, flushing to disk.
+///
+/// Called from the hot async path only when the writer channel is full (durable mode). This
+/// blocks the calling tokio task on the disk write — the deliberate tradeoff of durable mode;
+/// it only fires under sustained backpressure.
+///
+/// # Errors
+/// Returns [`StoreError::Json`] on serialization failure, [`StoreError::Io`] on disk failure.
+pub fn append_to_spill(handle: &SpillHandle, trace: &Trace) -> Result<(), StoreError> {
+    let line = serde_json::to_string(trace)?;
+    // Recover from a poisoned mutex rather than failing: a previous writer's panic doesn't
+    // corrupt the file, so we can safely continue appending.
+    let mut guard = handle.lock().unwrap_or_else(|e| e.into_inner());
+    writeln!(guard, "{line}")?;
+    // sync_data flushes the write to stable storage — the whole point of durable mode.
+    guard.sync_data()?;
+    Ok(())
 }
 
 /// Sending half of the trace channel; cheap to clone, safe to share across request handlers.
@@ -47,21 +93,59 @@ pub type TraceSender = mpsc::Sender<Trace>;
 /// stall) can't OOM the process — excess traces are dropped with a warning, not queued forever.
 pub const TRACE_CHANNEL_CAP: usize = 8192;
 
-/// Open (creating if needed) the SQLite trace database, migrate its schema, and spawn the
-/// background writer task.
+/// Open (creating if needed) the SQLite trace database in best-effort mode, migrate its schema,
+/// and spawn the background writer task.
 ///
 /// Returns a [`TraceSender`] for the hot path and the writer's [`JoinHandle`]. The writer
 /// exits cleanly once every clone of the sender is dropped.
 ///
+/// This is the backward-compatible convenience wrapper. Use [`open_with_receipts`] when you need
+/// durable (never-drop) mode.
+///
 /// # Errors
 /// Returns [`StoreError::Sqlite`] if the database cannot be opened or migrated.
 pub fn open(db_path: impl AsRef<Path>) -> Result<(TraceSender, JoinHandle<()>), StoreError> {
-    let conn = connect(db_path.as_ref())?;
+    let (tx, _spill, handle) = open_with_receipts(db_path, ReceiptsMode::BestEffort)?;
+    Ok((tx, handle))
+}
+
+/// Open the SQLite trace database with the given receipts mode, migrate its schema, and spawn
+/// the background writer task.
+///
+/// Returns a [`TraceSender`], an optional [`SpillHandle`] (present only in durable mode, for use
+/// by [`append_to_spill`] on channel-full), and the writer's [`JoinHandle`].
+///
+/// In [`ReceiptsMode::Durable`] mode the writer drains any existing spill file at startup and
+/// whenever the channel empties, inserting spilled traces BEFORE new channel arrivals so the hash
+/// chain stays append-only and valid across crashes and restarts.
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] if the database cannot be opened or migrated, or
+/// [`StoreError::Io`] if the spill file cannot be created in durable mode.
+pub fn open_with_receipts(
+    db_path: impl AsRef<Path>,
+    receipts_mode: ReceiptsMode,
+) -> Result<(TraceSender, Option<SpillHandle>, JoinHandle<()>), StoreError> {
+    let db_path = db_path.as_ref();
+    let conn = connect(db_path)?;
     migrate(&conn)?;
 
+    let spill = if receipts_mode == ReceiptsMode::Durable {
+        let path = spill_path(db_path);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)?;
+        Some(Arc::new(std::sync::Mutex::new(file)))
+    } else {
+        None
+    };
+
     let (tx, rx) = mpsc::channel::<Trace>(TRACE_CHANNEL_CAP);
-    let handle = tokio::task::spawn_blocking(move || writer_loop(conn, rx));
-    Ok((tx, handle))
+    let spill_writer = spill.clone();
+    let handle = tokio::task::spawn_blocking(move || writer_loop(conn, rx, spill_writer));
+    Ok((tx, spill, handle))
 }
 
 fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -100,32 +184,129 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Assign `prev_hash`, compute `hash`, and insert one trace. Updates `head` on success.
+/// Logs and skips on hash or insert failure — one bad record must not wedge the pipeline.
+fn write_trace(conn: &Connection, trace: &mut Trace, head: &mut String) {
+    trace.prev_hash = head.clone();
+    let hash = match trace.hash() {
+        Ok(h) => h,
+        Err(err) => {
+            tracing::error!(%err, trace_id = %trace.trace_id, "trace writer: hash failed, dropping");
+            return;
+        }
+    };
+    if let Err(err) = insert(conn, trace, &hash) {
+        tracing::error!(%err, trace_id = %trace.trace_id, "trace writer: insert failed, dropping");
+        return;
+    }
+    *head = hash;
+}
+
+/// Drain the spill file into the store, inserting traces in file order BEFORE any new channel
+/// arrivals. Truncates the file after a successful drain. Errors on individual lines are logged
+/// and skipped so one bad spill line can't stall the recovery.
+///
+/// ponytail: reads the entire file into memory; the spill file is bounded by the channel size
+/// and trace sizes, so this is fine in practice. Stream-parse if traces grow very large.
+fn drain_spill(conn: &Connection, spill: &SpillHandle, head: &mut String) {
+    // Hold the lock for the entire drain: prevents concurrent spill writers from appending
+    // new lines mid-drain, which would corrupt ordering.
+    let mut guard = spill.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Seek to start before reading.
+    if let Err(e) = guard.seek(SeekFrom::Start(0)) {
+        tracing::error!(%e, "drain_spill: seek failed");
+        return;
+    }
+
+    // Collect all non-empty lines while holding the lock (reader borrows from guard).
+    let lines: Vec<String> = {
+        let reader = BufReader::new(&*guard);
+        reader
+            .lines()
+            .filter_map(|l| match l {
+                Ok(s) if !s.trim().is_empty() => Some(s),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::error!(%e, "drain_spill: read error");
+                    None
+                }
+            })
+            .collect()
+    };
+
+    if lines.is_empty() {
+        return;
+    }
+
+    let n = lines.len();
+    for line in &lines {
+        let mut trace: Trace = match serde_json::from_str(line) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(%e, "drain_spill: bad JSON line, skipping");
+                continue;
+            }
+        };
+        write_trace(conn, &mut trace, head);
+    }
+    tracing::info!(drained = n, "spill file drained into trace store");
+
+    // Truncate: all lines have been processed (failures are skipped and logged above).
+    if let Err(e) = guard.seek(SeekFrom::Start(0)) {
+        tracing::error!(%e, "drain_spill: post-drain seek failed");
+        return;
+    }
+    if let Err(e) = guard.set_len(0) {
+        tracing::error!(%e, "drain_spill: truncate failed — spill file may replay on next boot");
+    }
+}
+
 /// The writer's main loop: runs on a blocking-pool thread for the lifetime of the store.
 /// Never panics on a bad trace — logs and drops it, so one malformed record can't wedge the
 /// whole audit pipeline.
-fn writer_loop(conn: Connection, mut rx: mpsc::Receiver<Trace>) {
+///
+/// In durable mode (`spill` is `Some`): drains the spill file at startup and whenever the
+/// channel empties, so spilled traces always land BEFORE later channel traces in the chain.
+fn writer_loop(conn: Connection, mut rx: mpsc::Receiver<Trace>, spill: Option<SpillHandle>) {
     let mut head = match current_head(&conn) {
-        Ok(head) => head,
+        Ok(h) => h,
         Err(err) => {
             tracing::error!(%err, "trace writer: failed to load chain head, stopping");
             return;
         }
     };
 
-    while let Some(mut trace) = rx.blocking_recv() {
-        trace.prev_hash = head.clone();
-        let hash = match trace.hash() {
-            Ok(hash) => hash,
-            Err(err) => {
-                tracing::error!(%err, trace_id = %trace.trace_id, "trace writer: failed to hash trace, dropping");
-                continue;
-            }
+    // Startup drain: recover any traces spilled during a previous run's backpressure.
+    if let Some(ref s) = spill {
+        drain_spill(&conn, s, &mut head);
+    }
+
+    loop {
+        let Some(mut trace) = rx.blocking_recv() else {
+            break;
         };
-        if let Err(err) = insert(&conn, &trace, &hash) {
-            tracing::error!(%err, trace_id = %trace.trace_id, "trace writer: failed to persist trace, dropping");
-            continue;
+        write_trace(&conn, &mut trace, &mut head);
+
+        // Fast-drain: pull any immediately available channel items, then drain spill when
+        // the channel is momentarily empty so spilled traces land before the next wave.
+        loop {
+            match rx.try_recv() {
+                Ok(mut t) => write_trace(&conn, &mut t, &mut head),
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if let Some(ref s) = spill {
+                        drain_spill(&conn, s, &mut head);
+                    }
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => return,
+            }
         }
-        head = hash;
+    }
+
+    // Channel closed: one final spill drain to capture any last-moment spills.
+    if let Some(ref s) = spill {
+        drain_spill(&conn, s, &mut head);
     }
 }
 
@@ -527,5 +708,122 @@ mod tests {
         verify_chain(&traces, GENESIS_HASH).unwrap();
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ── Durable-receipts tests ────────────────────────────────────────────────
+
+    /// Test (2): `append_to_spill` writes valid JSON lines to the spill file.
+    #[test]
+    fn durable_append_to_spill_writes_valid_json_line() {
+        let db_path =
+            std::env::temp_dir().join(format!("firstpass-spill-write-{}.db", uuid::Uuid::now_v7()));
+        let spill_p = spill_path(&db_path);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&spill_p)
+            .unwrap();
+        let handle = Arc::new(std::sync::Mutex::new(file));
+
+        let t = sample_trace("t", "s");
+        append_to_spill(&handle, &t).unwrap();
+
+        let content = std::fs::read_to_string(&spill_p).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "one line per spilled trace");
+        let parsed: Trace = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed.trace_id, t.trace_id);
+
+        let _ = std::fs::remove_file(&spill_p);
+    }
+
+    /// Test (3): on boot with a pre-populated spill file, the writer drains it and
+    /// `verify_chain` passes over the full store.
+    #[tokio::test]
+    async fn drain_on_boot_restores_spilled_traces_and_chain_is_valid() {
+        let db_path =
+            std::env::temp_dir().join(format!("firstpass-drain-boot-{}.db", uuid::Uuid::now_v7()));
+        let spill_p = spill_path(&db_path);
+
+        // Pre-populate spill file with 2 traces (simulating backpressure from a previous run).
+        let t1 = sample_trace("t", "s1");
+        let t2 = sample_trace("t", "s2");
+        {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&spill_p)
+                .unwrap();
+            let h = Arc::new(std::sync::Mutex::new(file));
+            append_to_spill(&h, &t1).unwrap();
+            append_to_spill(&h, &t2).unwrap();
+        }
+
+        // Open in durable mode — startup drain fires before any channel traffic.
+        let (tx, _spill, handle) = open_with_receipts(&db_path, ReceiptsMode::Durable).unwrap();
+        drop(tx); // close the channel immediately
+        handle.await.unwrap();
+
+        let traces = load_all_traces(&db_path).unwrap();
+        assert_eq!(traces.len(), 2, "both spilled traces recovered");
+        verify_chain(&traces, GENESIS_HASH).unwrap();
+
+        // Spill file must be empty after a successful drain.
+        let remaining = std::fs::read_to_string(&spill_p).unwrap();
+        assert!(
+            remaining.trim().is_empty(),
+            "spill file must be empty after drain"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spill_p);
+    }
+
+    /// Test (4): spilled traces land before later channel traces in the store, preserving the
+    /// hash chain's append-only ordering.
+    #[tokio::test]
+    async fn spilled_traces_land_before_later_channel_traces() {
+        let db_path =
+            std::env::temp_dir().join(format!("firstpass-spill-order-{}.db", uuid::Uuid::now_v7()));
+        let spill_p = spill_path(&db_path);
+
+        // Pre-populate the spill file (as if these traces were spilled under backpressure).
+        let spilled = sample_trace("t", "spilled");
+        {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&spill_p)
+                .unwrap();
+            let h = Arc::new(std::sync::Mutex::new(file));
+            append_to_spill(&h, &spilled).unwrap();
+        }
+
+        // Open in durable mode: startup drain inserts the spilled trace first.
+        let (tx, _spill, handle) = open_with_receipts(&db_path, ReceiptsMode::Durable).unwrap();
+        // Send a new channel trace after the store is open (arrives after startup drain).
+        let channel_trace = sample_trace("t", "channel");
+        tx.try_send(channel_trace.clone()).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let traces = load_all_traces(&db_path).unwrap();
+        assert_eq!(traces.len(), 2, "spilled + channel trace");
+        // Spilled trace must come first (lower seq).
+        assert_eq!(
+            traces[0].trace_id, spilled.trace_id,
+            "spilled trace must precede channel trace"
+        );
+        assert_eq!(
+            traces[1].trace_id, channel_trace.trace_id,
+            "channel trace must follow spilled trace"
+        );
+        verify_chain(&traces, GENESIS_HASH).unwrap();
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spill_p);
     }
 }

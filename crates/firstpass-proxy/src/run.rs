@@ -44,7 +44,7 @@ pub fn build_gate_health(config: &ProxyConfig) -> GateHealthRegistry {
 /// Returns any error from opening the store, building the HTTP client, binding the listener, or
 /// serving.
 pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let (traces, writer) = store::open(&config.db_path)?;
+    let (traces, spill, writer) = store::open_with_receipts(&config.db_path, config.receipts_mode)?;
     let bind = config.bind.clone();
     // Build the provider registry from any `[[provider]]` entries in the routing config (Groq,
     // Together, Ollama, …), on top of the built-in anthropic/openai defaults. No config => defaults.
@@ -114,6 +114,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         adaptive,
         bandit,
         tenant_rate_limiter,
+        spill,
     };
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
