@@ -20,7 +20,7 @@ The adaptive LLM router that checks **every answer** with your gate, pays for a 
 ## Highlights
 
 - 💸 **Cheapest model first, always** — you pay frontier prices only when a real check proves you must.
-- 🛡️ **A guarantee, not a vibe** — ≤10% wrong answers served at 95% confidence, earned live on 964 real coding tasks.
+- 🛡️ **A guarantee, not a vibe** — ≤10% wrong answers served at 95% confidence, earned live on 974 real coding tasks ([artifact](docs/benchmarks/mbpp-live-base.txt)).
 - 🧠 **Self-tuning** — the serve threshold recalibrates from live outcomes as your traffic drifts. No retraining, ever.
 - 🎯 **Predict-to-start, verify-to-serve** — a UCB1 bandit learns which rung to *start* on per context; the gate still checks the output before it ships.
 - 🔬 **Measured confidence** — the self-consistency gate resamples the model k times; agreement on the *actual output* is a calibrated confidence score, not a guess about the prompt.
@@ -89,7 +89,7 @@ For agents onboarding *themselves*: [`llms.txt`](llms.txt) + [`AGENTS.md`](AGENT
 
 <div align="center"><img src="assets/bench.svg" alt="Cost per successful task, live on 200 graded tasks: always-top $0.0023 at 0.98 success; predictive router $0.0007 at 0.88 success while silently serving wrong answers 12% of the time; always-cheap $0.0001 but 0.62 success; firstpass $0.0003 at 1.00 success with zero wrong answers served" width="900"></div>
 
-And the claim no other router makes: on **964 real MBPP coding tasks** (fail-closed sandbox, real test gates), firstpass earned a **distribution-free bound of ≤10% wrong answers served at 95% confidence** — empirically 7.6%, tightening to 5.9% with an LLM judge on the gate, while serving 82% of requests from the cheap tier. Your savings depend on your workload — which is why every trace records the always-top counterfactual, **so you measure your number instead of trusting ours.**
+And the claim no other router makes: on **974 real MBPP coding tasks** (fail-closed sandbox, real test gates — [committed artifact](docs/benchmarks/mbpp-live-base.txt), re-earned 2026-07-20), firstpass earned a **distribution-free bound of ≤10% wrong answers served at 95% confidence** — calibrated risk 5.5%, realized served-failure 7.7% at the threshold, while serving **82%** of requests from the cheap tier. An LLM judge on the gate tightens it further (judged artifact lands in the same directory). Your savings depend on your workload — which is why every trace records the always-top counterfactual, **so you measure your number instead of trusting ours.**
 
 Reproduce it — each command labels itself and states what it costs:
 
