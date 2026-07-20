@@ -1,0 +1,64 @@
+{
+  "title": "Firstpass — routing, proof, and money",
+  "uid": "firstpass-core",
+  "schemaVersion": 39,
+  "tags": ["firstpass"],
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "type": "stat", "title": "Savings (USD, total)", "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 5 },
+      "targets": [{ "expr": "firstpass_savings_usd_total", "legendFormat": "saved" }]
+    },
+    {
+      "type": "stat", "title": "Spent (USD, total)", "id": 2,
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 5 },
+      "targets": [
+        { "expr": "firstpass_cost_usd_total", "legendFormat": "spent" },
+        { "expr": "firstpass_gate_cost_usd_total", "legendFormat": "gates (price of proof)" }
+      ]
+    },
+    {
+      "type": "stat", "title": "Realized served-failure vs target", "id": 3,
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 5 },
+      "targets": [{ "expr": "firstpass_realized_served_failure", "legendFormat": "realized" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.1 } ] } }, "overrides": [] }
+    },
+    {
+      "type": "stat", "title": "Adaptive serve threshold", "id": 4,
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 5 },
+      "targets": [{ "expr": "firstpass_serve_threshold", "legendFormat": "threshold" }]
+    },
+    {
+      "type": "timeseries", "title": "Served by rung/model (the shape of the ladder)", "id": 5,
+      "gridPos": { "x": 0, "y": 5, "w": 12, "h": 8 },
+      "targets": [{ "expr": "sum by (rung, model) (rate(firstpass_served_rung_total[5m]))", "legendFormat": "rung {{rung}} · {{model}}" }]
+    },
+    {
+      "type": "timeseries", "title": "Escalations & upstream failures", "id": 6,
+      "gridPos": { "x": 12, "y": 5, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(firstpass_escalations_total[5m])", "legendFormat": "escalations/s" },
+        { "expr": "rate(firstpass_upstream_failures_total[5m])", "legendFormat": "upstream failures/s" },
+        { "expr": "rate(firstpass_traces_dropped_total[5m])", "legendFormat": "receipts dropped/s (should be 0)" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Enforce latency (ms)", "id": 7,
+      "gridPos": { "x": 0, "y": 13, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum by (le) (rate(firstpass_enforce_latency_ms_bucket[5m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(firstpass_enforce_latency_ms_bucket[5m])))", "legendFormat": "p95" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Money over time (spend vs always-top baseline)", "id": 8,
+      "gridPos": { "x": 12, "y": 13, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(firstpass_cost_usd_total[5m])", "legendFormat": "spend $/s" },
+        { "expr": "rate(firstpass_baseline_usd_total[5m])", "legendFormat": "always-top baseline $/s" }
+      ]
+    }
+  ]
+}

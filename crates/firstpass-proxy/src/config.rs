@@ -194,8 +194,24 @@ impl ProxyConfig {
             tenant_keys,
             prompt_salt,
             mode,
+            prices: {
+                // Operator [[price]] overrides pin THIS deployment's real prices onto the
+                // built-in defaults — savings math tracks the contract, not a stale list.
+                let mut prices = PriceTable::defaults();
+                if let Some(cfg) = routing.as_ref() {
+                    for p in &cfg.price_defs {
+                        prices = prices.with_override(
+                            p.model.clone(),
+                            firstpass_core::ModelPrice {
+                                input_per_mtok: p.input_per_mtok,
+                                output_per_mtok: p.output_per_mtok,
+                            },
+                        );
+                    }
+                }
+                prices
+            },
             routing,
-            prices: PriceTable::defaults(),
             max_concurrency,
             tenant_rate_per_sec,
         })
@@ -288,5 +304,21 @@ gates = ["non-empty"]
             _ => None,
         });
         assert!(matches!(result, Err(ConfigError::Config(_))));
+    }
+
+    #[test]
+    fn price_overrides_reach_the_price_table() {
+        let toml = "[[route]]\nmatch = {}\nmode = \"observe\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n\n[[price]]\nmodel = \"anthropic/claude-haiku-4-5\"\ninput_per_mtok = 2.0\noutput_per_mtok = 10.0\n";
+        let cfg = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        // 1000 in + 1000 out at 2.0/10.0 per Mtok = 0.002 + 0.010.
+        let cost = cfg
+            .prices
+            .cost_usd("anthropic/claude-haiku-4-5", 1000, 1000)
+            .unwrap();
+        assert!((cost - 0.012).abs() < 1e-9, "override must win: {cost}");
     }
 }

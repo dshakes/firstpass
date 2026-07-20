@@ -173,3 +173,12 @@ speculation = 0
 #
 # [escalation.exploration]
 # epsilon = 0.05   # 5 % of requests start at a random rung; receipts record propensity
+
+# Per-deployment price overrides (USD per 1M tokens). List prices drift and enterprise
+# contracts differ; savings math is only honest when it uses YOUR prices. Overrides replace
+# the built-in defaults for the named models — everything else keeps the defaults.
+#
+# [[price]]
+# model           = "anthropic/claude-haiku-4-5"
+# input_per_mtok  = 0.80
+# output_per_mtok = 4.00
