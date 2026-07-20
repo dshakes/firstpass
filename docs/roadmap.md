@@ -74,7 +74,7 @@ baseline.
       escalation on the easy/medium slice, and the gate makes exploiting that safe.
 - [ ] Speculative deferral: prefetch the next rung only in the marginal serve-probability
       band, under a latency SLA.
-- [ ] Doubly-robust estimator alongside IPS/SNIPS in `firstpass ope`.
+- [x] Doubly-robust estimator alongside IPS/SNIPS in `firstpass ope`.
 - [ ] Reproducible benchmark vs the unified routing+cascading policy from the literature,
       including a drift scenario in which the bound must hold.
 

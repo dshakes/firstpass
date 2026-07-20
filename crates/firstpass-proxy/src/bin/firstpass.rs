@@ -23,7 +23,7 @@ USAGE:
     firstpass ope --config <candidate.toml> [--db <path>] [--tenant <id>]
                                    evaluate a candidate policy against logged traffic before enforcing
     firstpass ope --start-rung N [--db <path>] [--tenant <id>]
-                                   IPS/SNIPS estimate for a fixed start-rung (requires propensity-logged traffic)
+                                   IPS/SNIPS/DR estimate for a fixed start-rung (requires propensity-logged traffic)
     firstpass mcp                 serve MCP over stdio (agent reads traces + submits feedback)
     firstpass --help | --version
 
