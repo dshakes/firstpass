@@ -188,6 +188,73 @@ fn can_write_db(db_path: &str) -> bool {
     }
 }
 
+/// Per-gate and per-rung evaluation summary computed from receipts — the operator's live
+/// eval suite: how each gate is verdict-ing, how often routing escalates, where serves land.
+#[derive(Debug, serde::Serialize)]
+pub struct EvalsSummary {
+    /// Traces aggregated (enforce mode only — observe records no gate decisions on-path).
+    pub enforce_traces: usize,
+    /// Total escalations across those traces.
+    pub escalations: u64,
+    /// gate_id → (pass, fail, abstain) counts across every attempt.
+    pub gates: std::collections::BTreeMap<String, (u64, u64, u64)>,
+    /// rung index → times an attempt at that rung was the served one.
+    pub served_by_rung: std::collections::BTreeMap<u32, u64>,
+}
+
+/// Aggregate gate verdicts + routing behavior over `traces` (enforce only).
+#[must_use]
+pub fn summarize_evals(traces: &[Trace]) -> EvalsSummary {
+    let mut s = EvalsSummary {
+        enforce_traces: 0,
+        escalations: 0,
+        gates: std::collections::BTreeMap::new(),
+        served_by_rung: std::collections::BTreeMap::new(),
+    };
+    for t in traces {
+        if t.mode != Mode::Enforce {
+            continue;
+        }
+        s.enforce_traces += 1;
+        s.escalations += u64::from(t.final_.escalations);
+        if let Some(rung) = t.final_.served_rung {
+            *s.served_by_rung.entry(rung).or_insert(0) += 1;
+        }
+        for attempt in &t.attempts {
+            for g in &attempt.gates {
+                let e = s.gates.entry(g.gate_id.clone()).or_insert((0, 0, 0));
+                match g.verdict {
+                    firstpass_core::Verdict::Pass => e.0 += 1,
+                    firstpass_core::Verdict::Fail => e.1 += 1,
+                    firstpass_core::Verdict::Abstain => e.2 += 1,
+                }
+            }
+        }
+    }
+    s
+}
+
+/// Render an [`EvalsSummary`] for humans (`--json` callers serialize the struct instead).
+#[must_use]
+pub fn format_evals(s: &EvalsSummary) -> String {
+    if s.enforce_traces == 0 {
+        return "no enforce traces yet — route some traffic in enforce mode first".to_owned();
+    }
+    let mut out = format!(
+        "enforce traces: {} · escalations: {}\n",
+        s.enforce_traces, s.escalations
+    );
+    out.push_str("gates (pass / fail / abstain):\n");
+    for (id, (p, f, a)) in &s.gates {
+        out.push_str(&format!("  {id:<24} {p:>6} / {f:>6} / {a:>6}\n"));
+    }
+    out.push_str("served by rung:\n");
+    for (rung, n) in &s.served_by_rung {
+        out.push_str(&format!("  rung {rung:<2} {n:>6}\n"));
+    }
+    out.trim_end().to_owned()
+}
+
 /// Aggregated spend/savings over a set of traces — the number the operator screenshots.
 /// Pure so it's unit-testable; `firstpass savings` feeds it the trace store.
 #[derive(Debug, serde::Serialize)]
@@ -350,5 +417,12 @@ mod tests {
         let empty = summarize_savings(&[]);
         assert_eq!(empty.traces, 0);
         assert!(format_savings(&empty).contains("no traces"));
+    }
+
+    #[test]
+    fn evals_summary_empty_zero_state() {
+        let s = summarize_evals(&[]);
+        assert_eq!(s.enforce_traces, 0);
+        assert!(format_evals(&s).contains("no enforce traces"));
     }
 }
