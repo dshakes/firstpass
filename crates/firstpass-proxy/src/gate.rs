@@ -454,6 +454,7 @@ mod tests {
             messages: vec![],
             max_tokens: 16,
             tools: Value::Null,
+            raw: Value::Null,
         }
     }
 

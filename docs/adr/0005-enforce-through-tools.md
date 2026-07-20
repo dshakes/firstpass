@@ -108,3 +108,22 @@ code and correctness. The flag still ships **off** by default.
 - **OpenAI tool-format divergence** — Anthropic and OpenAI differ on tool/message
   shapes. P1 keeps content opaque (forwarded as-is per adapter); cross-provider
   tool routing is validated per-adapter in P2.
+
+## Addendum (P1 roadmap, post-v0.1.7): default-on + verbatim raw carry + fidelity guard
+
+- **P4 — raw-body carry.** `ModelRequest.raw` now holds the full original inbound JSON;
+  Anthropic-dialect adapters (anthropic / bedrock / vertex) send it **verbatim** with only
+  `model` swapped and `stream` stripped — so `tools`, `tool_choice`, `temperature`,
+  `thinking`, `stop_sequences`, and any future field survive the rung without a translation
+  layer. Proven by `anthropic_wire_body_carries_raw_request_verbatim` and
+  `bedrock_vertex_body_carries_raw_minus_model_plus_version`.
+- **P5 — default flip, guarded.** `enforce_structured` now defaults **true**. I3's
+  operator-verification burden is replaced by a structural **fidelity guard**: a structured
+  request routes only when every ladder rung's provider reports
+  `carries_structured_verbatim()`; a ladder containing a dialect that would need
+  (not-yet-built) translation — OpenAI-compatible, Gemini — falls back to transparent
+  observe passthrough (I4 preserved). Proven by
+  `fidelity_guard_blocks_structured_on_non_verbatim_ladder` and the default-on halves of
+  `enforce_falls_back_to_observe_for_tool_requests`.
+- I1 is superseded for defaults (default behavior is now route-structured) but preserved
+  under `enforce_structured = false`.

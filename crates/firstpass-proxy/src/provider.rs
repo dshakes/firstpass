@@ -70,6 +70,13 @@ pub struct ModelRequest {
     /// Opaque tool/function-calling passthrough, forwarded as-is to the wire provider.
     #[serde(default)]
     pub tools: Value,
+    /// The **full original inbound request JSON**, when this request came off the proxy's wire
+    /// (ADR 0005). Anthropic-dialect providers send it verbatim with only `model` swapped (and
+    /// `stream` stripped), so every field — `tools`, `tool_choice`, `temperature`, `thinking`,
+    /// `stop_sequences`, … — survives the rung exactly as the caller wrote it. `Null` for
+    /// synthesized requests (judge / consistency samples), which use the normalized fields.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub raw: Value,
 }
 
 /// A provider-agnostic model response.
@@ -179,12 +186,16 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
 
     /// Provider identity, e.g. `"anthropic"`.
     fn id(&self) -> &str;
-}
 
-#[derive(Serialize)]
-struct AnthropicWireMessage<'a> {
-    role: &'a str,
-    content: &'a Value,
+    /// Whether this provider carries Anthropic-shaped structured content (tool_use / tool_result /
+    /// image blocks and top-level `tools`) **verbatim** on the wire. The enforce path's fidelity
+    /// guard (ADR 0005) only routes structured requests through ladders where every rung's
+    /// provider returns `true`; a dialect that would need translation returns `false` until that
+    /// translation exists — falling back to transparent passthrough is always safe, corrupting a
+    /// tool turn never is.
+    fn carries_structured_verbatim(&self) -> bool {
+        false
+    }
 }
 
 /// Strip the `provider/` prefix from a ladder model id for the provider's wire API — Anthropic and
@@ -205,13 +216,38 @@ fn resolve_api_key(api_key_env: Option<&str>, byok_override: Option<&str>) -> St
         .unwrap_or_default()
 }
 
-#[derive(Serialize)]
-struct AnthropicWireRequest<'a> {
-    model: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
-    max_tokens: u32,
-    messages: Vec<AnthropicWireMessage<'a>>,
+/// Build the Anthropic Messages wire body for `req`: the original inbound JSON **verbatim** with
+/// only `model` swapped to the rung's wire id and `stream` stripped (`complete` is the buffered
+/// call — the gate needs the whole candidate). Falls back to the normalized fields when there is
+/// no raw body (synthesized judge/consistency requests). Pure, so fidelity is unit-testable.
+#[must_use]
+pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
+    if let Value::Object(raw) = &req.raw {
+        let mut body = raw.clone();
+        body.insert(
+            "model".to_owned(),
+            Value::String(wire_model(&req.model).to_owned()),
+        );
+        body.remove("stream");
+        return Value::Object(body);
+    }
+    let messages: Vec<Value> = req
+        .messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+    let mut body = serde_json::json!({
+        "model": wire_model(&req.model),
+        "max_tokens": req.max_tokens,
+        "messages": messages,
+    });
+    if let Some(system) = req.system.as_deref() {
+        body["system"] = serde_json::json!(system);
+    }
+    if !req.tools.is_null() {
+        body["tools"] = req.tools.clone();
+    }
+    body
 }
 
 /// Speaks `POST {base}/v1/messages` (Anthropic Messages API).
@@ -238,25 +274,17 @@ impl Provider for AnthropicProvider {
         &self.id
     }
 
+    fn carries_structured_verbatim(&self) -> bool {
+        true
+    }
+
     async fn complete(
         &self,
         req: &ModelRequest,
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
         let key = resolve_api_key(self.api_key_env.as_deref(), auth.anthropic_key.as_deref());
-        let body = AnthropicWireRequest {
-            model: wire_model(&req.model),
-            system: req.system.as_deref(),
-            max_tokens: req.max_tokens,
-            messages: req
-                .messages
-                .iter()
-                .map(|m| AnthropicWireMessage {
-                    role: &m.role,
-                    content: &m.content,
-                })
-                .collect(),
-        };
+        let body = anthropic_wire_body(req);
 
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let resp = self
@@ -329,6 +357,18 @@ fn anthropic_parse_response(json: &Value) -> Result<(String, u64, u64), Provider
 /// which need `model` in the body ([`AnthropicWireRequest`]). `anthropic_version` is the dialect
 /// version string each host expects (`bedrock-2023-05-31` / `vertex-2023-10-16`).
 fn anthropic_messages_body(req: &ModelRequest, anthropic_version: &str) -> Value {
+    // Same verbatim-carry rule as `anthropic_wire_body`, adapted to hosts that put the model in
+    // the URL: original inbound JSON minus `model`/`stream`, plus the host's version string.
+    if let Value::Object(raw) = &req.raw {
+        let mut body = raw.clone();
+        body.remove("model");
+        body.remove("stream");
+        body.insert(
+            "anthropic_version".to_owned(),
+            Value::String(anthropic_version.to_owned()),
+        );
+        return Value::Object(body);
+    }
     let messages: Vec<Value> = req
         .messages
         .iter()
@@ -341,6 +381,9 @@ fn anthropic_messages_body(req: &ModelRequest, anthropic_version: &str) -> Value
     });
     if let Some(system) = req.system.as_deref() {
         body["system"] = serde_json::json!(system);
+    }
+    if !req.tools.is_null() {
+        body["tools"] = req.tools.clone();
     }
     body
 }
@@ -706,6 +749,10 @@ impl Provider for BedrockProvider {
         &self.id
     }
 
+    fn carries_structured_verbatim(&self) -> bool {
+        true
+    }
+
     async fn complete(
         &self,
         req: &ModelRequest,
@@ -788,6 +835,10 @@ pub struct VertexProvider {
 impl Provider for VertexProvider {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn carries_structured_verbatim(&self) -> bool {
+        true
     }
 
     async fn complete(
@@ -1023,6 +1074,10 @@ impl Provider for MockProvider {
         &self.id
     }
 
+    fn carries_structured_verbatim(&self) -> bool {
+        true
+    }
+
     async fn complete(
         &self,
         req: &ModelRequest,
@@ -1064,6 +1119,7 @@ mod tests {
             ],
             max_tokens: 256,
             tools: Value::Null,
+            raw: Value::Null,
         };
         let body = gemini_request_body(&req);
         // System prompt goes in system_instruction, not contents.
@@ -1160,6 +1216,7 @@ mod tests {
             ],
             max_tokens: 128,
             tools: Value::Null,
+            raw: Value::Null,
         };
         let body = anthropic_messages_body(&req, "bedrock-2023-05-31");
         // Model goes in the URL for Bedrock/Vertex, never the body.
@@ -1204,6 +1261,7 @@ mod tests {
             messages: vec![],
             max_tokens: 16,
             tools: Value::Null,
+            raw: Value::Null,
         };
         let err = provider.complete(&req, &Auth::default()).await.unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
@@ -1259,6 +1317,7 @@ mod tests {
             messages: vec![],
             max_tokens: 16,
             tools: Value::Null,
+            raw: Value::Null,
         };
         let err = provider.complete(&req, &Auth::default()).await.unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
@@ -1317,7 +1376,7 @@ mod tests {
         // ADR 0005 I3 (request side): the Anthropic adapter serializes tool_use / tool_result /
         // image content blocks byte-for-byte into the wire body — enforce forwards them, it does not
         // flatten them. A plain-string message still serializes as a bare string (I1).
-        let messages = [
+        let messages = vec![
             ChatMessage::text("user", "hi"),
             ChatMessage {
                 role: "assistant".to_owned(),
@@ -1333,19 +1392,14 @@ mod tests {
                 ]),
             },
         ];
-        let body = AnthropicWireRequest {
-            model: "claude-haiku-4-5",
+        let wire = anthropic_wire_body(&ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
             system: None,
+            messages,
             max_tokens: 64,
-            messages: messages
-                .iter()
-                .map(|m| AnthropicWireMessage {
-                    role: &m.role,
-                    content: &m.content,
-                })
-                .collect(),
-        };
-        let wire = serde_json::to_value(&body).unwrap();
+            tools: Value::Null,
+            raw: Value::Null,
+        });
         assert_eq!(wire["messages"][0]["content"], serde_json::json!("hi"));
         assert_eq!(
             wire["messages"][1]["content"],
@@ -1418,8 +1472,82 @@ mod tests {
             messages: vec![],
             max_tokens: 100,
             tools: Value::Null,
+            raw: Value::Null,
         };
         let out = provider.complete(&req, &Auth::default()).await.unwrap();
         assert_eq!(out.text, "hello");
+    }
+
+    #[test]
+    fn anthropic_wire_body_carries_raw_request_verbatim() {
+        // ADR 0005: with a raw inbound body present, the wire request IS that body — every field
+        // the caller set (tools, tool_choice, temperature, thinking, ...) survives; only `model`
+        // is swapped to the rung's wire id and `stream` is stripped (complete() buffers to gate).
+        let raw = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "stream": true,
+            "max_tokens": 512,
+            "temperature": 0.2,
+            "tool_choice": { "type": "auto" },
+            "tools": [{ "name": "get_weather", "input_schema": { "type": "object" } }],
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 512,
+            tools: raw["tools"].clone(),
+            raw: raw.clone(),
+        };
+        let wire = anthropic_wire_body(&req);
+        assert_eq!(wire["model"], "claude-haiku-4-5", "rung model swapped in");
+        assert!(wire.get("stream").is_none(), "stream stripped");
+        for field in [
+            "temperature",
+            "tool_choice",
+            "tools",
+            "thinking",
+            "max_tokens",
+            "messages",
+        ] {
+            assert_eq!(
+                wire[field], raw[field],
+                "field {field} must survive verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_vertex_body_carries_raw_minus_model_plus_version() {
+        let raw = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "stream": true,
+            "max_tokens": 64,
+            "tools": [{ "name": "t" }],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let req = ModelRequest {
+            model: "bedrock/anthropic.claude-haiku".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 64,
+            tools: raw["tools"].clone(),
+            raw: raw.clone(),
+        };
+        let body = anthropic_messages_body(&req, "bedrock-2023-05-31");
+        assert!(body.get("model").is_none(), "model lives in the URL");
+        assert!(body.get("stream").is_none());
+        assert_eq!(body["anthropic_version"], "bedrock-2023-05-31");
+        assert_eq!(body["tools"], raw["tools"]);
+        assert_eq!(body["messages"], raw["messages"]);
+    }
+
+    #[test]
+    fn verbatim_carriers_are_anthropic_shaped_dialects_only() {
+        let reg = ProviderRegistry::new("http://localhost", "http://localhost");
+        assert!(reg.get("anthropic").unwrap().carries_structured_verbatim());
+        assert!(!reg.get("openai").unwrap().carries_structured_verbatim());
     }
 }

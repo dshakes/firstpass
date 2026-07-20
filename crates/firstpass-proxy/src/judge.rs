@@ -131,6 +131,7 @@ pub fn build_judge_request(judge_model: &str, rubric: &str, candidate: &str) -> 
         messages: vec![ChatMessage::text("user", user)],
         max_tokens: 256,
         tools: Value::Null, // the judge runs no tools (§8.3)
+        raw: Value::Null,   // synthesized request — normalized fields are the wire truth
     }
 }
 

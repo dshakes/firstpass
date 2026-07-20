@@ -432,7 +432,13 @@ async fn messages(
             // Clone the matched route so no borrow of `state.config` is held across the await;
             // routes are tiny (a handful of strings).
             let route = route.clone();
-            if enforce_can_handle(&features, &body, routing.escalation.enforce_structured) {
+            if enforce_can_handle(
+                &features,
+                &body,
+                routing.escalation.enforce_structured,
+                &route.ladder,
+                &state.providers,
+            ) {
                 return handle_enforce(
                     &state,
                     &headers,
@@ -444,12 +450,11 @@ async fn messages(
                 )
                 .await;
             }
-            // With `enforce_structured` off (default), tool/image/tool-block requests fall through
-            // to transparent observe passthrough (correct, un-gated) rather than being routed —
-            // byte-identical to before ADR 0005. (With it on, `enforce_can_handle` returns true and
-            // we never reach here.)
+            // Structured request that can't be routed faithfully (flag off, or a ladder rung's
+            // dialect doesn't carry structured content verbatim yet): transparent observe
+            // passthrough — correct and un-gated beats routed and corrupted.
             tracing::info!(
-                "enforce route matched but request carries tools/images; serving via observe passthrough"
+                "enforce route matched but structured request can't be routed faithfully (flag/ladder); serving via observe passthrough"
             );
         }
     }
@@ -458,18 +463,38 @@ async fn messages(
 
 /// Whether the enforce path can faithfully handle this request.
 ///
-/// Request content is carried verbatim (ADR 0005 P1), so tool_use/tool_result/image blocks survive
-/// the round trip, and a streaming client is served the gated result as SSE (P3). Whether such
-/// requests are actually *routed* is the operator's call:
-/// - `enforce_structured == false` (default): tools/images/tool-blocks fall back to observe —
-///   byte-identical to before the ADR (invariant I1).
-/// - `enforce_structured == true` (opt-in, live-verified): tools, images, and streaming all route
-///   through enforce.
-fn enforce_can_handle(features: &Features, body: &[u8], enforce_structured: bool) -> bool {
-    if enforce_structured {
+/// The request body is carried verbatim per rung (ADR 0005 P1: [`crate::provider::ModelRequest::raw`]),
+/// so tool_use/tool_result/image blocks — and every other field the caller set — survive the round
+/// trip; a streaming client is served the gated result as SSE (P3). Structured requests route iff:
+/// - `enforce_structured == true` (**the default** — agent traffic is the target workload), and
+/// - the **fidelity guard** holds: every ladder rung's provider carries Anthropic-shaped
+///   structured content verbatim ([`crate::provider::Provider::carries_structured_verbatim`]).
+///   A ladder containing a dialect that would need (not-yet-built) translation falls back to
+///   transparent observe passthrough — un-gated is safe, corrupted is not.
+///
+/// `enforce_structured == false` restores the pre-ADR-0005 behavior: structured requests always
+/// fall back to observe.
+fn enforce_can_handle(
+    features: &Features,
+    body: &[u8],
+    enforce_structured: bool,
+    ladder: &[String],
+    providers: &crate::provider::ProviderRegistry,
+) -> bool {
+    let structured =
+        features.tool_count > 0 || features.has_images || messages_have_tool_blocks(body);
+    if !structured {
         return true;
     }
-    features.tool_count == 0 && !features.has_images && !messages_have_tool_blocks(body)
+    if !enforce_structured {
+        return false;
+    }
+    ladder.iter().all(|rung| {
+        let provider_id = rung.split('/').next().unwrap_or_default();
+        providers
+            .get(provider_id)
+            .is_some_and(|p| p.carries_structured_verbatim())
+    })
 }
 
 /// Whether any message carries a `tool_use` or `tool_result` content block (a multi-turn tool
@@ -716,6 +741,7 @@ async fn handle_enforce(
 // `enforce_can_handle`; this function only guarantees no fidelity is lost once they do.
 fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
     let json: Value = serde_json::from_slice(body).ok()?;
+    let raw = json.clone();
     let messages_json = json.get("messages")?.as_array()?;
     let messages = messages_json
         .iter()
@@ -751,6 +777,7 @@ fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
         messages,
         max_tokens,
         tools,
+        raw,
     })
 }
 
@@ -1592,9 +1619,23 @@ mod tests {
         );
         let f_plain = extract_features(&HeaderMap::new(), &plain);
         let f_tools = extract_features(&HeaderMap::new(), &tools);
-        // Default (enforce_structured = false): plain text routes, tools fall back to observe.
-        assert!(enforce_can_handle(&f_plain, &plain, false));
-        assert!(!enforce_can_handle(&f_tools, &tools, false));
+        let anthropic_ladder = vec!["anthropic/claude-haiku-4-5".to_owned()];
+        let providers = test_registry();
+        // Opted out (enforce_structured = false): plain text routes, tools fall back to observe.
+        assert!(enforce_can_handle(
+            &f_plain,
+            &plain,
+            false,
+            &anthropic_ladder,
+            &providers
+        ));
+        assert!(!enforce_can_handle(
+            &f_tools,
+            &tools,
+            false,
+            &anthropic_ladder,
+            &providers
+        ));
     }
 
     #[test]
@@ -1608,8 +1649,63 @@ mod tests {
             br#"{"model":"m","stream":true,"tools":[{"name":"t"}],"messages":[{"role":"user","content":"hi"}]}"#,
         );
         let f = extract_features(&HeaderMap::new(), &tools);
-        assert!(enforce_can_handle(&f, &tools, true));
-        assert!(enforce_can_handle(&f, &streaming_tools, true));
+        let anthropic_ladder = vec![
+            "anthropic/claude-haiku-4-5".to_owned(),
+            "anthropic/claude-sonnet-5".to_owned(),
+        ];
+        let providers = test_registry();
+        assert!(enforce_can_handle(
+            &f,
+            &tools,
+            true,
+            &anthropic_ladder,
+            &providers
+        ));
+        assert!(enforce_can_handle(
+            &f,
+            &streaming_tools,
+            true,
+            &anthropic_ladder,
+            &providers
+        ));
+    }
+
+    /// Registry with the built-in `anthropic` (verbatim carrier) + `openai` (not yet) providers.
+    fn test_registry() -> crate::provider::ProviderRegistry {
+        crate::provider::ProviderRegistry::new("http://localhost", "http://localhost")
+    }
+
+    #[test]
+    fn fidelity_guard_blocks_structured_on_non_verbatim_ladder() {
+        // The default-on guard: a tool request routes through an all-Anthropic ladder, but a
+        // ladder containing an OpenAI-dialect rung (structured translation not built) falls back
+        // to observe — un-gated is safe, corrupted is not. Plain text routes on any ladder.
+        let tools = Bytes::from_static(
+            br#"{"model":"m","tools":[{"name":"t"}],"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let plain =
+            Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        let f_tools = extract_features(&HeaderMap::new(), &tools);
+        let f_plain = extract_features(&HeaderMap::new(), &plain);
+        let providers = test_registry();
+        let mixed_ladder = vec![
+            "openai/gpt-4.1-mini".to_owned(),
+            "anthropic/claude-sonnet-5".to_owned(),
+        ];
+        assert!(!enforce_can_handle(
+            &f_tools,
+            &tools,
+            true,
+            &mixed_ladder,
+            &providers
+        ));
+        assert!(enforce_can_handle(
+            &f_plain,
+            &plain,
+            true,
+            &mixed_ladder,
+            &providers
+        ));
     }
 
     #[test]
@@ -1660,9 +1756,10 @@ mod tests {
         );
     }
 
-    /// B2: an enforce route serves plain text (200 from the mock) but falls back to transparent
-    /// observe passthrough for tool/image requests rather than dropping blocks — proven by the
-    /// tool request hitting the (bogus) upstream instead of the enforcing mock.
+    /// ADR 0005, default-on: an enforce route now serves BOTH plain text and tool requests (the
+    /// mock ladder carries structured content verbatim). Setting `enforce_structured = false`
+    /// restores the old behavior: tool requests fall back to transparent observe passthrough —
+    /// proven by the tool request hitting the (bogus) upstream instead of the enforcing mock.
     #[tokio::test]
     async fn enforce_falls_back_to_observe_for_tool_requests() {
         let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n";
@@ -1711,12 +1808,40 @@ mod tests {
             "plain text should enforce"
         );
 
-        // Declares tools => cannot enforce faithfully => observe fallback => bogus upstream => not 200.
+        // Default-on (enforce_structured = true) + verbatim-carrying ladder: tools now ENFORCE —
+        // the mock serves 200 and the tool request never touches the bogus upstream.
         let tools = Bytes::from_static(
             br#"{"model":"m","tools":[{"name":"get_weather"}],"messages":[{"role":"user","content":"hi"}]}"#,
         );
         let resp = messages(
             State(state.clone()),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            tools.clone(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "tool request must route through enforce by default (ADR 0005 default-on)"
+        );
+
+        // Opt-out (enforce_structured = false): the same tool request falls back to observe —
+        // it hits the bogus upstream and is not 200.
+        let toml_off = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n[escalation]\nenforce_structured = false\n";
+        let config_off = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml_off.to_owned()),
+            "FIRSTPASS_MODE" => Some("enforce".to_owned()),
+            "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some("http://127.0.0.1:1".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let state_off = AppState {
+            config: Arc::new(config_off),
+            ..state.clone()
+        };
+        let resp = messages(
+            State(state_off),
             Extension(TenantId("default".to_owned())),
             HeaderMap::new(),
             tools,
@@ -1725,7 +1850,7 @@ mod tests {
         assert_ne!(
             resp.status(),
             axum::http::StatusCode::OK,
-            "tool request must fall back to observe, not enforce"
+            "with enforce_structured = false a tool request must fall back to observe"
         );
 
         // tool_result block in a message => same fallback.
@@ -1739,10 +1864,10 @@ mod tests {
             toolres,
         )
         .await;
-        assert_ne!(
+        assert_eq!(
             resp.status(),
             axum::http::StatusCode::OK,
-            "tool_result request must fall back to observe, not enforce"
+            "tool_result blocks route through enforce by default too (verbatim carry)"
         );
     }
 

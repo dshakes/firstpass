@@ -359,11 +359,13 @@ pub struct Escalation {
     /// distribution shift. `None` (default) uses the fixed `serve_threshold` above — byte-identical.
     #[serde(default)]
     pub adaptive: Option<AdaptiveConfig>,
-    /// Opt-in: route tool-calling / multimodal requests through enforce instead of falling back to
-    /// observe (ADR 0005). `false` (default) is byte-identical to today — such requests pass through
-    /// un-gated. Turn on **only after** verifying enforce faithfully round-trips your tool workload;
-    /// content fidelity is preserved either way, but escalating a live tool turn is operator-gated.
-    #[serde(default)]
+    /// Route tool-calling / multimodal requests through enforce (ADR 0005). **Default `true`**:
+    /// agent traffic — the target workload — is gated out of the box. A per-request fidelity
+    /// guard still applies: structured content only routes when every ladder rung's provider
+    /// carries it verbatim (Anthropic-dialect today); otherwise the request falls back to
+    /// transparent observe passthrough rather than risking corruption. Set `false` to restore
+    /// the pre-ADR-0005 behavior (structured requests always pass through un-gated).
+    #[serde(default = "default_enforce_structured")]
     pub enforce_structured: bool,
     /// UCB1 start-rung bandit: learn which rung to START the ladder on per request context, to
     /// cut expected cost by skipping rungs that almost always fail for this context. `None`
@@ -442,6 +444,12 @@ const fn default_max_rungs() -> u32 {
     3
 }
 
+/// Structured (tools/images) enforce is on by default — the fidelity guard in the proxy keeps
+/// it safe (verbatim-carry rungs only).
+fn default_enforce_structured() -> bool {
+    true
+}
+
 impl Default for Escalation {
     fn default() -> Self {
         Self {
@@ -450,7 +458,7 @@ impl Default for Escalation {
             speculation: 0,
             serve_threshold: None,
             adaptive: None,
-            enforce_structured: false,
+            enforce_structured: default_enforce_structured(),
             bandit: None,
             exploration: None,
         }

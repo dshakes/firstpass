@@ -131,11 +131,13 @@ session_promotion = { after_failures = 3, window = "30m" }
 # calls are paid for). 0 = serial (default). Raise it to cut worst-case escalation latency when the
 # extra spend is acceptable.
 speculation = 0
-# Route tool-calling / multimodal / streaming requests through enforce instead of passing them
-# through un-gated (ADR 0005). Off by default = byte-identical to observe fallback. Content
-# round-trips verbatim and a streaming client is served the gated result as SSE. Turn this on ONLY
-# after verifying enforce faithfully handles your tool workload live.
-# enforce_structured = true
+# Route tool-calling / multimodal / streaming requests through enforce (ADR 0005). ON by default —
+# agent traffic is the target workload. The request body is carried verbatim per rung (every field
+# survives; only the model is swapped), and a fidelity guard applies: structured requests route
+# only through ladders whose every rung carries Anthropic-shaped content verbatim (anthropic /
+# bedrock / vertex today); any other ladder falls back to transparent un-gated passthrough rather
+# than risking corruption. Set false to restore the pre-ADR-0005 behavior.
+# enforce_structured = false
 # Serve threshold: a rung is served iff its aggregate gate score >= this value. Omit to serve on a
 # gate Pass (default, byte-identical).
 # serve_threshold = 0.5
