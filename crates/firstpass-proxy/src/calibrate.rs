@@ -222,8 +222,8 @@ pub fn calibrate_from_store(
 #[cfg(test)]
 mod tests {
     use firstpass_core::{
-        Features, FinalOutcome, GENESIS_HASH, GateResult, Mode, PolicyRef, RequestInfo, ServedFrom,
-        TaskKind,
+        Features, FinalOutcome, GateResult, Mode, PolicyRef, RequestInfo, ServedFrom, TaskKind,
+        GENESIS_HASH,
     };
 
     use super::*;
@@ -267,6 +267,7 @@ mod tests {
                 id: "test@v0".to_owned(),
                 explore: false,
                 propensity: None,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),

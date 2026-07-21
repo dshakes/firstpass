@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use firstpass_core::{DeferredVerdict, GENESIS_HASH, Score, Trace, Verdict};
+use firstpass_core::{DeferredVerdict, Score, Trace, Verdict, GENESIS_HASH};
 use rusqlite::Connection;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -511,8 +511,8 @@ pub fn load_trace_view(
 #[cfg(test)]
 mod tests {
     use firstpass_core::{
-        Attempt, Features, FinalOutcome, GENESIS_HASH, PolicyRef, RequestInfo, ServedFrom,
-        TaskKind, Verdict, verify_chain,
+        verify_chain, Attempt, Features, FinalOutcome, PolicyRef, RequestInfo, ServedFrom,
+        TaskKind, Verdict, GENESIS_HASH,
     };
 
     use super::*;
@@ -540,6 +540,7 @@ mod tests {
                 id: "observe-passthrough@v0".to_owned(),
                 explore: false,
                 propensity: None,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),
@@ -622,21 +623,15 @@ mod tests {
         assert!(!trace_exists(&db_path, "tenant-b", &a1_id).unwrap());
 
         // The view is likewise scoped: cross-tenant reads are indistinguishable from a miss.
-        assert!(
-            load_trace_view(&db_path, "tenant-a", &a0_id)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            load_trace_view(&db_path, "tenant-a", &b0_id)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            load_trace_view(&db_path, "tenant-b", &a0_id)
-                .unwrap()
-                .is_none()
-        );
+        assert!(load_trace_view(&db_path, "tenant-a", &a0_id)
+            .unwrap()
+            .is_some());
+        assert!(load_trace_view(&db_path, "tenant-a", &b0_id)
+            .unwrap()
+            .is_none());
+        assert!(load_trace_view(&db_path, "tenant-b", &a0_id)
+            .unwrap()
+            .is_none());
 
         // A tenant that owns nothing sees nothing.
         assert!(load_tenant_traces(&db_path, "ghost").unwrap().is_empty());
@@ -684,19 +679,15 @@ mod tests {
         assert_eq!(view.deferred[0].gate_id, "tests");
         assert_eq!(view.deferred[0].verdict, Verdict::Pass);
         // ...the second trace has none.
-        assert!(
-            load_trace_view(&db_path, "acme", &id1)
-                .unwrap()
-                .unwrap()
-                .deferred
-                .is_empty()
-        );
+        assert!(load_trace_view(&db_path, "acme", &id1)
+            .unwrap()
+            .unwrap()
+            .deferred
+            .is_empty());
         // Cross-tenant: another tenant cannot read this trace's view at all.
-        assert!(
-            load_trace_view(&db_path, "other-tenant", &id0)
-                .unwrap()
-                .is_none()
-        );
+        assert!(load_trace_view(&db_path, "other-tenant", &id0)
+            .unwrap()
+            .is_none());
 
         // THE INVARIANT: the sealed bodies are untouched, so the chain still verifies. A late
         // outcome can never alter a past decision's hash.

@@ -407,8 +407,8 @@ impl StartRungBandit {
 mod tests {
     use super::*;
     use firstpass_core::{
-        Attempt, Features, FinalOutcome, GENESIS_HASH, Mode, PolicyRef, RequestInfo, ServedFrom,
-        TaskKind, Trace,
+        Attempt, Features, FinalOutcome, Mode, PolicyRef, RequestInfo, ServedFrom, TaskKind, Trace,
+        GENESIS_HASH,
     };
 
     fn ctx_code() -> ContextBucket {
@@ -578,6 +578,7 @@ mod tests {
                 id: "test@v0".to_owned(),
                 explore: false,
                 propensity: None,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),

@@ -2,6 +2,7 @@
 //! audit trail. Every subcommand reads the same environment as the server, so onboarding is one
 //! `base_url` swap and offboarding is one `unset`.
 
+use firstpass_core::RoutingMode;
 use firstpass_proxy::calibrate::{calibrate_from_store, calibrate_from_store_ltt};
 use firstpass_proxy::ope::{CandidatePolicy, ips_from_store, ope_from_store};
 use firstpass_proxy::{ProxyConfig, cli, run, store};
@@ -28,13 +29,15 @@ USAGE:
                                    evaluate a candidate policy against logged traffic before enforcing
     firstpass ope --start-rung N [--db <path>] [--tenant <id>]
                                    IPS/SNIPS/DR estimate for a fixed start-rung (requires propensity-logged traffic)
+    firstpass modes               list routing-mode profiles, what each sets, and honest tradeoffs
     firstpass mcp                 serve MCP over stdio (agent reads traces + submits feedback)
     firstpass --help | --version
 
 ENVIRONMENT (shared by every subcommand):
-    FIRSTPASS_MODE=observe|enforce   FIRSTPASS_BIND=127.0.0.1:8080
+    FIRSTPASS_MODE=observe|enforce       FIRSTPASS_BIND=127.0.0.1:8080
+    FIRSTPASS_MODE_PROFILE=balanced|...  global routing-mode preset (default: balanced)
     FIRSTPASS_CONFIG=./firstpass.toml (or FIRSTPASS_CONFIG_TOML=<inline>)
-    FIRSTPASS_DB=./firstpass.db       RUST_LOG=info
+    FIRSTPASS_DB=./firstpass.db          RUST_LOG=info
 
 Point your agent at it:  export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 Offboard any time:       unset ANTHROPIC_BASE_URL";
@@ -58,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "verify" => cmd_verify(&args),
         "calibrate" => cmd_calibrate(&args),
         "ope" => cmd_ope(&args),
+        "modes" => cmd_modes(),
         "mcp" => {
             // Synchronous stdio server; run it off the async runtime so nothing else contends.
             // Scoped to a single tenant (ADR 0004 §D3): `--tenant <id>` or the configured default.
@@ -81,6 +85,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(2);
         }
     }
+}
+
+/// `firstpass modes` — print each routing-mode profile: what knobs it sets and its tradeoff.
+/// Pure: reads no config and touches no store. Useful as a quick reference before setting
+/// FIRSTPASS_MODE_PROFILE, route-level routing_mode, or x-firstpass-mode.
+fn cmd_modes() -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "Routing-mode profiles — set via x-firstpass-mode header, \
+         route `routing_mode`, or FIRSTPASS_MODE_PROFILE env var.\n"
+    );
+    for mode in RoutingMode::ALL {
+        let p = mode.preset();
+        println!("  {:8}  {}", mode.as_str(), p.description);
+        println!("           tradeoff: {}", p.tradeoff);
+        let mut overrides = Vec::new();
+        if let Some(s) = p.speculation {
+            overrides.push(format!("speculation={s}"));
+        }
+        if let Some(d) = p.max_rungs_delta {
+            overrides.push(format!("max_rungs+={d}"));
+        }
+        if p.start_at_top {
+            overrides.push("start_at_top=true".to_owned());
+        }
+        if !overrides.is_empty() {
+            println!("           sets:     {}", overrides.join(", "));
+        }
+        println!();
+    }
+    Ok(())
 }
 
 /// `firstpass doctor` — a config error is itself a finding, so report it and exit non-zero rather

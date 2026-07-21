@@ -21,6 +21,142 @@ pub enum Mode {
     Observe,
 }
 
+/// Named routing-mode presets: coherent (accuracy/cost/latency) constraint bundles layered
+/// on top of the existing escalation knobs. A mode is a **resolver** over existing config,
+/// not a new engine — it overrides only the knobs it has an opinion on; everything else
+/// comes from the route/global config unchanged.
+///
+/// `Balanced` (the default) is a strict no-op: with no mode set anywhere, behaviour is
+/// byte-identical to existing behaviour. All other modes are opt-in overlays.
+///
+/// Set per-request via the `x-firstpass-mode` header, per-route via `routing_mode = "..."`,
+/// or globally via the `FIRSTPASS_MODE_PROFILE` env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    /// Forward without routing or gating; verdicts are asynchronous learning signals only.
+    /// Maps to the existing observe passthrough path. Zero added latency, zero quality proof.
+    Observe,
+    /// Prefer cheapest start; no speculative prefetch.
+    /// Tradeoff: lowest token spend; can serve lower quality on hard or heavy traffic.
+    Cost,
+    /// Today's default — bandit start, configured thresholds, configured speculation.
+    /// **This preset is a strict no-op: byte-identical to existing behaviour when applied.**
+    #[default]
+    Balanced,
+    /// One extra escalation rung allowed; serial (no speculative prefetch waste).
+    /// Tradeoff: higher quality ceiling at higher cost; still bounded by gate verification.
+    Quality,
+    /// `speculation = 1` always: always prefetch one rung ahead to cut p95 latency.
+    /// Tradeoff: pays 1 wasted speculative call when the cheap rung passes.
+    Latency,
+    /// Start at the top (most expensive) ladder rung; verification as insurance.
+    /// Tradeoff: highest quality, highest cost per call; bandit is bypassed; savings are minimal.
+    Max,
+}
+
+impl RoutingMode {
+    /// Lowercase string name, for use in headers and trace fields.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Cost => "cost",
+            Self::Balanced => "balanced",
+            Self::Quality => "quality",
+            Self::Latency => "latency",
+            Self::Max => "max",
+        }
+    }
+
+    /// All named modes in display order, for discovery surfaces (capabilities, MCP, CLI).
+    pub const ALL: &'static [Self] = &[
+        Self::Observe,
+        Self::Cost,
+        Self::Balanced,
+        Self::Quality,
+        Self::Latency,
+        Self::Max,
+    ];
+
+    /// The knob overrides this mode applies on top of the route/global escalation config.
+    /// `None` fields are left unchanged — modes only override where they have an opinion.
+    ///
+    /// **`Balanced` returns all `None`/`false`: it is a strict no-op by invariant.**
+    #[must_use]
+    pub fn preset(self) -> ModePreset {
+        match self {
+            // Observe: handled as a passthrough redirect before EnforceCtx; preset is unused.
+            Self::Observe => ModePreset {
+                speculation: None,
+                max_rungs_delta: None,
+                start_at_top: false,
+                description: "shadow mode: forward without gating; verdicts are async learning signals only",
+                tradeoff: "zero added latency, zero quality proof; use to observe before enforcing",
+            },
+            // Cost: kill speculative spend; let the bandit start cheap.
+            Self::Cost => ModePreset {
+                speculation: Some(0),
+                max_rungs_delta: None,
+                start_at_top: false,
+                description: "no speculative prefetch; bandit start on cheapest rung",
+                tradeoff: "lowest token spend; can serve lower quality on hard or heavy traffic",
+            },
+            // Balanced: all None — strict no-op so existing behaviour is preserved.
+            Self::Balanced => ModePreset {
+                speculation: None,
+                max_rungs_delta: None,
+                start_at_top: false,
+                description: "bandit start, configured thresholds and speculation (default — no behavioral change)",
+                tradeoff: "today's tuned balance; add a mode only when you need a different point",
+            },
+            // Quality: one more rung; no speculative waste.
+            Self::Quality => ModePreset {
+                speculation: Some(0),
+                max_rungs_delta: Some(1),
+                start_at_top: false,
+                description: "one extra escalation rung; serial (no speculative waste)",
+                tradeoff: "higher quality ceiling at higher cost; still bounded by gate verification",
+            },
+            // Latency: speculation=1 always; pay 1 wasted call to cut p95.
+            Self::Latency => ModePreset {
+                speculation: Some(1),
+                max_rungs_delta: None,
+                start_at_top: false,
+                description: "speculation=1: always prefetch one rung ahead to cut p95 latency",
+                tradeoff: "pays 1 wasted speculative call when cheap rung passes; speculation_band is overridden",
+            },
+            // Max: jump to top rung immediately; verification as insurance.
+            Self::Max => ModePreset {
+                speculation: Some(0),
+                max_rungs_delta: None,
+                start_at_top: true,
+                description: "start at the top (most expensive) ladder rung; verification as insurance",
+                tradeoff: "highest quality, highest cost per call; bandit bypassed; savings minimal",
+            },
+        }
+    }
+}
+
+/// Knob overrides a [`RoutingMode`] applies on top of the route/global escalation config.
+/// Only non-`None` fields override; absent fields leave the config value unchanged.
+///
+/// `Balanced` returns all `None`/`false` — it is a strict no-op.
+#[derive(Debug, Clone, Copy)]
+pub struct ModePreset {
+    /// Override for `escalation.speculation`. `None` = no override (config value unchanged).
+    pub speculation: Option<u32>,
+    /// Additive delta applied to `max_rungs_per_request`. `None` = no change.
+    /// Applied as `(current + delta).max(1)`.
+    pub max_rungs_delta: Option<i32>,
+    /// When `true`, start at the last ladder rung (top quality), bypassing the bandit.
+    pub start_at_top: bool,
+    /// One-line description of what this mode targets.
+    pub description: &'static str,
+    /// Honest tradeoff: what you gain and what you give up.
+    pub tradeoff: &'static str,
+}
+
 /// Top-level configuration document.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,6 +387,11 @@ pub struct Route {
     /// learning signal and never block the response.
     #[serde(default)]
     pub deferred_gates: Vec<String>,
+    /// Per-route routing-mode preset. Overrides `FIRSTPASS_MODE_PROFILE`; overridden by the
+    /// per-request `x-firstpass-mode` header. Absent (default `None`) falls through to the
+    /// global default, then `Balanced` — byte-identical to existing behaviour.
+    #[serde(default)]
+    pub routing_mode: Option<RoutingMode>,
 }
 
 /// Predicate over a request's [`Features`]. Every present field is an AND-constraint; absent
@@ -1171,6 +1312,104 @@ output_per_mtok = 4.0
 
         let bad = toml.replace("input_per_mtok = 0.8", "input_per_mtok = -1.0");
         assert!(Config::parse(&bad).is_err(), "negative price rejected");
+    }
+
+    // ── RoutingMode / ModePreset ──────────────────────────────────────────────
+
+    /// The Balanced preset must be a strict no-op: all overrides None/false.
+    /// This is the invariant that guarantees byte-identical behaviour when no mode is set.
+    #[test]
+    fn balanced_preset_is_strict_noop() {
+        let p = RoutingMode::Balanced.preset();
+        assert!(
+            p.speculation.is_none(),
+            "Balanced must not override speculation"
+        );
+        assert!(
+            p.max_rungs_delta.is_none(),
+            "Balanced must not override max_rungs"
+        );
+        assert!(!p.start_at_top, "Balanced must not set start_at_top");
+    }
+
+    #[test]
+    fn cost_preset_disables_speculation() {
+        let p = RoutingMode::Cost.preset();
+        assert_eq!(p.speculation, Some(0));
+        assert!(p.max_rungs_delta.is_none());
+        assert!(!p.start_at_top);
+    }
+
+    #[test]
+    fn quality_preset_bumps_max_rungs_and_disables_speculation() {
+        let p = RoutingMode::Quality.preset();
+        assert_eq!(p.max_rungs_delta, Some(1));
+        assert_eq!(p.speculation, Some(0));
+        assert!(!p.start_at_top);
+    }
+
+    #[test]
+    fn latency_preset_enables_speculation() {
+        let p = RoutingMode::Latency.preset();
+        assert_eq!(p.speculation, Some(1));
+        assert!(p.max_rungs_delta.is_none());
+        assert!(!p.start_at_top);
+    }
+
+    #[test]
+    fn max_preset_sets_start_at_top_and_disables_speculation() {
+        let p = RoutingMode::Max.preset();
+        assert!(p.start_at_top);
+        assert_eq!(p.speculation, Some(0));
+        assert!(p.max_rungs_delta.is_none());
+    }
+
+    #[test]
+    fn routing_mode_as_str_roundtrips() {
+        for mode in RoutingMode::ALL {
+            let s = mode.as_str();
+            let back: RoutingMode = serde_json::from_str(&format!("\"{s}\"")).unwrap();
+            assert_eq!(*mode, back, "as_str/serde roundtrip for {s}");
+        }
+    }
+
+    #[test]
+    fn routing_mode_defaults_to_balanced() {
+        assert_eq!(RoutingMode::default(), RoutingMode::Balanced);
+    }
+
+    #[test]
+    fn route_routing_mode_parses_and_defaults_to_none() {
+        // Absent → None (byte-identical, no behavioral change).
+        let no_mode = Config::parse(
+            "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n",
+        )
+        .unwrap();
+        assert_eq!(no_mode.routes[0].routing_mode, None);
+
+        // Explicit cost mode.
+        let with_mode = Config::parse(
+            "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\nrouting_mode = \"cost\"\n",
+        )
+        .unwrap();
+        assert_eq!(with_mode.routes[0].routing_mode, Some(RoutingMode::Cost));
+    }
+
+    #[test]
+    fn all_routing_modes_have_non_empty_description_and_tradeoff() {
+        for mode in RoutingMode::ALL {
+            let p = mode.preset();
+            assert!(
+                !p.description.is_empty(),
+                "mode {} has empty description",
+                mode.as_str()
+            );
+            assert!(
+                !p.tradeoff.is_empty(),
+                "mode {} has empty tradeoff",
+                mode.as_str()
+            );
+        }
     }
 
     #[test]

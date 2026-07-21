@@ -63,6 +63,11 @@ pub struct PolicyRef {
     /// existing logs. Only populated when `[escalation.exploration]` is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub propensity: Option<f64>,
+    /// Resolved routing-mode profile when it was explicitly set (header / route / global env).
+    /// `None` means `Balanced` was in effect (the default, no override active). Absent from
+    /// the JSON when `None` → byte-identical serialization for all existing traces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_profile: Option<String>,
 }
 
 /// The routed request, described without its raw content.
@@ -207,6 +212,7 @@ mod tests {
                 id: "static@v0".into(),
                 explore: false,
                 propensity: None,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".into(),
@@ -309,6 +315,7 @@ mod tests {
             id: "static@v0".into(),
             explore: false,
             propensity: None,
+            mode_profile: None,
         };
         let j = serde_json::to_string(&pr).unwrap();
         assert!(
@@ -333,11 +340,57 @@ mod tests {
             id: "bandit@v1+eps".into(),
             explore: true,
             propensity: Some(0.3),
+            mode_profile: None,
         };
         let j = serde_json::to_string(&pr).unwrap();
         assert!(
             j.contains("\"propensity\":0.3"),
             "expected propensity in: {j}"
+        );
+        let back: PolicyRef = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, pr);
+    }
+
+    // ── mode_profile backward-compat ─────────────────────────────────────────
+
+    /// `mode_profile = None` must not appear in the serialized JSON — byte-identical for
+    /// existing traces (Balanced is the default and must be invisible).
+    #[test]
+    fn mode_profile_none_absent_from_json() {
+        let pr = PolicyRef {
+            id: "static@v0".into(),
+            explore: false,
+            propensity: None,
+            mode_profile: None,
+        };
+        let j = serde_json::to_string(&pr).unwrap();
+        assert!(
+            !j.contains("mode_profile"),
+            "mode_profile=None must be omitted (skip_serializing_if): {j}"
+        );
+    }
+
+    /// Old JSON without a `mode_profile` field deserializes to `mode_profile: None`.
+    #[test]
+    fn old_trace_without_mode_profile_deserializes_to_none() {
+        let old_json = r#"{"id":"static@v0","explore":false}"#;
+        let pr: PolicyRef = serde_json::from_str(old_json).unwrap();
+        assert_eq!(pr.mode_profile, None);
+    }
+
+    /// `mode_profile = Some(...)` round-trips correctly.
+    #[test]
+    fn mode_profile_some_roundtrips() {
+        let pr = PolicyRef {
+            id: "static@v0".into(),
+            explore: false,
+            propensity: None,
+            mode_profile: Some("quality".into()),
+        };
+        let j = serde_json::to_string(&pr).unwrap();
+        assert!(
+            j.contains("\"mode_profile\":\"quality\""),
+            "expected mode_profile in: {j}"
         );
         let back: PolicyRef = serde_json::from_str(&j).unwrap();
         assert_eq!(back, pr);

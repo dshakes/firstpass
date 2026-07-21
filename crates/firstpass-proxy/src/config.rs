@@ -4,7 +4,7 @@
 use std::env;
 use std::num::NonZeroU32;
 
-use firstpass_core::{Config as RoutingConfig, Mode, PriceTable};
+use firstpass_core::{Config as RoutingConfig, Mode, PriceTable, RoutingMode};
 
 /// The built-in prompt salt used when `FIRSTPASS_PROMPT_SALT` is unset. Fine for local
 /// development; an operator should set their own before handling real traffic, since a
@@ -81,6 +81,10 @@ pub struct ProxyConfig {
     /// Whether to guarantee audit-trace durability under backpressure (`FIRSTPASS_RECEIPTS`).
     /// Default [`ReceiptsMode::BestEffort`] is byte-identical to the previous behavior.
     pub receipts_mode: ReceiptsMode,
+    /// Global default routing-mode preset (`FIRSTPASS_MODE_PROFILE`). Overridden by per-route
+    /// `routing_mode` and the per-request `x-firstpass-mode` header. Default `Balanced` is
+    /// byte-identical to existing behaviour (no knob changes at all).
+    pub default_routing_mode: RoutingMode,
 }
 
 /// Default for [`ProxyConfig::max_concurrency`] when `FIRSTPASS_MAX_CONCURRENCY` is unset.
@@ -98,6 +102,13 @@ pub enum ConfigError {
     /// `FIRSTPASS_RECEIPTS` named an unknown mode (valid: `best_effort`, `durable`).
     #[error("FIRSTPASS_RECEIPTS={0:?} is not valid; set `best_effort` (default) or `durable`")]
     UnsupportedReceiptsMode(String),
+
+    /// `FIRSTPASS_MODE_PROFILE` named an unknown routing mode.
+    #[error(
+        "FIRSTPASS_MODE_PROFILE={0:?} is not a known routing mode; \
+         valid: observe|cost|balanced|quality|latency|max"
+    )]
+    UnsupportedModeProfile(String),
 
     /// The routing config file could not be read or parsed.
     #[error("routing config error: {0}")]
@@ -222,6 +233,19 @@ impl ProxyConfig {
             }
         };
 
+        // Global routing-mode profile — default Balanced (byte-identical to existing behaviour).
+        let default_routing_mode = match lookup("FIRSTPASS_MODE_PROFILE").as_deref() {
+            None | Some("balanced") => RoutingMode::Balanced,
+            Some("observe") => RoutingMode::Observe,
+            Some("cost") => RoutingMode::Cost,
+            Some("quality") => RoutingMode::Quality,
+            Some("latency") => RoutingMode::Latency,
+            Some("max") => RoutingMode::Max,
+            Some(other) => {
+                return Err(ConfigError::UnsupportedModeProfile(other.to_owned()));
+            }
+        };
+
         Ok(Self {
             bind,
             upstream_anthropic,
@@ -253,6 +277,7 @@ impl ProxyConfig {
             max_concurrency,
             tenant_rate_per_sec,
             receipts_mode,
+            default_routing_mode,
         })
     }
 }
@@ -376,6 +401,29 @@ gates = ["non-empty"]
         assert!(
             matches!(result, Err(ConfigError::UnsupportedReceiptsMode(m)) if m == "never_drop")
         );
+    }
+
+    #[test]
+    fn default_routing_mode_is_balanced() {
+        let cfg = ProxyConfig::from_lookup(|_| None).unwrap();
+        assert_eq!(cfg.default_routing_mode, RoutingMode::Balanced);
+    }
+
+    #[test]
+    fn firstpass_mode_profile_is_parsed() {
+        let cfg = ProxyConfig::from_lookup(|k| {
+            (k == "FIRSTPASS_MODE_PROFILE").then(|| "quality".to_owned())
+        })
+        .unwrap();
+        assert_eq!(cfg.default_routing_mode, RoutingMode::Quality);
+    }
+
+    #[test]
+    fn unknown_mode_profile_is_rejected() {
+        let result = ProxyConfig::from_lookup(|k| {
+            (k == "FIRSTPASS_MODE_PROFILE").then(|| "turbo".to_owned())
+        });
+        assert!(matches!(result, Err(ConfigError::UnsupportedModeProfile(m)) if m == "turbo"));
     }
 
     #[test]

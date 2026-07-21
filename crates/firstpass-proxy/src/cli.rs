@@ -593,8 +593,8 @@ mod tests {
     #[test]
     fn verify_and_export_round_trip_detects_tampering() {
         use firstpass_core::{
-            Attempt, Features, FinalOutcome, GENESIS_HASH, PolicyRef, RequestInfo, ServedFrom,
-            TaskKind, Verdict,
+            Attempt, Features, FinalOutcome, PolicyRef, RequestInfo, ServedFrom, TaskKind, Verdict,
+            GENESIS_HASH,
         };
 
         // Build a valid 3-link chain: each prev_hash = the previous record's hash.
@@ -609,6 +609,7 @@ mod tests {
                 id: "observe-passthrough@v0".to_owned(),
                 explore: false,
                 propensity: None,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),
@@ -690,8 +691,8 @@ mod tests {
     #[test]
     fn explain_trace_summarizes_served_and_escalation() {
         use firstpass_core::{
-            Attempt, Features, FinalOutcome, GENESIS_HASH, GateResult, PolicyRef, RequestInfo,
-            ServedFrom, TaskKind, Verdict,
+            Attempt, Features, FinalOutcome, GateResult, PolicyRef, RequestInfo, ServedFrom,
+            TaskKind, Verdict, GENESIS_HASH,
         };
         let t = Trace {
             trace_id: uuid::Uuid::now_v7(),
@@ -704,6 +705,7 @@ mod tests {
                 id: "static-ladder@v0".to_owned(),
                 explore: false,
                 propensity: None,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),
