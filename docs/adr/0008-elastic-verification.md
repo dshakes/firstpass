@@ -1,6 +1,19 @@
 # ADR 0008 — Elastic verification: value-of-information routing with a conformal guarantee over the verify/skip decision
 
-Status: **proposed — gated on empirical validation** · 2026-07-21
+Status: **accepted — validated with a corrected signal** · 2026-07-21
+
+> **Validation result (2026-07-21, `firstpass-bench --probe-study`, k=5, n=150 MBPP,
+> artifact: [`docs/benchmarks/probe-study-mbpp.txt`](../benchmarks/probe-study-mbpp.txt)).**
+> The pre-registered continuous metric — **AUC(self-consistency entropy → oracle-failure) =
+> 0.431 — FAILED** (below 0.5). Binary entropy discards *direction*: "all k agree it fails
+> visible" and "all k agree it passes visible" both have zero entropy but opposite outcomes,
+> so entropy is the wrong signal. **The corrected signal — the k-sample visible-pass *count* —
+> succeeds cleanly and strongly:** 0/5 pass → oracle-correct **0.0%** (12% of traffic);
+> 5/5 pass → oracle-correct **99.0%** (65%); 1–4/5 → mixed (23%). **77% of traffic is decidable
+> by the cheap probe alone at ~99% safety.** Elastic verification is therefore justified — but
+> keyed on the pass-count regime, *not* the entropy AUC this ADR originally proposed. The
+> mechanism below is updated accordingly. Caveat: n=150, one cheap model, one distribution —
+> replicate on other task kinds before any default-on.
 
 ## Context
 
@@ -31,9 +44,9 @@ decision of *whether to verify*.
 The mechanism, per request:
 
 1. **Probe before commit.** Instead of a full cheap attempt, draw a cheap *probe*: the small model
-   at low token budget, k=2–4 samples. The probe yields (a) a candidate output and (b) a calibrated
-   self-consistency **uncertainty** signal (semantic-entropy family; a few samples, or a single-pass
-   entropy probe). Cost is a fraction of a full attempt.
+   at low token budget, k samples, each scored against the cheap **visible** gate (tests/schema —
+   near-free). The signal is the **visible-pass count** across the k samples (validated), which
+   sorts every request into three regimes — *not* the entropy of that count (falsified, AUC 0.431).
 
 2. **A learned value function chooses the action.** From the probe uncertainty + request features +
    receipt history, estimate `P(pass | rung, probe signal)` per rung, then take the action with the
@@ -41,10 +54,12 @@ The mechanism, per request:
    **draw more samples**, or **escalate**. The action space is `(model, #samples, verify?)`, not just
    "which model."
 
-3. **Elastic verification (the money-saver).**
-   - Probe **confident** + predicted `P(pass)` high → serve **without** the full gate.
-   - Probe **ambiguous** → run the gate; this is where verification's information is worth its cost.
-   - Probe **confidently hard** → skip the cheap attempt *and* its gate, escalate directly.
+3. **Elastic verification (the money-saver) — the validated three-regime rule.**
+   - **All k pass visible** (65% of MBPP traffic, 99% oracle-correct) → serve **without** the
+     expensive gate (judge / hidden tests). Saves the uniform-verification tax.
+   - **Zero of k pass visible** (12%, 0% oracle-correct) → skip the cheap attempt *and* its gate,
+     **escalate directly**. Saves the doomed-attempt tax.
+   - **Mixed** (23%) → run the full gate; this is where verification's information is worth its cost.
    Verification cost concentrates in the ambiguous middle instead of being paid everywhere.
 
 4. **Conformal guarantee over the verify/skip decision (the novel, load-bearing part).** The
@@ -68,17 +83,14 @@ The entire architecture rests on one empirical claim: **a cheap probe's self-con
 uncertainty predicts whether the served output will clear the (hidden) oracle.** If it does not,
 elastic verification is unfounded and we keep uniform verification.
 
-This is pre-registered and measured by `firstpass-bench --probe-study` (committed): draw k cheap
-samples per real MBPP task, compute uncertainty, serve the candidate a cascade would serve, and
-record the oracle outcome. The decision metric is **AUC(uncertainty → oracle-failure)** plus
-**skip-safety when confident** (`P(oracle correct | probe confident)`):
-
-- AUC ≤ ~0.55 or low skip-safety → **do not build the skip logic**; the probe is noise. The engine
-  stays a uniform-verification cascade and this ADR is withdrawn.
-- AUC ≳ 0.65 with high skip-safety → the signal is real; implement in phases below.
-
-The result artifact lands in `docs/benchmarks/` next to the MBPP bound. **No skip logic ships until
-this gate is green.**
+This was pre-registered and measured by `firstpass-bench --probe-study` (committed). **Outcome
+(see the status box above): the entropy AUC failed (0.431) but the pass-count regime signal
+passed decisively** — the confident-serve regime is 99% safe over 65% of traffic and the
+confident-escalate regime is a clean 0% over 12%. Per the pre-registered rule ("do not build the
+skip logic if the probe is noise"), the *entropy* skip logic is withdrawn and the *pass-count*
+skip logic is greenlit. The result artifact is committed at
+[`docs/benchmarks/probe-study-mbpp.txt`](../benchmarks/probe-study-mbpp.txt). Default-on still
+requires the held-out + drift validation in Phase 3 below and replication beyond MBPP.
 
 ## Invariants (must never regress)
 

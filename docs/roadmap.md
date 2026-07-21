@@ -64,10 +64,13 @@ baseline.
       epsilon overlay), geometric forgetting for model churn. Receipts remain the durable
       state (warm-start on boot). Default stays `ucb1` until a live A/B promotes it.
 - [ ] Per-rung P(gate-pass | features) prediction rather than a single difficulty scalar.
-- [ ] **Elastic verification** (ADR 0008, research — go/no-go gated): probe-before-commit, verify
-      *proportional to doubt*, with a conformal guarantee over the *verify/skip* decision so
-      un-verified serves keep the same served-failure bound. Validated by `firstpass-bench
-      --probe-study` before any skip logic ships.
+- [~] **Elastic verification** (ADR 0008): probe-before-commit + verify *proportional to doubt*,
+      with a conformal guarantee over the *verify/skip* decision. **Go/no-go study PASSED with a
+      corrected signal** ([artifact](benchmarks/probe-study-mbpp.txt)): the k-sample visible-pass
+      *count* (not entropy — that failed at AUC 0.431) sorts 77% of MBPP traffic into
+      serve-without-gate (65% @ 99% safe) or escalate-now (12% @ 0%), concentrating verification
+      on the ambiguous 23%. Next: implement the three-regime skip behind LTT calibration; validate
+      held-out + under drift + beyond MBPP before default-on.
 - [x] Learn-then-Test threshold calibration (`--method ltt` in `firstpass calibrate`):
       distribution-free finite-sample risk control via fixed-sequence exact-binomial testing
       (Angelopoulos et al. 2021 / RCPS). Includes per-λ diagnostics and the gate's empirical

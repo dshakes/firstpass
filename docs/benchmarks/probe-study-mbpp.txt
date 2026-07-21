@@ -1,0 +1,175 @@
+# firstpass-bench --probe-study · MBPP · k=5 · ADR 0008 go/no-go
+# date: 2026-07-21 · cheap model: claude-haiku-4-5 · sandbox: docker (runc) · n=150 (mbpp head)
+# command: FIRSTPASS_CODING_DATASET=./mbpp.jsonl FIRSTPASS_PROBE_K=5 firstpass-bench --probe-study
+#
+# VERDICT: GO, with a CORRECTED signal. The pre-registered continuous metric —
+# AUC(self-consistency entropy -> oracle-failure) = 0.431 — FAILED (entropy discards
+# direction). The k-sample visible-PASS-COUNT succeeds cleanly:
+#   0/5 pass visible (12% of traffic): oracle-correct 0.000  -> escalate now, skip cheap attempt
+#   5/5 pass visible (65% of traffic): oracle-correct 0.990  -> serve, skip the expensive gate
+#   1-4/5 (23%): mixed -> run the gate (verification concentrates here)
+# => 77% of traffic decidable by the cheap probe alone at ~99% safety. Elastic verification
+#    is justified via the pass-count regime signal, NOT the entropy AUC. n=150, one model,
+#    one distribution — replicate on other task kinds before default-on.
+
+# Probe-signal validation study (ADR 0008 go/no-go)
+
+- samples per task (k): 5
+- tasks: 150
+- AUC(uncertainty → oracle-failure): 0.431   (0.5 = no signal; >0.65 = usable; >0.75 = strong)
+- confident fraction (all k agree on visible pass): 0.653
+- skip-safety when confident (P(oracle correct | confident)): 0.990
+
+VERDICT: elastic verification is justified iff AUC is meaningfully > 0.5 AND skip-safety is high (≥ 1 − your target α). Low AUC ⇒ the probe is noise ⇒ do NOT build the skip logic; keep uniform verification.
+
+## Per-task points (visible_pass_count of k=5, oracle outcome)
+{"id":"mbpp-1","visible_pass_count":2,"p_hat":0.4,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-2","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-3","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-4","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-5","visible_pass_count":2,"p_hat":0.4,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-6","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-7","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-8","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-9","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-10","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-11","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-12","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-13","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-14","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-15","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-16","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-17","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-18","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-19","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-20","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-21","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-22","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-23","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-24","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-25","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-26","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-27","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-28","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-29","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-30","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-31","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-32","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-33","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-34","visible_pass_count":2,"p_hat":0.4,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-35","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-36","visible_pass_count":3,"p_hat":0.6,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-37","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-38","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-39","visible_pass_count":3,"p_hat":0.6,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-40","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-41","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-42","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-43","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-44","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-45","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-46","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-47","visible_pass_count":2,"p_hat":0.4,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-48","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-49","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-50","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-51","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-52","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-53","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-54","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-55","visible_pass_count":2,"p_hat":0.4,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-56","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-57","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-58","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-59","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-60","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-61","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-62","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-63","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-64","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-65","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-66","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-67","visible_pass_count":3,"p_hat":0.6,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-68","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-69","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-70","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-71","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-72","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-73","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-74","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-75","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-76","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-77","visible_pass_count":2,"p_hat":0.4,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":false}
+{"id":"mbpp-78","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-79","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-80","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-81","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-82","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-83","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-84","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-85","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-86","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-87","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-88","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-89","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-90","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-91","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-92","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-93","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-94","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-95","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-96","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-97","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-98","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-99","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-100","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-101","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-102","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-103","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-104","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-105","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-106","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-107","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-108","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-109","visible_pass_count":3,"p_hat":0.6,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-110","visible_pass_count":1,"p_hat":0.2,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-111","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-112","visible_pass_count":2,"p_hat":0.4,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-113","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-114","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-115","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-116","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-117","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-118","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-119","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-120","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-121","visible_pass_count":3,"p_hat":0.6,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":false}
+{"id":"mbpp-122","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-123","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-124","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-125","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-126","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-127","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-128","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-129","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-130","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-131","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-132","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-133","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-134","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-135","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-136","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-137","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-138","visible_pass_count":3,"p_hat":0.6,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-139","visible_pass_count":1,"p_hat":0.2,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-140","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-141","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-142","visible_pass_count":4,"p_hat":0.8,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-143","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":false}
+{"id":"mbpp-144","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-145","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-146","visible_pass_count":1,"p_hat":0.2,"uncertainty":0.7219280948873623,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-147","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
+{"id":"mbpp-148","visible_pass_count":3,"p_hat":0.6,"uncertainty":0.9709505944546686,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-149","visible_pass_count":5,"p_hat":1.0,"uncertainty":0.0,"served_visible_full_pass":true,"served_oracle_correct":true}
+{"id":"mbpp-150","visible_pass_count":0,"p_hat":0.0,"uncertainty":0.0,"served_visible_full_pass":false,"served_oracle_correct":false}
