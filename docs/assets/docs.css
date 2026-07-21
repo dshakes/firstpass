@@ -438,6 +438,77 @@ h1.title{font-size:clamp(40px,6vw,72px);font-weight:680;letter-spacing:-.04em;li
 .fp-svg .m{font-family:var(--mono)}
 .fp-svg .accent-ink{fill:var(--accent-strong)}
 
+/* ---- animated diagram primitives ------------------------------------------
+   Motion is layered ONLY inside prefers-reduced-motion:no-preference. Every
+   SVG's own markup is its correct static (reduced-motion / JS-off) state, so
+   the diagrams stay complete and legible with animation and JS both absent.
+   Decorative overlays (.flow/.halo/.spark) are hidden when motion is off —
+   the wire/node they sit on is always drawn beneath them.                    */
+.fp-svg .flow,.fp-svg .halo,.fp-svg .spark{opacity:0}
+@media (prefers-reduced-motion:no-preference){
+  /* signal pulse travelling along a wire (bright overlay on a static connector) */
+  .fp-svg .flow{opacity:1;fill:none;stroke:var(--accent);stroke-linecap:round;
+    stroke-dasharray:16 230;stroke-dashoffset:246;animation:fp-flow 3s linear infinite}
+  .fp-svg .flow.f{stroke:var(--d-fail)}.fp-svg .flow.w{stroke:var(--d-warn)}
+  .fp-svg .flow.p{stroke:var(--d-pass)}
+  .fp-svg .flow.s{animation-duration:2.1s}.fp-svg .flow.l{animation-duration:4.2s}
+  @keyframes fp-flow{from{stroke-dashoffset:246}to{stroke-dashoffset:0}}
+
+  /* staggered starts, shared by any looped primitive */
+  .fp-svg .d1{animation-delay:-.5s}.fp-svg .d2{animation-delay:-1s}
+  .fp-svg .d3{animation-delay:-1.5s}.fp-svg .d4{animation-delay:-2s}
+  .fp-svg .d5{animation-delay:-2.5s}.fp-svg .d6{animation-delay:-3s}
+
+  /* node breathing (opacity only) */
+  .fp-svg .breathe{animation:fp-breathe 3.2s ease-in-out infinite}
+  @keyframes fp-breathe{0%,100%{opacity:.62}50%{opacity:1}}
+
+  /* pulsing node — subtle scale */
+  .fp-svg .beat{transform-box:fill-box;transform-origin:center;
+    animation:fp-beat 2.6s ease-in-out infinite}
+  @keyframes fp-beat{0%,100%{transform:scale(1)}50%{transform:scale(1.08)}}
+
+  /* expanding halo ring behind an active node */
+  .fp-svg .halo{opacity:1;transform-box:fill-box;transform-origin:center;
+    animation:fp-halo 2.8s ease-out infinite}
+  @keyframes fp-halo{0%{opacity:.5;transform:scale(.5)}70%{opacity:0;transform:scale(1.7)}100%{opacity:0}}
+
+  /* mint / semantic glow (no SVG filter defs needed) */
+  .fp-svg .glow{filter:drop-shadow(0 0 2px var(--accent))}
+  .fp-svg .glow-f{filter:drop-shadow(0 0 2px var(--d-fail))}
+  .fp-svg .glow-w{filter:drop-shadow(0 0 2px var(--d-warn))}
+  .fp-svg .glow-p{filter:drop-shadow(0 0 2px var(--d-pass))}
+
+  /* sequenced reveal — items light up in order on a slow loop */
+  .fp-svg .seq{animation:fp-seq 6s ease-in-out infinite both}
+  @keyframes fp-seq{0%,5%{opacity:.18}15%,92%{opacity:1}100%{opacity:.18}}
+
+  /* bar grow from its own base (rises from the axis) */
+  .fp-svg .grow{transform-box:fill-box;transform-origin:bottom center;
+    animation:fp-grow 3s ease-out infinite both}
+  @keyframes fp-grow{0%{transform:scaleY(0)}34%,100%{transform:scaleY(1)}}
+
+  /* horizontal fill grow (meter/track bars) */
+  .fp-svg .fill{transform-box:fill-box;transform-origin:left center;
+    animation:fp-fill 3.2s ease-out infinite both}
+  @keyframes fp-fill{0%{transform:scaleX(0)}40%,100%{transform:scaleX(1)}}
+
+  /* gate check — an affirming pulse */
+  .fp-svg .tick{transform-box:fill-box;transform-origin:center;
+    animation:fp-tick 3s ease-in-out infinite}
+  @keyframes fp-tick{0%,42%,100%{opacity:.5;transform:scale(.88)}
+    56%{opacity:1;transform:scale(1.16)}72%{opacity:1;transform:scale(1)}}
+
+  /* blink caret / status dot */
+  .fp-svg .flick{animation:fp-flick 1.5s steps(1) infinite}
+  @keyframes fp-flick{50%{opacity:.25}}
+
+  /* dashed link draw-in (build a chain/loop one segment at a time) */
+  .fp-svg .draw{stroke-dasharray:180;stroke-dashoffset:180;
+    animation:fp-draw 6s ease-in-out infinite both}
+  @keyframes fp-draw{0%,5%{stroke-dashoffset:180}20%,90%{stroke-dashoffset:0}100%{stroke-dashoffset:180}}
+}
+
 /* small inline stat chips used in docs */
 .chips{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 24px}
 .chip{border:1px solid var(--border);border-radius:var(--r);padding:14px 16px;min-width:130px;background:var(--surface)}

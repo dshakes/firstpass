@@ -83,16 +83,16 @@
 <line x1="120" y1="100" x2="470" y2="100" class="fail-s" stroke-width="1.6" stroke-dasharray="6 4"/>
 <text x="466" y="94" text-anchor="end" class="fail" font-size="11" font-weight="640">10% target (95% conf.)</text>
 <!-- bars: calibrated risk 5.5, realized 7.7 -->
-<rect x="170" y="176" width="90" height="94" rx="5" class="accent"/>
+<rect x="170" y="176" width="90" height="94" rx="5" class="accent grow d2"/>
 <text x="215" y="168" text-anchor="middle" class="accent-ink" font-size="13" font-weight="680">5.5%</text>
 <text x="215" y="286" text-anchor="middle" class="ink-mut" font-size="11">calibrated risk</text>
-<rect x="300" y="139" width="90" height="131" rx="5" class="pass"/>
+<rect x="300" y="139" width="90" height="131" rx="5" class="pass grow glow-p d4"/>
 <text x="345" y="131" text-anchor="middle" class="pass" font-size="13" font-weight="680">7.7%</text>
 <text x="345" y="286" text-anchor="middle" class="ink-mut" font-size="11">realized served-fail</text>
 <!-- right: cheap-tier donut/bar -->
 <text x="560" y="40" class="ink" font-size="13" font-weight="640">Where requests are served</text>
 <rect x="560" y="120" width="380" height="46" rx="8" class="track"/>
-<rect x="560" y="120" width="312" height="46" rx="8" class="accent"/>
+<rect x="560" y="120" width="312" height="46" rx="8" class="accent fill glow"/>
 <text x="716" y="148" text-anchor="middle" fill="#04140f" font-size="15" font-weight="700">82% cheap tier</text>
 <text x="906" y="148" text-anchor="middle" class="ink-mut" font-size="12" font-weight="600">18%</text>
 <text x="560" y="192" class="ink-mut" font-size="12">82% of requests clear the gate on the cheapest rung — no escalation, no expensive call.</text>
@@ -123,6 +123,36 @@
 
 <h2 id="adaptive">Adaptive conformal<a class="anchor" href="#adaptive" aria-label="Link to this section">#</a></h2>
 <p>A static threshold decays as your traffic drifts. Adaptive conformal (Gibbs–Candès) tracks the threshold <strong>live</strong>: each deferred outcome reported to <code>/v1/feedback</code> nudges the threshold up or down to keep the realized failure rate near the target. No recalibration run, no downtime — the bound follows the distribution.</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="loopT">
+<title id="loopT">The self-tuning loop: the router serves the first pass, the true outcome is reported to /v1/feedback, adaptive conformal nudges the serve threshold up or down to hold the target, and the next request serves against the updated threshold — a closed loop that tracks drift with no recalibration run.</title>
+<defs><marker id="lp" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
+<text x="500" y="30" text-anchor="middle" class="accent-ink m" font-size="11" letter-spacing="1.2">THE SELF-TUNING LOOP</text>
+<rect x="110" y="196" width="210" height="66" rx="12" class="n-fill pass-s glow-p" stroke-width="1.6"/>
+<text x="215" y="226" text-anchor="middle" class="ink" font-size="14" font-weight="640">Serve first pass</text>
+<text x="215" y="246" text-anchor="middle" class="ink-mut m" font-size="10.5">above threshold</text>
+<rect x="690" y="196" width="220" height="66" rx="12" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="800" y="226" text-anchor="middle" class="ink" font-size="14" font-weight="620">Outcome known</text>
+<text x="800" y="246" text-anchor="middle" class="ink-mut m" font-size="10.5">POST /v1/feedback</text>
+<rect x="690" y="52" width="220" height="66" rx="12" class="n-fill accent-s glow" stroke-width="1.6"/>
+<text x="800" y="82" text-anchor="middle" class="ink" font-size="13.5" font-weight="620">Adaptive conformal</text>
+<text x="800" y="102" text-anchor="middle" class="ink-mut m" font-size="10.5">Gibbs–Candès nudge</text>
+<rect x="110" y="52" width="220" height="66" rx="12" class="n-fill accent-s" stroke-width="1.6"/>
+<text x="220" y="80" text-anchor="middle" class="ink" font-size="13.5" font-weight="620">Serve threshold</text>
+<text x="220" y="100" text-anchor="middle" class="accent-ink m" font-size="10.5">↑ / ↓ tracks drift</text>
+<line x1="320" y1="229" x2="686" y2="229" class="n-stroke" stroke-width="1.6" marker-end="url(#lp)"/>
+<line x1="800" y1="196" x2="800" y2="122" class="n-stroke" stroke-width="1.6" marker-end="url(#lp)"/>
+<line x1="690" y1="85" x2="334" y2="85" class="n-stroke" stroke-width="1.6" marker-end="url(#lp)"/>
+<line x1="220" y1="118" x2="220" y2="192" class="n-stroke" stroke-width="1.6" marker-end="url(#lp)"/>
+<line x1="320" y1="229" x2="686" y2="229" class="flow p l" stroke-width="2.4"/>
+<line x1="800" y1="196" x2="800" y2="122" class="flow w l d3" stroke-width="2.4"/>
+<line x1="690" y1="85" x2="334" y2="85" class="flow l d4" stroke-width="2.4"/>
+<line x1="220" y1="118" x2="220" y2="192" class="flow l d6" stroke-width="2.4"/>
+<rect x="430" y="128" width="140" height="58" rx="12" class="n-fill-2 n-stroke breathe" stroke-width="1.3"/>
+<text x="500" y="152" text-anchor="middle" class="ink-mut" font-size="10.5">held live at</text>
+<text x="500" y="174" text-anchor="middle" class="accent-ink" font-size="17" font-weight="700">≤10%</text>
+</svg>
+  <figcaption>Each reported outcome moves the serve threshold to keep realized served-failure under target as traffic drifts — no recalibration run, no downtime.</figcaption>
+</div>
 
 <h2 id="gauges">The two gauges<a class="anchor" href="#gauges" aria-label="Link to this section">#</a></h2>
 <p>The loop is observable in Prometheus, so you can watch the guarantee hold in real time:</p>
