@@ -60,22 +60,24 @@
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 260" role="img" aria-labelledby="ldT">
 <title id="ldT">The ladder: rungs ordered cheapest to most capable. A request opens on the start rung, and escalates one rung at a time only when the gate fails, stopping at the first rung whose output passes or when the budget or max_rungs cap is hit.</title>
 <g>
-  <rect x="60" y="190" width="240" height="52" rx="10" class="n-fill accent-s" stroke-width="1.6"/>
+  <rect x="60" y="190" width="240" height="52" rx="10" class="n-fill accent-s glow" stroke-width="1.6"/>
   <text x="78" y="214" class="ink m" font-size="13" font-weight="600">anthropic/haiku</text>
   <text x="78" y="232" class="ink-mut" font-size="11">start rung · cheapest</text>
-  <text x="275" y="222" text-anchor="end" class="accent-ink m" font-size="11" font-weight="640">$</text>
+  <text x="275" y="222" text-anchor="end" class="accent-ink m breathe" font-size="11" font-weight="640">$</text>
 </g><g>
   <rect x="360" y="130" width="240" height="52" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
   <text x="378" y="154" class="ink m" font-size="13" font-weight="600">openai/gpt-mini</text>
   <text x="378" y="172" class="ink-mut" font-size="11">+1 on gate fail</text>
-  <text x="575" y="162" text-anchor="end" class="ink-mut m" font-size="11" font-weight="640">$$</text>
+  <text x="575" y="162" text-anchor="end" class="ink-mut m breathe d3" font-size="11" font-weight="640">$$</text>
 </g><g>
   <rect x="660" y="70" width="240" height="52" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
   <text x="678" y="94" class="ink m" font-size="13" font-weight="600">anthropic/sonnet</text>
   <text x="678" y="112" class="ink-mut" font-size="11">+1 on gate fail</text>
-  <text x="875" y="102" text-anchor="end" class="ink-mut m" font-size="11" font-weight="640">$$$</text>
+  <text x="875" y="102" text-anchor="end" class="ink-mut m breathe d5" font-size="11" font-weight="640">$$$</text>
 </g><line x1="300" y1="216" x2="356" y2="182" class="fail-s" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#ld)"/>
 <line x1="600" y1="156" x2="656" y2="122" class="fail-s" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#ld)"/>
+<line x1="300" y1="216" x2="356" y2="182" class="flow f s" stroke-width="2.2"/>
+<line x1="600" y1="156" x2="656" y2="122" class="flow f s d3" stroke-width="2.2"/>
 <text x="330" y="160" class="fail" font-size="10.5" font-weight="600">escalate</text>
 <text x="630" y="100" class="fail" font-size="10.5" font-weight="600">escalate</text>
 <text x="60" y="40" class="ink" font-size="13" font-weight="640">Cheapest first — climb only on proof of need</text>
@@ -88,6 +90,46 @@ rungs = [
   &quot;anthropic/claude-sonnet-5&quot;,    # rung 2
 ]
 max_rungs = 3                      # hard cap on the climb</code></pre></div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 260" role="img" aria-labelledby="climbT">
+<title id="climbT">Escalation in motion: a request opens on rung 0, the gate fails, so it climbs exactly one rung; the gate on rung 1 passes and that output is served. The climb happens only on proof of gate failure.</title>
+<defs><marker id="cb" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="cbf" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-fail)"/></marker>
+<marker id="cbp" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker></defs>
+<!-- request -->
+<rect x="20" y="150" width="120" height="58" rx="12" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="80" y="176" text-anchor="middle" class="ink" font-size="13.5" font-weight="640">Request</text>
+<text x="80" y="195" text-anchor="middle" class="ink-mut m" font-size="10">one prompt</text>
+<!-- rung 0 (bottom) -->
+<rect x="200" y="150" width="170" height="58" rx="10" class="n-fill accent-s" stroke-width="1.6"/>
+<text x="285" y="175" text-anchor="middle" class="ink m" font-size="12.5" font-weight="600">rung 0 · haiku</text>
+<text x="285" y="193" text-anchor="middle" class="ink-mut" font-size="10.5">cheapest first pass</text>
+<circle cx="410" cy="179" r="17" class="fail glow-f tick"/>
+<text x="410" y="184" text-anchor="middle" fill="var(--text-inv)" font-size="15" font-weight="700">✗</text>
+<text x="410" y="222" text-anchor="middle" class="fail" font-size="10.5" font-weight="620">gate fail</text>
+<!-- rung 1 (top) -->
+<rect x="470" y="52" width="170" height="58" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="555" y="77" text-anchor="middle" class="ink m" font-size="12.5" font-weight="600">rung 1 · sonnet</text>
+<text x="555" y="95" text-anchor="middle" class="ink-mut" font-size="10.5">+1 on proof of need</text>
+<circle cx="680" cy="81" r="17" class="pass glow-p tick d3"/>
+<text x="680" y="86" text-anchor="middle" fill="var(--text-inv)" font-size="14" font-weight="700">✓</text>
+<text x="680" y="124" text-anchor="middle" class="pass" font-size="10.5" font-weight="620">gate pass</text>
+<!-- serve -->
+<rect x="800" y="52" width="170" height="58" rx="12" class="n-fill pass-s glow-p" stroke-width="1.6"/>
+<text x="885" y="78" text-anchor="middle" class="ink" font-size="13.5" font-weight="640">Serve</text>
+<text x="885" y="96" text-anchor="middle" class="ink-mut m" font-size="10">verified first pass</text>
+<!-- connectors -->
+<line x1="140" y1="179" x2="196" y2="179" class="n-stroke" stroke-width="1.6" marker-end="url(#cb)"/>
+<path d="M427 172 C455 150 448 81 466 81" fill="none" class="fail-s" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#cbf)"/>
+<text x="455" y="140" text-anchor="middle" class="fail m" font-size="10" font-weight="600">climb +1</text>
+<line x1="697" y1="81" x2="796" y2="81" class="pass-s" stroke-width="1.6" marker-end="url(#cbp)"/>
+<!-- pulses -->
+<line x1="140" y1="179" x2="196" y2="179" class="flow s" stroke-width="2.2"/>
+<path d="M427 172 C455 150 448 81 466 81" class="flow f s d3" stroke-width="2.2"/>
+<line x1="697" y1="81" x2="796" y2="81" class="flow p s d5" stroke-width="2.2"/>
+<text x="80" y="40" class="ink" font-size="13" font-weight="640">One rung at a time — climb only on gate failure</text>
+</svg>
+  <figcaption>The gate on rung 0 fails, so the request climbs exactly one rung; rung 1 passes and is served. A mis-started rung only changes where the climb begins — the gate always decides what ships.</figcaption>
+</div>
 
 <h2 id="startrung">Learned start-rung<a class="anchor" href="#startrung" aria-label="Link to this section">#</a></h2>
 <p>Always starting at rung 0 is wasteful when a class of traffic reliably escalates. An optional bandit learns a better <strong>start rung</strong> — where to <em>begin</em> the cascade. The gate still decides what to serve, so a mis-predicted start only changes the entry point, never correctness. This is the "predict-to-start, verify-to-serve" split.</p>
@@ -102,6 +144,32 @@ max_rungs = 3                      # hard cap on the climb</code></pre></div>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[bandit]
 enabled = false            # default-off
 algo    = &quot;ucb1&quot;           # or &quot;thompson&quot;</code></pre></div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="banditT">
+<title id="banditT">The learned start-rung bandit: each rung has a posterior over how often its first pass clears the gate. The sampler draws from each posterior and starts the cascade at the cheapest rung likely to clear — here rung 1 — while the gate still decides what is actually served.</title>
+<text x="80" y="34" class="ink" font-size="13" font-weight="640">Sample each rung's posterior · start at the cheapest likely to clear</text>
+<!-- baseline -->
+<line x1="80" y1="240" x2="920" y2="240" class="grid" stroke-width="1"/>
+<!-- rung 0 posterior — low mean, wide (usually escalates) -->
+<path d="M110 240 Q220 168 330 240 Z" class="n-stroke breathe" fill="var(--d-fill-2)" stroke-width="1.4"/>
+<circle cx="205" cy="196" r="6" class="ink-mut beat"/>
+<text x="220" y="266" text-anchor="middle" class="ink m" font-size="12" font-weight="600">rung 0 · haiku</text>
+<text x="220" y="284" text-anchor="middle" class="ink-mut m" font-size="10.5">$ · low P(clear)</text>
+<!-- rung 1 posterior — high mean, chosen -->
+<path d="M370 240 Q480 96 590 240 Z" class="accent-s glow" fill="var(--accent-soft)" stroke-width="1.8"/>
+<circle cx="480" cy="128" r="7" class="accent beat glow d2"/>
+<text x="480" y="266" text-anchor="middle" class="accent-ink m" font-size="12" font-weight="700">rung 1 · gpt-mini</text>
+<text x="480" y="284" text-anchor="middle" class="ink-mut m" font-size="10.5">$$ · cheapest safe start</text>
+<!-- rung 2 posterior — high mean but pricier -->
+<path d="M630 240 Q740 108 850 240 Z" class="n-stroke breathe d4" fill="var(--d-fill-2)" stroke-width="1.4"/>
+<circle cx="740" cy="140" r="6" class="ink-mut beat d4"/>
+<text x="740" y="266" text-anchor="middle" class="ink m" font-size="12" font-weight="600">rung 2 · sonnet</text>
+<text x="740" y="284" text-anchor="middle" class="ink-mut m" font-size="10.5">$$$ · pricier</text>
+<!-- chosen marker -->
+<path d="M472 64 L488 64 L480 78 Z" class="accent glow beat"/>
+<text x="480" y="56" text-anchor="middle" class="accent-ink m" font-size="11" font-weight="700">▲ start here</text>
+</svg>
+  <figcaption>Predict-to-start, verify-to-serve: the bandit only sets where the cascade begins. A mis-drawn start never changes correctness — the gate still proves every served output.</figcaption>
+</div>
 
 <h2 id="speculation">Speculative escalation<a class="anchor" href="#speculation" aria-label="Link to this section">#</a></h2>
 <p>When an escalation is likely, waiting for the gate to fail before starting the next rung pays serial latency. Speculation prefetches <code>k</code> rungs ahead in parallel, serves the first that passes, and discards the rest. The served bytes are <strong>byte-identical</strong> to the serial path — speculation changes latency, never output.</p>
@@ -110,6 +178,44 @@ algo    = &quot;ucb1&quot;           # or &quot;thompson&quot;</code></pre></div
 enabled = true
 lookahead = 1              # prefetch 1 rung ahead
 speculation_band = [0.35, 0.65]   # only speculate when the pass-signal is marginal</code></pre></div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 280" role="img" aria-labelledby="specT">
+<title id="specT">Speculative escalation: in the marginal zone, rung 0 and rung 1 fire in parallel. Rung 0's gate resolves first and its output is served; the speculative rung 1, already in flight, is aborted and discarded. The served bytes are byte-identical to the serial path.</title>
+<defs><marker id="sp" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="spp" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker></defs>
+<text x="80" y="30" class="ink" font-size="13" font-weight="640">Both rungs fire at once — serve the first to clear, discard the rest</text>
+<!-- request -->
+<rect x="24" y="104" width="120" height="60" rx="12" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="84" y="130" text-anchor="middle" class="ink" font-size="13.5" font-weight="640">Request</text>
+<text x="84" y="149" text-anchor="middle" class="ink-mut m" font-size="10">marginal zone</text>
+<!-- top branch: rung 0 → gate pass → serve -->
+<rect x="250" y="54" width="160" height="54" rx="10" class="n-fill accent-s" stroke-width="1.6"/>
+<text x="330" y="78" text-anchor="middle" class="ink m" font-size="12" font-weight="600">rung 0 · haiku</text>
+<text x="330" y="95" text-anchor="middle" class="ink-mut" font-size="10">runs now</text>
+<circle cx="470" cy="81" r="16" class="pass glow-p tick"/>
+<text x="470" y="86" text-anchor="middle" fill="var(--text-inv)" font-size="13" font-weight="700">✓</text>
+<rect x="770" y="54" width="180" height="54" rx="12" class="n-fill pass-s glow-p" stroke-width="1.6"/>
+<text x="860" y="78" text-anchor="middle" class="ink" font-size="13.5" font-weight="640">Serve rung 0</text>
+<text x="860" y="95" text-anchor="middle" class="pass m" font-size="10">resolves first</text>
+<!-- bottom branch: rung 1 speculative → aborted -->
+<rect x="250" y="170" width="160" height="54" rx="10" class="n-fill n-stroke" stroke-width="1.5" stroke-dasharray="5 3"/>
+<text x="330" y="194" text-anchor="middle" class="ink-mut m" font-size="12" font-weight="600">rung 1 · spec</text>
+<text x="330" y="211" text-anchor="middle" class="ink-mut" font-size="10">prefetched in parallel</text>
+<rect x="560" y="170" width="190" height="54" rx="10" class="n-fill-2 n-stroke" stroke-width="1.4" stroke-dasharray="5 3"/>
+<text x="655" y="194" text-anchor="middle" class="ink-mut" font-size="12.5" font-weight="600">aborted</text>
+<text x="655" y="211" text-anchor="middle" class="ink-mut m" font-size="10">discarded · no cost served</text>
+<!-- connectors -->
+<path d="M144 134 C185 134 190 81 246 81" fill="none" class="n-stroke" stroke-width="1.6" marker-end="url(#sp)"/>
+<path d="M144 134 C185 134 190 197 246 197" fill="none" class="n-stroke" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#sp)"/>
+<line x1="487" y1="81" x2="766" y2="81" class="pass-s" stroke-width="1.6" marker-end="url(#spp)"/>
+<line x1="410" y1="197" x2="556" y2="197" class="n-stroke" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#sp)"/>
+<!-- pulses: both branches fire together (same delay); top wins to serve -->
+<path d="M144 134 C185 134 190 81 246 81" class="flow s" stroke-width="2.2"/>
+<path d="M144 134 C185 134 190 197 246 197" class="flow s" stroke-width="2.2" opacity=".55"/>
+<line x1="487" y1="81" x2="766" y2="81" class="flow p s d3" stroke-width="2.4"/>
+<text x="628" y="120" text-anchor="middle" class="ink-mut m" font-size="10">byte-identical to the serial path</text>
+</svg>
+  <figcaption>In the marginal band, the next rung is prefetched in parallel so a likely escalation pays no serial latency. The first rung to clear the gate is served; the speculative rung is aborted. Latency changes; output never does.</figcaption>
+</div>
 
 <h2 id="failover">Failover &amp; budgets<a class="anchor" href="#failover" aria-label="Link to this section">#</a></h2>
 <p>Escalation doubles as resilience. A transport error or a 5xx from a provider triggers <strong>cross-provider failover</strong> — the next rung may be a different vendor, so one provider's outage degrades gracefully instead of failing the request.</p>
@@ -144,7 +250,7 @@ per_day_usd     = 250.00</code></pre></div>
 <p>When more than one source names a mode, the most specific wins:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 120" role="img" aria-label="Mode precedence: the x-firstpass-mode request header beats the per-route routing_mode, which beats the FIRSTPASS_MODE_PROFILE environment default, which beats the built-in balanced default.">
   <g font-size="12.5">
-    <rect x="20" y="40" width="210" height="52" rx="10" class="n-fill accent-s" stroke-width="1.6"/>
+    <rect x="20" y="40" width="210" height="52" rx="10" class="n-fill accent-s glow" stroke-width="1.6"/>
     <text x="125" y="62" text-anchor="middle" class="ink m" font-size="12" font-weight="620">x-firstpass-mode</text>
     <text x="125" y="80" text-anchor="middle" class="ink-mut" font-size="10.5">request header</text>
     <rect x="270" y="40" width="200" height="52" rx="10" class="n-fill n-stroke" stroke-width="1.4"/>
@@ -161,6 +267,9 @@ per_day_usd     = 250.00</code></pre></div>
   <line x1="230" y1="66" x2="268" y2="66" class="n-stroke" stroke-width="1.5" marker-end="url(#mp)"/>
   <line x1="470" y1="66" x2="508" y2="66" class="n-stroke" stroke-width="1.5" marker-end="url(#mp)"/>
   <line x1="740" y1="66" x2="778" y2="66" class="n-stroke" stroke-width="1.5" marker-end="url(#mp)"/>
+  <line x1="230" y1="66" x2="268" y2="66" class="flow s" stroke-width="2.2"/>
+  <line x1="470" y1="66" x2="508" y2="66" class="flow s d2" stroke-width="2.2"/>
+  <line x1="740" y1="66" x2="778" y2="66" class="flow s d4" stroke-width="2.2"/>
   <defs><marker id="mp" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
 </svg><figcaption><code>x-firstpass-mode</code> header &gt; per-route <code>routing_mode</code> &gt; <code>FIRSTPASS_MODE_PROFILE</code> env &gt; <code>balanced</code>.</figcaption></div>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># override the mode for a single request</span>

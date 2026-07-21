@@ -57,6 +57,57 @@
 
 <h2 id="model">The provider model<a class="anchor" href="#model" aria-label="Link to this section">#</a></h2>
 <p>Providers are the vendors behind the rungs. When you write <code>anthropic/claude-haiku-4-5</code> in a ladder, <code>anthropic</code> is the provider and <code>claude-haiku-4-5</code> is the model. Adding a new model is just naming a new rung — there is <strong>no classifier to retrain</strong>, which is what makes zero-retrain onboarding possible.</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 360" role="img" aria-labelledby="fanT">
+<title id="fanT">Provider fan-out: one ladder of provider/model rungs routes through the Firstpass proxy, which resolves each rung to its provider and calls it with your own key. Built-in Anthropic and OpenAI, plus any OpenAI-compatible host, Gemini, AWS Bedrock via SigV4, Google Vertex via OAuth, and local runtimes — all bring-your-own-key, zero markup.</title>
+<defs><marker id="fn" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="fna" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/></marker></defs>
+<text x="120" y="28" text-anchor="middle" class="ink-mut m" font-size="11" letter-spacing="1">ONE LADDER</text>
+<text x="500" y="28" text-anchor="middle" class="accent-ink m" font-size="11" letter-spacing="1">FIRSTPASS</text>
+<text x="810" y="28" text-anchor="middle" class="ink-mut m" font-size="11" letter-spacing="1">ANY PROVIDER · BYOK</text>
+<!-- ladder -->
+<g font-size="12" class="m" font-weight="600">
+  <rect x="34" y="112" width="180" height="46" rx="9" class="n-fill accent-s" stroke-width="1.5"/><text x="52" y="140" class="ink">anthropic/haiku</text>
+  <rect x="34" y="164" width="180" height="46" rx="9" class="n-fill n-stroke" stroke-width="1.5"/><text x="52" y="192" class="ink">openai/gpt-mini</text>
+  <rect x="34" y="216" width="180" height="46" rx="9" class="n-fill n-stroke" stroke-width="1.5"/><text x="52" y="244" class="ink">gemini/flash</text>
+</g>
+<!-- hub -->
+<rect x="330" y="140" width="170" height="94" rx="14" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="415" y="178" text-anchor="middle" class="ink" font-size="14" font-weight="640">Firstpass</text>
+<text x="415" y="198" text-anchor="middle" class="ink-mut" font-size="11">resolve provider</text>
+<text x="415" y="216" text-anchor="middle" class="accent-ink m" font-size="10">route · gate · call</text>
+<!-- ladder -> hub -->
+<path d="M214 135 C270 135 274 176 328 176" fill="none" class="n-stroke" stroke-width="1.5" marker-end="url(#fn)"/>
+<path d="M214 187 L328 187" fill="none" class="n-stroke" stroke-width="1.5" marker-end="url(#fn)"/>
+<path d="M214 239 C270 239 274 200 328 200" fill="none" class="n-stroke" stroke-width="1.5" marker-end="url(#fn)"/>
+<path d="M214 135 C270 135 274 176 328 176" class="flow s" stroke-width="2.2"/>
+<path d="M214 187 L328 187" class="flow s d2" stroke-width="2.2"/>
+<path d="M214 239 C270 239 274 200 328 200" class="flow s d4" stroke-width="2.2"/>
+<!-- providers -->
+<g font-size="12">
+  <rect x="640" y="36" width="320" height="42" rx="9" class="n-fill n-stroke" stroke-width="1.4"/><text x="658" y="62" class="ink" font-size="12.5" font-weight="620">Anthropic</text><text x="944" y="62" text-anchor="end" class="ink-mut m" font-size="10">api_key</text>
+  <rect x="640" y="88" width="320" height="42" rx="9" class="n-fill n-stroke" stroke-width="1.4"/><text x="658" y="114" class="ink" font-size="12.5" font-weight="620">OpenAI-compatible</text><text x="944" y="114" text-anchor="end" class="ink-mut m" font-size="10">api_key</text>
+  <rect x="640" y="140" width="320" height="42" rx="9" class="n-fill n-stroke" stroke-width="1.4"/><text x="658" y="166" class="ink" font-size="12.5" font-weight="620">Gemini</text><text x="944" y="166" text-anchor="end" class="ink-mut m" font-size="10">api_key</text>
+  <rect x="640" y="192" width="320" height="42" rx="9" class="n-fill n-stroke" stroke-width="1.4"/><text x="658" y="218" class="ink" font-size="12.5" font-weight="620">AWS Bedrock</text><text x="944" y="218" text-anchor="end" class="ink-mut m" font-size="10">aws_sigv4</text>
+  <rect x="640" y="244" width="320" height="42" rx="9" class="n-fill n-stroke" stroke-width="1.4"/><text x="658" y="270" class="ink" font-size="12.5" font-weight="620">Google Vertex</text><text x="944" y="270" text-anchor="end" class="ink-mut m" font-size="10">gcp_oauth</text>
+  <rect x="640" y="296" width="320" height="42" rx="9" class="n-fill n-stroke" stroke-width="1.4"/><text x="658" y="322" class="ink" font-size="12.5" font-weight="620">Local · Ollama / vLLM</text><text x="944" y="322" text-anchor="end" class="ink-mut m" font-size="10">self-host</text>
+</g>
+<!-- hub -> providers -->
+<path d="M500 168 C580 168 560 57 638 57" fill="none" class="accent-s" stroke-width="1.4" marker-end="url(#fna)"/>
+<path d="M500 176 C580 176 560 109 638 109" fill="none" class="accent-s" stroke-width="1.4" marker-end="url(#fna)"/>
+<path d="M500 184 L638 161" fill="none" class="accent-s" stroke-width="1.4" marker-end="url(#fna)"/>
+<path d="M500 192 C580 192 560 213 638 213" fill="none" class="accent-s" stroke-width="1.4" marker-end="url(#fna)"/>
+<path d="M500 200 C580 200 560 265 638 265" fill="none" class="accent-s" stroke-width="1.4" marker-end="url(#fna)"/>
+<path d="M500 208 C580 208 560 317 638 317" fill="none" class="accent-s" stroke-width="1.4" marker-end="url(#fna)"/>
+<path d="M500 168 C580 168 560 57 638 57" class="flow s d1" stroke-width="2"/>
+<path d="M500 176 C580 176 560 109 638 109" class="flow s d2" stroke-width="2"/>
+<path d="M500 184 L638 161" class="flow s d3" stroke-width="2"/>
+<path d="M500 192 C580 192 560 213 638 213" class="flow s d4" stroke-width="2"/>
+<path d="M500 200 C580 200 560 265 638 265" class="flow s d5" stroke-width="2"/>
+<path d="M500 208 C580 208 560 317 638 317" class="flow s d6" stroke-width="2"/>
+<text x="565" y="238" text-anchor="middle" class="accent-ink m" font-size="10" font-weight="600">your key · zero markup</text>
+</svg>
+  <figcaption>A rung is <code>provider/model</code>. The proxy resolves each rung to its provider and calls it with your own key — Anthropic and OpenAI built in, any OpenAI-compatible host, Gemini, Bedrock (SigV4), Vertex (OAuth), and local runtimes. Adding one is naming a rung; no classifier to retrain.</figcaption>
+</div>
 
 <h2 id="builtin">Built-in providers<a class="anchor" href="#builtin" aria-label="Link to this section">#</a></h2>
 <div class="tblwrap"><table>

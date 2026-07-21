@@ -78,7 +78,7 @@
   <text x="262" y="139" class="accent-ink" font-size="11" font-weight="600">a91f…</text>
   <text x="262" y="158" class="ink-mut" font-size="10.5">hash 5c02…</text>
 </g><g>
-  <rect x="472" y="70" width="180" height="100" rx="12" class="fail-s" fill="var(--d-fill)" stroke-width="1.6"/>
+  <rect x="472" y="70" width="180" height="100" rx="12" class="fail-s breathe glow-f" fill="var(--d-fill)" stroke-width="1.6"/>
   <text x="486" y="94" class="ink" font-size="12.5" font-weight="640">receipt #2 · TAMPERED</text>
   <line x1="486" y1="104" x2="638" y2="104" class="grid" stroke-width="1"/>
   <text x="486" y="124" class="ink-mut" font-size="10.5">prev_hash</text>
@@ -96,8 +96,10 @@
 <line x1="204" y1="120" x2="246" y2="120" class="n-stroke" stroke-width="1.6" marker-end="url(#hc)"/>
 <line x1="428" y1="120" x2="470" y2="120" class="pass-s" stroke-width="1.6" marker-end="url(#hcP)"/>
 <line x1="652" y1="120" x2="694" y2="120" class="fail-s" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#hcF)"/>
+<line x1="204" y1="120" x2="246" y2="120" class="flow p s" stroke-width="2.4"/>
+<line x1="428" y1="120" x2="470" y2="120" class="flow p s d2" stroke-width="2.4"/>
 <!-- break marker -->
-<text x="673" y="112" text-anchor="middle" class="fail" font-size="15" font-weight="700">✗</text>
+<text x="673" y="112" text-anchor="middle" class="fail beat glow-f" font-size="15" font-weight="700">✗</text>
 <text x="500" y="212" class="ink" font-size="12.5" font-weight="600">Edit receipt #2 → its hash changes → receipt #3's prev_hash (e7d4…) no longer matches.</text>
 <text x="500" y="232" class="ink-mut" font-size="12"><tspan class="m" fill="var(--d-fail)">firstpass verify</tspan> re-derives the chain from genesis and exits non-zero at index 3.</text>
 <text x="500" y="252" class="pass" font-size="11.5" font-weight="600">Records #0–#1 still verify. The break is localized and provable.</text>
@@ -140,6 +142,48 @@ firstpass export --out receipts.jsonl
 
 <span class="tk-c"># 2. an auditor re-derives the chain from genesis — no proxy, no DB</span>
 firstpass verify --file receipts.jsonl</code></pre></div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 250" role="img" aria-labelledby="sealT">
+<title id="sealT">Seal and verify: live decisions are sealed into a hash-linked chain, exported to a portable receipts.jsonl file, and an external auditor re-derives every hash from genesis with no proxy or database — ending in a green pass when the chain is intact, or a red break at the exact tampered index.</title>
+<defs><marker id="sl" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="slp" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker></defs>
+<text x="40" y="30" class="ink-mut m" font-size="11" letter-spacing=".8">SEAL</text>
+<!-- three sealed receipts forming a chain -->
+<g font-size="10.5" class="m">
+  <rect x="34" y="70" width="86" height="90" rx="10" class="n-stroke" fill="var(--d-fill)" stroke-width="1.5"/>
+  <text x="47" y="92" class="ink" font-size="10.5" font-weight="640">#0</text><text x="47" y="112" class="ink-mut" font-size="9.5">genesis</text><text x="47" y="132" class="accent-ink" font-size="9.5">hash a91f…</text>
+  <rect x="150" y="70" width="86" height="90" rx="10" class="n-stroke" fill="var(--d-fill)" stroke-width="1.5"/>
+  <text x="163" y="92" class="ink" font-size="10.5" font-weight="640">#1</text><text x="163" y="112" class="ink-mut" font-size="9.5">prev a91f…</text><text x="163" y="132" class="accent-ink" font-size="9.5">hash 5c02…</text>
+  <rect x="266" y="70" width="86" height="90" rx="10" class="n-stroke" fill="var(--d-fill)" stroke-width="1.5"/>
+  <text x="279" y="92" class="ink" font-size="10.5" font-weight="640">#2</text><text x="279" y="112" class="ink-mut" font-size="9.5">prev 5c02…</text><text x="279" y="132" class="accent-ink" font-size="9.5">hash 1b88…</text>
+</g>
+<line x1="120" y1="115" x2="148" y2="115" class="n-stroke" stroke-width="1.5" marker-end="url(#sl)"/>
+<line x1="236" y1="115" x2="264" y2="115" class="n-stroke" stroke-width="1.5" marker-end="url(#sl)"/>
+<line x1="120" y1="115" x2="148" y2="115" class="flow p s" stroke-width="2.2"/>
+<line x1="236" y1="115" x2="264" y2="115" class="flow p s d2" stroke-width="2.2"/>
+<!-- export to file -->
+<line x1="352" y1="115" x2="422" y2="115" class="n-stroke" stroke-width="1.6" marker-end="url(#sl)"/>
+<line x1="352" y1="115" x2="422" y2="115" class="flow s d3" stroke-width="2.4"/>
+<text x="388" y="106" text-anchor="middle" class="ink-mut m" font-size="9.5">export</text>
+<rect x="424" y="78" width="150" height="74" rx="11" class="n-fill-2 n-stroke" stroke-width="1.5"/>
+<text x="499" y="108" text-anchor="middle" class="ink m" font-size="12" font-weight="620">receipts.jsonl</text>
+<text x="499" y="128" text-anchor="middle" class="ink-mut" font-size="10">portable · self-contained</text>
+<!-- auditor re-derives -->
+<line x1="574" y1="115" x2="644" y2="115" class="n-stroke" stroke-width="1.6" marker-end="url(#sl)"/>
+<line x1="574" y1="115" x2="644" y2="115" class="flow s d5" stroke-width="2.4"/>
+<rect x="646" y="78" width="176" height="74" rx="11" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="734" y="106" text-anchor="middle" class="ink" font-size="12.5" font-weight="620">Auditor</text>
+<text x="734" y="126" text-anchor="middle" class="ink-mut m" font-size="10">re-derive from genesis</text>
+<text x="734" y="142" text-anchor="middle" class="ink-mut m" font-size="9.5">no proxy · no DB</text>
+<!-- verdict -->
+<line x1="822" y1="115" x2="884" y2="115" class="pass-s" stroke-width="1.6" marker-end="url(#slp)"/>
+<line x1="822" y1="115" x2="884" y2="115" class="flow p s d6" stroke-width="2.4"/>
+<circle cx="924" cy="115" r="30" class="pass glow-p tick"/>
+<text x="924" y="123" text-anchor="middle" fill="var(--text-inv)" font-size="26" font-weight="700">✓</text>
+<text x="924" y="176" text-anchor="middle" class="pass" font-size="11" font-weight="640">verified</text>
+<text x="500" y="216" text-anchor="middle" class="ink-mut" font-size="12">Any edit, insert, delete, or reorder recomputes a different hash — <tspan class="m" fill="var(--d-fail)">verify</tspan> exits non-zero at the first broken index.</text>
+</svg>
+  <figcaption>Seal → export → independent re-derivation. The check is just SHA-256 over a documented record, so a third party reaches the same yes/no with the proxy offline, compromised, or gone.</figcaption>
+</div>
 <p><code>verify</code> reads only the file. It recomputes every hash from the genesis record forward and confirms each <code>prev_hash</code> link. If a record was edited, inserted, deleted, or reordered, the recomputed hash diverges and <code>verify</code> <strong>exits non-zero at the first broken index</strong> — a clean signal for CI or an external auditor. There is nothing to trust except the math and the file.</p>
 <div class="note"><span class="nt">Independent by design</span> The whole point is that verification needs nothing from Firstpass. Hand the JSONL to a third party; they run <code>firstpass verify</code> (or reimplement the check — it is just SHA-256 over a documented record) and get the same yes/no. The proxy could be offline, compromised, or gone.</div>
 

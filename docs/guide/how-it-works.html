@@ -75,7 +75,7 @@
   <text x="284" y="135" text-anchor="middle" class="ink">Route</text>
   <text x="284" y="153" text-anchor="middle" class="ink-mut m" font-size="10">cheapest rung</text>
 
-  <rect x="366" y="110" width="120" height="58" rx="10" class="n-fill accent-s" stroke-width="1.5"/>
+  <rect x="366" y="110" width="120" height="58" rx="10" class="n-fill accent-s glow" stroke-width="1.5"/>
   <text x="426" y="135" text-anchor="middle" class="ink">Gate</text>
   <text x="426" y="153" text-anchor="middle" class="ink-mut m" font-size="10">real output</text>
 
@@ -83,7 +83,7 @@
   <text x="568" y="135" text-anchor="middle" class="ink">Escalate</text>
   <text x="568" y="153" text-anchor="middle" class="ink-mut m" font-size="10">+1 on fail</text>
 
-  <rect x="650" y="110" width="118" height="58" rx="10" class="n-fill pass-s" stroke-width="1.5"/>
+  <rect x="650" y="110" width="118" height="58" rx="10" class="n-fill pass-s glow-p" stroke-width="1.5"/>
   <text x="709" y="135" text-anchor="middle" class="ink">Serve</text>
   <text x="709" y="153" text-anchor="middle" class="ink-mut m" font-size="10">first pass</text>
 </g>
@@ -124,6 +124,13 @@
 <!-- served response back to agent -->
 <path d="M709 168 L709 285 L84 285 L84 222" fill="none" class="pass-s" stroke-width="1.5" marker-end="url(#arP)"/>
 <text x="120" y="278" text-anchor="start" class="pass" font-size="10" font-weight="600">served response</text>
+<!-- travelling request/response pulses (overlay on the static wires) -->
+<line x1="148" y1="185" x2="196" y2="185" class="flow s" stroke-width="2.4"/>
+<line x1="344" y1="139" x2="362" y2="139" class="flow s d2" stroke-width="2.4"/>
+<path d="M426 168 L426 196 L709 196 L709 172" class="flow p l d3" stroke-width="2.2"/>
+<line x1="788" y1="139" x2="836" y2="139" class="flow s d4" stroke-width="2.4"/>
+<path d="M709 168 L709 285 L84 285 L84 222" class="flow p l d5" stroke-width="2.2"/>
+<path d="M674 336 L674 300 L560 300 L560 172" class="flow l d6" stroke-width="2"/>
 <defs>
   <marker id="ar" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" class="n-stroke" fill="var(--d-stroke)"/></marker>
   <marker id="arF" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-fail)"/></marker>
