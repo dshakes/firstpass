@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview — Firstpass docs</title>
+<meta name="description" content="Firstpass is an open-source adaptive LLM router: open on the cheapest model, prove the real output against a gate, escalate one rung only on failure, and seal a tamper-evident receipt for every decision.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.0</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html" aria-current="page"><span class="num">01</span>Overview</a>
+<a href="how-it-works.html"><span class="num">02</span>How it works</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html"><span class="num">03</span>Gates</a>
+<a href="routing.html"><span class="num">04</span>Routing & escalation</a>
+<a href="guarantee.html"><span class="num">05</span>The guarantee</a>
+<a href="receipts.html"><span class="num">06</span>Receipts & audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">07</span>Providers</a>
+<a href="configuration.html"><span class="num">08</span>Configuration</a>
+<a href="cli.html"><span class="num">09</span>CLI reference</a>
+<a href="api.html"><span class="num">10</span>API & MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research & data</p>
+<a href="elastic-verification.html"><span class="num">11</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">12</span>Benchmarks</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / Overview</p>
+<h1>Overview</h1>
+<p class="page-sub">Firstpass is an open-source adaptive LLM router. Every request opens on the cheapest model in a ladder; a gate checks the actual output; it serves the first output that passes and escalates one rung only on gate failure. Every decision gets a tamper-evident, hash-chained receipt.</p>
+
+<div class="chips">
+  <div class="chip good"><div class="cn">≤10<span class="u">%</span></div><div class="cl">served-failure, 95% conf.</div></div>
+  <div class="chip"><div class="cn">82<span class="u">%</span></div><div class="cl">served from cheap tier</div></div>
+  <div class="chip"><div class="cn">974</div><div class="cl">real tasks in the live bound</div></div>
+  <div class="chip"><div class="cn">v0.2.0</div><div class="cl">pre-GA, open source</div></div>
+</div>
+
+<h2 id="what">What Firstpass is<a class="anchor" href="#what" aria-label="Link to this section">#</a></h2>
+<p>Most model gateways route by <em>prediction</em>: a classifier reads the prompt and guesses which model can handle it, before a single token of output exists. If the guess is wrong, you find out in production — and there's no artifact explaining why the request went where it did.</p>
+<p>Firstpass routes by <strong>proof</strong>. It opens on the cheapest model, then <strong>gates the real output</strong> — runs your tests, checks a schema, asks a judge, or measures self-consistency. If the output passes, it serves. If it fails, it escalates exactly one rung and gates again. The cheap model handles most traffic; the expensive model is spent only when the cheap one is provably not enough.</p>
+<p>The positioning is one line: <strong>proof over prediction</strong> — verified cascade routing.</p>
+
+<div class="note"><span class="nt">Honest novelty</span> The cascade mechanism itself is prior art. Firstpass is not claiming to have invented cheap-model-first escalation. What is new is the combination in the section below — the audit, the calibration, and the guarantee wrapped around the cascade.</div>
+
+<h2 id="moves">The four moves<a class="anchor" href="#moves" aria-label="Link to this section">#</a></h2>
+<p>Everything the router does reduces to four moves, in order, on every request.</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 190" role="img" aria-labelledby="movesT">
+<title id="movesT">The four moves: Route opens on the cheapest model, Prove gates the real output, Escalate goes one rung up only on failure, and Learn feeds outcomes back so the serve threshold self-tunes.</title>
+<g font-size="14">
+<g>
+  <rect x="20" y="46" width="200" height="96" rx="14" class="n-fill accent-s" stroke-width="1.6"/>
+  <circle cx="50" cy="76" r="15" class="accent"/>
+  <text x="50" y="81" text-anchor="middle" fill="var(--text-inv)" font-size="14" font-weight="700">1</text>
+  <text x="76" y="81" class="ink" font-size="16" font-weight="640">Route</text>
+  <text x="40" y="112" class="ink-mut" font-size="12.5">open the cheapest</text>
+  <text x="40" y="130" class="ink-mut" font-size="12.5">rung in the ladder</text>
+</g><g>
+  <rect x="280" y="46" width="200" height="96" rx="14" class="n-fill accent-s" stroke-width="1.6"/>
+  <circle cx="310" cy="76" r="15" class="accent"/>
+  <text x="310" y="81" text-anchor="middle" fill="var(--text-inv)" font-size="14" font-weight="700">2</text>
+  <text x="336" y="81" class="ink" font-size="16" font-weight="640">Prove</text>
+  <text x="300" y="112" class="ink-mut" font-size="12.5">gate the real output,</text>
+  <text x="300" y="130" class="ink-mut" font-size="12.5">not the prompt</text>
+</g><g>
+  <rect x="540" y="46" width="200" height="96" rx="14" class="n-fill fail-s" stroke-width="1.6"/>
+  <circle cx="570" cy="76" r="15" class="fail"/>
+  <text x="570" y="81" text-anchor="middle" fill="var(--text-inv)" font-size="14" font-weight="700">3</text>
+  <text x="596" y="81" class="ink" font-size="16" font-weight="640">Escalate</text>
+  <text x="560" y="112" class="ink-mut" font-size="12.5">one rung on fail,</text>
+  <text x="560" y="130" class="ink-mut" font-size="12.5">budget-capped</text>
+</g><g>
+  <rect x="800" y="46" width="200" height="96" rx="14" class="n-fill pass-s" stroke-width="1.6"/>
+  <circle cx="830" cy="76" r="15" class="pass"/>
+  <text x="830" y="81" text-anchor="middle" fill="var(--text-inv)" font-size="14" font-weight="700">4</text>
+  <text x="856" y="81" class="ink" font-size="16" font-weight="640">Learn</text>
+  <text x="820" y="112" class="ink-mut" font-size="12.5">outcomes tune the</text>
+  <text x="820" y="130" class="ink-mut" font-size="12.5">serve threshold</text>
+</g></g>
+<line x1="222" y1="94" x2="276" y2="94" class="n-stroke" stroke-width="1.8" marker-end="url(#m1)"/>
+<line x1="482" y1="94" x2="536" y2="94" class="n-stroke" stroke-width="1.8" marker-end="url(#m1)"/>
+<line x1="742" y1="94" x2="796" y2="94" class="n-stroke" stroke-width="1.8" marker-end="url(#m1)"/>
+<defs><marker id="m1" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
+</svg></div>
+<div class="defs">
+  <div class="row"><div class="k">Route</div><div class="v">Open the cheapest rung in the ladder. No per-prompt prediction — the cheap model takes the first pass.</div></div>
+  <div class="row"><div class="k">Prove</div><div class="v">Gate the real output, not the prompt. Built-in checks, your test suite, an LLM judge, or self-consistency.</div></div>
+  <div class="row"><div class="k">Escalate</div><div class="v">One rung up on gate failure — budget-capped, with cross-provider failover on transport or 5xx errors.</div></div>
+  <div class="row"><div class="k">Learn</div><div class="v">Deferred outcomes feed back through <code>/v1/feedback</code>; adaptive conformal moves the serve threshold under drift.</div></div>
+</div>
+<p><a href="how-it-works.html">How it works</a> follows a single request through all four in detail.</p>
+
+<h2 id="novelty">What is actually new<a class="anchor" href="#novelty" aria-label="Link to this section">#</a></h2>
+<p>Five things, and Firstpass is precise about which are novel versus assembled from known parts:</p>
+<ol>
+  <li><strong>Tamper-evident audit + independent verification.</strong> Every decision is a hash-chained receipt; an external auditor re-derives the whole chain from genesis with no access to the proxy or its database. See <a href="receipts.html">Receipts &amp; audit</a>.</li>
+  <li><strong>Outcome-feedback calibration of the serve threshold.</strong> Real outcomes — not prompt features — move the threshold that decides serve-versus-escalate. See <a href="guarantee.html#adaptive">Adaptive conformal</a>.</li>
+  <li><strong>Zero-retrain model onboarding.</strong> Add a rung as <code>provider/model</code>; there is no classifier to retrain when models change. See <a href="providers.html">Providers</a>.</li>
+  <li><strong>Predict-to-start, verify-to-serve.</strong> A learned start-rung bandit predicts <em>where to begin</em>; the gate still proves <em>what to serve</em>. Prediction sets the entry point; proof sets the exit. See <a href="routing.html#startrung">Learned start-rung</a>.</li>
+  <li><strong>A served-failure guarantee.</strong> A distribution-free bound on how often a wrong answer is served, earned from a real run. See <a href="guarantee.html">The guarantee</a>.</li>
+</ol>
+
+<h2 id="who">Who it's for<a class="anchor" href="#who" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>Teams running agents at volume</strong> who pay for a frontier model on requests a cheap model could have handled — and want the savings without gambling on quality.</li>
+  <li><strong>Anyone who has to answer "why did the model say that?"</strong> — regulated workflows, incident reviews, or a customer dispute. The receipt is the answer.</li>
+  <li><strong>Builders who already have a notion of "good"</strong> — a test suite, a schema, a rubric — and want routing decided by that definition instead of a vendor's opaque classifier.</li>
+</ul>
+
+<h2 id="status">Status<a class="anchor" href="#status" aria-label="Link to this section">#</a></h2>
+<p>Firstpass is <strong>v0.2.0, pre-GA</strong>, and honest about the line between shipped and researched.</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>Shipped &amp; verified</th><th>Next / research</th></tr></thead>
+  <tbody>
+    <tr><td>Both wire dialects, structured enforce</td><td>Elastic verification (validated, phasing in)</td></tr>
+    <tr><td>All five gate kinds</td><td>Per-query difficulty prediction</td></tr>
+    <tr><td>Start-rung bandit, speculation, failover</td><td>Session-level routing</td></tr>
+    <tr><td>Conformal guarantee + Learn-then-Test</td><td>Hosted plane (gated on external audit)</td></tr>
+    <tr><td>Adaptive threshold, OPE, savings/evals</td><td>crates.io publish, 30-day soak</td></tr>
+    <tr><td>Receipts + export/verify + durable mode</td><td></td></tr>
+    <tr><td>Modes, provider-smoke CI</td><td></td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="next">Where to go next<a class="anchor" href="#next" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><a href="how-it-works.html">How it works</a> — the full request flow, observe vs enforce, and the anatomy of one decision.</li>
+  <li><a href="gates.html">Gates</a> — the mechanism that makes routing proof-based.</li>
+  <li><a href="guarantee.html">The guarantee</a> — how the served-failure bound is computed, with the real data.</li>
+  <li><a href="cli.html">CLI reference</a> — every subcommand, from <code>onboard</code> to <code>verify</code>.</li>
+</ul>
+
+<nav class="pager" aria-label="Pagination"><span></span><a class="next" href="how-it-works.html"><span class="dir">Next →</span><span class="t">How it works</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#what" class="">What Firstpass is</a><a href="#moves" class="">The four moves</a><a href="#novelty" class="">What is actually new</a><a href="#who" class="">Who it&#x27;s for</a><a href="#status" class="">Status</a><a href="#next" class="">Where to go next</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js"></script>
+</body></html>

@@ -163,6 +163,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
             counterfactual_baseline_usd: baseline,
             savings_usd: 0.0,
         },
+        probe: None,
     };
     trace.recompute_savings();
     (outcome, trace)

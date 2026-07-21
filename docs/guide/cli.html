@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLI reference — Firstpass docs</title>
+<meta name="description" content="Every firstpass subcommand: onboard/offboard, up, doctor, trace, savings, evals, explain, export, verify, calibrate, ope, modes, and mcp.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.0</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html"><span class="num">01</span>Overview</a>
+<a href="how-it-works.html"><span class="num">02</span>How it works</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html"><span class="num">03</span>Gates</a>
+<a href="routing.html"><span class="num">04</span>Routing & escalation</a>
+<a href="guarantee.html"><span class="num">05</span>The guarantee</a>
+<a href="receipts.html"><span class="num">06</span>Receipts & audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">07</span>Providers</a>
+<a href="configuration.html"><span class="num">08</span>Configuration</a>
+<a href="cli.html" aria-current="page"><span class="num">09</span>CLI reference</a>
+<a href="api.html"><span class="num">10</span>API & MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research & data</p>
+<a href="elastic-verification.html"><span class="num">11</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">12</span>Benchmarks</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / CLI reference</p>
+<h1>CLI reference</h1>
+<p class="page-sub">One binary, <code>firstpass</code>, covers the whole lifecycle — from agentic one-command setup to independent receipt verification. Every subcommand, grouped by what it's for.</p>
+
+<h2 id="install">Install<a class="anchor" href="#install" aria-label="Link to this section">#</a></h2>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh   # or:
+pip install firstpass          # or: uvx firstpass
+brew install dshakes/tap/firstpass-proxy
+docker run -p 8080:8080 ghcr.io/dshakes/firstpass
+cargo install --git https://github.com/dshakes/firstpass</code></pre></div>
+
+<h2 id="lifecycle">Lifecycle<a class="anchor" href="#lifecycle" aria-label="Link to this section">#</a></h2>
+<div class="tblwrap"><table>
+  <thead><tr><th>Command</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>firstpass onboard --apply</code></td><td>One-command agentic setup — detects your provider config and wires the proxy in. Reversible.</td></tr>
+    <tr><td><code>firstpass offboard</code></td><td>Reverses onboarding cleanly — removes the proxy from the path.</td></tr>
+    <tr><td><code>firstpass up</code></td><td>Start the proxy.</td></tr>
+    <tr><td><code>firstpass doctor</code></td><td>Diagnose config, keys, connectivity, and sandbox readiness.</td></tr>
+  </tbody>
+</table></div>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass onboard --apply
+firstpass doctor
+firstpass up</code></pre></div>
+
+<h2 id="inspect">Inspect<a class="anchor" href="#inspect" aria-label="Link to this section">#</a></h2>
+<div class="tblwrap"><table>
+  <thead><tr><th>Command</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>firstpass trace &lt;request_id&gt;</code></td><td>Show the full decision for one request — rungs, gate verdicts, cost, chain link.</td></tr>
+    <tr><td><code>firstpass explain</code></td><td>Explain why a request routed the way it did.</td></tr>
+    <tr><td><code>firstpass savings</code></td><td>Net savings vs always-top-rung, with gate cost already subtracted.</td></tr>
+    <tr><td><code>firstpass evals</code></td><td>Aggregate gate outcomes and served-failure across recorded traffic.</td></tr>
+    <tr><td><code>firstpass modes</code></td><td>Show the resolved preset for each mode.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="audit">Audit &amp; calibrate<a class="anchor" href="#audit" aria-label="Link to this section">#</a></h2>
+<div class="tblwrap"><table>
+  <thead><tr><th>Command</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>firstpass export --out receipts.jsonl</code></td><td>Seal the receipt log to portable JSONL.</td></tr>
+    <tr><td><code>firstpass verify --file receipts.jsonl</code></td><td>Re-derive the hash chain from genesis; exit non-zero on tamper. No proxy/DB needed.</td></tr>
+    <tr><td><code>firstpass calibrate --method conformal</code></td><td>Compute the split-conformal serve threshold + bound.</td></tr>
+    <tr><td><code>firstpass calibrate --method ltt</code></td><td>Learn-then-Test / RCPS — exact-binomial false-accept control.</td></tr>
+  </tbody>
+</table></div>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass export --out receipts.jsonl
+firstpass verify --file receipts.jsonl &amp;&amp; echo &quot;chain intact&quot;
+firstpass calibrate --method conformal --alpha 0.10 --delta 0.05</code></pre></div>
+
+<h2 id="rehearse">Rehearse &amp; modes<a class="anchor" href="#rehearse" aria-label="Link to this section">#</a></h2>
+<div class="tblwrap"><table>
+  <thead><tr><th>Command</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>firstpass ope</code></td><td>Policy rehearsal — off-policy evaluation of a routing change against recorded traffic, using IPS, SNIPS, or DR estimators. See a policy's effect before you ship it.</td></tr>
+    <tr><td><code>firstpass modes</code></td><td>List modes and their resolved knobs.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="mcp">MCP server<a class="anchor" href="#mcp" aria-label="Link to this section">#</a></h2>
+<p><code>firstpass mcp</code> starts a stdio MCP server so an agent can inspect routing, savings, evals, and receipts as tools. See <a href="api.html#mcp">API &amp; MCP</a> for the tool list.</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass mcp        # stdio MCP server</code></pre></div>
+
+<nav class="pager" aria-label="Pagination"><a class="prev" href="configuration.html"><span class="dir">← Previous</span><span class="t">Configuration</span></a><a class="next" href="api.html"><span class="dir">Next →</span><span class="t">API & MCP</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#install" class="">Install</a><a href="#lifecycle" class="">Lifecycle</a><a href="#inspect" class="">Inspect</a><a href="#audit" class="">Audit &amp; calibrate</a><a href="#rehearse" class="">Rehearse &amp; modes</a><a href="#mcp" class="">MCP server</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js"></script>
+</body></html>

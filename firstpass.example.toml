@@ -214,6 +214,25 @@ speculation = 0
 # [escalation.exploration]
 # epsilon = 0.05   # 5 % of requests start at a random rung; receipts record propensity
 
+# Shadow probe (ADR 0008 Phase 1): measure the k-sample gate-pass-count signal on a sampled
+# fraction of enforce requests WITHOUT changing serving — pure measurement, no behavior change.
+#
+# How it works: on `sample_rate` fraction of requests, after the cascade resolves, k extra model
+# calls are made at the `start_rung` model concurrently. Each sample is scored through the same
+# gates and serve-threshold rule as the main path. The pass count is recorded as `trace.probe`
+# with a three-regime classification (confident_pass / confident_fail / ambiguous).
+#
+# Cost caveat: k × (shadow model cost) on `sample_rate` fraction of requests. These costs appear
+# in `firstpass_probe_cost_usd_total` but NOT in `trace.final_.total_cost_usd`, so your savings
+# math stays clean. This is the honest price of the measurement; disable when not needed.
+#
+# When to enable: when you want to validate ADR 0008 regime distributions on your own traffic
+# before enabling elastic verification (Phase 3). Replicate on held-out + drift splits.
+#
+# [escalation.probe]
+# k           = 5     # parallel samples per request; must be in [2, 8]
+# sample_rate = 0.01  # fraction of requests that trigger the probe (1% here); in [0, 1]
+
 # Per-deployment price overrides (USD per 1M tokens). List prices drift and enterprise
 # contracts differ; savings math is only honest when it uses YOUR prices. Overrides replace
 # the built-in defaults for the named models — everything else keeps the defaults.

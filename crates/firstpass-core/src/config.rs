@@ -546,6 +546,11 @@ pub struct Escalation {
     /// deterministic policy — byte-identical to today. See [`ExplorationConfig`].
     #[serde(default)]
     pub exploration: Option<ExplorationConfig>,
+    /// Shadow probe (ADR 0008 Phase 1): measure the k-sample gate-pass-count signal on a
+    /// sampled fraction of enforce requests without changing serving or the served cost.
+    /// `None` (default) = off = zero extra provider calls = byte-identical to today.
+    #[serde(default)]
+    pub probe: Option<ProbeConfig>,
 }
 
 /// Config for online/adaptive conformal serving ([`crate::conformal::AdaptiveConformal`]).
@@ -582,6 +587,24 @@ pub struct ExplorationConfig {
     /// A small `epsilon` (0.05–0.1) is usually enough: it keeps learning alive and makes
     /// IPS/SNIPS estimates valid at low cost in exploration waste.
     pub epsilon: f64,
+}
+
+/// Shadow-probe configuration (ADR 0008 Phase 1): measure the validated k-sample
+/// gate-pass-count signal on a sampled fraction of requests WITHOUT changing serving.
+///
+/// **Cost caveat**: `sample_rate × k` extra model calls (at the `start_rung` model) per
+/// sampled request — measurement only, nothing served changes. Default absent = off = zero
+/// extra provider calls, byte-identical to today. Enable only when you want to collect the
+/// regime signal for offline analysis.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeConfig {
+    /// Number of parallel probe samples per request. Must be in `[2, 8]`; validated by
+    /// [`Config::parse`]. Each sample is one model call at the `start_rung` model.
+    pub k: u32,
+    /// Fraction of requests that trigger the probe, in `[0, 1]`. `0.0` = never; `1.0` = always.
+    /// Must be finite; validated by [`Config::parse`].
+    pub sample_rate: f64,
 }
 
 /// Config for the UCB1 start-rung bandit (`firstpass_proxy::bandit::StartRungBandit`).
@@ -656,6 +679,7 @@ impl Default for Escalation {
             speculation_band: None,
             bandit: None,
             exploration: None,
+            probe: None,
         }
     }
 }
@@ -828,6 +852,20 @@ impl Config {
                 "escalation.exploration.epsilon must be finite and in (0, 0.5], got {}",
                 exp.epsilon
             )));
+        }
+        if let Some(probe) = &config.escalation.probe {
+            if !(2..=8).contains(&probe.k) {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.probe.k must be in [2, 8], got {}",
+                    probe.k
+                )));
+            }
+            if !probe.sample_rate.is_finite() || !(0.0..=1.0).contains(&probe.sample_rate) {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.probe.sample_rate must be finite and in [0, 1], got {}",
+                    probe.sample_rate
+                )));
+            }
         }
         Ok(config)
     }
@@ -1451,6 +1489,68 @@ discount = 0.98
                 "speculation_band = [0.9, 0.2]"
             ))
             .is_err()
+        );
+    }
+
+    // ── ProbeConfig parse / validation ───────────────────────────────────────
+
+    #[test]
+    fn probe_absent_defaults_to_none() {
+        // Default off = byte-identical to today.
+        let c = Config::parse("").unwrap();
+        assert!(c.escalation.probe.is_none());
+    }
+
+    #[test]
+    fn parses_valid_probe_config() {
+        let c = Config::parse("[escalation.probe]\nk = 5\nsample_rate = 0.1\n").unwrap();
+        let p = c.escalation.probe.expect("[escalation.probe] should parse");
+        assert_eq!(p.k, 5);
+        assert!((p.sample_rate - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn probe_sample_rate_boundaries_accepted() {
+        // 0.0 (never probe) and 1.0 (always probe) are both valid.
+        let c0 = Config::parse("[escalation.probe]\nk = 2\nsample_rate = 0.0\n").unwrap();
+        assert!((c0.escalation.probe.unwrap().sample_rate - 0.0).abs() < 1e-12);
+        let c1 = Config::parse("[escalation.probe]\nk = 8\nsample_rate = 1.0\n").unwrap();
+        assert!((c1.escalation.probe.unwrap().sample_rate - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn probe_rejects_k_below_2() {
+        let bad = "[escalation.probe]\nk = 1\nsample_rate = 0.5\n";
+        assert!(
+            matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
+            "k=1 must be rejected"
+        );
+    }
+
+    #[test]
+    fn probe_rejects_k_above_8() {
+        let bad = "[escalation.probe]\nk = 9\nsample_rate = 0.5\n";
+        assert!(
+            matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
+            "k=9 must be rejected"
+        );
+    }
+
+    #[test]
+    fn probe_rejects_sample_rate_above_1() {
+        let bad = "[escalation.probe]\nk = 5\nsample_rate = 1.5\n";
+        assert!(
+            matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
+            "sample_rate=1.5 must be rejected"
+        );
+    }
+
+    #[test]
+    fn probe_rejects_negative_sample_rate() {
+        let bad = "[escalation.probe]\nk = 5\nsample_rate = -0.1\n";
+        assert!(
+            matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
+            "negative sample_rate must be rejected"
         );
     }
 }

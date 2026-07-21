@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API &amp; MCP — Firstpass docs</title>
+<meta name="description" content="HTTP endpoints — both inbound dialects, deferred feedback, capabilities, health, and Prometheus metrics — plus the MCP stdio server tools for agent-native inspection.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.0</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html"><span class="num">01</span>Overview</a>
+<a href="how-it-works.html"><span class="num">02</span>How it works</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html"><span class="num">03</span>Gates</a>
+<a href="routing.html"><span class="num">04</span>Routing & escalation</a>
+<a href="guarantee.html"><span class="num">05</span>The guarantee</a>
+<a href="receipts.html"><span class="num">06</span>Receipts & audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">07</span>Providers</a>
+<a href="configuration.html"><span class="num">08</span>Configuration</a>
+<a href="cli.html"><span class="num">09</span>CLI reference</a>
+<a href="api.html" aria-current="page"><span class="num">10</span>API & MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research & data</p>
+<a href="elastic-verification.html"><span class="num">11</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">12</span>Benchmarks</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / API &amp; MCP</p>
+<h1>API &amp; MCP</h1>
+<p class="page-sub">Firstpass exposes a small HTTP surface — both inbound dialects, deferred feedback, capabilities, health, and Prometheus metrics — plus an MCP stdio server so agents can inspect the router as native tools.</p>
+
+<h2 id="endpoints">HTTP endpoints<a class="anchor" href="#endpoints" aria-label="Link to this section">#</a></h2>
+<div class="tblwrap"><table>
+  <thead><tr><th>Method &amp; path</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td><code>POST /v1/messages</code></td><td>Anthropic-dialect inbound. Runs the cascade, returns a normal response.</td></tr>
+    <tr><td><code>POST /v1/chat/completions</code></td><td>OpenAI-dialect inbound. Same cascade, OpenAI wire format.</td></tr>
+    <tr><td><code>POST /v1/feedback</code></td><td>Report a deferred outcome for a past request — drives adaptive calibration.</td></tr>
+    <tr><td><code>GET /v1/capabilities</code></td><td>What this instance supports — providers, gates, modes.</td></tr>
+    <tr><td><code>GET /healthz</code></td><td>Liveness / readiness.</td></tr>
+    <tr><td><code>GET /metrics</code></td><td>Prometheus exposition.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="messages">Chat &amp; messages<a class="anchor" href="#messages" aria-label="Link to this section">#</a></h2>
+<p>Both inbound endpoints are drop-in: keep your existing request body, point it at Firstpass, and it routes, gates, and serves. Override the mode per request with a header (<a href="routing.html#precedence">precedence</a>).</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl http://localhost:8080/v1/messages \
+  -H &quot;content-type: application/json&quot; \
+  -H &quot;x-firstpass-mode: quality&quot; \
+  -d &#x27;{
+    &quot;model&quot;: &quot;auto&quot;,
+    &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Write a function to merge two sorted lists.&quot;}]
+  }&#x27;</code></pre></div>
+
+<h2 id="feedback">Feedback<a class="anchor" href="#feedback" aria-label="Link to this section">#</a></h2>
+<p>When a request's true outcome becomes known later — CI went green, a reviewer approved, a user rejected — report it. This is what makes the serve threshold self-tune.</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl http://localhost:8080/v1/feedback \
+  -H &quot;content-type: application/json&quot; \
+  -d &#x27;{ &quot;request_id&quot;: &quot;req_9f2c8a41&quot;, &quot;outcome&quot;: &quot;correct&quot; }&#x27;</code></pre></div>
+
+<h2 id="caps">Capabilities &amp; health<a class="anchor" href="#caps" aria-label="Link to this section">#</a></h2>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl http://localhost:8080/v1/capabilities   # providers, gates, modes
+curl http://localhost:8080/healthz           # 200 when ready</code></pre></div>
+
+<h2 id="metrics">Metrics<a class="anchor" href="#metrics" aria-label="Link to this section">#</a></h2>
+<p><code>GET /metrics</code> is Prometheus exposition. The two gauges that make the guarantee observable:</p>
+<div class="defs">
+  <div class="row"><div class="k">firstpass_serve_threshold</div><div class="v">Current serve threshold; moves with adaptive conformal.</div></div>
+  <div class="row"><div class="k">firstpass_realized_served_failure</div><div class="v">Measured served-failure rate from reported outcomes — alert on this.</div></div>
+</div>
+
+<h2 id="headers">Request headers<a class="anchor" href="#headers" aria-label="Link to this section">#</a></h2>
+<div class="tblwrap"><table>
+  <thead><tr><th>Header</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>x-firstpass-mode</code></td><td>Override the routing mode for this request (highest precedence).</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="mcp">MCP server tools<a class="anchor" href="#mcp" aria-label="Link to this section">#</a></h2>
+<p><code>firstpass mcp</code> is a stdio MCP server. It gives an agent first-class access to the router's state and controls — inspection, rehearsal, and audit, no HTTP glue:</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>Tool</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>list_traces</code></td><td>Recent routing decisions.</td></tr>
+    <tr><td><code>get_trace</code></td><td>The full decision for one request.</td></tr>
+    <tr><td><code>get_savings</code></td><td>Net savings, gate cost included.</td></tr>
+    <tr><td><code>get_evals</code></td><td>Gate outcomes and served-failure aggregates.</td></tr>
+    <tr><td><code>explain_route</code></td><td>Why a request routed as it did.</td></tr>
+    <tr><td><code>rehearse_policy</code></td><td>Off-policy evaluation of a routing change (IPS/SNIPS/DR).</td></tr>
+    <tr><td><code>verify_receipts</code></td><td>Re-derive the hash chain and report integrity.</td></tr>
+    <tr><td><code>list_modes</code></td><td>Available modes and their resolved knobs.</td></tr>
+    <tr><td><code>submit_feedback</code></td><td>Report a deferred outcome.</td></tr>
+  </tbody>
+</table></div>
+
+<nav class="pager" aria-label="Pagination"><a class="prev" href="cli.html"><span class="dir">← Previous</span><span class="t">CLI reference</span></a><a class="next" href="elastic-verification.html"><span class="dir">Next →</span><span class="t">Elastic verification</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#endpoints" class="">HTTP endpoints</a><a href="#messages" class="">Chat &amp; messages</a><a href="#feedback" class="">Feedback</a><a href="#caps" class="">Capabilities &amp; health</a><a href="#metrics" class="">Metrics</a><a href="#headers" class="">Request headers</a><a href="#mcp" class="">MCP server tools</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js"></script>
+</body></html>

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Routing &amp; escalation — Firstpass docs</title>
+<meta name="description" content="The ladder, the learned start-rung bandit, speculative escalation, cross-provider failover, budget caps, and the mode presets that tune all of it per task, turn, or request.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.0</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html"><span class="num">01</span>Overview</a>
+<a href="how-it-works.html"><span class="num">02</span>How it works</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html"><span class="num">03</span>Gates</a>
+<a href="routing.html" aria-current="page"><span class="num">04</span>Routing & escalation</a>
+<a href="guarantee.html"><span class="num">05</span>The guarantee</a>
+<a href="receipts.html"><span class="num">06</span>Receipts & audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">07</span>Providers</a>
+<a href="configuration.html"><span class="num">08</span>Configuration</a>
+<a href="cli.html"><span class="num">09</span>CLI reference</a>
+<a href="api.html"><span class="num">10</span>API & MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research & data</p>
+<a href="elastic-verification.html"><span class="num">11</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">12</span>Benchmarks</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / Routing &amp; escalation</p>
+<h1>Routing &amp; escalation</h1>
+<p class="page-sub">The ladder decides where a request can go; the gate decides whether it stays. This page covers the ladder, the learned start-rung bandit, speculative escalation, cross-provider failover, budget caps, and the modes that tune all of it.</p>
+
+<h2 id="ladder">The ladder<a class="anchor" href="#ladder" aria-label="Link to this section">#</a></h2>
+<p>A ladder is an ordered list of rungs, cheapest first. Each rung is <code>provider/model</code>. A request opens on the start rung and climbs one rung per gate failure until something passes or a cap is hit.</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 260" role="img" aria-labelledby="ldT">
+<title id="ldT">The ladder: rungs ordered cheapest to most capable. A request opens on the start rung, and escalates one rung at a time only when the gate fails, stopping at the first rung whose output passes or when the budget or max_rungs cap is hit.</title>
+<g>
+  <rect x="60" y="190" width="240" height="52" rx="10" class="n-fill accent-s" stroke-width="1.6"/>
+  <text x="78" y="214" class="ink m" font-size="13" font-weight="600">anthropic/haiku</text>
+  <text x="78" y="232" class="ink-mut" font-size="11">start rung · cheapest</text>
+  <text x="275" y="222" text-anchor="end" class="accent-ink m" font-size="11" font-weight="640">$</text>
+</g><g>
+  <rect x="360" y="130" width="240" height="52" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
+  <text x="378" y="154" class="ink m" font-size="13" font-weight="600">openai/gpt-mini</text>
+  <text x="378" y="172" class="ink-mut" font-size="11">+1 on gate fail</text>
+  <text x="575" y="162" text-anchor="end" class="ink-mut m" font-size="11" font-weight="640">$$</text>
+</g><g>
+  <rect x="660" y="70" width="240" height="52" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
+  <text x="678" y="94" class="ink m" font-size="13" font-weight="600">anthropic/sonnet</text>
+  <text x="678" y="112" class="ink-mut" font-size="11">+1 on gate fail</text>
+  <text x="875" y="102" text-anchor="end" class="ink-mut m" font-size="11" font-weight="640">$$$</text>
+</g><line x1="300" y1="216" x2="356" y2="182" class="fail-s" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#ld)"/>
+<line x1="600" y1="156" x2="656" y2="122" class="fail-s" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#ld)"/>
+<text x="330" y="160" class="fail" font-size="10.5" font-weight="600">escalate</text>
+<text x="630" y="100" class="fail" font-size="10.5" font-weight="600">escalate</text>
+<text x="60" y="40" class="ink" font-size="13" font-weight="640">Cheapest first — climb only on proof of need</text>
+<defs><marker id="ld" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-fail)"/></marker></defs>
+</svg></div>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[ladder]
+rungs = [
+  &quot;anthropic/claude-haiku-4-5&quot;,   # rung 0
+  &quot;openai/gpt-mini&quot;,              # rung 1
+  &quot;anthropic/claude-sonnet-5&quot;,    # rung 2
+]
+max_rungs = 3                      # hard cap on the climb</code></pre></div>
+
+<h2 id="startrung">Learned start-rung<a class="anchor" href="#startrung" aria-label="Link to this section">#</a></h2>
+<p>Always starting at rung 0 is wasteful when a class of traffic reliably escalates. An optional bandit learns a better <strong>start rung</strong> — where to <em>begin</em> the cascade. The gate still decides what to serve, so a mis-predicted start only changes the entry point, never correctness. This is the "predict-to-start, verify-to-serve" split.</p>
+<p>Two algorithms are available (ADR 0007). The default is <strong>UCB1</strong>, and the bandit is <strong>default-off</strong>.</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>Algorithm</th><th>Character</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td><code>ucb1</code> (default)</td><td>Deterministic, fully auditable — the same history yields the same choice.</td><td>You need every routing decision to be replayable from the receipt.</td></tr>
+    <tr><td><code>thompson</code></td><td>Beta posteriors with discounting for drift; Monte-Carlo propensities for clean off-policy evaluation.</td><td>Traffic shifts over time and you want the sampler to track it, with propensities OPE can trust.</td></tr>
+  </tbody>
+</table></div>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[bandit]
+enabled = false            # default-off
+algo    = &quot;ucb1&quot;           # or &quot;thompson&quot;</code></pre></div>
+
+<h2 id="speculation">Speculative escalation<a class="anchor" href="#speculation" aria-label="Link to this section">#</a></h2>
+<p>When an escalation is likely, waiting for the gate to fail before starting the next rung pays serial latency. Speculation prefetches <code>k</code> rungs ahead in parallel, serves the first that passes, and discards the rest. The served bytes are <strong>byte-identical</strong> to the serial path — speculation changes latency, never output.</p>
+<p>To avoid speculating on requests that will obviously pass or obviously fail, a <code>speculation_band</code> fires the prefetch only in the marginal gate-pass zone:</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[speculation]
+enabled = true
+lookahead = 1              # prefetch 1 rung ahead
+speculation_band = [0.35, 0.65]   # only speculate when the pass-signal is marginal</code></pre></div>
+
+<h2 id="failover">Failover &amp; budgets<a class="anchor" href="#failover" aria-label="Link to this section">#</a></h2>
+<p>Escalation doubles as resilience. A transport error or a 5xx from a provider triggers <strong>cross-provider failover</strong> — the next rung may be a different vendor, so one provider's outage degrades gracefully instead of failing the request.</p>
+<p>Spend is bounded at three levels, plus the rung cap:</p>
+<div class="defs">
+  <div class="row"><div class="k">per_request</div><div class="v">Cap on total cost for a single request across all rungs and gates.</div></div>
+  <div class="row"><div class="k">per_session</div><div class="v">Cap across a session / conversation.</div></div>
+  <div class="row"><div class="k">per_day</div><div class="v">A daily ceiling so an unattended loop can't produce a surprise bill.</div></div>
+  <div class="row"><div class="k">max_rungs</div><div class="v">The maximum number of rungs a single request may climb.</div></div>
+</div>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[budget]
+per_request_usd = 0.05
+per_session_usd = 1.00
+per_day_usd     = 250.00</code></pre></div>
+
+<h2 id="modes">Modes<a class="anchor" href="#modes" aria-label="Link to this section">#</a></h2>
+<p>A <strong>mode</strong> is a named preset over the escalation knobs — a single dial that shifts the cost/quality/latency balance without editing config. Set it per task, per turn, or per request.</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>Mode</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>observe</code></td><td>Shadow only — route and gate, record everything, serve the original path. Zero behavior change.</td></tr>
+    <tr><td><code>cost</code></td><td>Bias hard to the cheap tier; escalate reluctantly.</td></tr>
+    <tr><td><code>balanced</code> (default)</td><td>The no-op baseline — escalate on proof of need.</td></tr>
+    <tr><td><code>quality</code></td><td>Add one rung of headroom (+1 rung) for harder work.</td></tr>
+    <tr><td><code>latency</code></td><td>Turn speculation on — prefetch ahead, serve the first pass.</td></tr>
+    <tr><td><code>max</code></td><td>Start at the top rung when nothing less will do.</td></tr>
+  </tbody>
+</table></div>
+<p>Inspect the resolved presets with <code>firstpass modes</code>. The mode in force is recorded on every receipt.</p>
+
+<h2 id="precedence">Mode precedence<a class="anchor" href="#precedence" aria-label="Link to this section">#</a></h2>
+<p>When more than one source names a mode, the most specific wins:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 120" role="img" aria-label="Mode precedence: the x-firstpass-mode request header beats the per-route routing_mode, which beats the FIRSTPASS_MODE_PROFILE environment default, which beats the built-in balanced default.">
+  <g font-size="12.5">
+    <rect x="20" y="40" width="210" height="52" rx="10" class="n-fill accent-s" stroke-width="1.6"/>
+    <text x="125" y="62" text-anchor="middle" class="ink m" font-size="12" font-weight="620">x-firstpass-mode</text>
+    <text x="125" y="80" text-anchor="middle" class="ink-mut" font-size="10.5">request header</text>
+    <rect x="270" y="40" width="200" height="52" rx="10" class="n-fill n-stroke" stroke-width="1.4"/>
+    <text x="370" y="62" text-anchor="middle" class="ink m" font-size="12" font-weight="600">routing_mode</text>
+    <text x="370" y="80" text-anchor="middle" class="ink-mut" font-size="10.5">per-route config</text>
+    <rect x="510" y="40" width="230" height="52" rx="10" class="n-fill n-stroke" stroke-width="1.4"/>
+    <text x="625" y="62" text-anchor="middle" class="ink m" font-size="11.5" font-weight="600">FIRSTPASS_MODE_PROFILE</text>
+    <text x="625" y="80" text-anchor="middle" class="ink-mut" font-size="10.5">env default</text>
+    <rect x="780" y="40" width="200" height="52" rx="10" class="n-fill n-stroke" stroke-width="1.4"/>
+    <text x="880" y="62" text-anchor="middle" class="ink m" font-size="12" font-weight="600">balanced</text>
+    <text x="880" y="80" text-anchor="middle" class="ink-mut" font-size="10.5">built-in default</text>
+  </g>
+  <text x="500" y="24" text-anchor="middle" class="ink-mut" font-size="11.5">highest precedence  →  fallback</text>
+  <line x1="230" y1="66" x2="268" y2="66" class="n-stroke" stroke-width="1.5" marker-end="url(#mp)"/>
+  <line x1="470" y1="66" x2="508" y2="66" class="n-stroke" stroke-width="1.5" marker-end="url(#mp)"/>
+  <line x1="740" y1="66" x2="778" y2="66" class="n-stroke" stroke-width="1.5" marker-end="url(#mp)"/>
+  <defs><marker id="mp" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
+</svg><figcaption><code>x-firstpass-mode</code> header &gt; per-route <code>routing_mode</code> &gt; <code>FIRSTPASS_MODE_PROFILE</code> env &gt; <code>balanced</code>.</figcaption></div>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># override the mode for a single request</span>
+curl localhost:8080/v1/messages \
+  -H &quot;x-firstpass-mode: quality&quot; \
+  -d @request.json</code></pre></div>
+
+<nav class="pager" aria-label="Pagination"><a class="prev" href="gates.html"><span class="dir">← Previous</span><span class="t">Gates</span></a><a class="next" href="guarantee.html"><span class="dir">Next →</span><span class="t">The guarantee</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#ladder" class="">The ladder</a><a href="#startrung" class="">Learned start-rung</a><a href="#speculation" class="">Speculative escalation</a><a href="#failover" class="">Failover &amp; budgets</a><a href="#modes" class="">Modes</a><a href="#precedence" class="">Mode precedence</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js"></script>
+</body></html>
