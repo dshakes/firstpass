@@ -1,0 +1,81 @@
+<svg viewBox="0 0 1000 430" xmlns="http://www.w3.org/2000/svg" role="img" preserveAspectRatio="xMidYMid meet" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <title>Firstpass architecture. Your agent calls the proxy on its existing endpoint — either POST /v1/messages (Anthropic dialect) or POST /v1/chat/completions (OpenAI dialect). Inside the proxy the request flows route to the cheapest rung, gate the real output, escalate one rung on failure, and serve the first pass. Rungs call providers with your own keys: anthropic, openai, or any OpenAI-compatible endpoint, with failover on 5xx. Every decision writes a SHA-256 hash-chained receipt, and deferred outcomes on /v1/feedback tune the serve threshold.</title>
+  <defs>
+    <marker id="a-arw" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#3a4a5e"/></marker>
+    <marker id="a-arp" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#19E3B1"/></marker>
+    <marker id="a-arf" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#FF5C5C"/></marker>
+  </defs>
+
+  <rect x="1.5" y="1.5" width="997" height="427" rx="16" fill="#0B0E14" stroke="#243244"/>
+
+  <!-- agent + two dialects -->
+  <rect x="26" y="158" width="140" height="104" rx="12" fill="#10151d" stroke="#2a3a4d" stroke-width="1.4"/>
+  <text x="96" y="192" text-anchor="middle" fill="#E6EDF3" font-size="15" font-weight="700">Your agent</text>
+  <text x="96" y="212" text-anchor="middle" fill="#8A97A6" font-size="10.5" font-family="ui-monospace, Menlo, monospace">SDK / any client</text>
+  <text x="96" y="234" text-anchor="middle" fill="#19E3B1" font-size="10" font-family="ui-monospace, Menlo, monospace">/v1/messages</text>
+  <text x="96" y="248" text-anchor="middle" fill="#19E3B1" font-size="10" font-family="ui-monospace, Menlo, monospace">/v1/chat/completions</text>
+  <line x1="166" y1="196" x2="212" y2="196" stroke="#3a4a5e" stroke-width="1.6" marker-end="url(#a-arw)"/>
+  <text x="189" y="188" text-anchor="middle" fill="#8A97A6" font-size="9.5" font-family="ui-monospace, Menlo, monospace">both dialects</text>
+
+  <!-- proxy container -->
+  <rect x="216" y="60" width="560" height="300" rx="16" fill="#0d1219" stroke="#2a3a4d" stroke-width="1.4"/>
+  <rect x="216" y="60" width="14" height="300" rx="7" fill="#19E3B1" opacity="0.7"/>
+  <text x="244" y="88" fill="#19E3B1" font-size="12" font-weight="700" font-family="ui-monospace, Menlo, monospace">firstpass proxy</text>
+
+  <!-- pipeline -->
+  <g font-weight="700">
+    <rect x="244" y="106" width="120" height="60" rx="10" fill="#10151d" stroke="#19E3B1" stroke-width="1.5"/>
+    <text x="304" y="132" text-anchor="middle" fill="#E6EDF3" font-size="14">Route</text>
+    <text x="304" y="150" text-anchor="middle" fill="#8A97A6" font-size="10" font-weight="400" font-family="ui-monospace, Menlo, monospace">cheapest rung</text>
+
+    <rect x="384" y="106" width="120" height="60" rx="10" fill="#10151d" stroke="#19E3B1" stroke-width="1.5"/>
+    <text x="444" y="132" text-anchor="middle" fill="#E6EDF3" font-size="14">Gate</text>
+    <text x="444" y="150" text-anchor="middle" fill="#8A97A6" font-size="10" font-weight="400" font-family="ui-monospace, Menlo, monospace">real output</text>
+
+    <rect x="524" y="106" width="120" height="60" rx="10" fill="#10151d" stroke="#FF5C5C" stroke-width="1.5"/>
+    <text x="584" y="132" text-anchor="middle" fill="#E6EDF3" font-size="14">Escalate</text>
+    <text x="584" y="150" text-anchor="middle" fill="#8A97A6" font-size="10" font-weight="400" font-family="ui-monospace, Menlo, monospace">+1 on fail</text>
+
+    <rect x="664" y="106" width="98" height="60" rx="10" fill="#10151d" stroke="#5EEACB" stroke-width="1.5"/>
+    <text x="713" y="132" text-anchor="middle" fill="#E6EDF3" font-size="14">Serve</text>
+    <text x="713" y="150" text-anchor="middle" fill="#8A97A6" font-size="10" font-weight="400" font-family="ui-monospace, Menlo, monospace">first pass</text>
+  </g>
+  <line x1="364" y1="136" x2="382" y2="136" stroke="#3a4a5e" stroke-width="1.6" marker-end="url(#a-arw)"/>
+  <line x1="504" y1="136" x2="522" y2="136" stroke="#FF5C5C" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#a-arf)"/>
+  <line x1="644" y1="136" x2="662" y2="136" stroke="#19E3B1" stroke-width="1.6" marker-end="url(#a-arp)"/>
+  <!-- gate pass shortcut -->
+  <path d="M444 166 L444 190 L713 190 L713 168" fill="none" stroke="#19E3B1" stroke-width="1.4" marker-end="url(#a-arp)"/>
+  <text x="578" y="205" text-anchor="middle" fill="#19E3B1" font-size="10" font-weight="600">gate passes → serve, no escalation (82% of traffic)</text>
+  <!-- escalate re-gate loop -->
+  <path d="M584 166 L584 230 L444 230 L444 168" fill="none" stroke="#FF5C5C" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#a-arf)"/>
+  <text x="514" y="248" text-anchor="middle" fill="#FF5C5C" font-size="10" font-weight="600">re-gate the next rung</text>
+
+  <!-- receipt -->
+  <rect x="244" y="286" width="238" height="58" rx="11" fill="#10151d" stroke="#2a3a4d" stroke-width="1.3"/>
+  <text x="363" y="311" text-anchor="middle" fill="#E6EDF3" font-size="13" font-weight="700">Receipt</text>
+  <text x="363" y="329" text-anchor="middle" fill="#8A97A6" font-size="10" font-family="ui-monospace, Menlo, monospace">SHA-256 hash-chained · append-only</text>
+  <path d="M444 168 L444 262 L363 262 L363 282" fill="none" stroke="#3a4a5e" stroke-width="1.3" marker-end="url(#a-arw)"/>
+
+  <!-- feedback -->
+  <rect x="510" y="286" width="252" height="58" rx="11" fill="#10151d" stroke="#2a3a4d" stroke-width="1.3"/>
+  <text x="636" y="311" text-anchor="middle" fill="#E6EDF3" font-size="13" font-weight="700">Feedback</text>
+  <text x="636" y="329" text-anchor="middle" fill="#8A97A6" font-size="10" font-family="ui-monospace, Menlo, monospace">/v1/feedback → serve threshold</text>
+  <path d="M636 286 L636 258 L560 258 L560 168" fill="none" stroke="#19E3B1" stroke-width="1.4" stroke-dasharray="2 3" marker-end="url(#a-arp)"/>
+
+  <!-- providers (BYOK) -->
+  <line x1="776" y1="136" x2="822" y2="136" stroke="#3a4a5e" stroke-width="1.6" marker-end="url(#a-arw)"/>
+  <text x="799" y="128" text-anchor="middle" fill="#8A97A6" font-size="9.5" font-family="ui-monospace, Menlo, monospace">BYOK</text>
+  <g font-family="ui-monospace, Menlo, monospace" font-size="11">
+    <rect x="826" y="96" width="150" height="34" rx="8" fill="#10151d" stroke="#2a3a4d" stroke-width="1.2"/>
+    <text x="901" y="117" text-anchor="middle" fill="#E6EDF3">anthropic/*</text>
+    <rect x="826" y="138" width="150" height="34" rx="8" fill="#10151d" stroke="#2a3a4d" stroke-width="1.2"/>
+    <text x="901" y="159" text-anchor="middle" fill="#E6EDF3">openai/*</text>
+    <rect x="826" y="180" width="150" height="34" rx="8" fill="#10151d" stroke="#2a3a4d" stroke-width="1.2"/>
+    <text x="901" y="201" text-anchor="middle" fill="#8A97A6" font-size="10">any OpenAI-compat</text>
+  </g>
+  <text x="901" y="234" text-anchor="middle" fill="#8A97A6" font-size="10" font-family="ui-monospace, Menlo, monospace">failover on 5xx</text>
+
+  <!-- served response back -->
+  <path d="M713 166 L713 270 L96 270 L96 262" fill="none" stroke="#19E3B1" stroke-width="1.5" marker-end="url(#a-arp)"/>
+  <text x="150" y="263" text-anchor="start" fill="#19E3B1" font-size="10" font-weight="600">served response — byte-identical</text>
+</svg>
