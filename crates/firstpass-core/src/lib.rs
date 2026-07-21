@@ -34,8 +34,8 @@ pub mod verdict;
 
 pub use config::{
     AbstainPolicy, AuthScheme, BanditAlgorithm, BanditConfig, Budget, Config, ConsistencyDef,
-    Dialect, Escalation, GateDef, JudgeDef, Mode, ModelRef, OnExhausted, PriceDef, ProviderDef,
-    Route, SessionPromotion,
+    Dialect, Escalation, GateDef, JudgeDef, Mode, ModePreset, ModelRef, OnExhausted, PriceDef,
+    ProviderDef, Route, RoutingMode, SessionPromotion,
 };
 pub use conformal::{ConformalResult, calibrate, served_failure_rate};
 pub use cost::{ModelPrice, PriceTable};

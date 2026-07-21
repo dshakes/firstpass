@@ -776,6 +776,7 @@ mod tests {
                 id: "test@v0".to_owned(),
                 explore: false,
                 propensity: None,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),
@@ -851,6 +852,7 @@ mod tests {
                 id: "test@v0".to_owned(),
                 explore: false,
                 propensity: None,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),
@@ -1258,6 +1260,7 @@ serve_threshold = 0.75
                 id: "bandit@v1+eps".to_owned(),
                 explore: rung != 0,
                 propensity,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),

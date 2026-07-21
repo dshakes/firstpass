@@ -16,7 +16,7 @@ use firstpass_core::features::{hour_bucket, token_bucket};
 use firstpass_core::hashchain::sha256_hex;
 use firstpass_core::{
     Attempt, DeferredVerdict, Dialect, FEATURE_VERSION, Features, FinalOutcome, GENESIS_HASH, Mode,
-    PolicyRef, RequestInfo, Score, ServedFrom, TaskKind, Trace, Verdict,
+    PolicyRef, RequestInfo, RoutingMode, Score, ServedFrom, TaskKind, Trace, Verdict,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -300,11 +300,23 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
         .and_then(|c| c.routes.iter().find(|r| r.mode == Mode::Enforce))
         .map(|r| (r.ladder.clone(), r.gates.clone()))
         .unwrap_or_default();
+    let routing_modes: Vec<serde_json::Value> = RoutingMode::ALL
+        .iter()
+        .map(|m| {
+            let p = m.preset();
+            serde_json::json!({
+                "name": m.as_str(),
+                "description": p.description,
+                "tradeoff": p.tradeoff,
+            })
+        })
+        .collect();
     Json(serde_json::json!({
         "service": "firstpass",
         "version": env!("CARGO_PKG_VERSION"),
         "feature_version": FEATURE_VERSION,
         "modes": ["observe", "enforce"],
+        "routing_modes": routing_modes,
         "wire_apis": ["anthropic.messages", "openai.chat_completions"],
         "ladder": ladder,
         "gates": gates,
@@ -441,6 +453,44 @@ const SESSION_HEADER: &str = "x-firstpass-session";
 const AGENT_HEADER: &str = "x-firstpass-agent";
 /// Header carrying the calling subagent identity.
 const SUBAGENT_HEADER: &str = "x-firstpass-subagent";
+/// Per-request routing-mode override. Case-insensitive; unknown values are logged and ignored
+/// (fall through to route-level / global-default). Valid values: observe|cost|balanced|quality|latency|max.
+const MODE_PROFILE_HEADER: &str = "x-firstpass-mode";
+
+/// Resolve the effective [`RoutingMode`] for this request.
+///
+/// Precedence (highest first):
+/// 1. `x-firstpass-mode` request header (case-insensitive; unknown values → warn + fall through)
+/// 2. `route.routing_mode` (per-route config)
+/// 3. `config.default_routing_mode` (global `FIRSTPASS_MODE_PROFILE` env var, default `Balanced`)
+///
+/// When nothing is set, returns `Balanced` — a strict no-op over existing config.
+fn resolve_mode(headers: &HeaderMap, route: &Route, config: &ProxyConfig) -> RoutingMode {
+    // (a) per-request header wins over everything
+    if let Some(val) = header_str(headers, MODE_PROFILE_HEADER) {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "observe" => return RoutingMode::Observe,
+            "cost" => return RoutingMode::Cost,
+            "balanced" => return RoutingMode::Balanced,
+            "quality" => return RoutingMode::Quality,
+            "latency" => return RoutingMode::Latency,
+            "max" => return RoutingMode::Max,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "unknown x-firstpass-mode value; ignoring \
+                     (valid: observe|cost|balanced|quality|latency|max)"
+                );
+            }
+        }
+    }
+    // (b) per-route config
+    if let Some(m) = route.routing_mode {
+        return m;
+    }
+    // (c) global default (env FIRSTPASS_MODE_PROFILE, default Balanced)
+    config.default_routing_mode
+}
 
 /// `POST /v1/messages` — dispatch on the matched route's mode. **Enforce** routes run the
 /// escalation engine (gate + escalate + failover); everything else is an **observe**
@@ -465,6 +515,12 @@ async fn messages(
             // Clone the matched route so no borrow of `state.config` is held across the await;
             // routes are tiny (a handful of strings).
             let route = route.clone();
+            // Resolve routing-mode preset (header > route > global default).
+            let routing_mode = resolve_mode(&headers, &route, &state.config);
+            // Observe mode forces the observe passthrough path — no gating, no escalation.
+            if routing_mode == RoutingMode::Observe {
+                return observe_passthrough(state, headers, body, session_header, tenant).await;
+            }
             if enforce_can_handle(
                 &features,
                 &body,
@@ -481,6 +537,7 @@ async fn messages(
                     &route,
                     session_header,
                     tenant,
+                    routing_mode,
                 )
                 .await;
             }
@@ -618,6 +675,7 @@ fn extract_features(headers: &HeaderMap, body: &[u8]) -> Features {
 
 /// Enforce mode (SPEC §7.1): run the escalation engine and serve the first output that clears
 /// the route's gates, escalating on failure with cross-provider failover.
+#[allow(clippy::too_many_arguments)]
 async fn handle_enforce(
     state: &AppState,
     headers: &HeaderMap,
@@ -626,6 +684,7 @@ async fn handle_enforce(
     route: &Route,
     session_header: Option<String>,
     tenant: String,
+    routing_mode: RoutingMode,
 ) -> Response {
     // A streaming client gets its SSE connection opened IMMEDIATELY: the routing pipeline
     // (model call + gates + possible escalation) runs in a spawned task while the response body
@@ -647,6 +706,7 @@ async fn handle_enforce(
                 &route_c,
                 session_header,
                 tenant,
+                routing_mode,
             )
             .await;
             let _ = tx.send(out);
@@ -661,6 +721,7 @@ async fn handle_enforce(
         route,
         session_header,
         tenant,
+        routing_mode,
     )
     .await
     {
@@ -672,7 +733,7 @@ async fn handle_enforce(
 /// Inner pipeline: resolve gates → route the ladder → bookkeeping (bandit, trace) → the served
 /// [`ModelResponse`]. Shared by both Anthropic and OpenAI enforce paths; callers handle dialect-
 /// specific parsing before and response rendering after.
-#[allow(clippy::too_many_arguments)] // 9 params: all are genuinely distinct, not groupable
+#[allow(clippy::too_many_arguments)] // 10 params: all are genuinely distinct, not groupable
 async fn enforce_pipeline_inner(
     state: &AppState,
     body: &Bytes,
@@ -683,6 +744,7 @@ async fn enforce_pipeline_inner(
     session_header: Option<String>,
     tenant: String,
     api: &str,
+    routing_mode: RoutingMode,
 ) -> Result<ModelResponse, ProxyError> {
     let gate_defs = state
         .config
@@ -713,6 +775,16 @@ async fn enforce_pipeline_inner(
         .as_ref()
         .and_then(|a| a.lock().ok().map(|g| g.threshold()))
         .or(serve_threshold);
+
+    // Apply routing-mode preset overrides on top of config values.
+    // Balanced preset has all None/false — byte-identical to existing behaviour.
+    let preset = routing_mode.preset();
+    let max_rungs = if let Some(delta) = preset.max_rungs_delta {
+        (max_rungs as i32 + delta).max(1) as u32
+    } else {
+        max_rungs
+    };
+    let speculation = preset.speculation.unwrap_or(speculation);
 
     // Predict-to-start (bandit): choose where the ladder starts for this context.
     // The gate still verifies the chosen rung's output before serving — prediction errors cost
@@ -777,6 +849,14 @@ async fn enforce_pipeline_inner(
         (chosen, format!("{base_policy_id}+eps"), eps_branch, Some(p))
     } else {
         (greedy_rung, base_policy_id, false, None)
+    };
+
+    // Apply start_at_top mode override: Max mode skips bandit/epsilon and jumps to top rung.
+    // ponytail: if ladder is empty start_rung stays 0 (saturating_sub handles it).
+    let start_rung = if preset.start_at_top {
+        route.ladder.len().saturating_sub(1) as u32
+    } else {
+        start_rung
     };
 
     // Speculative-deferral band: prefetch only when the bandit's gate-pass estimate for the
@@ -845,6 +925,11 @@ async fn enforce_pipeline_inner(
     // route_enforce leaves these at (false, None); we own the trace before it's hashed+stored.
     trace.policy.explore = explore_flag;
     trace.policy.propensity = propensity;
+    // Stamp the resolved mode profile when it's not Balanced (the default).
+    // None → absent from JSON → byte-identical for existing traces.
+    if routing_mode != RoutingMode::Balanced {
+        trace.policy.mode_profile = Some(routing_mode.as_str().to_owned());
+    }
 
     // Online bandit learning: feed back every gate verdict from this request so the bandit
     // refines its start-rung estimates. Cheap in-memory update; done before offer_trace so the
@@ -868,6 +953,7 @@ async fn enforce_pipeline_inner(
 
 /// Anthropic enforce pipeline: parse → inner pipeline → Anthropic-shaped response JSON.
 /// Shared verbatim by the buffered (non-streaming) and keepalive-streaming paths.
+#[allow(clippy::too_many_arguments)]
 async fn enforce_pipeline(
     state: &AppState,
     headers: &HeaderMap,
@@ -876,6 +962,7 @@ async fn enforce_pipeline(
     route: &Route,
     session_header: Option<String>,
     tenant: String,
+    routing_mode: RoutingMode,
 ) -> Result<Value, ProxyError> {
     let Some(base_request) = parse_model_request(body) else {
         return Err(ProxyError::BadRequest(
@@ -893,6 +980,7 @@ async fn enforce_pipeline(
         session_header,
         tenant,
         "anthropic.messages",
+        routing_mode,
     )
     .await?;
     Ok(anthropic_response_json(&resp))
@@ -900,6 +988,7 @@ async fn enforce_pipeline(
 
 /// OpenAI enforce pipeline: parse (with raw-carry for all-OpenAI ladders, else translation) →
 /// inner pipeline → OpenAI `chat.completion` JSON.
+#[allow(clippy::too_many_arguments)]
 async fn enforce_pipeline_openai(
     state: &AppState,
     headers: &HeaderMap,
@@ -908,6 +997,7 @@ async fn enforce_pipeline_openai(
     route: &Route,
     session_header: Option<String>,
     tenant: String,
+    routing_mode: RoutingMode,
 ) -> Result<Value, ProxyError> {
     // Decide between verbatim raw-carry (all-OpenAI ladder) and translation (Anthropic ladder).
     let providers = &state.providers;
@@ -933,6 +1023,7 @@ async fn enforce_pipeline_openai(
         session_header,
         tenant,
         "openai.chat_completions",
+        routing_mode,
     )
     .await?;
     Ok(openai_response_json(&resp))
@@ -1539,6 +1630,7 @@ fn base_trace(
             id: "observe-passthrough@v0".to_owned(),
             explore: false,
             propensity: None,
+            mode_profile: None,
         },
         request: RequestInfo {
             api: "anthropic.messages".to_owned(),
@@ -2074,6 +2166,7 @@ fn openai_sse_from_message(message: &Value) -> String {
 
 /// Enforce mode for an OpenAI-inbound request: run the escalation engine and serve the
 /// first output that clears the route's gates, rendered as an OpenAI `chat.completion`.
+#[allow(clippy::too_many_arguments)]
 async fn handle_enforce_openai(
     state: &AppState,
     headers: &HeaderMap,
@@ -2082,6 +2175,7 @@ async fn handle_enforce_openai(
     route: &Route,
     session_header: Option<String>,
     tenant: String,
+    routing_mode: RoutingMode,
 ) -> Response {
     if is_stream_request(body) {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
@@ -2096,6 +2190,7 @@ async fn handle_enforce_openai(
                 &route_c,
                 session_header,
                 tenant,
+                routing_mode,
             )
             .await;
             let _ = tx.send(out);
@@ -2110,6 +2205,7 @@ async fn handle_enforce_openai(
         route,
         session_header,
         tenant,
+        routing_mode,
     )
     .await
     {
@@ -2210,6 +2306,13 @@ async fn chat_completions(
             .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
         {
             let route = route.clone();
+            // Resolve routing-mode preset (header > route > global default).
+            let routing_mode = resolve_mode(&headers, &route, &state.config);
+            // Observe mode forces the observe passthrough path — no gating, no escalation.
+            if routing_mode == RoutingMode::Observe {
+                return observe_passthrough_openai(state, headers, body, session_header, tenant)
+                    .await;
+            }
             if enforce_can_handle(
                 &features,
                 &body,
@@ -2226,6 +2329,7 @@ async fn chat_completions(
                     &route,
                     session_header,
                     tenant,
+                    routing_mode,
                 )
                 .await;
             }
@@ -2455,6 +2559,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mode_profile_stamped_on_trace_when_non_balanced() {
+        let (state, mut rx) = enforce_state(
+            &["anthropic/claude-haiku-4-5"],
+            &["non-empty"],
+            vec![(
+                "anthropic/claude-haiku-4-5",
+                Ok(model_resp("anthropic/claude-haiku-4-5", "hello")),
+            )],
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-firstpass-mode", "quality".parse().unwrap());
+        let resp = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            headers,
+            user_body(),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let trace = rx.try_recv().expect("trace enqueued");
+        assert_eq!(
+            trace.policy.mode_profile.as_deref(),
+            Some("quality"),
+            "mode_profile must be stamped when quality mode is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_profile_absent_from_trace_when_balanced() {
+        let (state, mut rx) = enforce_state(
+            &["anthropic/claude-haiku-4-5"],
+            &["non-empty"],
+            vec![(
+                "anthropic/claude-haiku-4-5",
+                Ok(model_resp("anthropic/claude-haiku-4-5", "hello")),
+            )],
+        );
+        // No mode header, no route routing_mode → Balanced by default → None.
+        let resp = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            user_body(),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let trace = rx.try_recv().expect("trace enqueued");
+        assert!(
+            trace.policy.mode_profile.is_none(),
+            "mode_profile must be absent when Balanced (byte-identical invariant)"
+        );
+    }
+
+    #[tokio::test]
     async fn enforce_serves_first_pass_and_returns_anthropic_shape() {
         let (state, mut rx) = enforce_state(
             &["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"],
@@ -2568,6 +2726,121 @@ mod tests {
         .await;
         // Observe path forwards upstream; the bogus host yields a gateway error, not our 200.
         assert_ne!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    // ── resolve_mode tests ────────────────────────────────────────────────────
+
+    fn bare_enforce_route() -> Route {
+        use firstpass_core::config::{Match, Mode};
+        Route {
+            match_: Match::default(),
+            mode: Mode::Enforce,
+            ladder: vec!["anthropic/claude-haiku-4-5".to_owned()],
+            gates: vec![],
+            deferred_gates: vec![],
+            routing_mode: None,
+        }
+    }
+
+    #[test]
+    fn balanced_preset_application_is_noop() {
+        // The core invariant: applying the Balanced preset to any base values returns them unchanged.
+        let base_max_rungs = 3u32;
+        let base_speculation = 2u32;
+        let preset = RoutingMode::Balanced.preset();
+        let max_rungs = if let Some(d) = preset.max_rungs_delta {
+            (base_max_rungs as i32 + d).max(1) as u32
+        } else {
+            base_max_rungs
+        };
+        let speculation = preset.speculation.unwrap_or(base_speculation);
+        let start_at_top = preset.start_at_top;
+        assert_eq!(max_rungs, 3, "Balanced must not change max_rungs");
+        assert_eq!(speculation, 2, "Balanced must not change speculation");
+        assert!(!start_at_top, "Balanced must not set start_at_top");
+    }
+
+    #[test]
+    fn resolve_mode_header_wins_over_route_and_global() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-firstpass-mode", "cost".parse().unwrap());
+        let mut route = bare_enforce_route();
+        route.routing_mode = Some(RoutingMode::Quality); // lower priority
+        let mut config = test_config();
+        config.default_routing_mode = RoutingMode::Max; // lowest priority
+        assert_eq!(
+            resolve_mode(&headers, &route, &config),
+            RoutingMode::Cost,
+            "header must win"
+        );
+    }
+
+    #[test]
+    fn resolve_mode_route_wins_over_global_when_no_header() {
+        let mut route = bare_enforce_route();
+        route.routing_mode = Some(RoutingMode::Latency);
+        let mut config = test_config();
+        config.default_routing_mode = RoutingMode::Max;
+        assert_eq!(
+            resolve_mode(&HeaderMap::new(), &route, &config),
+            RoutingMode::Latency,
+            "route must beat global default"
+        );
+    }
+
+    #[test]
+    fn resolve_mode_global_when_header_and_route_absent() {
+        let mut config = test_config();
+        config.default_routing_mode = RoutingMode::Quality;
+        assert_eq!(
+            resolve_mode(&HeaderMap::new(), &bare_enforce_route(), &config),
+            RoutingMode::Quality
+        );
+    }
+
+    #[test]
+    fn resolve_mode_unknown_header_falls_through_to_route() {
+        let mut headers = HeaderMap::new();
+        // An unrecognised value must be ignored (warn + fall through).
+        headers.insert("x-firstpass-mode", "turbo-mode".parse().unwrap());
+        let mut route = bare_enforce_route();
+        route.routing_mode = Some(RoutingMode::Cost);
+        let config = test_config();
+        assert_eq!(
+            resolve_mode(&headers, &route, &config),
+            RoutingMode::Cost,
+            "unknown header value must fall through to route"
+        );
+    }
+
+    #[test]
+    fn resolve_mode_header_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-firstpass-mode", "QUALITY".parse().unwrap());
+        assert_eq!(
+            resolve_mode(&headers, &bare_enforce_route(), &test_config()),
+            RoutingMode::Quality
+        );
+    }
+
+    #[test]
+    fn resolve_mode_no_mode_set_returns_balanced() {
+        // Default config has Balanced; route has None → must return Balanced.
+        assert_eq!(
+            resolve_mode(&HeaderMap::new(), &bare_enforce_route(), &test_config()),
+            RoutingMode::Balanced
+        );
+    }
+
+    #[test]
+    fn capabilities_json_includes_routing_modes() {
+        let modes: Vec<&'static str> = RoutingMode::ALL.iter().map(|m| m.as_str()).collect();
+        assert!(modes.contains(&"balanced"));
+        assert!(modes.contains(&"cost"));
+        assert!(modes.contains(&"quality"));
+        assert!(modes.contains(&"latency"));
+        assert!(modes.contains(&"max"));
+        assert!(modes.contains(&"observe"));
     }
 
     #[test]

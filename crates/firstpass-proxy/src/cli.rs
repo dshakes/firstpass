@@ -609,6 +609,7 @@ mod tests {
                 id: "observe-passthrough@v0".to_owned(),
                 explore: false,
                 propensity: None,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),
@@ -704,6 +705,7 @@ mod tests {
                 id: "static-ladder@v0".to_owned(),
                 explore: false,
                 propensity: None,
+                mode_profile: None,
             },
             request: RequestInfo {
                 api: "anthropic.messages".to_owned(),

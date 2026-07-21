@@ -144,6 +144,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
             id: ctx.policy_id,
             explore: false,
             propensity: None, // patched by handle_enforce when exploration is configured
+            mode_profile: None, // patched by handle_enforce when routing_mode != Balanced
         },
         request: RequestInfo {
             api: ctx.api,

@@ -6,7 +6,7 @@
 //! unit-test by value beats pulling in an async MCP framework. [`handle_rpc`] is the pure core;
 //! [`serve_stdio`] is the thin transport loop around it.
 
-use firstpass_core::{DeferredVerdict, Score, Verdict};
+use firstpass_core::{DeferredVerdict, RoutingMode, Score, Verdict};
 use serde_json::{Value, json};
 
 use crate::store;
@@ -82,6 +82,11 @@ fn tool_schemas() -> Value {
                 },
                 "required": ["trace_id", "gate_id", "verdict", "reporter"]
             }
+        },
+        {
+            "name": "list_modes",
+            "description": "List the supported routing-mode profiles with their knob overrides and honest tradeoffs. Set a mode via the x-firstpass-mode header, per-route routing_mode, or FIRSTPASS_MODE_PROFILE env var.",
+            "inputSchema": { "type": "object", "properties": {} }
         }
     ])
 }
@@ -137,6 +142,7 @@ fn handle_tool_call(id: Value, params: Option<&Value>, db_path: &str, tenant: &s
         "verify_receipts" => tool_verify_receipts(db_path),
         "get_trace" => tool_get_trace(&args, db_path, tenant),
         "submit_feedback" => tool_submit_feedback(&args, db_path, tenant),
+        "list_modes" => tool_list_modes(),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -264,6 +270,26 @@ fn tool_submit_feedback(args: &Value, db_path: &str, tenant: &str) -> Result<Str
     Ok(json!({ "status": "recorded", "trace_id": trace_id }).to_string())
 }
 
+fn tool_list_modes() -> Result<String, String> {
+    let modes: Vec<Value> = RoutingMode::ALL
+        .iter()
+        .map(|m| {
+            let p = m.preset();
+            json!({
+                "name": m.as_str(),
+                "description": p.description,
+                "tradeoff": p.tradeoff,
+                "overrides": {
+                    "speculation": p.speculation,
+                    "max_rungs_delta": p.max_rungs_delta,
+                    "start_at_top": p.start_at_top,
+                }
+            })
+        })
+        .collect();
+    serde_json::to_string(&modes).map_err(|e| format!("encode error: {e}"))
+}
+
 fn ok(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
@@ -342,7 +368,8 @@ mod tests {
                 "explain_route",
                 "rehearse_policy",
                 "verify_receipts",
-                "submit_feedback"
+                "submit_feedback",
+                "list_modes",
             ]
         );
     }
@@ -409,6 +436,44 @@ mod tests {
             handle_rpc(&unknown, &db, "default").unwrap()["result"]["isError"],
             true
         );
+    }
+
+    #[test]
+    fn list_modes_returns_all_named_modes() {
+        let req = json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                          "params": { "name": "list_modes", "arguments": {} } });
+        let resp = handle_rpc(&req, "unused.db", "default").unwrap();
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "list_modes must not error"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let modes: serde_json::Value = serde_json::from_str(text).unwrap();
+        let names: Vec<&str> = modes
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["name"].as_str())
+            .collect();
+        assert!(names.contains(&"balanced"), "balanced must be listed");
+        assert!(names.contains(&"cost"), "cost must be listed");
+        assert!(names.contains(&"quality"), "quality must be listed");
+        assert!(names.contains(&"latency"), "latency must be listed");
+        assert!(names.contains(&"max"), "max must be listed");
+        assert!(names.contains(&"observe"), "observe must be listed");
+        // Each entry must have description and tradeoff.
+        for mode in modes.as_array().unwrap() {
+            assert!(
+                mode["description"].as_str().is_some_and(|s| !s.is_empty()),
+                "mode {:?} missing description",
+                mode["name"]
+            );
+            assert!(
+                mode["tradeoff"].as_str().is_some_and(|s| !s.is_empty()),
+                "mode {:?} missing tradeoff",
+                mode["name"]
+            );
+        }
     }
 
     #[test]
