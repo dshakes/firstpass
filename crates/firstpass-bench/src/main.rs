@@ -47,6 +47,64 @@ fn main() {
     // `--coding` = offline solver (no model spend); `--coding-live` = live candidate model.
     // FIRSTPASS_CODING_N=<n> swaps the 3-task demo suite for the scalable generated suite of n tasks
     // (needed for a feasible conformal bound).
+    // Probe-signal validation study (ADR 0008 go/no-go): draw k cheap samples per task, measure
+    // whether self-consistency uncertainty predicts the oracle outcome. Needs a dataset + key + Docker.
+    //   FIRSTPASS_CODING_DATASET=mbpp.jsonl FIRSTPASS_PROBE_K=5 firstpass-bench --probe-study
+    if args.iter().any(|a| a == "--probe-study") {
+        let key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                eprintln!("--probe-study needs ANTHROPIC_API_KEY set (BYOK)");
+                std::process::exit(2);
+            }
+        };
+        let dataset_path = std::env::var("FIRSTPASS_CODING_DATASET").ok();
+        let k: u32 = std::env::var("FIRSTPASS_PROBE_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        let sb = match establish_sandbox(SANDBOX_IMAGE) {
+            Ok(sb) => sb,
+            Err(e) => {
+                eprintln!("cannot run probe study — sandbox not established: {e}");
+                std::process::exit(1);
+            }
+        };
+        let n_gen = std::env::var("FIRSTPASS_CODING_N")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        let tasks = match &dataset_path {
+            Some(path) => match load_mbpp_jsonl(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("failed to load coding dataset {path}: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => match n_gen {
+                Some(n) => generated_coding_suite(n),
+                None => coding_suite(),
+            },
+        };
+        let solver = LiveSolver::new(key, "claude-haiku-4-5".to_owned());
+        match firstpass_bench::coding::run_probe_study(&tasks, &solver, sb.as_ref(), k) {
+            Ok(report) => {
+                println!("{}", report.render());
+                // Emit the per-task points as JSONL on stderr for the committed artifact / ROC.
+                for pt in &report.points {
+                    if let Ok(line) = serde_json::to_string(pt) {
+                        eprintln!("{line}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("probe study failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args.iter().any(|a| a == "--coding" || a == "--coding-live") {
         let live_coding = args.iter().any(|a| a == "--coding-live");
         let dataset_path = std::env::var("FIRSTPASS_CODING_DATASET").ok();

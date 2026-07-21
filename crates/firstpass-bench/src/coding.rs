@@ -751,6 +751,23 @@ impl CandidateSolver for GeneratedSolver {
 mod tests {
     use super::*;
 
+    #[test]
+    fn binary_entropy_endpoints_and_peak() {
+        assert!((binary_entropy(0.0)).abs() < 1e-12);
+        assert!((binary_entropy(1.0)).abs() < 1e-12);
+        assert!((binary_entropy(0.5) - 1.0).abs() < 1e-12); // max doubt = 1 bit
+        assert!(binary_entropy(0.2) > 0.0 && binary_entropy(0.2) < 1.0);
+    }
+
+    #[test]
+    fn auc_perfect_separation_and_no_signal() {
+        let perfect = [(0.9, true), (0.8, true), (0.1, false), (0.2, false)];
+        assert!((auc(&perfect) - 1.0).abs() < 1e-12);
+        let flat = [(0.5, true), (0.5, false)];
+        assert!((auc(&flat) - 0.5).abs() < 1e-12);
+        assert!((auc(&[(0.3, true)]) - 0.5).abs() < 1e-12);
+    }
+
     fn outcome(id: &str, score: f64, oracle: bool) -> TaskOutcome {
         TaskOutcome {
             id: id.to_owned(),
@@ -1058,5 +1075,200 @@ mod tests {
             broken.is_some(),
             "expected at least one broken generated task with a partial score"
         );
+    }
+}
+
+// ── Probe-signal validation study (ADR 0008 go/no-go) ────────────────────────
+//
+// The elastic-verification thesis rests on ONE empirical question: does a cheap probe's
+// self-consistency uncertainty predict whether the served output will actually pass the
+// (hidden) oracle? If yes, we can verify *proportional to doubt* — serve without the expensive
+// gate when the probe is confident, escalate before wasting a cheap attempt when it is
+// confidently hard — and still bound served-failure. If the signal is noise, the whole
+// architecture is unjustified. This module measures that signal on real tasks; the resulting
+// AUC is the pre-registered go/no-go, not a product feature.
+
+/// One task's probe measurement: `k` cheap samples, their visible-test agreement, and the
+/// ground-truth oracle outcome of the candidate a cascade would actually serve.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbePoint {
+    /// Task id.
+    pub id: String,
+    /// How many of the `k` samples fully passed the visible tests.
+    pub visible_pass_count: u32,
+    /// `visible_pass_count / k` — the probe's empirical pass-rate estimate.
+    pub p_hat: f64,
+    /// Binary entropy of `p_hat`, in `[0, 1]`: 0 = the `k` samples all agree (confident),
+    /// 1 = maximal split (maximal doubt). This is the cheap probe's uncertainty signal.
+    pub uncertainty: f64,
+    /// The served candidate (first that fully passes visible, else the first sample) fully
+    /// passes the visible gate — the condition a cascade serves on today.
+    pub served_visible_full_pass: bool,
+    /// Ground truth: the served candidate passes the hidden oracle.
+    pub served_oracle_correct: bool,
+}
+
+/// Aggregate of a probe study — the decision-relevant numbers.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbeStudyReport {
+    /// Samples drawn per task.
+    pub k: u32,
+    /// Tasks measured.
+    pub n: usize,
+    /// AUC of `uncertainty` predicting oracle **failure** (label = `!served_oracle_correct`).
+    /// 0.5 = no signal (thesis dead); → 1.0 = the probe cleanly separates hard from easy.
+    pub auc_uncertainty_predicts_failure: f64,
+    /// Fraction of tasks the probe calls "confident" (`uncertainty == 0`: all `k` samples agree
+    /// on full visible pass). These are the candidates elastic verification would serve without
+    /// the expensive gate.
+    pub confident_frac: f64,
+    /// Among confident tasks that also serve a visible-passing candidate, the fraction that are
+    /// actually oracle-correct — the **safety** of skipping verification. If this is ≥ 1 − α the
+    /// skip is safe; if it is low, confident-looking answers are silently wrong and skipping is
+    /// unsafe.
+    pub skip_safety_when_confident: f64,
+    /// Per-task points (for the committed artifact / offline ROC).
+    pub points: Vec<ProbePoint>,
+}
+
+/// Binary entropy of a Bernoulli(`p`) in bits, normalized to `[0, 1]`.
+fn binary_entropy(p: f64) -> f64 {
+    if p <= 0.0 || p >= 1.0 {
+        return 0.0;
+    }
+    -(p * p.log2() + (1.0 - p) * (1.0 - p).log2())
+}
+
+/// AUC via the Mann–Whitney rank-sum identity: P(score(positive) > score(negative)), ties = 0.5.
+/// `labeled` is `(score, is_positive)`. Returns 0.5 when either class is empty (no signal).
+fn auc(labeled: &[(f64, bool)]) -> f64 {
+    let pos: Vec<f64> = labeled
+        .iter()
+        .filter(|(_, y)| *y)
+        .map(|(s, _)| *s)
+        .collect();
+    let neg: Vec<f64> = labeled
+        .iter()
+        .filter(|(_, y)| !*y)
+        .map(|(s, _)| *s)
+        .collect();
+    if pos.is_empty() || neg.is_empty() {
+        return 0.5;
+    }
+    let mut wins = 0.0_f64;
+    for &p in &pos {
+        for &n in &neg {
+            wins += if p > n {
+                1.0
+            } else if (p - n).abs() < f64::EPSILON {
+                0.5
+            } else {
+                0.0
+            };
+        }
+    }
+    wins / (pos.len() as f64 * neg.len() as f64)
+}
+
+/// Measure the probe signal on `tasks`: draw `k` cheap samples per task, score each against the
+/// visible tests, pick the candidate a cascade would serve, and record whether it clears the
+/// hidden oracle. Aborts (`Err`) on any solver failure — a corrupted sample corrupts the study.
+///
+/// # Errors
+/// The first solver failure, verbatim.
+pub fn run_probe_study(
+    tasks: &[CodingTask],
+    solver: &dyn CandidateSolver,
+    sb: &dyn Sandbox,
+    k: u32,
+) -> Result<ProbeStudyReport, String> {
+    let limits = Limits::default();
+    let mut points = Vec::with_capacity(tasks.len());
+
+    for task in tasks {
+        // Draw k samples; score each against the visible tests (the cheap probe signal).
+        let mut samples: Vec<(String, bool)> = Vec::with_capacity(k as usize);
+        for _ in 0..k {
+            let sol = solver.solve(task)?;
+            let (vp, vt) = suite_score(sb, task, &sol.code, &task.visible_cases, &limits);
+            let full = vt > 0 && vp == vt;
+            samples.push((sol.code, full));
+        }
+        let visible_pass_count = samples.iter().filter(|(_, f)| *f).count() as u32;
+        let p_hat = f64::from(visible_pass_count) / f64::from(k.max(1));
+        let uncertainty = binary_entropy(p_hat);
+
+        // The served candidate: the first that fully passes visible (what a gate serves), else
+        // the first sample (best-attempt fallback). Score it against the hidden oracle.
+        let served_code = samples
+            .iter()
+            .find(|(_, f)| *f)
+            .or_else(|| samples.first())
+            .map(|(c, _)| c.clone())
+            .unwrap_or_default();
+        let served_visible_full_pass = visible_pass_count > 0;
+        let (hp, ht) = suite_score(sb, task, &served_code, &task.hidden_cases, &limits);
+        let served_oracle_correct = ht > 0 && hp == ht;
+
+        points.push(ProbePoint {
+            id: task.id.clone(),
+            visible_pass_count,
+            p_hat,
+            uncertainty,
+            served_visible_full_pass,
+            served_oracle_correct,
+        });
+    }
+
+    // AUC: does uncertainty predict oracle failure?
+    let labeled: Vec<(f64, bool)> = points
+        .iter()
+        .map(|p| (p.uncertainty, !p.served_oracle_correct))
+        .collect();
+    let auc_uncertainty_predicts_failure = auc(&labeled);
+
+    // Confident = all k agree on full visible pass (uncertainty == 0 AND they passed).
+    let confident: Vec<&ProbePoint> = points
+        .iter()
+        .filter(|p| p.uncertainty == 0.0 && p.served_visible_full_pass)
+        .collect();
+    let confident_frac = confident.len() as f64 / points.len().max(1) as f64;
+    let skip_safety_when_confident = if confident.is_empty() {
+        0.0
+    } else {
+        confident.iter().filter(|p| p.served_oracle_correct).count() as f64 / confident.len() as f64
+    };
+
+    Ok(ProbeStudyReport {
+        k,
+        n: points.len(),
+        auc_uncertainty_predicts_failure,
+        confident_frac,
+        skip_safety_when_confident,
+        points,
+    })
+}
+
+impl ProbeStudyReport {
+    /// Human-readable summary — the go/no-go read.
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!(
+            "# Probe-signal validation study (ADR 0008 go/no-go)\n\n\
+             - samples per task (k): {k}\n\
+             - tasks: {n}\n\
+             - AUC(uncertainty → oracle-failure): {auc:.3}   (0.5 = no signal; >0.65 = usable; >0.75 = strong)\n\
+             - confident fraction (all k agree on visible pass): {cf:.3}\n\
+             - skip-safety when confident (P(oracle correct | confident)): {ss:.3}\n\
+             \n\
+             VERDICT: elastic verification is justified iff AUC is meaningfully > 0.5 AND \
+             skip-safety is high (≥ 1 − your target α). Low AUC ⇒ the probe is noise ⇒ do NOT \
+             build the skip logic; keep uniform verification.",
+            k = self.k,
+            n = self.n,
+            auc = self.auc_uncertainty_predicts_failure,
+            cf = self.confident_frac,
+            ss = self.skip_safety_when_confident,
+        )
     }
 }
