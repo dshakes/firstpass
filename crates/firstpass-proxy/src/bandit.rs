@@ -407,8 +407,8 @@ impl StartRungBandit {
 mod tests {
     use super::*;
     use firstpass_core::{
-        Attempt, Features, FinalOutcome, Mode, PolicyRef, RequestInfo, ServedFrom, TaskKind, Trace,
-        GENESIS_HASH,
+        Attempt, Features, FinalOutcome, GENESIS_HASH, Mode, PolicyRef, RequestInfo, ServedFrom,
+        TaskKind, Trace,
     };
 
     fn ctx_code() -> ContextBucket {

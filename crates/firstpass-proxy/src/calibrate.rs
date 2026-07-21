@@ -222,8 +222,8 @@ pub fn calibrate_from_store(
 #[cfg(test)]
 mod tests {
     use firstpass_core::{
-        Features, FinalOutcome, GateResult, Mode, PolicyRef, RequestInfo, ServedFrom, TaskKind,
-        GENESIS_HASH,
+        Features, FinalOutcome, GENESIS_HASH, GateResult, Mode, PolicyRef, RequestInfo, ServedFrom,
+        TaskKind,
     };
 
     use super::*;

@@ -731,8 +731,8 @@ pub fn ips_from_store(
 #[cfg(test)]
 mod tests {
     use firstpass_core::{
-        Features, FinalOutcome, GateResult, Mode, PolicyRef, RequestInfo, Score, ServedFrom,
-        TaskKind, Verdict, GENESIS_HASH,
+        Features, FinalOutcome, GENESIS_HASH, GateResult, Mode, PolicyRef, RequestInfo, Score,
+        ServedFrom, TaskKind, Verdict,
     };
 
     use super::*;
@@ -1193,7 +1193,7 @@ mod tests {
         assert_eq!(r.n_evaluable, 1);
         assert!((r.est_cost_per_request - 0.001).abs() < 1e-9); // haiku cost still counted
         assert_eq!(r.n_correctness_known, 0); // candidate served nothing vs logged haiku
-                                              // Escalated: exhausted past first candidate rung.
+        // Escalated: exhausted past first candidate rung.
         assert!((r.escalation_rate - 1.0).abs() < 1e-9);
 
         let _ = std::fs::remove_file(&db);
