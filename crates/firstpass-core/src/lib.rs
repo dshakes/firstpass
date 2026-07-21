@@ -35,7 +35,7 @@ pub mod verdict;
 pub use config::{
     AbstainPolicy, AuthScheme, BanditAlgorithm, BanditConfig, Budget, Config, ConsistencyDef,
     Dialect, Escalation, GateDef, JudgeDef, Mode, ModePreset, ModelRef, OnExhausted, PriceDef,
-    ProviderDef, Route, RoutingMode, SessionPromotion,
+    ProbeConfig, ProviderDef, Route, RoutingMode, SessionPromotion,
 };
 pub use conformal::{ConformalResult, calibrate, served_failure_rate};
 pub use cost::{ModelPrice, PriceTable};
@@ -44,6 +44,7 @@ pub use features::{FEATURE_VERSION, Features, TaskKind};
 pub use hashchain::{Chained, GENESIS_HASH, canonical_json, record_hash, verify_chain};
 pub use ltt::{LttDiagnostic, LttResult};
 pub use trace::{
-    Attempt, DeferredVerdict, FinalOutcome, PolicyRef, RequestInfo, ServedFrom, Trace,
+    Attempt, DeferredVerdict, FinalOutcome, PolicyRef, ProbeRegime, ProbeSignal, RequestInfo,
+    ServedFrom, Trace,
 };
 pub use verdict::{GateResult, Score, Verdict};

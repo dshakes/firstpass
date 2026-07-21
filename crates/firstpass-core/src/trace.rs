@@ -18,6 +18,55 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Regime classification from the k-sample visible-pass count (ADR 0008).
+///
+/// The three regimes are validated on MBPP (k=5, n=150): 0/5 pass → 0% oracle-correct (12% of
+/// traffic); 5/5 pass → 99% oracle-correct (65%); 1–4/5 → mixed (23%). Keyed on the pass
+/// *count*, not entropy — the entropy AUC (0.431) was falsified; the count AUC is decisive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeRegime {
+    /// All k samples passed — oracle-correct ≈99% (validated on MBPP).
+    ConfidentPass,
+    /// Zero of k samples passed — oracle-correct ≈0%.
+    ConfidentFail,
+    /// 1..k-1 samples passed — mixed signal; verification information is worth its cost.
+    Ambiguous,
+}
+
+impl ProbeRegime {
+    /// Classify a pass-count into one of three regimes.
+    ///
+    /// - `0` → `ConfidentFail`
+    /// - `pass_count >= k` → `ConfidentPass`
+    /// - otherwise → `Ambiguous`
+    #[must_use]
+    pub fn classify(pass_count: u32, k: u32) -> Self {
+        if pass_count == 0 {
+            Self::ConfidentFail
+        } else if pass_count >= k {
+            Self::ConfidentPass
+        } else {
+            Self::Ambiguous
+        }
+    }
+}
+
+/// The shadow-probe signal recorded on a sampled receipt (ADR 0008 Phase 1). Records the k-sample
+/// gate-pass-count signal and its cost separately from the served cost, so savings math is clean.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeSignal {
+    /// Number of parallel probe samples drawn.
+    pub k: u32,
+    /// How many of the k samples would have been served under the route's gate/threshold rule.
+    pub gate_pass_count: u32,
+    /// Which of the three validated regimes this request falls into.
+    pub regime: ProbeRegime,
+    /// USD cost of the k shadow model calls — **separate** from `trace.final_.total_cost_usd`
+    /// so per-request savings math is not polluted by measurement cost.
+    pub probe_cost_usd: f64,
+}
+
 /// A single routing decision, start to finish.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trace {
@@ -45,6 +94,11 @@ pub struct Trace {
     /// The final served outcome and its economics.
     #[serde(rename = "final")]
     pub final_: FinalOutcome,
+    /// Shadow probe signal (ADR 0008 Phase 1). Absent when probe is off (the default) or when
+    /// this request was not in the configured `sample_rate` — byte-identical to pre-probe traces
+    /// and hash-chain compatible (the `skip_serializing_if` keeps absent = absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeSignal>,
 }
 
 /// Reference to the policy that produced a decision.
@@ -254,6 +308,7 @@ mod tests {
                 counterfactual_baseline_usd: 0.0630,
                 savings_usd: 0.0,
             },
+            probe: None,
         };
         t.recompute_savings();
         t
@@ -394,5 +449,118 @@ mod tests {
         );
         let back: PolicyRef = serde_json::from_str(&j).unwrap();
         assert_eq!(back, pr);
+    }
+
+    // ── ProbeRegime::classify ─────────────────────────────────────────────────
+
+    #[test]
+    fn classify_zero_is_confident_fail() {
+        assert_eq!(ProbeRegime::classify(0, 5), ProbeRegime::ConfidentFail);
+    }
+
+    #[test]
+    fn classify_all_pass_is_confident_pass() {
+        assert_eq!(ProbeRegime::classify(5, 5), ProbeRegime::ConfidentPass);
+    }
+
+    #[test]
+    fn classify_above_k_is_confident_pass() {
+        // pass_count > k is technically impossible but the rule handles it gracefully.
+        assert_eq!(ProbeRegime::classify(6, 5), ProbeRegime::ConfidentPass);
+    }
+
+    #[test]
+    fn classify_mixed_is_ambiguous() {
+        assert_eq!(ProbeRegime::classify(1, 5), ProbeRegime::Ambiguous);
+        assert_eq!(ProbeRegime::classify(2, 5), ProbeRegime::Ambiguous);
+        assert_eq!(ProbeRegime::classify(4, 5), ProbeRegime::Ambiguous);
+    }
+
+    #[test]
+    fn classify_k_equals_2_boundaries() {
+        assert_eq!(ProbeRegime::classify(0, 2), ProbeRegime::ConfidentFail);
+        assert_eq!(ProbeRegime::classify(1, 2), ProbeRegime::Ambiguous);
+        assert_eq!(ProbeRegime::classify(2, 2), ProbeRegime::ConfidentPass);
+    }
+
+    // ── ProbeSignal serde backward-compat ────────────────────────────────────
+
+    /// `probe = None` must be absent from the JSON — byte-identical to pre-probe traces.
+    #[test]
+    fn probe_none_absent_from_json() {
+        let t = sample_trace(GENESIS_HASH, 1);
+        assert!(t.probe.is_none());
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(
+            !j.contains("\"probe\""),
+            "probe=None must be omitted (skip_serializing_if): {j}"
+        );
+    }
+
+    /// Old JSON without a `probe` field deserializes cleanly (probe defaults to None).
+    #[test]
+    fn old_trace_without_probe_deserializes_to_none() {
+        // Use the canonical JSON of a probe-None trace as a stand-in for old traces.
+        let t = sample_trace(GENESIS_HASH, 1);
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(!j.contains("probe"));
+        let back: Trace = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.probe, None);
+    }
+
+    /// `probe = Some(...)` round-trips correctly.
+    #[test]
+    fn probe_signal_some_roundtrips() {
+        let mut t = sample_trace(GENESIS_HASH, 1);
+        t.probe = Some(ProbeSignal {
+            k: 5,
+            gate_pass_count: 5,
+            regime: ProbeRegime::ConfidentPass,
+            probe_cost_usd: 0.0003,
+        });
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(j.contains("\"probe\""), "probe=Some must be present: {j}");
+        assert!(j.contains("\"regime\":\"confident_pass\""));
+        assert!(j.contains("\"gate_pass_count\":5"));
+        let back: Trace = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.probe, t.probe);
+    }
+
+    /// Hash chain still verifies when `probe` is present — field participates in the hash.
+    #[test]
+    fn verify_chain_passes_with_probe_field_present() {
+        let mut t0 = sample_trace(GENESIS_HASH, 10);
+        t0.probe = Some(ProbeSignal {
+            k: 3,
+            gate_pass_count: 0,
+            regime: ProbeRegime::ConfidentFail,
+            probe_cost_usd: 0.0001,
+        });
+        let t1 = sample_trace(&t0.hash().unwrap(), 11);
+        let chain = [t0, t1];
+        assert!(
+            verify_chain(&chain, GENESIS_HASH).is_ok(),
+            "chain must verify when probe is present"
+        );
+    }
+
+    /// Tampering the probe field is detectable via the hash chain.
+    #[test]
+    fn tampering_probe_field_is_detectable() {
+        let mut t0 = sample_trace(GENESIS_HASH, 20);
+        t0.probe = Some(ProbeSignal {
+            k: 5,
+            gate_pass_count: 5,
+            regime: ProbeRegime::ConfidentPass,
+            probe_cost_usd: 0.0005,
+        });
+        let t1 = sample_trace(&t0.hash().unwrap(), 21);
+        let mut chain = [t0, t1];
+        // Tamper the probe field.
+        chain[0].probe.as_mut().unwrap().gate_pass_count = 0;
+        assert!(
+            verify_chain(&chain, GENESIS_HASH).is_err(),
+            "tampered probe must break the chain"
+        );
     }
 }

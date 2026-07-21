@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The guarantee — Firstpass docs</title>
+<meta name="description" content="A distribution-free served-failure bound via split-conformal or Learn-then-Test, tracked live under drift by adaptive conformal — earned on 974 real MBPP coding tasks with real test gates.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.0</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html"><span class="num">01</span>Overview</a>
+<a href="how-it-works.html"><span class="num">02</span>How it works</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html"><span class="num">03</span>Gates</a>
+<a href="routing.html"><span class="num">04</span>Routing & escalation</a>
+<a href="guarantee.html" aria-current="page"><span class="num">05</span>The guarantee</a>
+<a href="receipts.html"><span class="num">06</span>Receipts & audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">07</span>Providers</a>
+<a href="configuration.html"><span class="num">08</span>Configuration</a>
+<a href="cli.html"><span class="num">09</span>CLI reference</a>
+<a href="api.html"><span class="num">10</span>API & MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research & data</p>
+<a href="elastic-verification.html"><span class="num">11</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">12</span>Benchmarks</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / The guarantee</p>
+<h1>The guarantee</h1>
+<p class="page-sub">Firstpass puts a distribution-free bound on how often a wrong answer is served. It is computed from a real run — not assumed — and tracked live as your traffic drifts. This is the headline claim, and this page shows exactly how it is earned.</p>
+
+<h2 id="headline">The headline<a class="anchor" href="#headline" aria-label="Link to this section">#</a></h2>
+<p>The guarantee is a bound on the <strong>served-failure rate</strong>: the fraction of served outputs that are actually wrong. Firstpass offers two ways to earn it, both distribution-free (no assumption about the shape of your data):</p>
+<ul>
+  <li><strong>Split-conformal</strong> — a Hoeffding upper confidence bound on the served-failure rate.</li>
+  <li><strong>Learn-then-Test / RCPS</strong> — fixed-sequence exact-binomial testing that reports the gate's false-accept rate at the chosen threshold (<code>firstpass calibrate --method ltt</code>).</li>
+</ul>
+<p>Either way, you pick a target failure rate <code>α</code> and a confidence <code>1−δ</code>, and Firstpass certifies whether the chosen serve threshold holds the bound.</p>
+
+<h2 id="chart">The live result<a class="anchor" href="#chart" aria-label="Link to this section">#</a></h2>
+<p>The committed result — from <code>docs/benchmarks/mbpp-live-base.txt</code> — is 974 real MBPP coding tasks, gated by real unit tests, live against an Anthropic solver, with pre-registered <code>α=0.10, δ=0.05</code>:</p>
+<div class="chips">
+  <div class="chip good"><div class="cn">≤10<span class="u">%</span></div><div class="cl">distribution-free target, 95% conf.</div></div>
+  <div class="chip good"><div class="cn">5.5<span class="u">%</span></div><div class="cl">calibrated risk (conformal)</div></div>
+  <div class="chip"><div class="cn">7.7<span class="u">%</span></div><div class="cl">realized served-failure at threshold</div></div>
+  <div class="chip"><div class="cn">82<span class="u">%</span></div><div class="cl">served from the cheap tier</div></div>
+</div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 340" role="img" aria-labelledby="gcT">
+<title id="gcT">On 974 MBPP tasks: the realized served-failure rate is 7.7%, below the 10% distribution-free target line at 95% confidence, with calibrated risk 5.5%. Separately, 82% of requests are served from the cheap tier.</title>
+<!-- left: served-failure bar vs target -->
+<text x="60" y="40" class="ink" font-size="13" font-weight="640">Served-failure vs the ≤10% target</text>
+<!-- axis -->
+<line x1="120" y1="80" x2="120" y2="270" class="grid" stroke-width="1"/>
+<line x1="120" y1="270" x2="470" y2="270" class="grid" stroke-width="1"/>
+<g><line x1="116" y1="270" x2="470" y2="270" class="grid" stroke-width="1" stroke-dasharray="2 4"/><text x="112" y="274" text-anchor="end" class="ink-mut m" font-size="10">0%</text></g><g><line x1="116" y1="236" x2="470" y2="236" class="grid" stroke-width="1" stroke-dasharray="2 4"/><text x="112" y="240" text-anchor="end" class="ink-mut m" font-size="10">2%</text></g><g><line x1="116" y1="202" x2="470" y2="202" class="grid" stroke-width="1" stroke-dasharray="2 4"/><text x="112" y="206" text-anchor="end" class="ink-mut m" font-size="10">4%</text></g><g><line x1="116" y1="168" x2="470" y2="168" class="grid" stroke-width="1" stroke-dasharray="2 4"/><text x="112" y="172" text-anchor="end" class="ink-mut m" font-size="10">6%</text></g><g><line x1="116" y1="134" x2="470" y2="134" class="grid" stroke-width="1" stroke-dasharray="2 4"/><text x="112" y="138" text-anchor="end" class="ink-mut m" font-size="10">8%</text></g><g><line x1="116" y1="100" x2="470" y2="100" class="grid" stroke-width="1" stroke-dasharray="2 4"/><text x="112" y="104" text-anchor="end" class="ink-mut m" font-size="10">10%</text></g>
+<!-- target line at 10% -->
+<line x1="120" y1="100" x2="470" y2="100" class="fail-s" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="466" y="94" text-anchor="end" class="fail" font-size="11" font-weight="640">10% target (95% conf.)</text>
+<!-- bars: calibrated risk 5.5, realized 7.7 -->
+<rect x="170" y="176" width="90" height="94" rx="5" class="accent"/>
+<text x="215" y="168" text-anchor="middle" class="accent-ink" font-size="13" font-weight="680">5.5%</text>
+<text x="215" y="286" text-anchor="middle" class="ink-mut" font-size="11">calibrated risk</text>
+<rect x="300" y="139" width="90" height="131" rx="5" class="pass"/>
+<text x="345" y="131" text-anchor="middle" class="pass" font-size="13" font-weight="680">7.7%</text>
+<text x="345" y="286" text-anchor="middle" class="ink-mut" font-size="11">realized served-fail</text>
+<!-- right: cheap-tier donut/bar -->
+<text x="560" y="40" class="ink" font-size="13" font-weight="640">Where requests are served</text>
+<rect x="560" y="120" width="380" height="46" rx="8" class="track"/>
+<rect x="560" y="120" width="312" height="46" rx="8" class="accent"/>
+<text x="716" y="148" text-anchor="middle" fill="#04140f" font-size="15" font-weight="700">82% cheap tier</text>
+<text x="906" y="148" text-anchor="middle" class="ink-mut" font-size="12" font-weight="600">18%</text>
+<text x="560" y="192" class="ink-mut" font-size="12">82% of requests clear the gate on the cheapest rung — no escalation, no expensive call.</text>
+<text x="560" y="212" class="ink-mut" font-size="12">The remaining 18% escalate on proof of need.</text>
+<!-- caption stats -->
+<g font-size="11.5">
+  <rect x="560" y="238" width="180" height="70" rx="10" class="n-fill n-stroke" stroke-width="1.3"/>
+  <text x="576" y="262" class="ink-mut" font-size="11">tasks</text>
+  <text x="576" y="288" class="ink" font-size="20" font-weight="680">974</text>
+  <rect x="756" y="238" width="184" height="70" rx="10" class="n-fill n-stroke" stroke-width="1.3"/>
+  <text x="772" y="262" class="ink-mut" font-size="11">real test gates</text>
+  <text x="772" y="288" class="ink" font-size="20" font-weight="680">live</text>
+</g>
+</svg>
+  <figcaption>Both the calibrated risk (5.5%) and the realized served-failure (7.7%) sit under the 10% target, at 95% confidence — while 82% of requests never left the cheapest rung.</figcaption>
+</div>
+<p>Read that as: on this run, serving every output that clears the threshold produced a wrong answer 7.7% of the time, and the machinery certifies the true rate is at or below 10% with 95% confidence — while the expensive tier was needed for fewer than one request in five.</p>
+<div class="note"><span class="nt">What the raw artifact also shows</span> The gate's false-accept rate — P(full visible pass | actually incorrect) — was 14.7%, and its false-reject rate was 0.0%. The conformal step turns that imperfect gate into a certified serve threshold rather than trusting the gate blindly.</div>
+
+<h2 id="conformal">Split-conformal<a class="anchor" href="#conformal" aria-label="Link to this section">#</a></h2>
+<p>Split-conformal calibration holds out a labeled slice of outcomes and derives a threshold on the gate's score such that serving above it keeps the failure rate under <code>α</code>. The bound is a Hoeffding upper confidence bound, so it is valid for any data distribution — no Gaussian assumptions, no model of the errors. The reported figures are the threshold (0.500 here), the served fraction (82%), the calibrated risk (5.5%), and a feasibility flag.</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass calibrate --method conformal --alpha 0.10 --delta 0.05</code></pre></div>
+
+<h2 id="ltt">Learn-then-Test / RCPS<a class="anchor" href="#ltt" aria-label="Link to this section">#</a></h2>
+<p>Learn-then-Test frames threshold selection as multiple hypothesis testing. It walks candidate thresholds in a fixed sequence, applying an exact-binomial test at each, and stops at the first that provably controls risk. Where conformal reports a served-failure bound, LTT reports the <strong>gate's false-accept rate</strong> at the chosen threshold — the same guarantee viewed through the gate.</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass calibrate --method ltt --alpha 0.10 --delta 0.05</code></pre></div>
+<div class="note info"><span class="nt">Which to use</span> Conformal is the default and speaks directly in served-failure terms. LTT is the choice when you want the exact-binomial guarantee expressed as the gate's false-accept rate, or when the fixed-sequence testing better matches your risk framing.</div>
+
+<h2 id="adaptive">Adaptive conformal<a class="anchor" href="#adaptive" aria-label="Link to this section">#</a></h2>
+<p>A static threshold decays as your traffic drifts. Adaptive conformal (Gibbs–Candès) tracks the threshold <strong>live</strong>: each deferred outcome reported to <code>/v1/feedback</code> nudges the threshold up or down to keep the realized failure rate near the target. No recalibration run, no downtime — the bound follows the distribution.</p>
+
+<h2 id="gauges">The two gauges<a class="anchor" href="#gauges" aria-label="Link to this section">#</a></h2>
+<p>The loop is observable in Prometheus, so you can watch the guarantee hold in real time:</p>
+<div class="defs">
+  <div class="row"><div class="k">firstpass_serve_threshold</div><div class="v">The current threshold the router serves above. Moves as adaptive conformal responds to feedback.</div></div>
+  <div class="row"><div class="k">firstpass_realized_served_failure</div><div class="v">The measured served-failure rate from reported outcomes. This is what you alert on if it approaches your target.</div></div>
+</div>
+
+<h2 id="repro">Reproduce it<a class="anchor" href="#repro" aria-label="Link to this section">#</a></h2>
+<p>Every published number regenerates from a committed command. The bound machinery is the reproducible part — the harness recomputes the conformal bound from <em>your</em> run's gate/oracle outcomes with the same pre-registered <code>α/δ</code>.</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># fetch the same public mbpp.jsonl (974 rows), then:</span>
+FIRSTPASS_CODING_DATASET=./mbpp.jsonl \
+  cargo run --release -p firstpass-bench -- --coding-live</code></pre></div>
+<p>Needs your provider key and Docker (for the sandboxed test gate); the run costs a few dollars. See <a href="benchmarks.html">Benchmarks</a> for the full artifact index and provenance rules.</p>
+
+<nav class="pager" aria-label="Pagination"><a class="prev" href="routing.html"><span class="dir">← Previous</span><span class="t">Routing & escalation</span></a><a class="next" href="receipts.html"><span class="dir">Next →</span><span class="t">Receipts & audit</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#headline" class="">The headline</a><a href="#chart" class="">The live result</a><a href="#conformal" class="">Split-conformal</a><a href="#ltt" class="">Learn-then-Test / RCPS</a><a href="#adaptive" class="">Adaptive conformal</a><a href="#gauges" class="">The two gauges</a><a href="#repro" class="">Reproduce it</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js"></script>
+</body></html>

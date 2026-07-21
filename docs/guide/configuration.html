@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Configuration — Firstpass docs</title>
+<meta name="description" content="The full firstpass.toml reference — ladder, gates, bandit, speculation, budgets, providers, modes — plus every environment variable and the multi-tenant options.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.0</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html"><span class="num">01</span>Overview</a>
+<a href="how-it-works.html"><span class="num">02</span>How it works</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html"><span class="num">03</span>Gates</a>
+<a href="routing.html"><span class="num">04</span>Routing & escalation</a>
+<a href="guarantee.html"><span class="num">05</span>The guarantee</a>
+<a href="receipts.html"><span class="num">06</span>Receipts & audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">07</span>Providers</a>
+<a href="configuration.html" aria-current="page"><span class="num">08</span>Configuration</a>
+<a href="cli.html"><span class="num">09</span>CLI reference</a>
+<a href="api.html"><span class="num">10</span>API & MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research & data</p>
+<a href="elastic-verification.html"><span class="num">11</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">12</span>Benchmarks</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / Configuration</p>
+<h1>Configuration</h1>
+<p class="page-sub">Firstpass reads a single <code>firstpass.toml</code> plus a handful of environment variables. This is the full reference — ladder, gates, bandit, speculation, budgets, providers, routes and modes — and the multi-tenant options.</p>
+
+<h2 id="shape">Config shape<a class="anchor" href="#shape" aria-label="Link to this section">#</a></h2>
+<p>A minimal config is a ladder and one gate. Everything else has a default. Point Firstpass at a file with <code>FIRSTPASS_CONFIG</code> (default <code>./firstpass.toml</code>).</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># firstpass.toml — a minimal, working config</span>
+[ladder]
+rungs = [&quot;anthropic/claude-haiku-4-5&quot;, &quot;anthropic/claude-sonnet-5&quot;]
+
+[[gate]]
+kind = &quot;json-valid&quot;</code></pre></div>
+
+<h2 id="ladder">[ladder]<a class="anchor" href="#ladder" aria-label="Link to this section">#</a></h2>
+<div class="tblwrap"><table>
+  <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>rungs</code></td><td>list of <code>provider/model</code></td><td>—</td><td>Ordered cheapest→most capable.</td></tr>
+    <tr><td><code>max_rungs</code></td><td>int</td><td><code>len(rungs)</code></td><td>Cap on how far a request may climb.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="gate">[[gate]]<a class="anchor" href="#gate" aria-label="Link to this section">#</a></h2>
+<p>Repeatable. Each block adds a gate; all gates on a rung must pass. See <a href="gates.html">Gates</a> for the semantics of each kind.</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>Key</th><th>Applies to</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>kind</code></td><td>all</td><td><code>non-empty</code> | <code>json-valid</code> | <code>schema</code> | <code>subprocess</code> | <code>judge</code> | <code>consistency</code></td></tr>
+    <tr><td><code>on_abstain</code></td><td>all</td><td><code>fail_open</code> (default) | <code>fail_closed</code></td></tr>
+    <tr><td><code>schema</code></td><td>schema</td><td>JSON-Schema subset: <code>type</code>, <code>required</code>, per-property <code>type</code>.</td></tr>
+    <tr><td><code>cmd</code>, <code>timeout_ms</code></td><td>subprocess</td><td>Executable + argv, and a timeout (→ abstain).</td></tr>
+    <tr><td><code>model</code>, <code>rubric</code>, <code>threshold</code></td><td>judge</td><td>Judge model (must differ from candidate), rubric, score bar.</td></tr>
+    <tr><td><code>k</code>, <code>threshold</code></td><td>consistency</td><td>Resample count and agreement bar.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="bandit">[bandit]<a class="anchor" href="#bandit" aria-label="Link to this section">#</a></h2>
+<p>The learned start-rung (<a href="routing.html#startrung">detail</a>). Default-off; default algorithm UCB1.</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[bandit]
+enabled = false
+algo    = &quot;ucb1&quot;        # ucb1 (deterministic) | thompson (Beta, discounted)</code></pre></div>
+
+<h2 id="speculation">[speculation] &amp; budgets<a class="anchor" href="#speculation" aria-label="Link to this section">#</a></h2>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[speculation]
+enabled          = false
+lookahead        = 1
+speculation_band = [0.35, 0.65]   # only prefetch in the marginal zone
+
+[budget]
+per_request_usd = 0.05
+per_session_usd = 1.00
+per_day_usd     = 250.00</code></pre></div>
+
+<h2 id="provider">[[provider]]<a class="anchor" href="#provider" aria-label="Link to this section">#</a></h2>
+<p>Repeatable. Adds an OpenAI-compatible endpoint as a provider (<a href="providers.html#custom">detail</a>).</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[provider]]
+name     = &quot;myllm&quot;
+base_url = &quot;https://api.internal.example.com/v1&quot;
+dialect  = &quot;openai&quot;      # openai | anthropic | gemini
+auth     = &quot;api_key&quot;     # api_key | aws_sigv4 | gcp_oauth</code></pre></div>
+
+<h2 id="routes">[[route]] &amp; modes<a class="anchor" href="#routes" aria-label="Link to this section">#</a></h2>
+<p>Routes let different traffic use different ladders and a per-route default <code>routing_mode</code> (overridden by the <code>x-firstpass-mode</code> header — see <a href="routing.html#precedence">mode precedence</a>).</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[route]]
+match        = &quot;/v1/chat/completions&quot;
+routing_mode = &quot;cost&quot;        # observe|cost|balanced|quality|latency|max</code></pre></div>
+
+<h2 id="env">Environment variables<a class="anchor" href="#env" aria-label="Link to this section">#</a></h2>
+<div class="tblwrap"><table>
+  <thead><tr><th>Variable</th><th>Values</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>FIRSTPASS_MODE</code></td><td><code>observe</code> | <code>enforce</code></td><td>Shadow vs live. Start with observe.</td></tr>
+    <tr><td><code>FIRSTPASS_CONFIG</code></td><td>path</td><td>Config file (default <code>./firstpass.toml</code>).</td></tr>
+    <tr><td><code>FIRSTPASS_DB</code></td><td>path</td><td>Receipt / state store location.</td></tr>
+    <tr><td><code>FIRSTPASS_BIND</code></td><td><code>host:port</code></td><td>Listen address (default <code>:8080</code>).</td></tr>
+    <tr><td><code>FIRSTPASS_RECEIPTS</code></td><td><code>best_effort</code> | <code>durable</code></td><td>Never-drop receipts (<a href="receipts.html#durable">detail</a>).</td></tr>
+    <tr><td><code>FIRSTPASS_MODE_PROFILE</code></td><td>mode name</td><td>Env-level default mode.</td></tr>
+    <tr><td><code>FIRSTPASS_MAX_CONCURRENCY</code></td><td>int</td><td>Max in-flight upstream requests.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="tenancy">Multi-tenant<a class="anchor" href="#tenancy" aria-label="Link to this section">#</a></h2>
+<p>Multi-tenancy is <strong>opt-in and default-off</strong>. When enabled it provides Argon2id keyed auth, AES-256-GCM key custody, and per-tenant rate limits.</p>
+<div class="note warn"><span class="nt">Pre-external-review</span> The multi-tenant path is implemented but <strong>not GA</strong> — it is pending external security review. Do not rely on it for tenant isolation in production until that review lands. See ADR 0004.</div>
+
+<nav class="pager" aria-label="Pagination"><a class="prev" href="providers.html"><span class="dir">← Previous</span><span class="t">Providers</span></a><a class="next" href="cli.html"><span class="dir">Next →</span><span class="t">CLI reference</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#shape" class="">Config shape</a><a href="#ladder" class="">[ladder]</a><a href="#gate" class="">[[gate]]</a><a href="#bandit" class="">[bandit]</a><a href="#speculation" class="">[speculation] &amp; budgets</a><a href="#provider" class="">[[provider]]</a><a href="#routes" class="">[[route]] &amp; modes</a><a href="#env" class="">Environment variables</a><a href="#tenancy" class="">Multi-tenant</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js"></script>
+</body></html>

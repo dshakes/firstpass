@@ -795,6 +795,7 @@ mod tests {
                 counterfactual_baseline_usd: cost_usd,
                 savings_usd: 0.0,
             },
+            probe: None,
         };
         trace.recompute_savings();
         trace
@@ -871,6 +872,7 @@ mod tests {
                 counterfactual_baseline_usd: total,
                 savings_usd: 0.0,
             },
+            probe: None,
         };
         trace.recompute_savings();
         trace
@@ -1279,6 +1281,7 @@ serve_threshold = 0.75
                 counterfactual_baseline_usd: cost_usd,
                 savings_usd: 0.0,
             },
+            probe: None,
         };
         trace.recompute_savings();
         trace

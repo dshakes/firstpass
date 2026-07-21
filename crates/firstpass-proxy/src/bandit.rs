@@ -597,6 +597,7 @@ mod tests {
                 counterfactual_baseline_usd: 0.001,
                 savings_usd: 0.0,
             },
+            probe: None,
         };
         trace.recompute_savings();
         trace

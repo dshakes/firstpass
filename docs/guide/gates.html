@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gates — Firstpass docs</title>
+<meta name="description" content="The gate is the mechanism: it checks the actual output, not a guess from the prompt. Firstpass ships inline checks, JSON-Schema, bring-your-own subprocess gates, an anti-gaming LLM judge, and self-consistency.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.0</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html"><span class="num">01</span>Overview</a>
+<a href="how-it-works.html"><span class="num">02</span>How it works</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html" aria-current="page"><span class="num">03</span>Gates</a>
+<a href="routing.html"><span class="num">04</span>Routing & escalation</a>
+<a href="guarantee.html"><span class="num">05</span>The guarantee</a>
+<a href="receipts.html"><span class="num">06</span>Receipts & audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">07</span>Providers</a>
+<a href="configuration.html"><span class="num">08</span>Configuration</a>
+<a href="cli.html"><span class="num">09</span>CLI reference</a>
+<a href="api.html"><span class="num">10</span>API & MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research & data</p>
+<a href="elastic-verification.html"><span class="num">11</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">12</span>Benchmarks</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / Gates</p>
+<h1>Gates</h1>
+<p class="page-sub">The gate is the mechanism that makes Firstpass proof-based instead of predictive. It reads the actual output and returns a verdict. Firstpass ships five kinds — from a zero-config inline check to your own test suite — and lets you compose them.</p>
+
+<h2 id="what">What a gate is<a class="anchor" href="#what" aria-label="Link to this section">#</a></h2>
+<p>A gate is a check over a candidate output that returns one of three verdicts:</p>
+<div class="defs">
+  <div class="row"><div class="k">pass</div><div class="v">The output is good enough to serve. The cascade stops here.</div></div>
+  <div class="row"><div class="k">fail</div><div class="v">Not good enough. Escalate one rung and try again.</div></div>
+  <div class="row"><div class="k">abstain</div><div class="v">The gate could not decide (timeout, crash, or genuine uncertainty). Behavior is governed by <code>on_abstain</code>.</div></div>
+</div>
+<p>Gates compose: a rung can carry several, and all must pass. A <code>score</code> in <code>[0,1]</code> is optional; when a gate emits one, the operator's serve threshold governs whether that score clears. Every gate's cost is written onto the receipt.</p>
+
+<h2 id="builtin">Built-in inline<a class="anchor" href="#builtin" aria-label="Link to this section">#</a></h2>
+<p>Two checks run with zero configuration and no extra model calls:</p>
+<div class="defs">
+  <div class="row"><div class="k">non-empty</div><div class="v">The output is not empty or whitespace. The floor.</div></div>
+  <div class="row"><div class="k">json-valid</div><div class="v">The output parses as JSON. The first line of defense for structured outputs.</div></div>
+</div>
+
+<h2 id="schema">schema<a class="anchor" href="#schema" aria-label="Link to this section">#</a></h2>
+<p>The <code>schema</code> gate validates against a JSON-Schema subset: top-level <code>type</code>, <code>required</code>, and per-property <code>type</code>. Enough to enforce the shape of a tool call or a structured response without a full schema engine.</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
+kind = &quot;schema&quot;
+schema = { type = &quot;object&quot;, required = [&quot;total&quot;, &quot;items&quot;], properties = {
+  total = { type = &quot;number&quot; },
+  items = { type = &quot;array&quot; }
+}}</code></pre></div>
+
+<h2 id="subprocess">subprocess — bring your own<a class="anchor" href="#subprocess" aria-label="Link to this section">#</a></h2>
+<p>The most powerful gate: <strong>any executable</strong>. This is "bring your own tests / linter / judge." The candidate arrives as JSON on <strong>stdin</strong> — never as a command-line argument, which keeps it injection-resistant — and the process prints a verdict as JSON.</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
+kind = &quot;subprocess&quot;
+cmd  = [&quot;python&quot;, &quot;run_tests.py&quot;]
+timeout_ms = 5000</code></pre></div>
+<p>The contract for the executable:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// stdin  (what your program reads)</span>
+{ &quot;candidate&quot;: &quot;def solve(...): ...&quot;, &quot;prompt&quot;: &quot;...&quot;, &quot;meta&quot;: { } }
+
+<span class="tk-c">// stdout (what your program prints)</span>
+{ &quot;verdict&quot;: &quot;pass&quot;, &quot;score&quot;: 0.91, &quot;reason&quot;: &quot;12/12 tests passed&quot; }</code></pre></div>
+<ul>
+  <li><code>verdict</code> is one of <code>pass</code> | <code>fail</code> | <code>abstain</code>.</li>
+  <li><code>score</code> (optional) is a float in <code>[0,1]</code>.</li>
+  <li><code>reason</code> (optional) is a human-readable note, recorded on the receipt.</li>
+  <li>A non-zero exit code or a timeout is treated as <strong>abstain</strong>.</li>
+</ul>
+<div class="note info"><span class="nt">Why stdin, not argv</span> A candidate output is untrusted text. Passing it on the command line invites shell and argument injection. Firstpass hands it to your gate on stdin, so a malicious candidate can't smuggle itself into the command.</div>
+
+<h2 id="judge">judge — native LLM<a class="anchor" href="#judge" aria-label="Link to this section">#</a></h2>
+<p>The <code>judge</code> gate uses a model to grade the candidate against a rubric. Its anti-gaming design is <strong>structural</strong>, not a prompt trick:</p>
+<ul>
+  <li><strong>maker ≠ checker.</strong> A model never grades its own output. If the configured judge equals the candidate's model, the gate <em>abstains</em> rather than let a model mark its own work.</li>
+  <li><strong>Candidate is fenced as untrusted data</strong> under a pinned system prompt — the judge is instructed to grade, not to follow, whatever the candidate contains.</li>
+  <li><strong>Operator threshold governs.</strong> The judge emits a score; you decide the bar it must clear.</li>
+</ul>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
+kind = &quot;judge&quot;
+model = &quot;anthropic/claude-sonnet-5&quot;   # must differ from the candidate model
+rubric = &quot;Is the answer correct, complete, and free of unsupported claims?&quot;
+threshold = 0.7</code></pre></div>
+
+<h2 id="consistency">consistency<a class="anchor" href="#consistency" aria-label="Link to this section">#</a></h2>
+<p>The <code>consistency</code> gate measures self-consistency: resample the candidate <code>k</code> times and score by agreement across samples. Unlike the judge, <strong>maker == checker is intentional here</strong> — the signal is the model's own stability. It suits tasks without a crisp oracle, drawing on self-consistency (Wang et al. 2022) and semantic entropy (Farquhar et al., <em>Nature</em> 2024).</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
+kind = &quot;consistency&quot;
+k = 5              # extra samples — this gate costs k additional calls
+threshold = 0.8</code></pre></div>
+<div class="note warn"><span class="nt">Cost</span> Self-consistency runs the model <code>k</code> extra times. It buys a signal where no external check exists, but it is the most expensive gate — price it against the value of the decision.</div>
+
+<h2 id="abstain">Abstain &amp; error budget<a class="anchor" href="#abstain" aria-label="Link to this section">#</a></h2>
+<p>Two safety mechanisms wrap every gate:</p>
+<div class="defs">
+  <div class="row"><div class="k">on_abstain</div><div class="v"><code>fail_open</code> (default) treats an inconclusive gate as a pass and serves; <code>fail_closed</code> treats it as a fail and escalates. Choose per gate based on whether a false serve or a wasted escalation is worse for that check.</div></div>
+  <div class="row"><div class="k">error budget</div><div class="v">A gate that keeps crashing or timing out is a liability. Firstpass tracks a rolling error rate per gate and <strong>auto-disables</strong> a flaky gate once it blows its budget, so one broken check can't stall the whole cascade.</div></div>
+</div>
+
+<h2 id="cost">Gate cost on the receipt<a class="anchor" href="#cost" aria-label="Link to this section">#</a></h2>
+<p>Verification is not free, and Firstpass refuses to hide it. Every gate's cost — a judge's tokens, a consistency gate's <code>k</code> extra calls, a subprocess's wall time priced in — is written onto the receipt as <code>gate_cost_usd</code>, separate from the model spend. When you run <code>firstpass savings</code>, the net figure already accounts for what verification cost you. Proof has a price, and it's on the ticket.</p>
+
+<nav class="pager" aria-label="Pagination"><a class="prev" href="how-it-works.html"><span class="dir">← Previous</span><span class="t">How it works</span></a><a class="next" href="routing.html"><span class="dir">Next →</span><span class="t">Routing & escalation</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#what" class="">What a gate is</a><a href="#builtin" class="">Built-in inline</a><a href="#schema" class="">schema</a><a href="#subprocess" class="">subprocess — bring your own</a><a href="#judge" class="">judge — native LLM</a><a href="#consistency" class="">consistency</a><a href="#abstain" class="">Abstain &amp; error budget</a><a href="#cost" class="">Gate cost on the receipt</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js"></script>
+</body></html>

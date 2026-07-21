@@ -638,6 +638,7 @@ mod tests {
                 counterfactual_baseline_usd: 0.001,
                 savings_usd: 0.0,
             },
+            probe: None,
         };
         let t0 = mk(GENESIS_HASH, "s0");
         let t1 = mk(&t0.hash().unwrap(), "s1");
@@ -747,6 +748,7 @@ mod tests {
                 counterfactual_baseline_usd: 0.02,
                 savings_usd: 0.009,
             },
+            probe: None,
         };
         let ex = explain_trace(&t);
         assert_eq!(

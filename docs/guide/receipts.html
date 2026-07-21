@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Receipts &amp; audit — Firstpass docs</title>
+<meta name="description" content="Every decision becomes a SHA-256 hash-chained, append-only receipt. Export the sealed log and re-verify it from genesis with no proxy or database — an independent audit that fails closed on tamper.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.0</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html"><span class="num">01</span>Overview</a>
+<a href="how-it-works.html"><span class="num">02</span>How it works</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html"><span class="num">03</span>Gates</a>
+<a href="routing.html"><span class="num">04</span>Routing & escalation</a>
+<a href="guarantee.html"><span class="num">05</span>The guarantee</a>
+<a href="receipts.html" aria-current="page"><span class="num">06</span>Receipts & audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">07</span>Providers</a>
+<a href="configuration.html"><span class="num">08</span>Configuration</a>
+<a href="cli.html"><span class="num">09</span>CLI reference</a>
+<a href="api.html"><span class="num">10</span>API & MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research & data</p>
+<a href="elastic-verification.html"><span class="num">11</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">12</span>Benchmarks</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / Receipts &amp; audit</p>
+<h1>Receipts &amp; audit</h1>
+<p class="page-sub">Every decision becomes a SHA-256 hash-chained, append-only receipt. Export the sealed log and an external auditor re-derives the whole chain from genesis — with no access to the proxy or its database. Tamper or reorder, and verification breaks at that index and exits non-zero.</p>
+
+<h2 id="why">Why receipts<a class="anchor" href="#why" aria-label="Link to this section">#</a></h2>
+<p>A router that decides what your users see needs to be answerable. "The model chose it" is not an answer a regulator, an incident review, or a customer dispute will accept. Firstpass makes every decision <strong>independently checkable after the fact</strong>: the rungs tried, each gate verdict, the mode, the cost, and a cryptographic link to the decision before it.</p>
+
+<h2 id="chain">The hash chain<a class="anchor" href="#chain" aria-label="Link to this section">#</a></h2>
+<p>Each receipt stores the SHA-256 hash of the previous record in <code>prev_hash</code>, forming an append-only chain from a genesis record. Because each hash covers the record's contents <em>and</em> its predecessor's hash, editing any record changes its hash — which no longer matches the next record's <code>prev_hash</code>. The chain is tamper-evident by construction.</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="hcT">
+<title id="hcT">Hash chain: each receipt stores the SHA-256 of the previous record in prev_hash, so records link genesis to head. Tampering with one block changes its hash, so the next block's prev_hash no longer matches and verification fails at that index.</title>
+<g font-size="12" class="m">
+<g>
+  <rect x="24" y="70" width="180" height="100" rx="12" class="n-stroke" fill="var(--d-fill)" stroke-width="1.6"/>
+  <text x="38" y="94" class="ink" font-size="12.5" font-weight="640">receipt #0 · genesis</text>
+  <line x1="38" y1="104" x2="190" y2="104" class="grid" stroke-width="1"/>
+  <text x="38" y="124" class="ink-mut" font-size="10.5">prev_hash</text>
+  <text x="38" y="139" class="ink-mut" font-size="11" font-weight="600">000000…</text>
+  <text x="38" y="158" class="ink-mut" font-size="10.5">hash a91f…</text>
+</g><g>
+  <rect x="248" y="70" width="180" height="100" rx="12" class="n-stroke" fill="var(--d-fill)" stroke-width="1.6"/>
+  <text x="262" y="94" class="ink" font-size="12.5" font-weight="640">receipt #1</text>
+  <line x1="262" y1="104" x2="414" y2="104" class="grid" stroke-width="1"/>
+  <text x="262" y="124" class="ink-mut" font-size="10.5">prev_hash</text>
+  <text x="262" y="139" class="accent-ink" font-size="11" font-weight="600">a91f…</text>
+  <text x="262" y="158" class="ink-mut" font-size="10.5">hash 5c02…</text>
+</g><g>
+  <rect x="472" y="70" width="180" height="100" rx="12" class="fail-s" fill="var(--d-fill)" stroke-width="1.6"/>
+  <text x="486" y="94" class="ink" font-size="12.5" font-weight="640">receipt #2 · TAMPERED</text>
+  <line x1="486" y1="104" x2="638" y2="104" class="grid" stroke-width="1"/>
+  <text x="486" y="124" class="ink-mut" font-size="10.5">prev_hash</text>
+  <text x="486" y="139" class="accent-ink" font-size="11" font-weight="600">5c02…</text>
+  <text x="486" y="158" class="ink-mut" font-size="10.5">hash e7d4…</text>
+</g><g>
+  <rect x="696" y="70" width="180" height="100" rx="12" class="fail-s" fill="var(--d-fill)" stroke-width="1.6"/>
+  <text x="710" y="94" class="ink" font-size="12.5" font-weight="640">receipt #3</text>
+  <line x1="710" y1="104" x2="862" y2="104" class="grid" stroke-width="1"/>
+  <text x="710" y="124" class="ink-mut" font-size="10.5">prev_hash</text>
+  <text x="710" y="139" class="fail" font-size="11" font-weight="600">e7d4…</text>
+  <text x="710" y="158" class="ink-mut" font-size="10.5">hash 1b88…</text>
+</g></g>
+<!-- link arrows -->
+<line x1="204" y1="120" x2="246" y2="120" class="n-stroke" stroke-width="1.6" marker-end="url(#hc)"/>
+<line x1="428" y1="120" x2="470" y2="120" class="pass-s" stroke-width="1.6" marker-end="url(#hcP)"/>
+<line x1="652" y1="120" x2="694" y2="120" class="fail-s" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#hcF)"/>
+<!-- break marker -->
+<text x="673" y="112" text-anchor="middle" class="fail" font-size="15" font-weight="700">✗</text>
+<text x="500" y="212" class="ink" font-size="12.5" font-weight="600">Edit receipt #2 → its hash changes → receipt #3's prev_hash (e7d4…) no longer matches.</text>
+<text x="500" y="232" class="ink-mut" font-size="12"><tspan class="m" fill="var(--d-fail)">firstpass verify</tspan> re-derives the chain from genesis and exits non-zero at index 3.</text>
+<text x="500" y="252" class="pass" font-size="11.5" font-weight="600">Records #0–#1 still verify. The break is localized and provable.</text>
+<defs>
+  <marker id="hc" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="hcP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+  <marker id="hcF" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-fail)"/></marker>
+</defs>
+</svg>
+  <figcaption>Edit one record and the break is localized and provable: everything before it still verifies, and the verifier exits non-zero at the exact index that was altered.</figcaption>
+</div>
+
+<h2 id="record">A real receipt<a class="anchor" href="#record" aria-label="Link to this section">#</a></h2>
+<p>A receipt is a JSON object. The load-bearing fields are the sequence number, the attempts (each with its gate verdicts and cost), the mode, the total cost, and the two hashes:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
+  &quot;seq&quot;: 4021,
+  &quot;ts&quot;: &quot;2026-07-20T18:42:07Z&quot;,
+  &quot;request_id&quot;: &quot;req_9f2c8a41&quot;,
+  &quot;mode&quot;: &quot;balanced&quot;,
+  &quot;attempts&quot;: [
+    { &quot;rung&quot;: 0, &quot;model&quot;: &quot;anthropic/claude-haiku-4-5&quot;,
+      &quot;gate&quot;: [{&quot;name&quot;: &quot;json-valid&quot;, &quot;verdict&quot;: &quot;pass&quot;},
+               {&quot;name&quot;: &quot;schema&quot;, &quot;verdict&quot;: &quot;fail&quot;, &quot;reason&quot;: &quot;missing &#x27;total&#x27;&quot;}],
+      &quot;cost_usd&quot;: 0.0003, &quot;escalated&quot;: true },
+    { &quot;rung&quot;: 1, &quot;model&quot;: &quot;openai/gpt-mini&quot;,
+      &quot;gate&quot;: [{&quot;name&quot;: &quot;json-valid&quot;, &quot;verdict&quot;: &quot;pass&quot;},
+               {&quot;name&quot;: &quot;schema&quot;, &quot;verdict&quot;: &quot;pass&quot;, &quot;score&quot;: 0.83}],
+      &quot;cost_usd&quot;: 0.0018, &quot;served&quot;: true }
+  ],
+  &quot;gate_cost_usd&quot;: 0.0000,
+  &quot;total_cost_usd&quot;: 0.0021,
+  &quot;prev_hash&quot;: &quot;sha256:a91f7c…&quot;,
+  &quot;hash&quot;: &quot;sha256:5c02d9…&quot;
+}</code></pre></div>
+
+<h2 id="export">Export &amp; verify<a class="anchor" href="#export" aria-label="Link to this section">#</a></h2>
+<p>Two commands, and the guarantee is independent of the running system:</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># 1. seal the log to portable JSONL</span>
+firstpass export --out receipts.jsonl
+
+<span class="tk-c"># 2. an auditor re-derives the chain from genesis — no proxy, no DB</span>
+firstpass verify --file receipts.jsonl</code></pre></div>
+<p><code>verify</code> reads only the file. It recomputes every hash from the genesis record forward and confirms each <code>prev_hash</code> link. If a record was edited, inserted, deleted, or reordered, the recomputed hash diverges and <code>verify</code> <strong>exits non-zero at the first broken index</strong> — a clean signal for CI or an external auditor. There is nothing to trust except the math and the file.</p>
+<div class="note"><span class="nt">Independent by design</span> The whole point is that verification needs nothing from Firstpass. Hand the JSONL to a third party; they run <code>firstpass verify</code> (or reimplement the check — it is just SHA-256 over a documented record) and get the same yes/no. The proxy could be offline, compromised, or gone.</div>
+
+<h2 id="durable">Durable never-drop<a class="anchor" href="#durable" aria-label="Link to this section">#</a></h2>
+<p>Under load, a best-effort writer might drop a receipt — and a gap in the chain is as bad as a tamper. Durable mode closes that hole:</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>FIRSTPASS_RECEIPTS=durable firstpass up</code></pre></div>
+<p>With <code>FIRSTPASS_RECEIPTS=durable</code>, receipts <strong>spill to disk under backpressure</strong> and <strong>drain on boot</strong>, so no decision is lost and the chain stays valid across restarts and load spikes. The default is <code>best_effort</code>; switch to <code>durable</code> when an unbroken audit trail is a requirement, not a nicety.</p>
+
+<h2 id="compliance">Compliance<a class="anchor" href="#compliance" aria-label="Link to this section">#</a></h2>
+<p>The receipt chain is the substrate for audit and compliance workflows:</p>
+<ul>
+  <li><strong>Answerability</strong> — every served output traces to a decision with its full rationale.</li>
+  <li><strong>Cost attribution</strong> — model spend and gate cost are itemized per decision.</li>
+  <li><strong>Tamper evidence</strong> — an altered log is provably altered, at a specific index.</li>
+  <li><strong>Independence</strong> — the check runs without the vendor in the loop.</li>
+</ul>
+<p>Verify receipts programmatically over MCP with the <code>verify_receipts</code> tool — see <a href="api.html#mcp">API &amp; MCP</a>.</p>
+
+<nav class="pager" aria-label="Pagination"><a class="prev" href="guarantee.html"><span class="dir">← Previous</span><span class="t">The guarantee</span></a><a class="next" href="providers.html"><span class="dir">Next →</span><span class="t">Providers</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#why" class="">Why receipts</a><a href="#chain" class="">The hash chain</a><a href="#record" class="">A real receipt</a><a href="#export" class="">Export &amp; verify</a><a href="#durable" class="">Durable never-drop</a><a href="#compliance" class="">Compliance</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js"></script>
+</body></html>
