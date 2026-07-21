@@ -1,0 +1,56 @@
+<svg viewBox="0 0 1000 340" xmlns="http://www.w3.org/2000/svg" role="img" preserveAspectRatio="xMidYMid meet" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <title>The guarantee, earned on 974 real MBPP coding tasks with real test gates. Left: served-failure is 5.5 percent calibrated risk and 7.7 percent realized, both under the 10 percent distribution-free target line at 95 percent confidence. Right: 82 percent of requests are served from the cheap tier, only 18 percent escalate. Pre-registered alpha 0.10, delta 0.05.</title>
+  <rect x="1.5" y="1.5" width="997" height="337" rx="16" fill="#0B0E14" stroke="#243244"/>
+
+  <!-- LEFT: served-failure vs target -->
+  <text x="40" y="44" font-size="14" font-weight="700" fill="#E6EDF3">Served-failure vs the &#8804;10% target</text>
+
+  <!-- y axis + gridlines -->
+  <line x1="110" y1="86" x2="110" y2="272" stroke="#243244" stroke-width="1"/>
+  <line x1="110" y1="272" x2="470" y2="272" stroke="#243244" stroke-width="1"/>
+  <g font-size="10" fill="#616d7b" font-family="ui-monospace, Menlo, monospace">
+    <line x1="110" y1="272" x2="470" y2="272" stroke="#1b2430" stroke-dasharray="2 4"/><text x="104" y="276" text-anchor="end">0%</text>
+    <line x1="110" y1="235" x2="470" y2="235" stroke="#1b2430" stroke-dasharray="2 4"/><text x="104" y="239" text-anchor="end">2%</text>
+    <line x1="110" y1="198" x2="470" y2="198" stroke="#1b2430" stroke-dasharray="2 4"/><text x="104" y="202" text-anchor="end">4%</text>
+    <line x1="110" y1="161" x2="470" y2="161" stroke="#1b2430" stroke-dasharray="2 4"/><text x="104" y="165" text-anchor="end">6%</text>
+    <line x1="110" y1="124" x2="470" y2="124" stroke="#1b2430" stroke-dasharray="2 4"/><text x="104" y="128" text-anchor="end">8%</text>
+  </g>
+
+  <!-- 10% target line -->
+  <line x1="110" y1="90" x2="470" y2="90" stroke="#FF5C5C" stroke-width="1.6" stroke-dasharray="6 4"/>
+  <text x="470" y="82" text-anchor="end" fill="#FF5C5C" font-size="11" font-weight="700">10% target · 95% conf.</text>
+
+  <!-- bar: calibrated risk 5.5% -->
+  <rect x="168" y="170" width="92" height="102" rx="5" fill="#19E3B1" opacity="0.55"/>
+  <text x="214" y="162" text-anchor="middle" fill="#5EEACB" font-size="14" font-weight="800">5.5%</text>
+  <text x="214" y="290" text-anchor="middle" fill="#8A97A6" font-size="11">calibrated risk</text>
+  <!-- bar: realized 7.7% -->
+  <rect x="308" y="129" width="92" height="143" rx="5" fill="#19E3B1"/>
+  <text x="354" y="121" text-anchor="middle" fill="#19E3B1" font-size="14" font-weight="800">7.7%</text>
+  <text x="354" y="290" text-anchor="middle" fill="#8A97A6" font-size="11">realized served-fail</text>
+
+  <!-- divider -->
+  <line x1="512" y1="70" x2="512" y2="290" stroke="#1B2636"/>
+
+  <!-- RIGHT: cheap tier + task stats -->
+  <text x="548" y="44" font-size="14" font-weight="700" fill="#E6EDF3">Where requests are served</text>
+  <rect x="548" y="112" width="400" height="48" rx="9" fill="#20262e"/>
+  <rect x="548" y="112" width="328" height="48" rx="9" fill="#19E3B1"/>
+  <text x="712" y="142" text-anchor="middle" fill="#04140f" font-size="16" font-weight="800">82% cheap tier</text>
+  <text x="912" y="142" text-anchor="middle" fill="#8A97A6" font-size="13" font-weight="700">18%</text>
+  <text x="548" y="186" fill="#8A97A6" font-size="12.5">82% clear the gate on the cheapest rung — no escalation.</text>
+  <text x="548" y="206" fill="#8A97A6" font-size="12.5">The other 18% escalate on proof of need.</text>
+
+  <g>
+    <rect x="548" y="230" width="192" height="60" rx="10" fill="#10151d" stroke="#2a3a4d" stroke-width="1.2"/>
+    <text x="566" y="253" fill="#8A97A6" font-size="11">real tasks in the bound</text>
+    <text x="566" y="280" fill="#E6EDF3" font-size="21" font-weight="800">974</text>
+    <rect x="756" y="230" width="192" height="60" rx="10" fill="#10151d" stroke="#2a3a4d" stroke-width="1.2"/>
+    <text x="774" y="253" fill="#8A97A6" font-size="11">gate type</text>
+    <text x="774" y="280" fill="#E6EDF3" font-size="21" font-weight="800">real tests</text>
+  </g>
+
+  <!-- footer -->
+  <line x1="40" y1="308" x2="960" y2="308" stroke="#1B2636"/>
+  <text x="500" y="328" text-anchor="middle" fill="#8A97A6" font-size="11.5">Distribution-free (Hoeffding UCB) · pre-registered &#945;=0.10 &#948;=0.05 · docs/benchmarks/mbpp-live-base.txt · <tspan fill="#E6EDF3">not assumed — measured</tspan></text>
+</svg>

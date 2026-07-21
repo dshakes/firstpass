@@ -1,0 +1,42 @@
+<svg viewBox="0 0 1000 300" xmlns="http://www.w3.org/2000/svg" role="img" preserveAspectRatio="xMidYMid meet" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <title>Elastic verification, a validated research result. A cheap probe samples the answer 5 times and its agreement decides how much verification to spend. Agreement 0 of 5 means escalate now — 12 percent of traffic, 0 percent oracle-correct. Agreement 1 to 4 of 5 is mixed, so run the full gate — 23 percent of traffic. Agreement 5 of 5 means serve without the expensive gate — 65 percent of traffic, 99 percent oracle-correct. 77 percent of traffic is decided by the cheap probe alone; only the 23 percent that actually needs it runs the gate. k equals 5, n equals 150.</title>
+  <rect x="1.5" y="1.5" width="997" height="297" rx="16" fill="#0B0E14" stroke="#243244"/>
+  <text x="34" y="42" font-size="14.5" font-weight="700" fill="#E6EDF3">Elastic verification <tspan fill="#8A97A6" font-weight="400">— a cheap 5-sample probe decides how much to spend on proof</tspan></text>
+
+  <!-- the split bar (proportional widths: 12 / 23 / 65 of 892px from x=54) -->
+  <!-- 0/5 escalate : 12% -> ~107 -->
+  <rect x="54" y="72" width="103" height="66" rx="8" fill="#FF5C5C" opacity="0.85"/>
+  <text x="105" y="100" text-anchor="middle" fill="#1a0808" font-size="14" font-weight="800">12%</text>
+  <text x="105" y="120" text-anchor="middle" fill="#1a0808" font-size="10.5" font-weight="600">0 / 5</text>
+  <!-- 1-4/5 gate : 23% -> ~205 -->
+  <rect x="161" y="72" width="201" height="66" rx="8" fill="#F5B544"/>
+  <text x="261" y="100" text-anchor="middle" fill="#1a1204" font-size="14" font-weight="800">23%</text>
+  <text x="261" y="120" text-anchor="middle" fill="#1a1204" font-size="10.5" font-weight="600">1 – 4 / 5</text>
+  <!-- 5/5 serve : 65% -> ~580 -->
+  <rect x="366" y="72" width="580" height="66" rx="8" fill="#19E3B1"/>
+  <text x="656" y="100" text-anchor="middle" fill="#04140f" font-size="14" font-weight="800">65%</text>
+  <text x="656" y="120" text-anchor="middle" fill="#04140f" font-size="10.5" font-weight="600">5 / 5</text>
+
+  <!-- regime labels -->
+  <g font-size="12.5" font-weight="600">
+    <circle cx="60" cy="168" r="4" fill="#FF5C5C"/>
+    <text x="72" y="173" fill="#E6EDF3">escalate now</text>
+    <text x="72" y="192" fill="#8A97A6" font-size="11" font-weight="400">probe unanimous-wrong · 0% oracle-correct</text>
+
+    <circle cx="300" cy="168" r="4" fill="#F5B544"/>
+    <text x="312" y="173" fill="#E6EDF3">run the full gate</text>
+    <text x="312" y="192" fill="#8A97A6" font-size="11" font-weight="400">mixed probe — genuinely uncertain</text>
+
+    <circle cx="620" cy="168" r="4" fill="#19E3B1"/>
+    <text x="632" y="173" fill="#E6EDF3">serve — skip the expensive gate</text>
+    <text x="632" y="192" fill="#8A97A6" font-size="11" font-weight="400">probe unanimous-right · 99% oracle-correct</text>
+  </g>
+
+  <!-- summary bracket -->
+  <line x1="54" y1="228" x2="362" y2="228" stroke="#19E3B1" stroke-width="1.4"/>
+  <line x1="54" y1="224" x2="54" y2="232" stroke="#19E3B1" stroke-width="1.4"/>
+  <line x1="362" y1="224" x2="362" y2="232" stroke="#19E3B1" stroke-width="1.4"/>
+  <text x="208" y="250" text-anchor="middle" fill="#8A97A6" font-size="11.5">only the <tspan fill="#E6EDF3" font-weight="700">23% that needs it</tspan> pays for the gate</text>
+
+  <text x="500" y="284" text-anchor="middle" fill="#8A97A6" font-size="11.5"><tspan fill="#19E3B1" font-weight="700">77% of traffic decided by the cheap probe alone</tspan> — validated, k=5, n=150 · phase-1 shipped, not default-on</text>
+</svg>
