@@ -3,17 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Firstpass — the autonomous LLM router that proves it before it serves it</title>
-<meta name="description" content="Firstpass sends every request to the cheapest model, proves the output passes your gate, and escalates only on failure — with a signed receipt for every decision. Proof over prediction.">
+<title>Firstpass — the LLM router that proves it before it serves it</title>
+<meta name="description" content="Cheapest model first, verified before it serves, escalate only on proof of need. A distribution-free ≤10% served-failure guarantee — earned live on 974 real coding tasks — and a signed receipt for every decision. Proof over prediction.">
 <meta property="og:title" content="Firstpass — proof over prediction">
-<meta property="og:description" content="The cheapest model takes the first pass. It clears your gate — proven, not guessed — or it escalates. Signed receipt every time.">
+<meta property="og:description" content="The cheapest model takes the first pass. It clears your gate — proven, not guessed — or it escalates. Signed receipt every time. ≤10% wrong answers served, earned live.">
 <meta name="theme-color" content="#05070A">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2305070A'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%2319E3B1' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="assets/site.css?v=7">
+<link rel="stylesheet" href="assets/site.css?v=8">
 </head>
 <body>
 <div class="progress" id="prog"></div>
-<div class="fx"><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
+<div class="fx"></div>
 <div class="grid-bg"></div>
 
 <header><div class="wrap"><nav>
@@ -21,8 +21,8 @@
   <span class="sp"></span>
   <a class="nl" href="#decide">Watch it decide</a>
   <a class="nl" href="#vs">Why</a>
-  <a class="nl" href="#onramp">Onboarding</a>
-  <a class="nl" href="#architecture">Architecture</a>
+  <a class="nl" href="#guarantee">Guarantee</a>
+  <a class="nl" href="#modes">Modes</a>
   <a class="nl" href="#install">Install</a>
   <a class="nl" href="usage.html">Docs</a>
   <a class="nl" href="https://github.com/dshakes/firstpass">GitHub ↗</a>
@@ -33,7 +33,8 @@
     <a class="demo" href="#install">⚡ Run the demo — no keys</a>
     <a href="#decide">Watch it decide</a>
     <a href="#vs">Why</a>
-    <a href="#architecture">Architecture</a>
+    <a href="#guarantee">Guarantee</a>
+    <a href="#modes">Modes</a>
     <a href="#install">Install</a>
     <a href="usage.html">Docs</a>
     <a href="https://github.com/dshakes/firstpass">GitHub ↗</a>
@@ -42,14 +43,14 @@
 
 <main id="top">
 <section class="hero"><div class="hero-glow" id="heroGlow"></div><div class="wrap">
-  <div class="tagpill"><b>◆ adaptive llm routing</b> · proof over prediction</div>
+  <div class="tagpill"><b>◆ verified cascade routing</b> · proof over prediction</div>
   <h1><span class="grad-text">Cheap until</span><span class="l2">proven otherwise.</span></h1>
-  <p class="sub">Every answer runs through your gate; a big model is paid for <b>only on proof of need</b>. Wrong answers <b>capped at ≤10%, guaranteed</b> — and it <b>tunes itself</b> as your traffic drifts.</p>
+  <p class="sub">The cheapest model takes the first pass. It clears <b>your gate</b> — proven on the real output, not guessed from the prompt — or it escalates. Wrong answers <b>capped at ≤10% at 95% confidence</b>, and it <b>tunes itself</b> as your traffic drifts.</p>
   <div class="cta">
     <a class="btn primary" href="#install">⚡ Run the demo — no keys</a>
     <a class="btn" href="https://github.com/dshakes/firstpass">★ Star on GitHub</a>
   </div>
-  <div class="trust"><span><b>cheapest-first</b> · gated</span><span><b>≤10%</b> served-fail @ 95%</span><span><b>every provider</b> + OSS</span><span><b>GA-ready</b> · v0.1.6</span></div>
+  <div class="trust"><span><b>cheapest-first</b> · gated</span><span><b>≤10%</b> served-fail @ 95%</span><span><b>every provider</b> · BYOK, zero markup</span><span><b>v0.2.0</b> · pre-GA, in the open</span></div>
 
   <!-- live agent decision stream -->
   <div class="term" id="decide" aria-label="Live agent routing decision">
@@ -58,9 +59,32 @@
   </div>
 </div></section>
 
+<!-- ═══ at-a-glance proof strip ═══ -->
+<section id="proofstrip" class="tight"><div class="wrap reveal">
+  <div class="pstrip">
+    <div class="pcell">
+      <div class="pn grad-text">≤10%<span class="pu">@ 95%</span></div>
+      <div class="pk">wrong answers served — a <b>distribution-free</b> bound, not a vibe</div>
+    </div>
+    <div class="pcell">
+      <div class="pn">974</div>
+      <div class="pk"><b>real MBPP coding tasks</b>, live — the guarantee <b>earned</b>, calibrated risk 5.5%</div>
+    </div>
+    <div class="pcell">
+      <div class="pn grad-text">82%</div>
+      <div class="pk">of requests served from the <b>cheap tier</b> at that bound</div>
+    </div>
+    <div class="pcell">
+      <div class="pn">100%</div>
+      <div class="pk">of decisions carry a <b>hash-chained receipt</b> an auditor re-derives</div>
+    </div>
+  </div>
+  <p class="pstrip-note">Numbers you can check, not take on trust — <a class="ln-in" href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/mbpp-live-base.txt">the committed benchmark artifact</a> regenerates from one command, and every trace records the always-top-tier counterfactual so you measure <i>your</i> number.</p>
+</div></section>
+
 <section id="vs"><div class="wrap reveal">
   <p class="eyebrow">the wedge</p>
-  <h2>Every other router <span style="color:var(--red)">guesses</span>.<br>Firstpass <span class="grad-text">proves</span>.</h2>
+  <h2>Every predictive router <span style="color:var(--red)">guesses</span>.<br>Firstpass <span class="grad-text">proves</span>.</h2>
   <div class="vs">
     <div class="side predict">
       <span class="badge">✕ Prediction — the status quo</span>
@@ -78,12 +102,13 @@
       <h3>Send cheap, gate the output, escalate on fail</h3>
       <ul>
         <li><span class="m">✓</span> Run the cheapest model, gate its <b>real output</b></li>
-        <li><span class="m">✓</span> Tests · typecheck · schema · a fresh-context judge</li>
+        <li><span class="m">✓</span> Your tests · JSON schema · a fresh-context judge · k-sample agreement</li>
         <li><span class="m">✓</span> Escalate one rung only on failure — signed receipt every time</li>
         <li><span class="m">✓</span> To improve, edit a gate. Zero retrain.</li>
       </ul>
     </div>
   </div>
+  <p class="vs-foot">The one good idea prediction had — <i>starting</i> on the right model — is inside Firstpass: a learned start-rung bandit picks where the ladder opens. A wrong guess costs latency, never correctness, because the gate still decides what ships.</p>
 </div></section>
 
 <section id="built-for"><div class="wrap reveal stagger">
@@ -92,38 +117,72 @@
   <div class="uses">
     <div class="use"><span class="ic">🤖</span><h3>Coding agents</h3><p>Gate on your real test suite. The cheap model writes the patch; it ships only if the tests actually pass — otherwise it escalates.</p><span class="tag">gate: cargo-test · pytest · tsc</span></div>
     <div class="use"><span class="ic">🛰️</span><h3>Agent fleets</h3><p>Per-tenant policies, ladders, and budgets. Route across providers with failover across boundaries — one drop-in hop for the whole fleet.</p><span class="tag">multi-tenant · multi-provider</span></div>
-    <div class="use"><span class="ic">📉</span><h3>Cost-sensitive production</h3><p>Serve the cheapest model that clears the bar; pay for the expensive one only when the gate demands it. Every dollar has a receipt.</p><span class="tag">~65% cheaper (sim)</span></div>
+    <div class="use"><span class="ic">📉</span><h3>Cost-sensitive production</h3><p>Serve the cheapest model that clears the bar; pay for the expensive one only when the gate demands it. Every dollar has a receipt.</p><span class="tag">82% served from the cheap tier (MBPP)</span></div>
   </div>
 </div></section>
 
 <section id="how"><div class="wrap reveal">
   <p class="eyebrow">how it works</p>
-  <h2>Three moves. One receipt.</h2>
-  <div class="cards g3">
-    <div class="card"><div class="kicker">▸</div><h3>Route</h3><p>Cheapest rung of a declarative ladder first — <b>across any provider</b>, incl. open-source models (Anthropic, OpenAI, Groq, DeepSeek, local Ollama / vLLM …). Drop-in: your agent speaks the Anthropic wire format, so just point <span class="mono c-mint">base_url</span> at it. BYOK, keys redacted from every log.</p></div>
-    <div class="card"><div class="kicker">◈</div><h3>Gate</h3><p>Run a real gate on the real output — inline or your own subprocess plugin, fed on <b>stdin not argv</b> (injection-resistant). Flaky gates auto-disable on an error budget.</p></div>
-    <div class="card"><div class="kicker">↑</div><h3>Escalate &amp; seal</h3><p>One rung up on failure, budget-capped; a provider 5xx fails over. The decision becomes a <b>tamper-evident hash-chain trace</b> anyone can re-derive.</p></div>
+  <h2>Four moves. One receipt.</h2>
+  <div class="cards g4">
+    <div class="card"><div class="kicker">▸</div><h3>Route</h3><p>Open on the cheapest rung of a declarative ladder — <b>across any provider</b>, incl. open-source (Anthropic, OpenAI, Groq, DeepSeek, local Ollama / vLLM …). Drop-in: your agent already speaks the wire format, so just point <span class="mono c-mint">base_url</span> at it. BYOK, keys redacted from every log.</p></div>
+    <div class="card"><div class="kicker">◈</div><h3>Prove</h3><p>Run a real gate on the <b>real output</b> — your tests, a JSON schema, a fresh-context judge (maker ≠ checker), or k-sample self-consistency. Meet you where you are: start with none, add one line when ready.</p></div>
+    <div class="card"><div class="kicker">↑</div><h3>Escalate</h3><p>One rung up on failure, budget-capped; a provider 5xx fails over — to a different provider if the ladder says so. The decision seals into a <b>tamper-evident hash-chain</b>.</p></div>
+    <div class="card"><div class="kicker">↻</div><h3>Learn</h3><p>Outcomes feed back. The serve threshold <b>self-tunes from live results</b> so the guarantee tracks your traffic as it drifts — no retraining, ever.</p></div>
   </div>
-  <div class="pipe"><img src="assets/how.svg" alt="Route to the cheapest model, gate its real output, escalate one rung only on failure, serve, and log every decision to a hash-chained audit trace." loading="lazy"></div>
+  <div class="pipe"><img src="assets/how.svg" alt="Route to the cheapest model, prove its real output against a gate, escalate one rung only on failure, serve, and seal every decision into a hash-chained audit trace." loading="lazy"></div>
 </div></section>
 
-<section id="onramp"><div class="wrap reveal stagger">
-  <p class="eyebrow">no heavy lift</p>
-  <h2>Onboards in one step. Tunes itself.</h2>
-  <p style="color:#8A97A6;max-width:660px;margin:6px 0 26px;font-size:16px;line-height:1.55">You don't have to write or babysit gates. Start with none, add one line when you're ready, and let the router keep itself calibrated.</p>
-  <div class="cards g3">
-    <div class="card"><div class="kicker">◷</div><h3>One command onboards you</h3><p><span class="mono c-mint">firstpass onboard --apply</span> detects your shell and agents, starts the proxy in <b>observe mode</b> (zero config, zero risk — watches, changes nothing), routes your agent, and verifies itself. Idempotent, dry-run by default, and <span class="mono c-mint">firstpass offboard</span> undoes all of it.</p></div>
-    <div class="card"><div class="kicker">✎</div><h3>Gate with no code</h3><p>Built-ins (<span class="mono c-mint">non-empty</span>, <span class="mono c-mint">json-valid</span>, schema) need zero setup. The <b>judge gate</b> is one plain-English sentence — a second model grades each answer. Bring your own tests only when you want the strongest gate.</p></div>
-    <div class="card"><div class="kicker">↻</div><h3>It learns on its own</h3><p>The serve threshold <b>self-tunes from live outcomes</b> (online conformal). The money-vs-accuracy balance holds as your traffic drifts — set it in front of your workload and it keeps itself calibrated. Accuracy is never what you trade for savings: the gate guarantees it.</p></div>
+<!-- ═══ the guarantee ═══ -->
+<section id="guarantee"><div class="wrap reveal">
+  <p class="eyebrow">the guarantee</p>
+  <h2>A served-failure rate you can<br>put in a <span class="grad-text">contract</span>.</h2>
+  <p class="lead">Of the requests Firstpass serves, <b>no more than α are wrong, at confidence 1−δ, distribution-free.</b> You set α and δ. The published run uses α=10%, δ=5% — and earns it, live.</p>
+
+  <div class="gcard">
+    <div class="gmetrics">
+      <div class="gm"><div class="gm-n grad-text">5.5%</div><div class="gm-k">calibrated risk on 974 real MBPP tasks — comfortably inside the 10% target</div></div>
+      <div class="gm"><div class="gm-n">7.7%</div><div class="gm-k">realized served-failure at the conformal serve threshold</div></div>
+      <div class="gm"><div class="gm-n grad-text">82%</div><div class="gm-k">of requests served from the cheap tier at that bound — feasible, not a trade</div></div>
+    </div>
+    <div class="gbar" aria-hidden="true">
+      <div class="gbar-track"><div class="gbar-fill" style="width:55%"></div><div class="gbar-cap" style="left:100%">α = 10% target</div></div>
+      <div class="gbar-legend"><span><i class="sw mint"></i>calibrated risk 5.5%</span><span><i class="sw line"></i>your α ceiling</span></div>
+    </div>
+    <p class="gnote">Earned on a fail-closed, network-isolated sandbox against real test gates. The full artifact — command, α/δ, per-task scores, the gate's own false-accept rate — is <a class="ln-in" href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/mbpp-live-base.txt">committed in the repo</a> and regenerates from one line.</p>
   </div>
+
+  <div class="gmech">
+    <div class="gstep"><span class="gs-n">1</span><div><b>Calibrate</b> — <span class="mono c-mint">firstpass calibrate --method ltt</span> gives a Learn-then-Test threshold: distribution-free, finite-sample risk control, and it reports the gate's observed false-accept rate so a rubber-stamp gate can't hide.</div></div>
+    <div class="gstep"><span class="gs-n">2</span><div><b>Enforce</b> — pin it as <span class="mono c-mint">serve_threshold</span>. Only outputs at or above it are served.</div></div>
+    <div class="gstep"><span class="gs-n">3</span><div><b>Track it live</b> — adaptive conformal inference nudges the threshold from <span class="mono c-mint">/v1/feedback</span> outcomes, so the bound <b>holds under drift</b> instead of silently decaying. Two gauges make it observable: <span class="mono">serve_threshold</span> and <span class="mono">realized_served_failure</span>.</div></div>
+  </div>
+  <div class="killbar">
+    <span style="color:var(--mut);font-size:14.5px"><b style="color:var(--ink)">Pre-registered kill criterion</b> — bootstrap CIs + a split-conformal / Learn-then-Test guarantee + a published go/no-go gate. <a class="ln-in" href="https://github.com/dshakes/firstpass/blob/main/docs/compliance/slo.md">Read the SLO ↗</a></span>
+    <span class="verdict">verdict: PROCEED</span>
+  </div>
+</div></section>
+
+<!-- ═══ gates: do I have to write them? ═══ -->
+<section id="gates"><div class="wrap reveal">
+  <p class="eyebrow">"do I have to write gates?"</p>
+  <h2>No. It meets you<br>where you are.</h2>
+  <p class="lead">Start with nothing and watch. Add one plain-English sentence. Bring your existing tests only when you want the strongest possible check. Every rung up is optional.</p>
+  <div class="glad">
+    <div class="grung"><span class="ge">none</span><div class="gr-b"><h4>Observe mode</h4><p>Firstpass reports what it <i>would</i> route and save. Zero behavior change, zero risk.</p></div></div>
+    <div class="grung"><span class="ge">one sentence</span><div class="gr-b"><h4>Judge gate</h4><p>A second model grades every answer against your rubric. Maker ≠ checker enforced structurally; the candidate is fenced as data.</p></div></div>
+    <div class="grung"><span class="ge">one line</span><div class="gr-b"><h4>Schema · consistency</h4><p><span class="mono c-mint">json-valid</span>, a minimal JSON-Schema, or k-sample self-consistency — measured confidence on the actual output.</p></div></div>
+    <div class="grung strong"><span class="ge">your tests</span><div class="gr-b"><h4>Subprocess gate</h4><p>The strongest gate: code ships only if your suite actually passes. Candidate on <b>stdin, never argv</b> — injection-resistant.</p></div></div>
+  </div>
+  <p class="gates-foot">Flaky gates auto-disable on a rolling error budget, with an alarm — one bad check can't take down a route.</p>
 </div></section>
 
 <section id="architecture"><div class="wrap reveal">
   <p class="eyebrow">system architecture</p>
   <h2>One hop between your agent<br>and every provider.</h2>
-  <p class="lead">Firstpass sits inline as a drop-in proxy. Hover any component to see what it does.</p>
+  <p class="lead">A drop-in proxy that speaks <b>both wire dialects</b> inbound — Anthropic <span class="mono c-mint">/v1/messages</span> and OpenAI <span class="mono c-mint">/v1/chat/completions</span>, both live-verified. Hover any component to see what it does.</p>
   <div class="arch" id="arch">
-    <svg viewBox="0 0 1000 430" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" aria-label="Firstpass system architecture: agents connect through the Firstpass proxy — router, gate engine, escalation and failover, trace store, and feedback API — to multiple providers.">
+    <svg viewBox="0 0 1000 430" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" aria-label="Firstpass system architecture: agents speaking either the Anthropic or OpenAI wire dialect connect through the Firstpass proxy — router, gate engine, escalation and failover, trace store, and feedback API — to multiple providers.">
       <defs>
         <marker id="mk" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#5a6b78"/></marker>
         <marker id="mkm" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#19E3B1"/></marker>
@@ -139,22 +198,23 @@
       <rect x="246" y="52" width="508" height="346" rx="16" fill="rgba(25,227,177,.03)" stroke="#1c4b40"/>
 
       <!-- Agent -->
-      <g class="node" data-t="Your agent" data-d="Any client that already speaks the Anthropic Messages API — Claude Code, an SDK, or your own app. You just point ANTHROPIC_BASE_URL at Firstpass.">
+      <g class="node" data-t="Your agent" data-d="Any client speaking the Anthropic Messages API OR the OpenAI Chat Completions API — Claude Code, an SDK, or your own app. Point base_url at Firstpass; both inbound dialects are live-verified end-to-end.">
         <rect x="34" y="176" width="150" height="88" rx="12" fill="#0b0b0c" stroke="#41505f"/>
-        <text class="nt" x="109" y="212" text-anchor="middle" font-size="14" font-weight="700" fill="#EDEDED">Your agent</text>
-        <text x="109" y="232" text-anchor="middle" font-size="10.5" fill="#9a9a9e">Anthropic wire</text>
+        <text class="nt" x="109" y="208" text-anchor="middle" font-size="14" font-weight="700" fill="#EDEDED">Your agent</text>
+        <text x="109" y="228" text-anchor="middle" font-size="9.5" fill="#9a9a9e">Anthropic OR</text>
+        <text x="109" y="242" text-anchor="middle" font-size="9.5" fill="#9a9a9e">OpenAI wire</text>
       </g>
       <path d="M184 214 C214 214 220 150 268 150" fill="none" stroke="#5a6b78" stroke-width="2" marker-end="url(#mk)"/>
       <text x="214" y="140" font-size="9.5" fill="#6a6a6f">base_url</text>
 
       <!-- pipeline: Router -> Gate -> Escalate -->
-      <g class="node" data-t="Router" data-d="Picks the cheapest rung of a declarative model ladder for this route (matched by agent, task, or language). First match wins.">
+      <g class="node" data-t="Router" data-d="Picks the cheapest rung of a declarative model ladder for this route (matched by agent, task, or language). A learned start-rung bandit can open higher when your own receipts say it pays. First match wins.">
         <rect x="270" y="124" width="128" height="52" rx="10" fill="#101011" stroke="#41505f"/>
         <text class="nt" x="334" y="147" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Router</text>
         <text x="334" y="163" text-anchor="middle" font-size="9.5" fill="#9a9a9e">cheapest first</text>
       </g>
       <path d="M398 150 L432 150" fill="none" stroke="#5a6b78" stroke-width="2" marker-end="url(#mk)"/>
-      <g class="node" data-t="Gate engine" data-d="Runs a real gate on the real output — inline (non-empty, JSON, JSON-Schema) or your own subprocess plugin (tests, linter, judge) fed on stdin. Flaky gates auto-disable on an error budget.">
+      <g class="node" data-t="Gate engine" data-d="Runs a real gate on the real output — inline (non-empty, JSON, JSON-Schema) or your own subprocess plugin (tests, linter, judge, self-consistency) fed on stdin. Flaky gates auto-disable on an error budget.">
         <rect x="434" y="124" width="128" height="52" rx="10" fill="#101011" stroke="#51637d"/>
         <text class="nt" x="498" y="147" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Gate engine</text>
         <text x="498" y="163" text-anchor="middle" font-size="9.5" fill="#9a9a9e">test the output</text>
@@ -167,12 +227,12 @@
       </g>
 
       <!-- record layer: Trace store + Feedback -->
-      <g class="node" data-t="Trace store" data-d="Every decision is written off the hot path to a SQLite store as a hash-chained JSON trace — re-derivable by an external auditor. Zero added latency on the request path.">
+      <g class="node" data-t="Trace store" data-d="Every decision is written off the hot path to a SQLite store as a hash-chained JSON trace — re-derivable by an external auditor with firstpass export + verify. Durable mode never drops a receipt. Zero added latency on the request path.">
         <rect x="270" y="256" width="196" height="60" rx="10" fill="#0d141b" stroke="#41505f"/>
         <text class="nt" x="368" y="281" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Trace store</text>
         <text x="368" y="299" text-anchor="middle" font-size="9.5" fill="#19E3B1">SQLite · hash-chain</text>
       </g>
-      <g class="node" data-t="Feedback API" data-d="POST /v1/feedback folds downstream outcomes (did the tests pass an hour later?) back onto a trace via a deferred-verdict side table — never altering the sealed record.">
+      <g class="node" data-t="Feedback API" data-d="POST /v1/feedback folds downstream outcomes (did the tests pass an hour later?) back onto a trace via a deferred-verdict side table — never altering the sealed record. This is what the threshold self-tunes on.">
         <rect x="490" y="256" width="160" height="60" rx="10" fill="#0d141b" stroke="#41505f"/>
         <text class="nt" x="570" y="281" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Feedback API</text>
         <text x="570" y="299" text-anchor="middle" font-size="9.5" fill="#9a9a9e">/v1/feedback</text>
@@ -182,11 +242,11 @@
       <path d="M498 176 L520 250" fill="none" stroke="#2b3f52" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#mk)"/>
 
       <!-- providers -->
-      <g class="node" data-t="Anthropic" data-d="Upstream provider adapter for the Anthropic Messages API. BYOK — your key passes through, redacted from every log.">
+      <g class="node" data-t="Anthropic" data-d="Upstream provider adapter for the Anthropic Messages API. BYOK — your key passes through, redacted from every log, zero markup. Live-verified end-to-end.">
         <rect x="812" y="120" width="152" height="52" rx="10" fill="#0b0b0c" stroke="#41505f"/>
         <text class="nt" x="888" y="151" text-anchor="middle" font-size="13" font-weight="600" fill="#EDEDED">Anthropic</text>
       </g>
-      <g class="node" data-t="OpenAI-compatible" data-d="One OpenAI Chat Completions adapter covers the whole OpenAI-compatible universe — OpenAI, Groq, Together, Fireworks, DeepSeek, Mistral, xAI, OpenRouter, Azure, and local Ollama / vLLM serving open-source models. Add one [[provider]] entry per endpoint; ladders mix providers and failover crosses boundaries.">
+      <g class="node" data-t="OpenAI-compatible" data-d="One OpenAI Chat Completions adapter covers the whole OpenAI-compatible universe — OpenAI, Groq, Together, Fireworks, DeepSeek, Mistral, xAI, Azure, and local Ollama / vLLM serving open-source models. Add one [[provider]] entry per endpoint; ladders mix providers and failover crosses boundaries.">
         <rect x="812" y="184" width="152" height="52" rx="10" fill="#0b0b0c" stroke="#41505f"/>
         <text class="nt" x="888" y="215" text-anchor="middle" font-size="11" font-weight="600" fill="#EDEDED">OpenAI-compatible</text>
       </g>
@@ -196,7 +256,7 @@
       </g>
       <text x="888" y="312" text-anchor="middle" font-size="9.5" fill="#8b98a5">+ Groq · Together · DeepSeek · Ollama · vLLM — any OpenAI-compatible host</text>
       <text x="888" y="326" text-anchor="middle" font-size="9.5" fill="#8b98a5">+ AWS Bedrock (SigV4) · Google Vertex (OAuth)</text>
-      <!-- provider bus: the provider adapters share the call/return interface -->
+      <!-- provider bus -->
       <line x1="806" y1="146" x2="806" y2="270" stroke="#41505f" stroke-width="1.5"/>
       <line x1="806" y1="146" x2="812" y2="146" stroke="#41505f" stroke-width="1.5"/>
       <line x1="806" y1="210" x2="812" y2="210" stroke="#41505f" stroke-width="1.5"/>
@@ -204,11 +264,11 @@
       <!-- escalate -> providers (call) -->
       <path d="M728 150 L802 150" fill="none" stroke="#19E3B1" stroke-width="2" marker-end="url(#mkm)"/>
       <text x="765" y="140" text-anchor="middle" font-size="9.5" fill="#19E3B1">call · BYOK</text>
-      <!-- providers -> gate: output returns to be gated, routed cleanly below the pipeline -->
+      <!-- providers -> gate: output returns to be gated -->
       <path d="M806 206 L576 206 C562 206 562 194 562 178" fill="none" stroke="#F5B544" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#mka)"/>
       <text x="700" y="199" text-anchor="middle" font-size="9.5" fill="#F5B544">output → re-gate</text>
 
-      <!-- animated request packet: agent → router → gate → escalate → provider -->
+      <!-- animated request packet -->
       <circle r="5" fill="#38E8FF"><animateMotion dur="4.5s" repeatCount="indefinite" path="M184 214 C214 214 220 150 268 150 L398 150 L432 150 L562 150 L596 150 L728 150 L802 150"/></circle>
     </svg>
     <div class="arch-cap" id="archCap"><span class="dot"></span><span class="hint">Hover a component to inspect it — router, gate, escalation, trace store, feedback, or a provider.</span></div>
@@ -218,7 +278,7 @@
 <section id="receipt"><div class="wrap reveal">
   <p class="eyebrow">the receipt</p>
   <h2>Not a dashboard number.<br>A decision you can <span class="grad-text">audit</span>.</h2>
-  <p class="lead">Every call becomes a hash-chained JSON trace an external auditor can re-derive. Point at any request and answer <i>why did this go to that model, and what did it cost.</i></p>
+  <p class="lead">Every call becomes a hash-chained JSON trace. Point at any request and answer <i>why did this go to that model, and what did it cost</i> — then hand the log to an auditor who re-derives the whole chain with <b>no proxy and no database</b>.</p>
   <div style="position:relative;margin-top:28px"><div class="seal" id="seal">SEALED ✓</div><div class="code"><button class="copy" data-copy='{ "trace_id": "0192f3a1", "prev_hash": "9f2c…a1b7", "mode": "enforce" }'>copy</button><pre style="margin:0"><span class="c">{</span>
   <span class="cy">"trace_id"</span>: <span class="p">"0192f3a1-7c4e-7abc"</span>, <span class="cy">"prev_hash"</span>: <span class="p">"9f2c…a1b7"</span>,   <span class="c">// chains to the prior decision — tamper-evident</span>
   <span class="cy">"attempts"</span>: [
@@ -227,22 +287,74 @@
   ],
   <span class="cy">"final"</span>: { <span class="cy">"served_rung"</span>:1, <span class="cy">"savings_usd"</span>:<span class="p">0.0502</span> }   <span class="c">// vs always-top-tier</span>
 <span class="c">}</span></pre></div></div>
+  <div class="rfeat">
+    <div class="rf"><b><span class="mono c-mint">firstpass export</span> + <span class="mono c-mint">verify</span></b><p>Export the sealed log as JSONL; anyone re-derives the hash chain from genesis on their own machine. A single altered or reordered receipt breaks the chain at its index and exits non-zero. The EU-AI-Act-style logging story, built in.</p></div>
+    <div class="rf"><b>Durable, never-drop</b><p><span class="mono c-mint">FIRSTPASS_RECEIPTS=durable</span> spills receipts to disk under backpressure and drains them on boot with the chain verified valid — no decision is ever silently lost.</p></div>
+  </div>
 </div></section>
 
-<section id="proof"><div class="wrap reveal">
-  <p class="eyebrow">proof, not adjectives</p>
-  <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between">
-    <h2>Error bars and a kill switch.</h2>
-    <span class="simchip">◆ harness ~65% cheaper · live n=200 + 974-task earned bound (artifact committed)</span>
+<!-- ═══ modes — near-term vision ═══ -->
+<section id="modes"><div class="wrap reveal">
+  <div class="sec-head">
+    <div>
+      <p class="eyebrow">on the near horizon</p>
+      <h2>One dial: <span class="grad-text">how hard should<br>this one try?</span></h2>
+    </div>
+    <span class="vbadge">◇ designed · validating</span>
   </div>
-  <div class="stats">
-    <div class="stat"><div class="n grad-text" data-to="65" data-suffix="%" data-prefix="~">~0%</div><div class="k">cheaper at equal-or-higher success vs a predictive router (harness; live arithmetic hit ~85% — measure yours per request)</div></div>
-    <div class="stat"><div class="n grad-text" data-to="0.16" data-dec="2">0.00</div><div class="k">served-failure rate <span class="vs-tag">vs 0.46</span> for prediction — verification catches what guessing serves</div></div>
-    <div class="stat"><div class="n grad-text" data-to="10" data-prefix="≤" data-suffix="%">≤0%</div><div class="k">conformal served-failure @ 95% confidence — <b>earned live on 974 real MBPP tasks — artifact in the repo</b>, and adaptive under drift</div></div>
+  <p class="lead">Cost, balanced, quality, latency, or max — a mode is a constraint the router honors, chosen <b>per task, per turn, even per request</b> with one header. Same guarantee underneath; the mode just moves where on the cost/quality frontier you sit.</p>
+
+  <div class="modewrap">
+    <div class="modesel" id="modesel" role="tablist" aria-label="Routing mode">
+      <button class="mode on" data-m="cost" role="tab" aria-selected="true">Cost</button>
+      <button class="mode" data-m="balanced" role="tab" aria-selected="false">Balanced</button>
+      <button class="mode" data-m="quality" role="tab" aria-selected="false">Quality</button>
+      <button class="mode" data-m="latency" role="tab" aria-selected="false">Latency</button>
+      <button class="mode" data-m="max" role="tab" aria-selected="false">Max</button>
+    </div>
+    <div class="modebody">
+      <div class="mode-desc" id="modeDesc">
+        <p data-m="cost" class="on"><b>Cost.</b> Open on the cheapest rung and stay there as long as the gate clears. Escalate only on hard proof of need. The default posture — most requests never leave the cheap tier.</p>
+        <p data-m="balanced"><b>Balanced.</b> Let the learned start-rung open a step higher when your own receipts say the cheap model usually fails this kind of task — trading a little spend for fewer escalations.</p>
+        <p data-m="quality"><b>Quality.</b> Raise the serve threshold and prefer stronger rungs. Fewer marginal passes served; the guarantee target tightens.</p>
+        <p data-m="latency"><b>Latency.</b> Fire speculative escalation in the marginal zone so the next rung is already in flight if the gate fails — pay parallel tokens to buy tail latency.</p>
+        <p data-m="max"><b>Max.</b> Open at the top of the ladder. For the rare request where the answer has to be right the first time and cost is no object.</p>
+      </div>
+      <div class="modecode"><div class="code"><button class="copy" data-copy='curl $BASE/v1/messages -H "x-firstpass-mode: cost" -d @req.json'>copy</button><pre style="margin:0"><span class="c"># choose the posture per request — one header</span>
+curl <span class="cy">$BASE</span>/v1/messages <span class="a">\</span>
+  -H <span class="p">"x-firstpass-mode: <span id="modeHdr">cost</span>"</span> <span class="a">\</span>
+  -d @req.json</pre></div></div>
+    </div>
   </div>
-  <div class="killbar">
-    <span style="color:var(--mut);font-size:14.5px"><b style="color:var(--ink)">Pre-registered kill criterion</b> — bootstrap CIs + split-conformal guarantee + a published go/no-go gate.</span>
-    <span class="verdict">verdict: PROCEED</span>
+  <p class="modes-honest"><b>Honest status:</b> modes are <b>designed, not yet shipped</b>. They land behind a validation gate — a mode is only worth exposing if it moves the cost/quality frontier measurably on your traffic, and that's the study that promotes each one from research to default.</p>
+</div></section>
+
+<!-- ═══ research vision — elastic verification ═══ -->
+<section id="vision"><div class="wrap reveal">
+  <div class="sec-head">
+    <div>
+      <p class="eyebrow">the research</p>
+      <h2>Verify <span class="grad-text">proportional to doubt.</span></h2>
+    </div>
+    <span class="vbadge">◇ research · go/no-go gated</span>
+  </div>
+  <p class="lead">Today Firstpass proves before it serves. The next question is <i>how much</i> proof each answer needs. An easy request that three signals already agree on shouldn't pay for a full test run; a genuinely uncertain one should. That's <b>elastic verification</b>: spend verification budget as a function of measured doubt — with a conformal guarantee over the verify-or-skip decision itself, so cutting a check is never a silent risk.</p>
+  <div class="cards g3">
+    <div class="card vcard"><div class="kicker">⌁</div><h3>Value-of-information gating</h3><p>Estimate what a verification step is worth before running it — skip the checks that can't change the decision, spend on the ones that can.</p></div>
+    <div class="card vcard"><div class="kicker">◎</div><h3>Per-query difficulty</h3><p>Predict how hard a request is likely to be for the cheap rung, from the prompt <i>and</i> cheap signals — to choose where to start and how much to check.</p></div>
+    <div class="card vcard"><div class="kicker">⟿</div><h3>Session-level routing</h3><p>Route over a whole trajectory, not one turn — carry difficulty and outcome context across an agent's session.</p></div>
+  </div>
+  <p class="vision-honest"><b>How we'll know it's real:</b> each of these ships only if a pre-registered go/no-go study shows it beats verify-everything on cost at an <b>equal-or-better</b> served-failure bound. Same rule that promoted the start-rung bandit from idea to code. Until then it's on the roadmap, honestly labeled — not in the product.</p>
+</div></section>
+
+<section id="onramp"><div class="wrap reveal stagger">
+  <p class="eyebrow">agent-first</p>
+  <h2>Onboards in one step.<br>Built for agents to run themselves.</h2>
+  <p class="onramp-sub">One env var in, one env var out. No SDK, no rewrite — the proxy speaks the wire format your agent already uses, and exposes itself for machines to discover.</p>
+  <div class="cards g3">
+    <div class="card"><div class="kicker">◷</div><h3>One command onboards you</h3><p><span class="mono c-mint">firstpass onboard --apply</span> detects your shell and agents, starts the proxy in <b>observe mode</b> (zero config, zero risk), routes your agent, and verifies itself. Idempotent, dry-run by default; <span class="mono c-mint">firstpass offboard</span> undoes all of it.</p></div>
+    <div class="card"><div class="kicker">⌘</div><h3>Discoverable at runtime</h3><p><span class="mono c-mint">GET /v1/capabilities</span> is a machine-readable descriptor; <span class="mono c-mint">llms.txt</span> + <span class="mono c-mint">AGENTS.md</span> ship machine-readable setup. An agent can wire and unwire itself with no human in the loop.</p></div>
+    <div class="card"><div class="kicker">⛭</div><h3>MCP server built in</h3><p><span class="mono c-mint">firstpass mcp</span> exposes traces, savings, evals, policy rehearsal, route explanation, and receipt verification as tools — so the agent reads its own decisions and rehearses changes before enforcing them.</p></div>
   </div>
 </div></section>
 
@@ -254,7 +366,7 @@
 git clone https://github.com/dshakes/firstpass <span class="a">&amp;&amp;</span> cd firstpass
 cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</span> demo</pre></div>
 
-  <h3 style="margin:40px 0 0;font-size:16px;font-weight:600;color:var(--mut)">Or install the proxy</h3>
+  <h3 class="inst-h">Or install the proxy</h3>
   <div class="inst" id="inst">
     <div class="tab on" data-t="pip"><span class="i">🐍</span> pip / uvx</div>
     <div class="tab" data-t="brew"><span class="i">🍺</span> Homebrew</div>
@@ -270,33 +382,47 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
   ghcr.io/dshakes/firstpass:latest</pre></div></div>
     <div class="panel" data-p="cargo"><div class="code"><button class="copy" data-copy="cargo install --git https://github.com/dshakes/firstpass firstpass-proxy">copy</button><pre style="margin:0"><span class="cy">cargo</span> install --git https://github.com/dshakes/firstpass firstpass-proxy</pre></div></div>
   </div>
-  <p style="color:var(--mut2);font-size:12.5px;margin:12px 0 0">Every tab above is live today and republishes on each release — pip · uvx · Homebrew · Docker · curl | sh · prebuilt binaries (Cargo builds from source and needs a Rust toolchain). Upgrade in place with <code>firstpass-proxy-update</code>.</p>
+  <p class="inst-note">Every tab above is live today and republishes on each release — pip · uvx · Homebrew · Docker · curl | sh · prebuilt binaries (Cargo builds from source and needs a Rust toolchain). Upgrade in place with <code>firstpass-proxy-update</code>.</p>
 
-  <h3 style="margin:40px 0 14px;font-size:16px;font-weight:600;color:var(--mut)">Then point your agent at it</h3>
+  <h3 class="inst-h">Then point your agent at it</h3>
   <div class="code"><button class="copy" data-copy="export ANTHROPIC_BASE_URL=http://127.0.0.1:8080">copy</button><pre style="margin:0">firstpass-proxy                                    <span class="c"># observe mode — logs, changes nothing</span>
 <span class="cy">export</span> ANTHROPIC_BASE_URL=http://127.0.0.1:8080   <span class="c"># same wire format your agent speaks</span>
 <span class="cy">unset</span> ANTHROPIC_BASE_URL                            <span class="c"># offboard anytime — one env var</span></pre></div>
 </div></section>
 
 <section id="roadmap"><div class="wrap reveal">
-  <p class="eyebrow">roadmap</p>
-  <h2>Shipped in the open.</h2>
-  <div class="road">
-    <div class="step done"><div class="dot"></div><h4><span>M0 ✓</span> Proof harness</h4><p>Baselines, bootstrap CIs, conformal guarantee, kill criterion.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>M1 ✓</span> The proxy</h4><p>Observe + enforce, escalation, cross-provider failover, trace store — real HTTP.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>M2 ✓</span> Gate framework</h4><p>Subprocess plugins, schema gates, budgets, feedback API.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>M3 ✓</span> Live proof</h4><p>Real-provider numbers (n=200) and a real LLM-judge gate — both done, against real Anthropic.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Speculative escalation</h4><p>Cheap and next-rung run in parallel. Measured p95: ~84ms serial → ~42ms speculative (~2× faster), byte-identical served result.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Fail-closed sandbox + coding-with-tests conformal</h4><p>gVisor-first, network-isolated code execution. Run live on 974 real MBPP tasks (result artifact committed in docs/benchmarks/): a feasible distribution-free ≤10%@95% served-failure bound — the guarantee arithmetic couldn't earn.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Learning loop</h4><p><code>firstpass calibrate</code> recalibrates the serving threshold from real deferred feedback — plus online/adaptive conformal (ACI) that tracks the bound under distribution shift.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Prod hardening + GA readiness</h4><p>Timeouts, load-shedding, opaque errors, body caps — ADR 0003 gap analysis.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Packaging</h4><p>Published on every channel — pip · uvx · Homebrew · npm · crates.io · Docker · binaries · self-updater. Each release auto-publishes all of them via a hands-off pipeline (npm + PyPI via OIDC, no tokens).</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Any provider · open-source routing</h4><p>Beyond Anthropic + OpenAI: one <code>[[provider]]</code> entry adds any OpenAI-compatible host — Groq, Together, Fireworks, DeepSeek, Mistral, xAI, OpenRouter, Azure, local Ollama / vLLM — or <b>Google Gemini</b> (its own dialect). A ladder rung is <code>&lt;id&gt;/&lt;model&gt;</code>, so a route can open on a cheap open-source model and escalate to a frontier model only when the gate fails.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Bespoke-auth backends</h4><p><b>AWS Bedrock</b> (SigV4) and <b>Google Vertex</b> (GCP OAuth), per ADR 0006. Auth is delegated to maintained crates — never hand-rolled — with credentials from the standard env vars, never in a URL or a log. Live-unverified until run against real AWS/GCP creds.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Enforce through tools &amp; multimodal</h4><p>ADR 0005: tool-calling, image, and streaming requests route through enforce with content preserved verbatim and the gated result re-emitted as SSE — so cost-routing reaches the traffic agents actually send. Opt-in, default-off, byte-identical until enabled.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Predict-to-start, verify-to-serve</h4><p>A deterministic UCB1 bandit learns which rung to <b>start</b> on per request context, minimizing expected cost from your own receipts — the best predictive-router idea, absorbed with the invariant they can't offer: prediction errors cost latency, never correctness. Warm-starts from the trace store; opt-in, default-off; honest <code>bandit@v1</code> stamp on every receipt.</p></div>
-    <div class="step done"><div class="dot"></div><h4><span>✓</span> Measured confidence + policy rehearsal</h4><p>Self-consistency gate (k-sample agreement — Wang et&nbsp;al.&nbsp;2022, semantic-entropy family) gives a continuous confidence score on the actual output; <code>firstpass ope</code> replays logged receipts against a candidate ladder with bootstrap CIs and honest coverage, so policy changes are rehearsed on your own traffic before they're enforced.</p></div>
+  <p class="eyebrow">status</p>
+  <h2>Shipped in the open — <span class="grad-text">honestly labeled.</span></h2>
+  <p class="lead">GA is a checklist we publish, not an adjective. Here's what runs today and what's still ahead.</p>
+
+  <div class="rmcols">
+    <div class="rmcol shipped">
+      <div class="rmcol-h"><span class="rm-tag on">✓ Shipped &amp; verified</span></div>
+      <ul>
+        <li><b>Both wire dialects.</b> Anthropic <span class="mono">/v1/messages</span> + OpenAI <span class="mono">/v1/chat/completions</span>, both live-verified end-to-end.</li>
+        <li><b>Enforce through tools &amp; streaming.</b> Structured (tool/image) enforce default-on with verbatim per-rung carry; SSE opens instantly and streams the gated result.</li>
+        <li><b>The earned guarantee.</b> ≤10%@95% distribution-free bound on 974 real MBPP tasks (committed artifact) + Learn-then-Test calibration + live adaptive threshold.</li>
+        <li><b>Learned start-rung.</b> UCB1 or discounted Thompson with logged propensities and a speculative-deferral band (ADR 0007). Default-off, honest policy stamp on every receipt.</li>
+        <li><b>Gates.</b> schema · subprocess · LLM-judge (maker ≠ checker) · k-sample self-consistency, each with an error budget and gate cost priced onto the receipt.</li>
+        <li><b>Receipts.</b> hash-chained; <span class="mono">export</span> + <span class="mono">verify</span> re-derive with no proxy/DB; durable never-drop mode.</li>
+        <li><b>Policy rehearsal.</b> <span class="mono">firstpass ope</span> replays your logs with IPS/SNIPS/DR and bootstrap CIs before you enforce.</li>
+        <li><b>Packaged everywhere.</b> pip · uvx · Homebrew · Docker · curl | sh · binaries, auto-published each release.</li>
+      </ul>
+    </div>
+    <div class="rmcol next">
+      <div class="rmcol-h"><span class="rm-tag amber">◇ Next &amp; research</span></div>
+      <ul>
+        <li><b>Selectable modes.</b> cost / balanced / quality / latency / max, per request via <span class="mono">x-firstpass-mode</span> — designed, behind a validation gate.</li>
+        <li><b>Elastic verification.</b> verify proportional to doubt, with a conformal guarantee over the verify/skip decision — research, go/no-go gated.</li>
+        <li><b>Per-rung P(gate-pass | features)</b> prediction, and joint (rung, sample-count) routing on the easy slice.</li>
+        <li><b>Session / trajectory routing</b> across a whole agent run, not one turn.</li>
+        <li><b>Live wire verification</b> for the OpenAI-compatible, Gemini, Bedrock, and Vertex adapters (smoke jobs activate when repo secrets are set).</li>
+        <li><b>Benchmark vs the unified routing+cascading baseline</b>, including a drift scenario the bound must survive.</li>
+        <li><b>GA hardening</b> — 30-day soak, external security audit, hosted multi-tenant plane (ADR 0003/0004).</li>
+      </ul>
+    </div>
   </div>
+  <p class="rm-foot">Full detail: the <a class="ln-in" href="https://github.com/dshakes/firstpass/blob/main/docs/roadmap.md">phased roadmap</a> and the <a class="ln-in" href="https://github.com/dshakes/firstpass/blob/main/docs/ga-handoff.md">GA handoff</a> — every gate stated, every remaining item enumerated.</p>
 </div></section>
 </main>
 
@@ -309,11 +435,12 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
     <a class="brand" href="#top" style="color:var(--ink)"><svg class="dot" width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0a1512"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#19E3B1" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
     <span class="sp" style="flex:1"></span>
     <a href="https://github.com/dshakes/firstpass">GitHub</a>
+    <a href="usage.html">Docs</a>
     <a href="https://github.com/dshakes/firstpass/blob/main/SPEC.md">SPEC</a>
     <a href="https://github.com/dshakes/firstpass/blob/main/firstpass.example.toml">Config</a>
     <a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">Apache-2.0</a>
   </div>
-  <p class="fnote">Proof over prediction. No competitor products named — Firstpass competes on evidence, not adjectives.</p>
+  <p class="fnote">Proof over prediction · receipts over adjectives. Firstpass competes on evidence, not competitors — no other products named.</p>
 </div></footer>
 
 <script>
@@ -342,18 +469,6 @@ function push(){
 }
 push();
 
-// ── count-up stats on scroll ──
-const io=new IntersectionObserver((es)=>es.forEach(e=>{
-  if(!e.isIntersecting) return;
-  const el=e.target; io.unobserve(el);
-  const to=parseFloat(el.dataset.to), dec=+(el.dataset.dec||0), pre=el.dataset.prefix||'', suf=el.dataset.suffix||'';
-  let t0=null, dur=1100;
-  const tick=(ts)=>{ t0=t0||ts; const p=Math.min((ts-t0)/dur,1); const v=(to*(1-Math.pow(1-p,3)));
-    el.textContent=pre+v.toFixed(dec)+suf; if(p<1) requestAnimationFrame(tick); else el.textContent=pre+to.toFixed(dec)+suf; };
-  requestAnimationFrame(tick);
-}),{threshold:.6});
-document.querySelectorAll('.stat .n').forEach(n=>io.observe(n));
-
 // ── reveal on scroll ──
 const ro=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');ro.unobserve(e.target);}}),{threshold:.12});
 document.querySelectorAll('.reveal').forEach(el=>ro.observe(el));
@@ -363,6 +478,14 @@ document.querySelectorAll('#inst .tab').forEach(tab=>tab.onclick=()=>{
   document.querySelectorAll('#inst .tab').forEach(t=>t.classList.remove('on'));
   document.querySelectorAll('#inst .panel').forEach(p=>p.classList.remove('on'));
   tab.classList.add('on'); document.querySelector(`#inst .panel[data-p="${tab.dataset.t}"]`).classList.add('on');
+});
+
+// ── modes selector ──
+document.querySelectorAll('#modesel .mode').forEach(m=>m.onclick=()=>{
+  document.querySelectorAll('#modesel .mode').forEach(x=>{x.classList.remove('on');x.setAttribute('aria-selected','false');});
+  m.classList.add('on'); m.setAttribute('aria-selected','true');
+  document.querySelectorAll('#modeDesc p').forEach(p=>p.classList.toggle('on',p.dataset.m===m.dataset.m));
+  const hdr=document.getElementById('modeHdr'); if(hdr) hdr.textContent=m.dataset.m;
 });
 
 // ── copy buttons ──

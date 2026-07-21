@@ -64,6 +64,10 @@ baseline.
       epsilon overlay), geometric forgetting for model churn. Receipts remain the durable
       state (warm-start on boot). Default stays `ucb1` until a live A/B promotes it.
 - [ ] Per-rung P(gate-pass | features) prediction rather than a single difficulty scalar.
+- [ ] **Elastic verification** (ADR 0008, research — go/no-go gated): probe-before-commit, verify
+      *proportional to doubt*, with a conformal guarantee over the *verify/skip* decision so
+      un-verified serves keep the same served-failure bound. Validated by `firstpass-bench
+      --probe-study` before any skip logic ships.
 - [x] Learn-then-Test threshold calibration (`--method ltt` in `firstpass calibrate`):
       distribution-free finite-sample risk control via fixed-sequence exact-binomial testing
       (Angelopoulos et al. 2021 / RCPS). Includes per-λ diagnostics and the gate's empirical

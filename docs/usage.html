@@ -7,7 +7,7 @@
 <meta name="description" content="How to install, configure, and run Firstpass — the autonomous LLM router. Modes, environment variables, routing config, gates, endpoints, and offboarding.">
 <meta name="theme-color" content="#05070A">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2305070A'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%2319E3B1' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="assets/site.css?v=7">
+<link rel="stylesheet" href="assets/site.css?v=8">
 <style>
   /* docs layout */
   .doc{display:grid;grid-template-columns:230px 1fr;gap:44px;align-items:start;padding:40px 0 96px}
@@ -87,6 +87,7 @@
     <a href="#providers">Providers</a>
     <a href="#gates">Gates</a>
     <div class="grp">Operate</div>
+    <a href="#cli">CLI</a>
     <a href="#endpoints">Endpoints</a>
     <a href="#receipts">Receipts &amp; feedback</a>
     <a href="#offboard">Offboarding</a>
@@ -132,6 +133,7 @@ cargo run <span class="a">-p</span> firstpass-proxy <span class="a">--example</s
       <tr><td>FIRSTPASS_BIND</td><td>listen address</td><td><code>127.0.0.1:8080</code></td></tr>
       <tr><td>FIRSTPASS_CONFIG</td><td>path to firstpass.toml</td><td><code>—</code></td></tr>
       <tr><td>FIRSTPASS_DB</td><td>trace store path</td><td><code>firstpass.db</code></td></tr>
+      <tr><td>FIRSTPASS_RECEIPTS</td><td>best_effort | durable — durable spills receipts to disk under backpressure and drains on boot (chain stays valid)</td><td><code>best_effort</code></td></tr>
       <tr><td>FIRSTPASS_UPSTREAM_ANTHROPIC</td><td>upstream base URL</td><td><code>api.anthropic.com</code></td></tr>
       <tr><td>FIRSTPASS_UPSTREAM_OPENAI</td><td>upstream base URL</td><td><code>api.openai.com</code></td></tr>
       <tr><td>FIRSTPASS_TENANT</td><td>tenant id for the trace</td><td><code>default</code></td></tr>
@@ -157,7 +159,7 @@ gates = ["schema", "cargo-test"]'>copy</button><pre style="margin:0"><span class
 <span class="cy">mode</span>  = <span class="p">"observe"</span></pre></div>
 
     <h2 id="providers">Providers</h2>
-    <p><code>anthropic</code> and <code>openai</code> are built in. A <code>[[provider]]</code> entry adds any other, so a ladder rung — <code>&lt;id&gt;/&lt;model&gt;</code> — can point anywhere. Because the OpenAI Chat Completions API is the de-facto standard, one <code>openai</code>-dialect entry covers Groq, Together, Fireworks, DeepSeek, Mistral, xAI, OpenRouter, Azure, or a local <b>Ollama / vLLM</b> server running open-source models. <code>gemini</code> is its own dialect; <code>aws_sigv4</code> (Bedrock) and <code>gcp_oauth</code> (Vertex) are bespoke-auth backends whose signing/token minting is delegated to maintained crates — credentials come from the standard env vars and never touch a URL or a log.</p>
+    <p><code>anthropic</code> and <code>openai</code> are built in. A <code>[[provider]]</code> entry adds any other, so a ladder rung — <code>&lt;id&gt;/&lt;model&gt;</code> — can point anywhere. Because the OpenAI Chat Completions API is the de-facto standard, one <code>openai</code>-dialect entry covers Groq, Together, Fireworks, DeepSeek, Mistral, xAI, Azure, or a local <b>Ollama / vLLM</b> server running open-source models. <code>gemini</code> is its own dialect; <code>aws_sigv4</code> (Bedrock) and <code>gcp_oauth</code> (Vertex) are bespoke-auth backends whose signing/token minting is delegated to maintained crates — credentials come from the standard env vars and never touch a URL or a log.</p>
     <div class="code"><button class="copy" data-copy='# any OpenAI-compatible host
 [[provider]]
 id = "groq"
@@ -237,11 +239,32 @@ ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]'>copy</bu
     </ul>
     <div class="callout warn"><b>Error budgets.</b> Each gate carries a rolling budget. A gate whose abstain rate exceeds its threshold is auto-disabled for subsequent requests (with an alarm), so one flaky gate can't take down a route.</div>
 
+    <h2 id="cli">CLI</h2>
+    <p>One binary, <code>firstpass</code>, wraps the whole loop — setup, operation, audit, and the science. Every subcommand shares the same environment (above); run <code>firstpass --help</code> for the reference.</p>
+    <table class="t"><thead><tr><th>Command</th><th>What it does</th></tr></thead><tbody>
+      <tr><td>onboard</td><td>Agentic setup — detect env, start the proxy, route your agent, verify itself. <code>--apply</code> writes; bare is a dry run.</td></tr>
+      <tr><td>offboard</td><td>Undo it — strip the rc line, stop the proxy, print the unset.</td></tr>
+      <tr><td>up</td><td>Start the proxy (serves until Ctrl-C).</td></tr>
+      <tr><td>doctor</td><td>Validate config, provider key, and gate binaries before you route anything.</td></tr>
+      <tr><td>trace</td><td>Print recent audit traces as JSON lines (<code>--limit N</code>).</td></tr>
+      <tr><td>savings</td><td>Spend vs the always-top counterfactual, from your own receipts (<code>--json</code>).</td></tr>
+      <tr><td>evals</td><td>Per-gate verdict rates + escalation + serve-by-rung, from receipts.</td></tr>
+      <tr><td>explain</td><td><code>explain &lt;trace-id&gt;</code> — why one routing decision went the way it did.</td></tr>
+      <tr><td>export</td><td>Write the sealed receipt log as JSONL (<code>--out F</code>) to hand to an auditor.</td></tr>
+      <tr><td>verify</td><td>Independently re-derive the receipt hash chain (<code>--file F</code>); exit 1 if broken.</td></tr>
+      <tr><td>calibrate</td><td>Recalibrate the serve threshold from deferred feedback. <code>--method ltt</code> gives the Learn-then-Test / risk-controlling variant; <code>--alpha</code> <code>--delta</code> <code>--min-n</code> tune it.</td></tr>
+      <tr><td>ope</td><td>Off-policy eval — <code>--config candidate.toml</code> rehearses a policy, or <code>--start-rung N</code> gives an IPS/SNIPS/DR estimate, before you enforce.</td></tr>
+      <tr><td>mcp</td><td>Serve MCP over stdio — an agent reads traces, savings, evals, rehearsal, route explanations, and receipt verification as tools.</td></tr>
+    </tbody></table>
+
     <h2 id="endpoints">Endpoints</h2>
+    <p>Both inbound wire dialects are live-verified end-to-end — point your agent at whichever it already speaks.</p>
     <table class="t"><thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead><tbody>
-      <tr><td>POST /v1/messages</td><td>Drop-in inference — observe or enforce per route.</td></tr>
+      <tr><td>POST /v1/messages</td><td>Anthropic drop-in inference — observe or enforce per route.</td></tr>
+      <tr><td>POST /v1/chat/completions</td><td>OpenAI-compatible drop-in inference — same routing, same receipts.</td></tr>
       <tr><td>POST /v1/feedback</td><td>Report a downstream outcome for a prior trace.</td></tr>
-      <tr><td>GET /v1/capabilities</td><td>Machine-readable capability descriptor.</td></tr>
+      <tr><td>GET /v1/capabilities</td><td>Machine-readable capability descriptor for agent discovery.</td></tr>
+      <tr><td>GET /metrics</td><td>Prometheus metrics — cost, savings, served-rung, serve threshold, realized served-failure.</td></tr>
       <tr><td>GET /healthz</td><td>Liveness.</td></tr>
     </tbody></table>
 
@@ -267,11 +290,13 @@ ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]'>copy</bu
   <div class="flinks">
     <a class="brand" href="index.html" style="color:var(--ink)"><svg class="dot" width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0a1512"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#19E3B1" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
     <span class="sp" style="flex:1"></span>
+    <a href="index.html">Home</a>
     <a href="https://github.com/dshakes/firstpass">GitHub</a>
     <a href="https://github.com/dshakes/firstpass/blob/main/SPEC.md">SPEC</a>
     <a href="https://github.com/dshakes/firstpass/blob/main/firstpass.example.toml">Config</a>
+    <a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">Apache-2.0</a>
   </div>
-  <p class="fnote">Proof over prediction. No competitor products named — Firstpass competes on evidence, not adjectives.</p>
+  <p class="fnote">Proof over prediction · receipts over adjectives. Firstpass competes on evidence, not competitors — no other products named.</p>
 </div></footer>
 
 <script>
