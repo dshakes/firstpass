@@ -63,7 +63,10 @@ baseline.
       ADR 0007): native Monte-Carlo propensities (clean off-policy estimates without the
       epsilon overlay), geometric forgetting for model churn. Receipts remain the durable
       state (warm-start on boot). Default stays `ucb1` until a live A/B promotes it.
-- [ ] Per-rung P(gate-pass | features) prediction rather than a single difficulty scalar.
+- [x] Per-rung P(gate-pass | features) prediction rather than a single difficulty scalar
+      (ADR 0008 Phase 2): an online logistic-regression predictor trained from receipts,
+      recorded on every receipt in **shadow** (default-off, byte-identical), validated offline
+      with `firstpass predictor-eval` (prequential AUC + Brier) before it is ever allowed to act.
 - [~] **Elastic verification** (ADR 0008): probe-before-commit + verify *proportional to doubt*,
       with a conformal guarantee over the *verify/skip* decision. **Go/no-go study PASSED with a
       corrected signal** ([artifact](benchmarks/probe-study-mbpp.txt)): the k-sample visible-pass

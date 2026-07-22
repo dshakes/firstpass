@@ -18,6 +18,8 @@ USAGE:
     firstpass trace [--limit N]   print recent audit traces as JSON lines (default 20)
     firstpass savings [--json]    spend vs the always-top counterfactual, from your own receipts
     firstpass evals [--json]      per-gate verdict rates + escalation + serve-by-rung, from receipts
+    firstpass predictor-eval [--json] [--lr L] [--l2 R]
+                                   prequential AUC/Brier of the per-query P(pass) predictor
     firstpass explain <trace-id>  [--json]  why one routing decision went the way it did
     firstpass export [--out F]    write the sealed receipt log as JSONL (hand to an auditor)
     firstpass verify [--file F] [--json]
@@ -56,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "trace" => cmd_trace(&args),
         "savings" => cmd_savings(&args),
         "evals" => cmd_evals(&args),
+        "predictor-eval" => cmd_predictor_eval(&args),
         "explain" => cmd_explain(&args),
         "export" => cmd_export(&args),
         "verify" => cmd_verify(&args),
@@ -232,6 +235,38 @@ fn cmd_evals(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
         println!("{}", cli::format_evals(&summary));
+    }
+    Ok(())
+}
+
+/// `firstpass predictor-eval [--json] [--lr L] [--l2 R] [--tenant ID]` — prequential AUC +
+/// Brier of the per-query gate-pass predictor over the trace store (predict-before-update on each
+/// labeled attempt). The honest check of whether the predictor beats a coin flip before it is ever
+/// allowed to influence routing. Empty store → n=0, exit 0.
+fn cmd_predictor_eval(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ProxyConfig::from_env()?;
+    let tenant = tenant_arg(args, &config);
+    let flag = |name: &str, default: f64| -> f64 {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(default)
+    };
+    let (lr, l2) = (flag("--lr", 0.05), flag("--l2", 1e-4));
+    let traces = store::load_tenant_traces(std::path::Path::new(&config.db_path), &tenant)
+        .unwrap_or_default();
+    let eval = cli::evaluate_predictor(&traces, lr, l2);
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&eval)?);
+    } else {
+        let auc = eval
+            .auc
+            .map_or("n/a (one class)".to_owned(), |a| format!("{a:.3}"));
+        println!(
+            "predictor-eval: n={} auc={} brier={:.4} (lr={lr} l2={l2})\n  AUC 0.5=no signal, >0.65 usable; Brier 0.25=coin-flip baseline, lower is better",
+            eval.n, auc, eval.brier
+        );
     }
     Ok(())
 }

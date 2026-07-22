@@ -560,6 +560,7 @@ mod tests {
                 savings_usd: 0.0,
             },
             probe: None,
+            predicted_pass: None,
         };
         trace.recompute_savings();
         trace

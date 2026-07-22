@@ -176,6 +176,7 @@ async fn spawn_proxy(upstream: &str, db: &std::path::Path) -> String {
         traces,
         adaptive: None,
         bandit: None,
+        predictor: None,
         tenant_rate_limiter: None,
         spill: None,
     };

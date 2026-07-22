@@ -29,13 +29,14 @@ pub mod error;
 pub mod features;
 pub mod hashchain;
 pub mod ltt;
+pub mod predictor;
 pub mod trace;
 pub mod verdict;
 
 pub use config::{
     AbstainPolicy, AuthScheme, BanditAlgorithm, BanditConfig, Budget, Config, ConsistencyDef,
-    Dialect, Escalation, GateDef, JudgeDef, Mode, ModePreset, ModelRef, OnExhausted, PriceDef,
-    ProbeConfig, ProviderDef, Route, RoutingMode, SessionPromotion,
+    Dialect, Escalation, GateDef, JudgeDef, Mode, ModePreset, ModelRef, OnExhausted,
+    PredictorConfig, PriceDef, ProbeConfig, ProviderDef, Route, RoutingMode, SessionPromotion,
 };
 pub use conformal::{ConformalResult, calibrate, served_failure_rate};
 pub use cost::{ModelPrice, PriceTable};
@@ -43,6 +44,7 @@ pub use error::{Error, Result};
 pub use features::{FEATURE_VERSION, Features, TaskKind};
 pub use hashchain::{Chained, GENESIS_HASH, canonical_json, record_hash, verify_chain};
 pub use ltt::{LttDiagnostic, LttResult};
+pub use predictor::PassPredictor;
 pub use trace::{
     Attempt, DeferredVerdict, FinalOutcome, PolicyRef, ProbeRegime, ProbeSignal, RequestInfo,
     ServedFrom, Trace,

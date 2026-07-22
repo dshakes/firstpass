@@ -551,6 +551,35 @@ pub struct Escalation {
     /// `None` (default) = off = zero extra provider calls = byte-identical to today.
     #[serde(default)]
     pub probe: Option<ProbeConfig>,
+    /// Per-query gate-pass predictor (ADR 0008 Phase 2): a learned `P(gate-pass | rung,
+    /// features)` model, trained online from receipts and recorded on the receipt in shadow.
+    /// `None` (default) = off = byte-identical to today (no predictor, no `predicted_pass`).
+    #[serde(default)]
+    pub predictor: Option<PredictorConfig>,
+}
+
+/// Per-query gate-pass predictor configuration (ADR 0008 Phase 2). The model is an online
+/// logistic regression (`firstpass_core::predictor::PassPredictor`) trained from the trace
+/// store. Its prediction is recorded on the receipt in **shadow** — it does not change routing
+/// in this phase; whether it is good enough to act on is decided offline (`firstpass
+/// predictor-eval`).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictorConfig {
+    /// SGD learning rate, in `(0, 1]`. Validated by [`Config::parse`].
+    #[serde(default = "default_predictor_lr")]
+    pub lr: f64,
+    /// L2 shrinkage on the weights (bias excluded), `>= 0`. Validated by [`Config::parse`].
+    #[serde(default = "default_predictor_l2")]
+    pub l2: f64,
+}
+
+fn default_predictor_lr() -> f64 {
+    0.05
+}
+
+fn default_predictor_l2() -> f64 {
+    1e-4
 }
 
 /// Config for online/adaptive conformal serving ([`crate::conformal::AdaptiveConformal`]).
@@ -680,6 +709,7 @@ impl Default for Escalation {
             bandit: None,
             exploration: None,
             probe: None,
+            predictor: None,
         }
     }
 }
@@ -864,6 +894,20 @@ impl Config {
                 return Err(Error::InvalidConfig(format!(
                     "escalation.probe.sample_rate must be finite and in [0, 1], got {}",
                     probe.sample_rate
+                )));
+            }
+        }
+        if let Some(pred) = &config.escalation.predictor {
+            if !pred.lr.is_finite() || !(0.0..=1.0).contains(&pred.lr) || pred.lr == 0.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.predictor.lr must be finite and in (0, 1], got {}",
+                    pred.lr
+                )));
+            }
+            if !pred.l2.is_finite() || pred.l2 < 0.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.predictor.l2 must be finite and >= 0, got {}",
+                    pred.l2
                 )));
             }
         }
@@ -1552,5 +1596,20 @@ discount = 0.98
             matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
             "negative sample_rate must be rejected"
         );
+    }
+
+    #[test]
+    fn predictor_config_parses_and_validates() {
+        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n[escalation.predictor]\nlr = 0.05\nl2 = 0.001\n";
+        let cfg = Config::parse(base).expect("valid predictor must parse");
+        let pred = cfg.escalation.predictor.unwrap();
+        assert!((pred.lr - 0.05).abs() < 1e-12 && (pred.l2 - 0.001).abs() < 1e-12);
+        // defaults when omitted
+        let d = Config::parse("[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n[escalation.predictor]\n").unwrap();
+        assert!(d.escalation.predictor.is_some());
+        // bad lr / l2 rejected
+        assert!(Config::parse(&base.replace("lr = 0.05", "lr = 0.0")).is_err());
+        assert!(Config::parse(&base.replace("lr = 0.05", "lr = 1.5")).is_err());
+        assert!(Config::parse(&base.replace("l2 = 0.001", "l2 = -1.0")).is_err());
     }
 }

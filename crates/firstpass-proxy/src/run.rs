@@ -112,6 +112,37 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
             Arc::new(std::sync::Mutex::new(b))
         });
 
+    // Per-query gate-pass predictor (ADR 0008 Phase 2, opt-in): warm-start from stored traces so
+    // the model survives restarts — every attempt with a clear Pass/Fail verdict is a training
+    // example. Forgiving: an unreadable or absent store simply yields a zero-init predictor.
+    let predictor = config
+        .routing
+        .as_ref()
+        .and_then(|r| r.escalation.predictor.as_ref())
+        .map(|pc| {
+            let mut p = firstpass_core::PassPredictor::new(pc.lr, pc.l2);
+            if let Ok(traces_history) = store::load_all_traces(&config.db_path) {
+                let mut n = 0usize;
+                for trace in &traces_history {
+                    for attempt in &trace.attempts {
+                        match attempt.verdict {
+                            firstpass_core::Verdict::Pass => {
+                                p.update(&trace.request.features, attempt.rung, true);
+                                n += 1;
+                            }
+                            firstpass_core::Verdict::Fail => {
+                                p.update(&trace.request.features, attempt.rung, false);
+                                n += 1;
+                            }
+                            firstpass_core::Verdict::Abstain => {}
+                        }
+                    }
+                }
+                tracing::info!(examples = n, "predictor warm-started from trace store");
+            }
+            Arc::new(std::sync::Mutex::new(p))
+        });
+
     let state = AppState {
         config: Arc::new(config),
         // Observe passthrough may stream SSE, so only bound the CONNECT phase here — a total or
@@ -125,6 +156,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         traces,
         adaptive,
         bandit,
+        predictor,
         tenant_rate_limiter,
         spill,
     };

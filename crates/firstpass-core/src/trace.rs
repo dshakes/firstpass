@@ -99,6 +99,11 @@ pub struct Trace {
     /// and hash-chain compatible (the `skip_serializing_if` keeps absent = absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<ProbeSignal>,
+    /// Shadow prediction of `P(gate-pass)` for the start rung (ADR 0008 Phase 2), from the
+    /// per-query predictor. Absent when the predictor is off (the default) — byte-identical to
+    /// pre-predictor traces and hash-chain compatible. Recorded but never acted on in this phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_pass: Option<f64>,
 }
 
 /// Reference to the policy that produced a decision.
@@ -309,6 +314,7 @@ mod tests {
                 savings_usd: 0.0,
             },
             probe: None,
+            predicted_pass: None,
         };
         t.recompute_savings();
         t
