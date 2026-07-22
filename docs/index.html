@@ -238,6 +238,53 @@
     <h2>Bring your own definition of "good."</h2>
     <p class="lead">A gate is any check on the real output. Firstpass ships several and lets you plug in your own — your tests, your linter, your judge.</p>
   </div>
+  <div class="figure" style="margin-bottom:36px"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="gkT">
+<title id="gkT">Five gate kinds — inline checks, JSON-Schema, your subprocess, an LLM judge, and k-sample self-consistency — each read the actual output and converge on one verdict. The verdict serves on proof or escalates one rung on failure.</title>
+<defs>
+  <marker id="gkP" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+  <marker id="gkW" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
+</defs>
+<text x="135" y="22" text-anchor="middle" class="ink-mut m" font-size="10.5" letter-spacing="1.4">GATE KINDS</text>
+<text x="565" y="22" text-anchor="middle" class="accent-ink m" font-size="10.5" letter-spacing="1.4">ONE VERDICT · ON THE REAL OUTPUT</text>
+<text x="860" y="22" text-anchor="middle" class="ink-mut m" font-size="10.5" letter-spacing="1.4">OUTCOME</text>
+<!-- five gate nodes -->
+<g font-size="12.5">
+  <rect x="30" y="34" width="212" height="40" rx="9" class="n-fill n-stroke" stroke-width="1.3"/><text x="46" y="59" class="ink" font-weight="620">inline</text><text x="230" y="59" text-anchor="end" class="ink-mut" font-size="10.5">non-empty · json-valid</text>
+  <rect x="30" y="84" width="212" height="40" rx="9" class="n-fill n-stroke" stroke-width="1.3"/><text x="46" y="109" class="ink" font-weight="620">schema</text><text x="230" y="109" text-anchor="end" class="ink-mut" font-size="10.5">JSON-Schema subset</text>
+  <rect x="30" y="134" width="212" height="40" rx="9" class="n-fill n-stroke" stroke-width="1.3"/><text x="46" y="159" class="ink" font-weight="620">subprocess</text><text x="230" y="159" text-anchor="end" class="ink-mut" font-size="10.5">your tests · stdin</text>
+  <rect x="30" y="184" width="212" height="40" rx="9" class="n-fill n-stroke" stroke-width="1.3"/><text x="46" y="209" class="ink" font-weight="620">LLM judge</text><text x="230" y="209" text-anchor="end" class="ink-mut" font-size="10.5">maker ≠ checker</text>
+  <rect x="30" y="234" width="212" height="40" rx="9" class="n-fill n-stroke" stroke-width="1.3"/><text x="46" y="259" class="ink" font-weight="620">self-consistency</text><text x="230" y="259" text-anchor="end" class="ink-mut" font-size="10.5">k-sample agree</text>
+</g>
+<!-- converging connectors -->
+<path d="M242 54 C365 54 350 146 468 146" fill="none" class="accent-s" stroke-width="1.4"/>
+<path d="M242 104 C365 104 355 156 468 156" fill="none" class="accent-s" stroke-width="1.4"/>
+<path d="M242 154 C360 154 380 164 468 164" fill="none" class="accent-s" stroke-width="1.4"/>
+<path d="M242 204 C365 204 355 172 468 172" fill="none" class="accent-s" stroke-width="1.4"/>
+<path d="M242 254 C365 254 350 182 468 182" fill="none" class="accent-s" stroke-width="1.4"/>
+<path d="M242 54 C365 54 350 146 468 146" class="flow s" stroke-width="2.2"/>
+<path d="M242 104 C365 104 355 156 468 156" class="flow s d2" stroke-width="2.2"/>
+<path d="M242 154 C360 154 380 164 468 164" class="flow s d3" stroke-width="2.2"/>
+<path d="M242 204 C365 204 355 172 468 172" class="flow s d4" stroke-width="2.2"/>
+<path d="M242 254 C365 254 350 182 468 182" class="flow s d5" stroke-width="2.2"/>
+<!-- verdict -->
+<rect x="470" y="126" width="188" height="72" rx="13" class="n-fill accent-s glow" stroke-width="1.6"/>
+<text x="558" y="158" text-anchor="middle" class="ink" font-size="14" font-weight="640">Gate verdict</text>
+<text x="558" y="178" text-anchor="middle" class="accent-ink m" font-size="10.5">proof, not a guess</text>
+<path class="pass tick" d="M600 150 l7 8 l15 -19" fill="none" stroke="var(--d-pass)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<!-- outcomes -->
+<rect x="770" y="108" width="182" height="52" rx="11" class="n-fill pass-s" stroke-width="1.5"/>
+<text x="861" y="132" text-anchor="middle" class="pass" font-size="13" font-weight="640">serve</text>
+<text x="861" y="149" text-anchor="middle" class="ink-mut" font-size="10.5">passes → first-pass answer</text>
+<rect x="770" y="188" width="182" height="52" rx="11" class="n-fill warn-s" stroke-width="1.5"/>
+<text x="861" y="212" text-anchor="middle" class="warn" font-size="13" font-weight="640">escalate</text>
+<text x="861" y="229" text-anchor="middle" class="ink-mut" font-size="10.5">fails → up one rung</text>
+<path d="M658 152 C712 152 714 134 768 134" fill="none" class="pass-s" stroke-width="1.5" marker-end="url(#gkP)"/>
+<path d="M658 172 C712 172 714 214 768 214" fill="none" class="warn-s" stroke-width="1.5" marker-end="url(#gkW)"/>
+<path d="M658 152 C712 152 714 134 768 134" class="flow p s" stroke-width="2.4"/>
+<path d="M658 172 C712 172 714 214 768 214" class="flow w s d3" stroke-width="2.4"/>
+</svg>
+    <figcaption>Any of the five kinds — or your own subprocess — produces the same thing: a verdict on the actual output. Pass serves it; fail escalates one rung. Prediction never overrides that verdict.</figcaption>
+  </div>
   <div class="cards g3">
     <div class="card"><h3>Built-in inline</h3><p><code>non-empty</code>, <code>json-valid</code>, and a JSON-Schema subset — zero config, running the moment you route.</p></div>
     <div class="card"><h3>Subprocess — bring your own</h3><p>Any executable. The candidate arrives as JSON on <b>stdin</b> (never argv, injection-resistant); print a verdict. Your tests, your linter, your policy.</p></div>
@@ -406,6 +453,36 @@
     <div class="card"><div class="step-n">latency</div><p>Fire speculative escalation in the marginal zone, so the next rung is already in flight if the gate fails — parallel tokens buy tail latency.</p></div>
     <div class="card"><div class="step-n">max</div><p>Open at the top of the ladder, for the rare request where the answer has to be right the first time and cost is no object.</p></div>
   </div>
+  <div class="figure" style="margin-top:36px"><svg class="fp-svg" viewBox="0 0 1000 356" role="img" aria-labelledby="mdT">
+<title id="mdT">The five modes are points on a single cost-versus-quality frontier. cost sits at the cheap floor, balanced (the default) a step up, quality higher, and max at the top. The dial only moves where you sit on the curve — it does not change the engine. latency is orthogonal: the same frontier point, with speculative escalation buying tail latency.</title>
+<text x="118" y="32" class="ink-mut m" font-size="10.5" letter-spacing="1.4">ONE DIAL · WHERE ON THE FRONTIER YOU SIT</text>
+<!-- axes -->
+<line x1="118" y1="52" x2="118" y2="296" class="grid" stroke-width="1.2"/>
+<line x1="118" y1="296" x2="906" y2="296" class="grid" stroke-width="1.2"/>
+<text transform="rotate(-90 92 176)" x="92" y="176" text-anchor="middle" class="ink-mut m" font-size="10.5">quality · tighter bound →</text>
+<text x="512" y="324" text-anchor="middle" class="ink-mut m" font-size="10.5">cost per served request →</text>
+<!-- frontier -->
+<path d="M150 294 C300 290 330 250 440 216 C560 178 700 128 880 92" fill="none" class="accent-s" stroke-width="2"/>
+<path d="M150 294 C300 290 330 250 440 216 C560 178 700 128 880 92" class="flow l" stroke-width="2.6"/>
+<!-- latency badge (orthogonal) -->
+<rect x="150" y="88" width="196" height="62" rx="10" class="n-fill-2 n-stroke" stroke-width="1.2"/>
+<text x="166" y="112" class="ink" font-size="12" font-weight="620">latency</text>
+<text x="166" y="130" class="ink-mut" font-size="10.5">speculative escalate —</text>
+<text x="166" y="144" class="ink-mut" font-size="10.5">same point, lower tail</text>
+<path d="M304 150 C356 176 400 196 432 212" fill="none" class="grid" stroke-width="1.2" stroke-dasharray="4 4"/>
+<!-- frontier points -->
+<circle cx="252" cy="284" r="7" class="accent" stroke="var(--d-fill)" stroke-width="2"/>
+<text x="252" y="270" text-anchor="middle" class="ink" font-size="12" font-weight="600">cost</text>
+<circle cx="622" cy="150" r="7" class="accent" stroke="var(--d-fill)" stroke-width="2"/>
+<text x="622" y="136" text-anchor="middle" class="ink" font-size="12" font-weight="600">quality</text>
+<circle cx="858" cy="96" r="7" class="accent" stroke="var(--d-fill)" stroke-width="2"/>
+<text x="858" y="82" text-anchor="middle" class="ink" font-size="12" font-weight="600">max</text>
+<circle cx="440" cy="216" r="14" class="accent-s halo" fill="none" stroke-width="1.6"/>
+<circle cx="440" cy="216" r="8" class="accent glow breathe" stroke="var(--d-fill)" stroke-width="2"/>
+<text x="440" y="196" text-anchor="middle" class="accent-ink" font-size="12" font-weight="640">balanced · default</text>
+</svg>
+    <figcaption>One dial, one curve. Every mode is a point on the same cost/quality frontier — moving it changes where you sit, not how the engine works. <code>latency</code> is the exception: same frontier point, speculation trades parallel tokens for tail latency.</figcaption>
+  </div>
   <div class="note" style="margin-top:24px"><span class="nt">How modes are built</span>Modes ship first as <b>presets over the existing escalation knobs</b> — a resolver that only overrides the knobs it has an opinion on. The richer constraint form, where you hand the router an <code>(α, latency, $)</code> budget and it solves for the knobs, lands behind a validation gate: worth exposing only once it measurably moves the frontier on real traffic. <a href="guide/routing.html#modes">How modes compose →</a></div>
 </div></section>
 
@@ -420,6 +497,53 @@
     <div class="card"><h3>Value-of-information gating</h3><p>Estimate what a verification step is worth before running it — skip the checks that can't change the decision, spend on the ones that can.</p></div>
     <div class="card"><h3>Per-query difficulty</h3><p>Predict how hard a request will be for the cheap rung, from the prompt <i>and</i> cheap probe signals — to choose where to start and how much to check.</p></div>
     <div class="card"><h3>Session-level routing</h3><p>Route over a whole trajectory, not one turn — carrying difficulty and outcome context across an agent's session.</p></div>
+  </div>
+  <div class="figure" style="margin-top:32px"><svg class="fp-svg" viewBox="0 0 1000 372" role="img" aria-labelledby="elT">
+<title id="elT">A cheap k-sample probe sorts all traffic into three regimes. On the MBPP probe study: 12% fail every sample and escalate immediately (0% would have been oracle-correct — a doomed cheap attempt skipped); 23% are mixed and pay for the full gate, where verification's information is worth its cost; 65% pass every sample and are served without the expensive gate at 99% oracle-safety. The skip carries the same distribution-free served-failure bound as a verified serve — held-out 7.5%, under the 10% target.</title>
+<defs>
+  <marker id="elF" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-fail)"/></marker>
+  <marker id="elW" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
+  <marker id="elP" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+</defs>
+<!-- probe node -->
+<rect x="380" y="26" width="240" height="52" rx="13" class="n-fill accent-s glow" stroke-width="1.6"/>
+<text x="500" y="50" text-anchor="middle" class="ink" font-size="13.5" font-weight="640">Cheap k-sample probe</text>
+<text x="500" y="68" text-anchor="middle" class="accent-ink m" font-size="10.5">100% of traffic · near-free visible gate</text>
+<!-- diverging connectors (static) -->
+<path d="M470 78 C400 110 250 116 180 146" fill="none" class="fail-s" stroke-width="1.6" marker-end="url(#elF)"/>
+<path d="M500 78 L500 146" fill="none" class="warn-s" stroke-width="1.6" marker-end="url(#elW)"/>
+<path d="M530 78 C600 110 750 116 820 146" fill="none" class="pass-s" stroke-width="1.6" marker-end="url(#elP)"/>
+<!-- travelling pulses -->
+<path d="M470 78 C400 110 250 116 180 146" class="flow f s" stroke-width="2.4"/>
+<path d="M500 78 L500 146" class="flow w s d2" stroke-width="2.4"/>
+<path d="M530 78 C600 110 750 116 820 146" class="flow p s d4" stroke-width="2.6"/>
+<!-- lane: confident fail -->
+<rect x="40" y="150" width="280" height="140" rx="14" class="n-fill fail-s" stroke-width="1.5"/>
+<text x="180" y="192" text-anchor="middle"><tspan class="fail" font-size="27" font-weight="720">12%</tspan><tspan class="ink" font-size="12.5" font-weight="620" dx="11">0 of k pass visible</tspan></text>
+<text x="180" y="224" text-anchor="middle" class="ink-mut" font-size="12">→ escalate now, skip the</text>
+<text x="180" y="240" text-anchor="middle" class="ink-mut" font-size="12">doomed cheap attempt</text>
+<rect x="96" y="256" width="168" height="24" rx="7" class="fail-s" fill="none" stroke-width="1.2"/>
+<text x="180" y="272" text-anchor="middle" class="fail m" font-size="11" font-weight="600">0% oracle-correct</text>
+<!-- lane: ambiguous -->
+<rect x="360" y="150" width="280" height="140" rx="14" class="n-fill warn-s" stroke-width="1.5"/>
+<text x="500" y="192" text-anchor="middle"><tspan class="warn" font-size="27" font-weight="720">23%</tspan><tspan class="ink" font-size="12.5" font-weight="620" dx="11">mixed — some pass</tspan></text>
+<text x="500" y="224" text-anchor="middle" class="ink-mut" font-size="12">→ run the full gate,</text>
+<text x="500" y="240" text-anchor="middle" class="ink-mut" font-size="12">where its info pays</text>
+<rect x="416" y="256" width="168" height="24" rx="7" class="warn-s" fill="none" stroke-width="1.2"/>
+<text x="500" y="272" text-anchor="middle" class="warn m" font-size="11" font-weight="600">verify here only</text>
+<!-- lane: confident pass -->
+<rect x="680" y="150" width="280" height="140" rx="14" class="n-fill pass-s glow-p" stroke-width="1.6"/>
+<text x="820" y="192" text-anchor="middle"><tspan class="pass" font-size="27" font-weight="720">65%</tspan><tspan class="ink" font-size="12.5" font-weight="620" dx="11">all k pass visible</tspan></text>
+<text x="820" y="224" text-anchor="middle" class="ink-mut" font-size="12">→ serve, skip the</text>
+<text x="820" y="240" text-anchor="middle" class="ink-mut" font-size="12">expensive gate</text>
+<rect x="736" y="256" width="168" height="24" rx="7" class="pass-s" fill="none" stroke-width="1.2"/>
+<text x="820" y="272" text-anchor="middle" class="pass m tick" font-size="11" font-weight="600">99% oracle-safe</text>
+<!-- conformal-bound chip under it all -->
+<rect x="40" y="312" width="920" height="46" rx="12" class="n-fill-2 accent-s breathe" stroke-width="1.4"/>
+<text x="500" y="333" text-anchor="middle" class="ink" font-size="12.5" font-weight="600">Conformal guarantee over the verify / skip decision</text>
+<text x="500" y="350" text-anchor="middle" class="accent-ink m" font-size="11">un-verified serves keep the ≤10% distribution-free bound — held-out served-failure 7.5% ✓</text>
+</svg>
+    <figcaption>The validated three-regime rule (probe study, MBPP, k=5). Verification cost concentrates on the ambiguous 23%; the confident 77% is decided by the cheap probe alone. Source: <code>docs/benchmarks/probe-study-mbpp.txt</code> · <code>elastic-validation.txt</code>.</figcaption>
   </div>
   <div class="note" style="margin-top:24px"><span class="nt">How we'll know it's real</span>Each ships only if a pre-registered go/no-go study beats verify-everything on cost at an <b>equal-or-better</b> served-failure bound — the same rule that promoted the start-rung bandit from idea to code. The first probe study already validated the signal (a corrected pass-count regime, not entropy). <a href="guide/elastic-verification.html">Read the study →</a></div>
 </div></section>
