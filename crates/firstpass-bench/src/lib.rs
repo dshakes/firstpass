@@ -10,6 +10,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod ablation;
 pub mod coding;
 pub mod dataset;
 pub mod live;
