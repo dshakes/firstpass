@@ -204,6 +204,73 @@ pub struct EvalsSummary {
 
 /// Aggregate gate verdicts + routing behavior over `traces` (enforce only).
 #[must_use]
+/// Prequential evaluation of the per-query gate-pass predictor (ADR 0008 Phase 2) — the honest
+/// "is it any good yet" check before the predictor is ever allowed to *act*. Replays the receipts
+/// in order through a fresh predictor: for each attempt with a clear Pass/Fail verdict, **predict
+/// before update** (so every prediction is on data the model has not trained on), then update.
+/// Reports AUC (predicted -> passed) and Brier score over those pairs.
+#[derive(Debug, serde::Serialize)]
+pub struct PredictorEval {
+    /// Labeled attempts evaluated.
+    pub n: usize,
+    /// AUC of predicted P(pass) ranking actual passes above fails. 0.5 = no signal; 1.0 = perfect.
+    /// `None` when one class is absent (all pass or all fail — AUC undefined).
+    pub auc: Option<f64>,
+    /// Mean squared error of the probabilistic prediction, in `[0, 1]`. Lower is better; 0.25 is
+    /// the always-0.5 baseline.
+    pub brier: f64,
+}
+
+/// AUC via the Mann-Whitney rank-sum identity (ties = 0.5). `None` if either class is empty.
+fn predictor_auc(pairs: &[(f64, bool)]) -> Option<f64> {
+    let pos: Vec<f64> = pairs.iter().filter(|(_, y)| *y).map(|(s, _)| *s).collect();
+    let neg: Vec<f64> = pairs.iter().filter(|(_, y)| !*y).map(|(s, _)| *s).collect();
+    if pos.is_empty() || neg.is_empty() {
+        return None;
+    }
+    let mut wins = 0.0_f64;
+    for &p in &pos {
+        for &n in &neg {
+            wins += if p > n {
+                1.0
+            } else if (p - n).abs() < f64::EPSILON {
+                0.5
+            } else {
+                0.0
+            };
+        }
+    }
+    Some(wins / (pos.len() as f64 * neg.len() as f64))
+}
+
+/// Run the prequential predictor evaluation over `traces` with the given `lr`/`l2`.
+pub fn evaluate_predictor(traces: &[Trace], lr: f64, l2: f64) -> PredictorEval {
+    use firstpass_core::{PassPredictor, Verdict};
+    let mut model = PassPredictor::new(lr, l2);
+    let mut pairs: Vec<(f64, bool)> = Vec::new();
+    let mut se = 0.0_f64;
+    for t in traces {
+        for a in &t.attempts {
+            let y = match a.verdict {
+                Verdict::Pass => true,
+                Verdict::Fail => false,
+                Verdict::Abstain => continue,
+            };
+            let p = model.predict(&t.request.features, a.rung);
+            let target = f64::from(u8::from(y));
+            se += (p - target) * (p - target);
+            pairs.push((p, y));
+            model.update(&t.request.features, a.rung, y);
+        }
+    }
+    let n = pairs.len();
+    PredictorEval {
+        n,
+        auc: predictor_auc(&pairs),
+        brier: if n == 0 { 0.0 } else { se / n as f64 },
+    }
+}
+
 pub fn summarize_evals(traces: &[Trace]) -> EvalsSummary {
     let mut s = EvalsSummary {
         enforce_traces: 0,
@@ -639,6 +706,7 @@ mod tests {
                 savings_usd: 0.0,
             },
             probe: None,
+            predicted_pass: None,
         };
         let t0 = mk(GENESIS_HASH, "s0");
         let t1 = mk(&t0.hash().unwrap(), "s1");
@@ -749,6 +817,7 @@ mod tests {
                 savings_usd: 0.009,
             },
             probe: None,
+            predicted_pass: None,
         };
         let ex = explain_trace(&t);
         assert_eq!(
@@ -763,5 +832,13 @@ mod tests {
             ("non-empty".to_owned(), "pass".to_owned())
         );
         assert!(ex.summary.contains("served anthropic/claude-sonnet-5"));
+    }
+
+    #[test]
+    fn evaluate_predictor_empty_and_signal() {
+        // empty store => n=0, no crash
+        let e = evaluate_predictor(&[], 0.05, 1e-4);
+        assert_eq!(e.n, 0);
+        assert!(e.auc.is_none());
     }
 }

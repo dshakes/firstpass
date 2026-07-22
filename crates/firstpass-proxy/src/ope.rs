@@ -796,6 +796,7 @@ mod tests {
                 savings_usd: 0.0,
             },
             probe: None,
+            predicted_pass: None,
         };
         trace.recompute_savings();
         trace
@@ -873,6 +874,7 @@ mod tests {
                 savings_usd: 0.0,
             },
             probe: None,
+            predicted_pass: None,
         };
         trace.recompute_savings();
         trace
@@ -1282,6 +1284,7 @@ serve_threshold = 0.75
                 savings_usd: 0.0,
             },
             probe: None,
+            predicted_pass: None,
         };
         trace.recompute_savings();
         trace

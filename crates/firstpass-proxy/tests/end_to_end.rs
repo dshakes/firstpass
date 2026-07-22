@@ -147,6 +147,7 @@ async fn spawn_proxy(
         traces,
         adaptive: None,
         bandit: None,
+        predictor: None,
         tenant_rate_limiter: None,
         spill: None,
     };

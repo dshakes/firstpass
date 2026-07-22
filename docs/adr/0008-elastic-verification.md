@@ -109,8 +109,11 @@ requires the held-out + drift validation in Phase 3 below and replication beyond
 
 1. **Probe + uncertainty signal** in the router (k-sample cheap probe, semantic-consistency score),
    recorded on the receipt. No behavior change yet.
-2. **Learned `P(pass | rung, features, probe)`** predictor, trained on receipts; reported only
-   (shadow), validated against realized outcomes via the existing OPE machinery.
+2. **Learned `P(pass | rung, features)`** predictor — **SHIPPED (Phase 2)**: an online logistic
+   regression (`firstpass_core::predictor::PassPredictor`) trained from receipts, recorded on
+   every receipt as `predicted_pass` in shadow (default-off, byte-identical, never acted on),
+   warm-started from the trace store on boot, and validated offline via `firstpass
+   predictor-eval` (prequential AUC + Brier). Probe signal as a feature is a follow-on.
 3. **Elastic-verification serving** behind the LTT-calibrated skip threshold; the conformal-over-skip
    bound validated on held-out + drift splits before default-on is even proposed.
 4. **`(rung, n, verify?)` joint optimizer** under per-turn `(α, latency, $)` mode constraints.

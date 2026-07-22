@@ -61,6 +61,12 @@ pub struct AppState {
     /// queries it for a predicted start rung per request and feeds back gate verdicts for online
     /// learning — all in-memory, per-process.
     pub bandit: Option<Arc<std::sync::Mutex<crate::bandit::StartRungBandit>>>,
+    /// Optional per-query gate-pass predictor (ADR 0008 Phase 2). `None` (default) = no
+    /// prediction, byte-identical to today. When `Some`, `handle_enforce` records its
+    /// `P(gate-pass)` for the start rung on the receipt in **shadow** (never acted on) and
+    /// feeds this request's attempts back for online learning — in-memory, per-process, warm-
+    /// started from receipts on boot.
+    pub predictor: Option<Arc<std::sync::Mutex<firstpass_core::PassPredictor>>>,
     /// Per-tenant request rate limiter (ADR 0004 §D6). `None` (the default) disables rate
     /// limiting entirely — set via [`build_tenant_rate_limiter`] from
     /// [`ProxyConfig::tenant_rate_per_sec`].
@@ -943,6 +949,27 @@ async fn enforce_pipeline_inner(
         }
     }
 
+    // ── Per-query gate-pass predictor (ADR 0008 Phase 2) ────────────────────────────────────
+    // Record the predicted P(gate-pass) for the start rung on the receipt in SHADOW (never acted
+    // on), then learn online from this request's attempts. Default-off (predictor = None):
+    // trace.predicted_pass stays None → byte-identical to today. The predictor never touches
+    // serving; it only writes a receipt field, updates in-memory weights, and emits a metric.
+    if let Some(predictor) = state.predictor.as_ref()
+        && let Ok(mut p) = predictor.lock()
+    {
+        // Read the routed features from the trace (the owned `features` was moved into the ctx).
+        let predicted = p.predict(&trace.request.features, start_rung);
+        for attempt in &trace.attempts {
+            match attempt.verdict {
+                Verdict::Pass => p.update(&trace.request.features, attempt.rung, true),
+                Verdict::Fail => p.update(&trace.request.features, attempt.rung, false),
+                Verdict::Abstain => {} // no clear label — don't train on it
+            }
+        }
+        trace.predicted_pass = Some(predicted);
+        metrics::histogram!("firstpass_predictor_pass_prob").record(predicted);
+    }
+
     // ── Shadow probe (ADR 0008 Phase 1) ─────────────────────────────────────────────────────
     // Measure the k-sample gate-pass-count signal on a sampled fraction of requests.
     // Default-off (probe = None): zero extra provider calls, trace.probe stays None — byte-identical.
@@ -1761,6 +1788,7 @@ fn base_trace(
             savings_usd: 0.0,
         },
         probe: None,
+        predicted_pass: None,
     }
 }
 
@@ -2651,6 +2679,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            predictor: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -2826,6 +2855,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            predictor: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -3157,6 +3187,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            predictor: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -3284,6 +3315,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            predictor: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -3533,6 +3565,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            predictor: None,
             tenant_rate_limiter,
             spill: None,
         }
@@ -3898,6 +3931,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            predictor: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -4258,6 +4292,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            predictor: None,
             tenant_rate_limiter,
             spill: None,
         }
@@ -4372,6 +4407,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            predictor: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -4609,5 +4645,90 @@ mod tests {
             sig.gate_pass_count <= 2,
             "gate_pass_count must be in [0, k]"
         );
+    }
+
+    /// Build an enforce AppState with the per-query predictor enabled (or not) and one mock rung.
+    fn predictor_state(
+        enabled: bool,
+        outcome: Result<ModelResponse, ProviderError>,
+    ) -> (AppState, mpsc::Receiver<Trace>) {
+        let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\ngates = [\"non-empty\"]\n";
+        let config = ProxyConfig::from_lookup(|k_| match k_ {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.to_owned()),
+            "FIRSTPASS_MODE" => Some("enforce".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let mut outs = HashMap::new();
+        outs.insert("anthropic/claude-haiku-4-5".to_owned(), outcome);
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        let (traces, rx) = mpsc::channel(64);
+        let predictor = enabled.then(|| {
+            Arc::new(std::sync::Mutex::new(firstpass_core::PassPredictor::new(
+                0.05, 1e-4,
+            )))
+        });
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(map),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            traces,
+            adaptive: None,
+            bandit: None,
+            predictor,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn predictor_off_leaves_predicted_pass_none() {
+        let (state, rx) =
+            predictor_state(false, Ok(model_resp("anthropic/claude-haiku-4-5", "ok")));
+        let trace = run_enforce_get_trace(state, rx).await;
+        assert!(
+            trace.predicted_pass.is_none(),
+            "predictor off => no field (byte-identical)"
+        );
+        // absent from JSON (skip_serializing_if)
+        let j = serde_json::to_string(&trace).unwrap();
+        assert!(!j.contains("predicted_pass"), "None must be omitted: {j}");
+    }
+
+    #[tokio::test]
+    async fn predictor_on_records_shadow_prediction_and_serves_identically() {
+        // Same mock output with predictor ON vs OFF must serve the same bytes; ON additionally
+        // records predicted_pass in (0,1) and never changes the served result.
+        let (state_off, rx_off) = predictor_state(
+            false,
+            Ok(model_resp("anthropic/claude-haiku-4-5", "served answer")),
+        );
+        let off = run_enforce_get_trace(state_off, rx_off).await;
+
+        let (state_on, rx_on) = predictor_state(
+            true,
+            Ok(model_resp("anthropic/claude-haiku-4-5", "served answer")),
+        );
+        let on = run_enforce_get_trace(state_on, rx_on).await;
+
+        assert_eq!(
+            on.final_.served_rung, off.final_.served_rung,
+            "served rung identical"
+        );
+        assert_eq!(on.attempts.len(), off.attempts.len(), "same attempts");
+        assert_eq!(
+            on.final_.total_cost_usd, off.final_.total_cost_usd,
+            "predictor never adds served cost"
+        );
+        let p = on
+            .predicted_pass
+            .expect("predictor on => predicted_pass recorded");
+        assert!(p > 0.0 && p < 1.0, "shadow prediction in (0,1): {p}");
     }
 }
