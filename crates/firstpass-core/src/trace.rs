@@ -9,11 +9,11 @@
 //! parse them and re-derive the hash chain; renaming one is a breaking change that requires a
 //! schema/version bump, never a silent edit.
 
-use crate::Result;
 use crate::config::Mode;
 use crate::features::Features;
-use crate::hashchain::{Chained, record_hash};
+use crate::hashchain::{record_hash, Chained};
 use crate::verdict::{GateResult, Score, Verdict};
+use crate::Result;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -67,6 +67,43 @@ pub struct ProbeSignal {
     pub probe_cost_usd: f64,
 }
 
+/// The action elastic verification (ADR 0008 Phase 3) took on the served rung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticAction {
+    /// Visible signal cleared λ → served **without** running the expensive gates (skip authorized
+    /// by the conformal bound). This is the un-verified serve the bound must cover.
+    ServeSkip,
+    /// Visible gates failed (signal at the floor) → escalated **without** paying for the expensive
+    /// gates on a doomed attempt.
+    EscalateNow,
+    /// Ambiguous middle → the expensive gates ran as usual; the gate decided.
+    Verified,
+}
+
+/// Why elastic verification (ADR 0008 Phase 3) skipped or ran the expensive gates on the served
+/// rung — recorded so an auditor can see *why* verification was skipped and check the conformal
+/// bound authorized it. Absent when elastic is off (the default), keeping pre-elastic traces
+/// byte-identical and hash-chain compatible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ElasticDecision {
+    /// Which of the three regimes fired.
+    pub action: ElasticAction,
+    /// The visible-gate score that drove the decision (`gate_score` over the cheap gates).
+    pub signal: f64,
+    /// The calibrated skip threshold λ the signal was compared against.
+    pub lambda: f64,
+    /// Target served-failure α the λ was calibrated at (provenance, from config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha: Option<f64>,
+    /// Confidence (1−δ) the λ was calibrated at (provenance, from config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<f64>,
+    /// Provenance id of the calibration run that produced λ (from config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_id: Option<String>,
+}
+
 /// A single routing decision, start to finish.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trace {
@@ -104,6 +141,12 @@ pub struct Trace {
     /// pre-predictor traces and hash-chain compatible. Recorded but never acted on in this phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicted_pass: Option<f64>,
+    /// Elastic verification decision (ADR 0008 Phase 3) on the served rung: why the expensive gates
+    /// were skipped or run, plus the λ / calibration provenance the skip was authorized under.
+    /// Absent when elastic is off (the default) — byte-identical to pre-elastic traces and
+    /// hash-chain compatible (the `skip_serializing_if` keeps absent = absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elastic: Option<ElasticDecision>,
 }
 
 /// Reference to the policy that produced a decision.
@@ -256,7 +299,7 @@ impl std::fmt::Display for Trace {
 mod tests {
     use super::*;
     use crate::features::{Features, TaskKind};
-    use crate::hashchain::{GENESIS_HASH, verify_chain};
+    use crate::hashchain::{verify_chain, GENESIS_HASH};
     use crate::verdict::Verdict;
 
     fn sample_trace(prev_hash: &str, id: u128) -> Trace {
@@ -315,6 +358,7 @@ mod tests {
             },
             probe: None,
             predicted_pass: None,
+            elastic: None,
         };
         t.recompute_savings();
         t

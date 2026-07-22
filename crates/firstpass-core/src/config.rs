@@ -556,6 +556,12 @@ pub struct Escalation {
     /// `None` (default) = off = byte-identical to today (no predictor, no `predicted_pass`).
     #[serde(default)]
     pub predictor: Option<PredictorConfig>,
+    /// Elastic verification (ADR 0008 Phase 3): skip the named expensive gates on a serve when the
+    /// cheap **visible** gate score clears the conformally-calibrated threshold λ. `None` (default)
+    /// runs every gate on every serve — byte-identical to today's uniform verification. See
+    /// [`ElasticConfig`].
+    #[serde(default)]
+    pub elastic: Option<ElasticConfig>,
 }
 
 /// Per-query gate-pass predictor configuration (ADR 0008 Phase 2). The model is an online
@@ -636,6 +642,44 @@ pub struct ProbeConfig {
     pub sample_rate: f64,
 }
 
+/// Elastic-verification serving config (ADR 0008 Phase 3). When present, the gates named in
+/// `expensive_gates` are treated as *skippable*: a rung serves without running them when the
+/// **visible** (cheap, always-run) gate score is `>= lambda` — the elastic three-regime rule,
+/// validated offline (`firstpass-bench --elastic`, artifact `docs/benchmarks/elastic-validation.txt`).
+///
+/// The load-bearing invariant (ADR 0008): the un-verified serves carry the *same* distribution-free
+/// served-failure bound as the verified ones **only when `lambda` was conformally calibrated on
+/// representative data and the workload has not drifted**. `lambda` is therefore operator-supplied
+/// from a calibration run — obtain it from `firstpass calibrate` / the offline `--elastic` harness,
+/// never hand-tuned. `alpha`/`delta`/`calibration_id` are recorded verbatim on every skip receipt so
+/// an auditor can check the bound held against realized deferred outcomes.
+///
+/// Default-off: absent config = today's uniform cascade, byte-identical. Applies to the serial
+/// engine only; if `speculation > 0` is also configured the expensive gates still run (conservative
+/// — running more gates never weakens the bound).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticConfig {
+    /// Gate ids that may be skipped when the visible signal clears `lambda`. Ids **not** listed
+    /// here are "visible" (cheap, e.g. `non-empty`/`json-valid`/`schema`) and always run — they are
+    /// the probe signal. Must be non-empty; validated by [`Config::parse`].
+    pub expensive_gates: Vec<String>,
+    /// Calibrated skip threshold λ: serve without the expensive gates iff the visible gate score is
+    /// `>= lambda`. Must be finite and in `[0, 1]`; validated by [`Config::parse`].
+    pub lambda: f64,
+    /// Target served-failure rate α the λ was calibrated at. Recorded on every skip receipt for
+    /// audit; not enforced per-request (the calibration already baked it into λ).
+    #[serde(default)]
+    pub alpha: Option<f64>,
+    /// Confidence level (1−δ) the λ was calibrated at. Recorded on every skip receipt for audit.
+    #[serde(default)]
+    pub delta: Option<f64>,
+    /// Provenance id of the calibration run that produced λ. Recorded on every skip receipt so the
+    /// skip traces back to the exact conformal calibration that authorized it.
+    #[serde(default)]
+    pub calibration_id: Option<String>,
+}
+
 /// Config for the UCB1 start-rung bandit (`firstpass_proxy::bandit::StartRungBandit`).
 ///
 /// Absent (`None`) → start every request at rung 0 (byte-identical to today).
@@ -710,6 +754,7 @@ impl Default for Escalation {
             exploration: None,
             probe: None,
             predictor: None,
+            elastic: None,
         }
     }
 }
@@ -908,6 +953,19 @@ impl Config {
                 return Err(Error::InvalidConfig(format!(
                     "escalation.predictor.l2 must be finite and >= 0, got {}",
                     pred.l2
+                )));
+            }
+        }
+        if let Some(elastic) = &config.escalation.elastic {
+            if elastic.expensive_gates.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "escalation.elastic.expensive_gates must name at least one gate to skip".into(),
+                ));
+            }
+            if !elastic.lambda.is_finite() || !(0.0..=1.0).contains(&elastic.lambda) {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.elastic.lambda must be finite and in [0, 1], got {}",
+                    elastic.lambda
                 )));
             }
         }
