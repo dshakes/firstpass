@@ -114,8 +114,14 @@ requires the held-out + drift validation in Phase 3 below and replication beyond
    every receipt as `predicted_pass` in shadow (default-off, byte-identical, never acted on),
    warm-started from the trace store on boot, and validated offline via `firstpass
    predictor-eval` (prequential AUC + Brier). Probe signal as a feature is a follow-on.
-3. **Elastic-verification serving** behind the LTT-calibrated skip threshold; the conformal-over-skip
-   bound validated on held-out + drift splits before default-on is even proposed.
+3. **Elastic-verification serving** behind the calibrated skip threshold. **Offline-validated
+   (`firstpass-bench --elastic`, artifact `docs/benchmarks/elastic-validation.txt`):** skipping
+   the expensive gate on the confident majority (~79%), with the skip threshold calibrated by
+   split-conformal on a train split, holds held-out served-failure at 7.5% ≤ α=10% while cutting
+   verification cost ~61%. The un-verified serves carry the same distribution-free bound as the
+   verified ones — the held-out skip served-failure ≤ α is the proof. **Still required before a
+   production serving change: replicate under induced drift and beyond MBPP** (the next step);
+   the serving-path change stays default-off until then.
 4. **`(rung, n, verify?)` joint optimizer** under per-turn `(α, latency, $)` mode constraints.
 
 ## Consequences

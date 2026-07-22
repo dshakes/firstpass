@@ -9,6 +9,7 @@ as stale and the artifact as the bug to file.
 |---|---|---|---|
 | [`mbpp-live-base.txt`](mbpp-live-base.txt) ✅ | MBPP served-failure bound, base (test) gate | `FIRSTPASS_CODING_DATASET=./mbpp.jsonl cargo run --release -p firstpass-bench -- --coding-live` | your key + Docker, ~$5 |
 | `mbpp-live-judged.txt` | MBPP bound with an LLM judge on the gate | same, plus `FIRSTPASS_CODING_JUDGE=<model>` | your key + Docker, ~$10 |
+| [`elastic-validation.txt`](elastic-validation.txt) ✅ | Elastic-verification Phase 3: cost saved + held-out served-failure bound | `cargo run --release -p firstpass-bench -- --elastic` | free (offline) |
 | `live-200.txt` | 200-task live cost/success table | `cargo run -p firstpass-bench -- --live` | your key, ~a few $ |
 
 Provenance rules:

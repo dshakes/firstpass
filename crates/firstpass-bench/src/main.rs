@@ -52,6 +52,18 @@ fn main() {
     //   FIRSTPASS_CODING_DATASET=mbpp.jsonl FIRSTPASS_PROBE_K=5 firstpass-bench --probe-study
     // Start-rung ablation (offline, no spend): is the learned start rung smart, or just safe?
     // FIRSTPASS_ABLATION_N=<n> (default 8000) tasks; sweeps context->difficulty signal levels.
+    // Elastic-verification offline validation (ADR 0008 Phase 3): does skipping the expensive
+    // gate on the confident majority save cost while holding served-failure <= alpha (held-out)?
+    if args.iter().any(|a| a == "--elastic") {
+        let n = std::env::var("FIRSTPASS_ELASTIC_N")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10000);
+        let r = firstpass_bench::elastic::run_elastic_validation(n, 0.10, 0.05, 1);
+        println!("{}", firstpass_bench::elastic::render(&r));
+        return;
+    }
+
     if args.iter().any(|a| a == "--ablation") {
         let n = std::env::var("FIRSTPASS_ABLATION_N")
             .ok()
