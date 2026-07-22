@@ -11,8 +11,8 @@ use crate::gate::{Gate, GateHealthRegistry, aggregate_with_policy};
 use crate::provider::{Auth, ModelRequest, ModelResponse, ProviderError, ProviderRegistry};
 use firstpass_core::verdict::reason;
 use firstpass_core::{
-    Attempt, ElasticAction, ElasticDecision, Features, FinalOutcome, GENESIS_HASH, GateResult, Mode,
-    ModelRef, PolicyRef, PriceTable, RequestInfo, ServedFrom, Trace, Verdict,
+    Attempt, ElasticAction, ElasticDecision, Features, FinalOutcome, GENESIS_HASH, GateResult,
+    Mode, ModelRef, PolicyRef, PriceTable, RequestInfo, ServedFrom, Trace, Verdict,
 };
 use jiff::Timestamp;
 use std::collections::HashMap;
@@ -315,8 +315,9 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
 
                 // Which gate ids elastic may skip. Elastic off ⇒ empty ⇒ every gate is "visible"
                 // and phase 1 below runs all of them: byte-identical to the original single pass.
-                let expensive: &[String] =
-                    ctx.elastic.map_or(&[][..], |e| e.expensive_gates.as_slice());
+                let expensive: &[String] = ctx
+                    .elastic
+                    .map_or(&[][..], |e| e.expensive_gates.as_slice());
                 let is_expensive = |id: &str| expensive.iter().any(|x| x == id);
 
                 let fail_closed: std::collections::HashSet<&str> = ctx
@@ -328,8 +329,7 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
 
                 // Phase 1: the visible (cheap, always-run) gates. Gates run sequentially — they're
                 // I/O (subprocess / model) — with auto-disabled ones skipped by the health budget.
-                let mut gate_results =
-                    eval_gates(ctx, &req, &resp, |id| !is_expensive(id)).await;
+                let mut gate_results = eval_gates(ctx, &req, &resp, |id| !is_expensive(id)).await;
 
                 // Phase 2 (elastic only): the three-regime rule (ADR 0008). The visible-gate score
                 // is the same aggregate `calibrate` fit λ against, so serving and calibration agree.

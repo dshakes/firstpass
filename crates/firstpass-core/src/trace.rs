@@ -9,11 +9,11 @@
 //! parse them and re-derive the hash chain; renaming one is a breaking change that requires a
 //! schema/version bump, never a silent edit.
 
+use crate::Result;
 use crate::config::Mode;
 use crate::features::Features;
-use crate::hashchain::{record_hash, Chained};
+use crate::hashchain::{Chained, record_hash};
 use crate::verdict::{GateResult, Score, Verdict};
-use crate::Result;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -299,7 +299,7 @@ impl std::fmt::Display for Trace {
 mod tests {
     use super::*;
     use crate::features::{Features, TaskKind};
-    use crate::hashchain::{verify_chain, GENESIS_HASH};
+    use crate::hashchain::{GENESIS_HASH, verify_chain};
     use crate::verdict::Verdict;
 
     fn sample_trace(prev_hash: &str, id: u128) -> Trace {
