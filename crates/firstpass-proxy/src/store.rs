@@ -561,6 +561,7 @@ mod tests {
             },
             probe: None,
             predicted_pass: None,
+            elastic: None,
         };
         trace.recompute_savings();
         trace

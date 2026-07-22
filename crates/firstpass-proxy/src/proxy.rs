@@ -766,15 +766,17 @@ async fn enforce_pipeline_inner(
         &state.config.prices,
     );
     let session_id = session_header.unwrap_or_else(|| Uuid::now_v7().to_string());
-    let (budget, max_rungs, speculation, serve_threshold) = match state.config.routing.as_ref() {
-        Some(cfg) => (
-            cfg.budget.per_request_usd,
-            cfg.escalation.max_rungs_per_request,
-            cfg.escalation.speculation,
-            cfg.escalation.serve_threshold,
-        ),
-        None => (None, 3, 0, None),
-    };
+    let (budget, max_rungs, speculation, serve_threshold, elastic) =
+        match state.config.routing.as_ref() {
+            Some(cfg) => (
+                cfg.budget.per_request_usd,
+                cfg.escalation.max_rungs_per_request,
+                cfg.escalation.speculation,
+                cfg.escalation.serve_threshold,
+                cfg.escalation.elastic.as_ref(),
+            ),
+            None => (None, 3, 0, None, None),
+        };
     // Online adaptive conformal: serve against the LIVE-tracked threshold (updated by /v1/feedback).
     // Falls back to the fixed config threshold when adaptive is off or its lock is poisoned.
     let serve_threshold = state
@@ -915,6 +917,7 @@ async fn enforce_pipeline_inner(
         max_rungs,
         speculation,
         serve_threshold,
+        elastic,
         features,
         start_rung,
         // The tenant stamped on the enforce trace is the resolved identity from the auth layer
@@ -1789,6 +1792,7 @@ fn base_trace(
         },
         probe: None,
         predicted_pass: None,
+        elastic: None,
     }
 }
 

@@ -46,7 +46,7 @@ pub use hashchain::{Chained, GENESIS_HASH, canonical_json, record_hash, verify_c
 pub use ltt::{LttDiagnostic, LttResult};
 pub use predictor::PassPredictor;
 pub use trace::{
-    Attempt, DeferredVerdict, FinalOutcome, PolicyRef, ProbeRegime, ProbeSignal, RequestInfo,
-    ServedFrom, Trace,
+    Attempt, DeferredVerdict, ElasticAction, ElasticDecision, FinalOutcome, PolicyRef, ProbeRegime,
+    ProbeSignal, RequestInfo, ServedFrom, Trace,
 };
 pub use verdict::{GateResult, Score, Verdict};

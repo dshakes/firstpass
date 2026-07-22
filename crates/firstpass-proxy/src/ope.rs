@@ -797,6 +797,7 @@ mod tests {
             },
             probe: None,
             predicted_pass: None,
+            elastic: None,
         };
         trace.recompute_savings();
         trace
@@ -875,6 +876,7 @@ mod tests {
             },
             probe: None,
             predicted_pass: None,
+            elastic: None,
         };
         trace.recompute_savings();
         trace
@@ -1285,6 +1287,7 @@ serve_threshold = 0.75
             },
             probe: None,
             predicted_pass: None,
+            elastic: None,
         };
         trace.recompute_savings();
         trace

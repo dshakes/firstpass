@@ -11,8 +11,8 @@ use crate::gate::{Gate, GateHealthRegistry, aggregate_with_policy};
 use crate::provider::{Auth, ModelRequest, ModelResponse, ProviderError, ProviderRegistry};
 use firstpass_core::verdict::reason;
 use firstpass_core::{
-    Attempt, Features, FinalOutcome, GENESIS_HASH, GateResult, Mode, ModelRef, PolicyRef,
-    PriceTable, RequestInfo, ServedFrom, Trace, Verdict,
+    Attempt, ElasticAction, ElasticDecision, Features, FinalOutcome, GENESIS_HASH, GateResult,
+    Mode, ModelRef, PolicyRef, PriceTable, RequestInfo, ServedFrom, Trace, Verdict,
 };
 use jiff::Timestamp;
 use std::collections::HashMap;
@@ -59,6 +59,12 @@ pub struct EnforceCtx<'a> {
     /// score is `>=` this value. `None` (the default) keeps the original rule — serve iff the
     /// aggregate gate verdict is `Pass` — byte-identical to the original engine.
     pub serve_threshold: Option<f64>,
+    /// Elastic verification (ADR 0008 Phase 3): when `Some`, gates named in
+    /// [`ElasticConfig::expensive_gates`] are *skipped* on a serve whose visible-gate score clears
+    /// the calibrated threshold λ — the conformal bound authorizes the skip. `None` (the default)
+    /// runs every gate on every serve, byte-identical to uniform verification. Serial engine only;
+    /// the speculative engine ignores it (running more gates never weakens the bound).
+    pub elastic: Option<&'a firstpass_core::config::ElasticConfig>,
     /// Feature vector routed on (recorded in the trace).
     pub features: Features,
     /// Index of the first ladder rung to attempt this request (predict-to-start).
@@ -95,6 +101,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
         best,
         mut served_rung,
         hard_error,
+        elastic,
     } = if ctx.speculation == 0 {
         run_serial(&ctx).await
     } else {
@@ -165,6 +172,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
         },
         probe: None,
         predicted_pass: None,
+        elastic,
     };
     trace.recompute_savings();
     (outcome, trace)
@@ -180,6 +188,9 @@ struct LadderRun {
     best: Option<(u32, ModelResponse)>,
     served_rung: Option<u32>,
     hard_error: Option<String>,
+    /// Elastic verification decision on the served (or last-attempted) rung, `None` when elastic is
+    /// off. Recorded on the trace so an auditor sees *why* the expensive gates were skipped or run.
+    elastic: Option<ElasticDecision>,
 }
 
 /// The shared serve decision (SPEC §10.1), used by both [`run_serial`] and [`run_speculative`] so
@@ -202,6 +213,34 @@ fn should_serve(
     }
 }
 
+/// Evaluate the gates for which `include(id)` holds, in ladder order, skipping any the error budget
+/// has auto-disabled and feeding each outcome back to the budget. Factored out so the elastic
+/// two-phase split (visible gates, then expensive gates only if the middle is ambiguous) and the
+/// uniform path evaluate gates by the exact same rule — with elastic off, `include` is always true,
+/// so this reproduces the original single-pass loop byte-for-byte.
+async fn eval_gates(
+    ctx: &EnforceCtx<'_>,
+    req: &ModelRequest,
+    resp: &ModelResponse,
+    include: impl Fn(&str) -> bool,
+) -> Vec<GateResult> {
+    let mut out: Vec<GateResult> = Vec::with_capacity(ctx.gates.len());
+    for g in ctx.gates {
+        if !include(g.id()) {
+            continue;
+        }
+        if !ctx.health.enabled(&ctx.tenant_id, g.id()) {
+            tracing::warn!(gate = %g.id(), "skipping auto-disabled gate");
+            continue;
+        }
+        let r = g.evaluate(req, resp).await;
+        ctx.health
+            .record(&ctx.tenant_id, g.id(), r.verdict == Verdict::Abstain);
+        out.push(r);
+    }
+    out
+}
+
 /// Serial engine: one rung at a time — call, gate, serve the first pass, escalate on fail. This is
 /// the original, proven loop; `speculation == 0` routes here unchanged.
 async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
@@ -211,6 +250,9 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
     let mut best: Option<(u32, ModelResponse)> = None;
     let mut served_rung: Option<u32> = None;
     let mut hard_error: Option<String> = None;
+    // Elastic decision on the most recent rung; on serve this is the served rung's decision, which
+    // is what the trace records. Stays `None` while elastic is off.
+    let mut last_elastic: Option<ElasticDecision> = None;
 
     let start = (ctx.start_rung as usize).min(ctx.ladder.len().saturating_sub(1));
     // max_rungs caps the NUMBER of rungs attempted from start; rung_end is the exclusive upper
@@ -271,22 +313,12 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                     .unwrap_or(0.0);
                 spent += model_cost;
 
-                // Run gates sequentially (they're I/O — subprocess/model), skipping any the
-                // error budget has auto-disabled, and feeding each outcome back to the budget.
-                let mut gate_results: Vec<GateResult> = Vec::with_capacity(ctx.gates.len());
-                for g in ctx.gates {
-                    if !ctx.health.enabled(&ctx.tenant_id, g.id()) {
-                        tracing::warn!(gate = %g.id(), "skipping auto-disabled gate");
-                        continue;
-                    }
-                    let r = g.evaluate(&req, &resp).await;
-                    ctx.health
-                        .record(&ctx.tenant_id, g.id(), r.verdict == Verdict::Abstain);
-                    gate_results.push(r);
-                }
-                let gc: f64 = gate_results.iter().map(|g| g.cost_usd).sum();
-                gate_cost_total += gc;
-                spent += gc;
+                // Which gate ids elastic may skip. Elastic off ⇒ empty ⇒ every gate is "visible"
+                // and phase 1 below runs all of them: byte-identical to the original single pass.
+                let expensive: &[String] = ctx
+                    .elastic
+                    .map_or(&[][..], |e| e.expensive_gates.as_slice());
+                let is_expensive = |id: &str| expensive.iter().any(|x| x == id);
 
                 let fail_closed: std::collections::HashSet<&str> = ctx
                     .gates
@@ -294,8 +326,57 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                     .filter(|g| g.abstain_fails_closed())
                     .map(|g| g.id())
                     .collect();
+
+                // Phase 1: the visible (cheap, always-run) gates. Gates run sequentially — they're
+                // I/O (subprocess / model) — with auto-disabled ones skipped by the health budget.
+                let mut gate_results = eval_gates(ctx, &req, &resp, |id| !is_expensive(id)).await;
+
+                // Phase 2 (elastic only): the three-regime rule (ADR 0008). The visible-gate score
+                // is the same aggregate `calibrate` fit λ against, so serving and calibration agree.
+                let mut elastic_decision: Option<ElasticDecision> = None;
+                if let Some(el) = ctx.elastic {
+                    let vis_verdict = aggregate_with_policy(&gate_results, &fail_closed);
+                    let signal = gate_score(&gate_results, vis_verdict);
+                    let action = if signal >= el.lambda {
+                        // Cleared λ → the conformal bound authorizes serving without the expensive
+                        // gates.
+                        ElasticAction::ServeSkip
+                    } else if signal <= 0.0 {
+                        // Visible floor → doomed; escalate without paying for expensive gates here.
+                        ElasticAction::EscalateNow
+                    } else {
+                        // Ambiguous middle → run the expensive gates and let the gate decide.
+                        let mut exp = eval_gates(ctx, &req, &resp, &is_expensive).await;
+                        gate_results.append(&mut exp);
+                        ElasticAction::Verified
+                    };
+                    elastic_decision = Some(ElasticDecision {
+                        action,
+                        signal,
+                        lambda: el.lambda,
+                        alpha: el.alpha,
+                        delta: el.delta,
+                        calibration_id: el.calibration_id.clone(),
+                    });
+                }
+
+                let gc: f64 = gate_results.iter().map(|g| g.cost_usd).sum();
+                gate_cost_total += gc;
+                spent += gc;
+
                 let verdict = aggregate_with_policy(&gate_results, &fail_closed);
-                let serve = should_serve(ctx.serve_threshold, &gate_results, verdict);
+                // ServeSkip already cleared λ over the visible gates → serve without the expensive
+                // ones. Every other case (incl. elastic off) uses the normal rule over whatever
+                // gates ran: EscalateNow's visible Fail won't serve, Verified saw the full set.
+                let serve = if matches!(
+                    elastic_decision.as_ref().map(|d| d.action),
+                    Some(ElasticAction::ServeSkip)
+                ) {
+                    true
+                } else {
+                    should_serve(ctx.serve_threshold, &gate_results, verdict)
+                };
+                last_elastic = elastic_decision;
                 attempts.push(Attempt {
                     rung: idx,
                     model: model_str.clone(),
@@ -331,6 +412,7 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
         best,
         served_rung,
         hard_error,
+        elastic: last_elastic,
     }
 }
 
@@ -521,6 +603,9 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
         best,
         served_rung,
         hard_error,
+        // The speculative engine intentionally ignores elastic (running every gate is always
+        // bound-safe); no skip decision to record.
+        elastic: None,
     }
 }
 
@@ -658,6 +743,7 @@ mod tests {
             max_rungs: 3,
             speculation: 0,
             serve_threshold: None,
+            elastic: None,
             features: Features::new(firstpass_core::TaskKind::CodeEdit),
             start_rung: 0,
             tenant_id: "acme".into(),
@@ -1492,5 +1578,136 @@ mod tests {
             "receipt records the honest abstain, not a rewritten Fail"
         );
         assert!(matches!(out, EngineOutcome::Served(_)));
+    }
+
+    // ── ADR 0008 Phase 3: elastic verification serving path ──────────────────────────────────
+    // A realistic elastic config: λ plus the calibration provenance every real λ carries.
+    fn elastic_cfg(expensive: &[&str], lambda: f64) -> firstpass_core::config::ElasticConfig {
+        firstpass_core::config::ElasticConfig {
+            expensive_gates: expensive.iter().map(|s| (*s).to_owned()).collect(),
+            lambda,
+            alpha: Some(0.10),
+            delta: Some(0.05),
+            calibration_id: Some("cal-mbpp-v1".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn elastic_off_records_no_elastic_field() {
+        // Wire/hash-chain contract: with elastic unconfigured the trace carries no decision and the
+        // field serializes away entirely (no JSON key), so the canonical hash is byte-identical to a
+        // pre-elastic build. This is what keeps every existing audit chain valid.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let providers = registry(vec![("anthropic", HAIKU, Ok(resp(HAIKU, "answer")))]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let (_out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+        assert!(trace.elastic.is_none());
+        let json = serde_json::to_string(&trace).unwrap();
+        assert!(
+            !json.contains("elastic"),
+            "elastic must not appear in the wire form when off"
+        );
+    }
+
+    #[tokio::test]
+    async fn elastic_serve_skip_skips_expensive_gate_and_records_receipt() {
+        // Visible ScoreGate scores 0.9 ≥ λ=0.5 → the conformal bound authorizes serving WITHOUT the
+        // expensive gate. Proof it was skipped: the expensive gate id never appears in the receipt.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(ScoreGate), Box::new(JsonValidGate)];
+        let req = base_request();
+        let providers = registry(vec![("anthropic", HAIKU, Ok(resp(HAIKU, "0.9")))]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let el = elastic_cfg(&["json-valid"], 0.5);
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.elastic = Some(&el);
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == HAIKU));
+        assert_eq!(trace.final_.served_rung, Some(0));
+        // Only the visible gate ran; the expensive one was skipped.
+        assert_eq!(trace.attempts[0].gates.len(), 1);
+        assert_eq!(trace.attempts[0].gates[0].gate_id, "score");
+        let d = trace.elastic.expect("elastic decision recorded");
+        assert_eq!(d.action, ElasticAction::ServeSkip);
+        assert!((d.signal - 0.9).abs() < 1e-9);
+        assert!((d.lambda - 0.5).abs() < 1e-9);
+        // Receipt records WHY the skip was authorized: the calibration provenance.
+        assert_eq!(d.alpha, Some(0.10));
+        assert_eq!(d.delta, Some(0.05));
+        assert_eq!(d.calibration_id.as_deref(), Some("cal-mbpp-v1"));
+    }
+
+    #[tokio::test]
+    async fn elastic_escalate_now_skips_expensive_and_escalates() {
+        // Visible NonEmptyGate fails on empty text → signal 0 → escalate WITHOUT paying for the
+        // expensive gate. Sonnet's non-empty answer clears λ → serve-skip at rung 1.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate), Box::new(JsonValidGate)];
+        let req = base_request();
+        let providers = registry(vec![
+            ("anthropic", HAIKU, Ok(resp(HAIKU, "   "))),
+            ("anthropic", SONNET, Ok(resp(SONNET, "real answer"))),
+        ]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let el = elastic_cfg(&["json-valid"], 0.5);
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.elastic = Some(&el);
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == SONNET));
+        assert_eq!(trace.final_.escalations, 1);
+        assert_eq!(trace.final_.served_rung, Some(1));
+        // Rung 0: only the visible gate ran (expensive skipped), and it escalated.
+        assert_eq!(trace.attempts[0].gates.len(), 1);
+        assert_eq!(trace.attempts[0].gates[0].gate_id, "non-empty");
+        assert_eq!(trace.attempts[0].verdict, Verdict::Fail);
+        // The served rung's decision is what the trace records.
+        assert_eq!(trace.elastic.unwrap().action, ElasticAction::ServeSkip);
+    }
+
+    #[tokio::test]
+    async fn elastic_ambiguous_middle_runs_expensive_gate() {
+        // Visible score 0.3 is between the floor (0) and λ=0.8 → ambiguous → run the expensive gate
+        // and let the full verdict decide. Proof it ran: both gate ids appear in the receipt.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(ScoreGate), Box::new(JsonValidGate)];
+        let req = base_request();
+        // "0.3" scores 0.3 on ScoreGate AND parses as valid JSON → expensive gate passes → serve.
+        let providers = registry(vec![("anthropic", HAIKU, Ok(resp(HAIKU, "0.3")))]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let el = elastic_cfg(&["json-valid"], 0.8);
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.elastic = Some(&el);
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == HAIKU));
+        assert_eq!(trace.final_.served_rung, Some(0));
+        // Both the visible and the expensive gate ran.
+        assert_eq!(trace.attempts[0].gates.len(), 2);
+        let ids: Vec<&str> = trace.attempts[0]
+            .gates
+            .iter()
+            .map(|g| g.gate_id.as_str())
+            .collect();
+        assert!(ids.contains(&"score") && ids.contains(&"json-valid"));
+        let d = trace.elastic.unwrap();
+        assert_eq!(d.action, ElasticAction::Verified);
+        assert!((d.signal - 0.3).abs() < 1e-9);
     }
 }

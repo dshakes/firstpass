@@ -707,6 +707,7 @@ mod tests {
             },
             probe: None,
             predicted_pass: None,
+            elastic: None,
         };
         let t0 = mk(GENESIS_HASH, "s0");
         let t1 = mk(&t0.hash().unwrap(), "s1");
@@ -818,6 +819,7 @@ mod tests {
             },
             probe: None,
             predicted_pass: None,
+            elastic: None,
         };
         let ex = explain_trace(&t);
         assert_eq!(
