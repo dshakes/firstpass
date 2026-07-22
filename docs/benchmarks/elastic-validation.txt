@@ -1,0 +1,18 @@
+# firstpass-bench --elastic · ADR 0008 Phase 3 offline validation · 2026-07-21
+# Distribution parameterized to the committed probe study (probe-study-mbpp.txt).
+# Calibrate skip threshold on train (split-conformal), measure cost + served-failure on held-out.
+# Reproduce: cargo run --release -p firstpass-bench -- --elastic
+
+# Elastic verification — offline validation (ADR 0008 Phase 3)
+
+target: served-failure ≤ 10% at 95% confidence
+calibrated skip threshold λ = 0.426 (feasible: true)
+held-out eval: 5000 requests
+- skipped the expensive gate on 78.9% of requests (confident pass)
+- served-failure AMONG SKIPS (held-out): 7.48%  ✓ ≤ α
+- cost/request: uniform 1.100 → elastic 0.432  (60.7% cheaper)
+
+VERDICT: VALIDATED — elastic verification saves cost while holding the served-failure bound.
+(The skip carries the SAME distribution-free bound as a verified serve — the held-out
+skip served-failure staying ≤ α is the proof. Replicate under drift + beyond MBPP
+before any production serving change; this is the pre-registered Phase 3 gate.)

@@ -72,8 +72,10 @@ baseline.
       corrected signal** ([artifact](benchmarks/probe-study-mbpp.txt)): the k-sample visible-pass
       *count* (not entropy — that failed at AUC 0.431) sorts 77% of MBPP traffic into
       serve-without-gate (65% @ 99% safe) or escalate-now (12% @ 0%), concentrating verification
-      on the ambiguous 23%. Next: implement the three-regime skip behind LTT calibration; validate
-      held-out + under drift + beyond MBPP before default-on.
+      on the ambiguous 23%. **Phase 3 offline-validated** (`firstpass-bench --elastic`,
+      [artifact](benchmarks/elastic-validation.txt)): the calibrated skip cuts verification cost
+      ~61% while holding held-out served-failure at 7.5% ≤ α=10% — the un-verified serves keep the
+      same bound. Next: replicate under drift + beyond MBPP, then the (default-off) serving-path change.
 - [x] Learn-then-Test threshold calibration (`--method ltt` in `firstpass calibrate`):
       distribution-free finite-sample risk control via fixed-sequence exact-binomial testing
       (Angelopoulos et al. 2021 / RCPS). Includes per-λ diagnostics and the gate's empirical
