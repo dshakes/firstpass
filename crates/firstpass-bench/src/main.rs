@@ -50,6 +50,17 @@ fn main() {
     // Probe-signal validation study (ADR 0008 go/no-go): draw k cheap samples per task, measure
     // whether self-consistency uncertainty predicts the oracle outcome. Needs a dataset + key + Docker.
     //   FIRSTPASS_CODING_DATASET=mbpp.jsonl FIRSTPASS_PROBE_K=5 firstpass-bench --probe-study
+    // Start-rung ablation (offline, no spend): is the learned start rung smart, or just safe?
+    // FIRSTPASS_ABLATION_N=<n> (default 8000) tasks; sweeps context->difficulty signal levels.
+    if args.iter().any(|a| a == "--ablation") {
+        let n = std::env::var("FIRSTPASS_ABLATION_N")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(8000);
+        println!("{}", firstpass_bench::ablation::run_ablation_sweep(n, 1));
+        return;
+    }
+
     if args.iter().any(|a| a == "--probe-study") {
         let key = match std::env::var("ANTHROPIC_API_KEY") {
             Ok(k) if !k.is_empty() => k,

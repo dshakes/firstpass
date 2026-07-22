@@ -92,6 +92,12 @@ baseline.
 - [ ] Reproducible benchmark vs the unified routing+cascading policy from the literature,
       including a drift scenario in which the bound must hold.
 
+- [x] Start-rung ablation (`firstpass-bench --ablation`): quantifies how much of the
+      start-0 → oracle cost headroom a *learned* start rung captures, as a function of how
+      predictive context is — the honest "is the cost-brain smart, or just safe?" answer
+      (0% when context is noise; 100% when it fully predicts). The real per-deployment number
+      is `firstpass predictor-eval` on receipts.
+
 **Exit gate:** a committed artifact showing ≥ cascade-routing cost/quality *plus* the bound
 holding under induced drift.
 
