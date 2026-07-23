@@ -31,22 +31,23 @@
 <div class="grp"><p class="grp-t">Getting started</p>
 <a href="index.html"><span class="num">01</span>Overview</a>
 <a href="how-it-works.html"><span class="num">02</span>How it works</a>
+<a href="request-flow.html"><span class="num">03</span>Request flow</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
-<a href="gates.html" aria-current="page"><span class="num">03</span>Gates</a>
-<a href="routing.html"><span class="num">04</span>Routing & escalation</a>
-<a href="guarantee.html"><span class="num">05</span>The guarantee</a>
-<a href="receipts.html"><span class="num">06</span>Receipts & audit</a>
+<a href="gates.html" aria-current="page"><span class="num">04</span>Gates</a>
+<a href="routing.html"><span class="num">05</span>Routing & escalation</a>
+<a href="guarantee.html"><span class="num">06</span>The guarantee</a>
+<a href="receipts.html"><span class="num">07</span>Receipts & audit</a>
 </div>
 <div class="grp"><p class="grp-t">Reference</p>
-<a href="providers.html"><span class="num">07</span>Providers</a>
-<a href="configuration.html"><span class="num">08</span>Configuration</a>
-<a href="cli.html"><span class="num">09</span>CLI reference</a>
-<a href="api.html"><span class="num">10</span>API & MCP</a>
+<a href="providers.html"><span class="num">08</span>Providers</a>
+<a href="configuration.html"><span class="num">09</span>Configuration</a>
+<a href="cli.html"><span class="num">10</span>CLI reference</a>
+<a href="api.html"><span class="num">11</span>API & MCP</a>
 </div>
 <div class="grp"><p class="grp-t">Research & data</p>
-<a href="elastic-verification.html"><span class="num">11</span>Elastic verification</a>
-<a href="benchmarks.html"><span class="num">12</span>Benchmarks</a>
+<a href="elastic-verification.html"><span class="num">12</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">13</span>Benchmarks</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -200,7 +201,7 @@ threshold = 0.8</code></pre></div>
 <h2 id="cost">Gate cost on the receipt<a class="anchor" href="#cost" aria-label="Link to this section">#</a></h2>
 <p>Verification is not free, and Firstpass refuses to hide it. Every gate's cost — a judge's tokens, a consistency gate's <code>k</code> extra calls, a subprocess's wall time priced in — is written onto the receipt as <code>gate_cost_usd</code>, separate from the model spend. When you run <code>firstpass savings</code>, the net figure already accounts for what verification cost you. Proof has a price, and it's on the ticket.</p>
 
-<nav class="pager" aria-label="Pagination"><a class="prev" href="how-it-works.html"><span class="dir">← Previous</span><span class="t">How it works</span></a><a class="next" href="routing.html"><span class="dir">Next →</span><span class="t">Routing & escalation</span></a></nav>
+<nav class="pager" aria-label="Pagination"><a class="prev" href="request-flow.html"><span class="dir">← Previous</span><span class="t">Request flow</span></a><a class="next" href="routing.html"><span class="dir">Next →</span><span class="t">Routing & escalation</span></a></nav>
 </main>
 <nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#what" class="">What a gate is</a><a href="#builtin" class="">Built-in inline</a><a href="#schema" class="">schema</a><a href="#subprocess" class="">subprocess — bring your own</a><a href="#judge" class="">judge — native LLM</a><a href="#consistency" class="">consistency</a><a href="#abstain" class="">Abstain &amp; error budget</a><a href="#cost" class="">Gate cost on the receipt</a></nav>
 </div>
