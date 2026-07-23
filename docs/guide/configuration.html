@@ -55,6 +55,42 @@
 <h1>Configuration</h1>
 <p class="page-sub">Firstpass reads a single <code>firstpass.toml</code> plus a handful of environment variables. This is the full reference — ladder, gates, bandit, speculation, budgets, providers, routes and modes — and the multi-tenant options.</p>
 
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 380" role="img" aria-labelledby="cfgT">
+<title id="cfgT">Anatomy of firstpass.toml — a ladder and one gate are required; every other section has a default and ships off</title>
+<defs><marker id="cfgA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/></marker></defs>
+<rect x="40" y="56" width="580" height="300" rx="14" class="n-fill n-stroke"/>
+<rect x="40" y="34" width="196" height="26" rx="7" class="n-fill n-stroke"/>
+<text x="60" y="51" class="m ink" font-size="12.5">firstpass.toml</text>
+
+<text x="64" y="84" class="m ink-mut" font-size="11" style="letter-spacing:.09em">REQUIRED — A MINIMAL WORKING CONFIG</text>
+<rect x="64" y="92" width="532" height="32" rx="8" class="n-fill pass-s glow-p"/>
+<text x="80" y="113" class="m pass" font-size="13">[ladder]</text>
+<text x="580" y="113" text-anchor="end" class="m ink-mut" font-size="10.5">ordered rungs · cheap → capable</text>
+<rect x="64" y="130" width="532" height="32" rx="8" class="n-fill pass-s glow-p"/>
+<text x="80" y="151" class="m pass" font-size="13">[[gate]]</text>
+<text x="580" y="151" text-anchor="end" class="m ink-mut" font-size="10.5">proof on every rung</text>
+
+<text x="64" y="186" class="m ink-mut" font-size="11" style="letter-spacing:.09em">OPTIONAL — EVERY SECTION BELOW HAS A DEFAULT</text>
+<rect x="64" y="194" width="532" height="30" rx="8" class="n-fill n-stroke" stroke-dasharray="5 4"/>
+<text x="80" y="214" class="m ink" font-size="13">[bandit]</text>
+<text x="580" y="214" text-anchor="end" class="m ink-mut" font-size="10.5">learned start rung · off</text>
+<rect x="64" y="228" width="532" height="30" rx="8" class="n-fill n-stroke" stroke-dasharray="5 4"/>
+<text x="80" y="248" class="m ink" font-size="13">[speculation]</text>
+<text x="580" y="248" text-anchor="end" class="m ink-mut" font-size="10.5">prefetch next rung · off</text>
+<rect x="64" y="262" width="532" height="30" rx="8" class="n-fill n-stroke" stroke-dasharray="5 4"/>
+<text x="80" y="282" class="m ink" font-size="13">[budget]</text>
+<text x="580" y="282" text-anchor="end" class="m ink-mut" font-size="10.5">hard cost ceiling</text>
+<rect x="64" y="296" width="532" height="30" rx="8" class="n-fill n-stroke" stroke-dasharray="5 4"/>
+<text x="80" y="316" class="m ink" font-size="13">[[provider]] · [[route]]</text>
+<text x="580" y="316" text-anchor="end" class="m ink-mut" font-size="10.5">custom endpoints · per-traffic ladders</text>
+
+<line x1="620" y1="206" x2="712" y2="206" class="grid" stroke-dasharray="5 5" marker-end="url(#cfgA)"/>
+<line x1="620" y1="206" x2="712" y2="206" class="flow s"/>
+<rect x="724" y="164" width="216" height="84" rx="12" class="n-fill accent-s glow"/>
+<text x="832" y="202" text-anchor="middle" class="accent-ink" font-size="15" font-weight="700">a running cascade</text>
+<text x="832" y="224" text-anchor="middle" class="m ink-mut" font-size="10.5">ladder + gates, wired</text>
+</svg><figcaption>A working config is a ladder and one gate. Every other section has a default and ships off — add it only when you reach for it.</figcaption></div>
+
 <h2 id="shape">Config shape<a class="anchor" href="#shape" aria-label="Link to this section">#</a></h2>
 <p>A minimal config is a ladder and one gate. Everything else has a default. Point Firstpass at a file with <code>FIRSTPASS_CONFIG</code> (default <code>./firstpass.toml</code>).</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># firstpass.toml — a minimal, working config</span>
