@@ -54,9 +54,78 @@
 <p class="crumb"><a href="index.html">Docs</a> / Gates</p>
 <h1>Gates</h1>
 <p class="page-sub">The gate is the mechanism that makes Firstpass proof-based instead of predictive. It reads the actual output and returns a verdict. Firstpass ships five kinds — from a zero-config inline check to your own test suite — and lets you compose them.</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 200" role="img" aria-labelledby="gcT">
+<title id="gcT">The five gate kinds ordered by cost, cheapest first: the inline non-empty and json-valid checks and the schema gate are free and add no model calls; the subprocess gate costs your executable's wall time; the judge gate costs one extra model call; the consistency gate is the most expensive, costing k extra resamples.</title>
+<text x="40" y="32" class="ink" font-size="13" font-weight="640">Five kinds, cheapest proof first</text>
+<line x1="70" y1="176" x2="930" y2="176" class="grid" stroke-width="1.4" marker-end="url(#g2a)"/>
+<line x1="70" y1="176" x2="924" y2="176" class="flow l" stroke-width="2"/>
+<text x="70" y="196" class="ink-mut" font-size="10.5">cheaper</text>
+<text x="924" y="196" text-anchor="end" class="ink-mut" font-size="10.5">costlier</text>
+<g><rect x="60" y="66" width="150" height="76" rx="10" class="n-fill pass-s glow-p" stroke-width="1.5"/>
+<text x="74" y="92" class="ink m" font-size="12" font-weight="640">non-empty</text>
+<text x="74" y="110" class="ink m" font-size="12" font-weight="640">json-valid</text>
+<text x="74" y="130" class="pass" font-size="10.5" font-weight="600">free · inline</text></g>
+<g><rect x="250" y="80" width="150" height="54" rx="10" class="n-fill pass-s" stroke-width="1.5"/>
+<text x="264" y="106" class="ink m" font-size="12" font-weight="640">schema</text>
+<text x="264" y="124" class="pass" font-size="10.5" font-weight="600">free · structural</text></g>
+<g><rect x="440" y="80" width="150" height="54" rx="10" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="454" y="106" class="ink m" font-size="12" font-weight="640">subprocess</text>
+<text x="454" y="124" class="ink-mut" font-size="10.5" font-weight="600">$ · your tests</text></g>
+<g><rect x="630" y="80" width="150" height="54" rx="10" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="644" y="106" class="ink m" font-size="12" font-weight="640">judge</text>
+<text x="644" y="124" class="ink-mut" font-size="10.5" font-weight="600">$$ · 1 model call</text></g>
+<g><rect x="820" y="66" width="150" height="76" rx="10" class="n-fill warn-s glow-w" stroke-width="1.5"/>
+<text x="834" y="92" class="ink m" font-size="12" font-weight="640">consistency</text>
+<text x="834" y="110" class="warn" font-size="10.5" font-weight="600">$$$ · k resamples</text>
+<text x="834" y="130" class="ink-mut" font-size="10">most expensive</text></g>
+<defs><marker id="g2a" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-ink-mut)"/></marker></defs>
+</svg><figcaption>Every gate's cost lands on the receipt. The cheapest proof that settles the decision is the one worth running.</figcaption></div>
 
 <h2 id="what">What a gate is<a class="anchor" href="#what" aria-label="Link to this section">#</a></h2>
 <p>A gate is a check over a candidate output that returns one of three verdicts:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="gvT">
+<title id="gvT">One gate, three verdicts. The gate reads the candidate output and returns pass, fail, or abstain: pass serves and stops the cascade, fail escalates one rung and retries, and abstain is governed by the gate's on_abstain policy — fail_open serves, fail_closed escalates.</title>
+<text x="40" y="40" class="ink" font-size="13" font-weight="640">One gate, three verdicts — the output decides, not the prompt</text>
+<g>
+  <rect x="40" y="126" width="176" height="56" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
+  <text x="58" y="152" class="ink m" font-size="13" font-weight="600">candidate</text>
+  <text x="58" y="170" class="ink-mut" font-size="11">the actual output bytes</text>
+</g>
+<g>
+  <rect x="410" y="112" width="180" height="84" rx="12" class="n-fill accent-s glow" stroke-width="1.8"/>
+  <text x="500" y="150" text-anchor="middle" class="accent-ink" font-size="19" font-weight="700">GATE</text>
+  <text x="500" y="172" text-anchor="middle" class="ink-mut" font-size="11">reads output → verdict</text>
+</g>
+<g>
+  <rect x="762" y="44" width="210" height="54" rx="10" class="n-fill pass-s glow-p" stroke-width="1.6"/>
+  <text x="780" y="70" class="pass m" font-size="13" font-weight="640">pass → serve</text>
+  <text x="780" y="88" class="ink-mut" font-size="11">cascade stops here</text>
+</g>
+<g>
+  <rect x="762" y="126" width="210" height="54" rx="10" class="n-fill fail-s" stroke-width="1.6"/>
+  <text x="780" y="152" class="fail m" font-size="13" font-weight="640">fail → escalate</text>
+  <text x="780" y="170" class="ink-mut" font-size="11">+1 rung, try again</text>
+</g>
+<g>
+  <rect x="762" y="208" width="210" height="54" rx="10" class="n-fill warn-s" stroke-width="1.6"/>
+  <text x="780" y="234" class="warn m" font-size="13" font-weight="640">abstain → on_abstain</text>
+  <text x="780" y="252" class="ink-mut" font-size="11">fail_open · fail_closed</text>
+</g>
+<line x1="216" y1="154" x2="404" y2="154" class="accent-s" stroke-width="1.7" marker-end="url(#g1a)"/>
+<line x1="216" y1="154" x2="404" y2="154" class="flow s" stroke-width="2.2"/>
+<line x1="590" y1="140" x2="756" y2="74" class="pass-s" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#g1p)"/>
+<line x1="590" y1="140" x2="756" y2="74" class="flow p s" stroke-width="2.2"/>
+<line x1="590" y1="154" x2="756" y2="153" class="fail-s" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#g1f)"/>
+<line x1="590" y1="154" x2="756" y2="153" class="flow f s d3" stroke-width="2.2"/>
+<line x1="590" y1="168" x2="756" y2="232" class="warn-s" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#g1w)"/>
+<line x1="590" y1="168" x2="756" y2="232" class="flow w s d5" stroke-width="2.2"/>
+<defs>
+  <marker id="g1a" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/></marker>
+  <marker id="g1p" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+  <marker id="g1f" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-fail)"/></marker>
+  <marker id="g1w" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
+</defs>
+</svg><figcaption>The gate reads the output, not the prompt. Its verdict decides whether the cascade serves, climbs, or defers to your abstain policy.</figcaption></div>
 <div class="defs">
   <div class="row"><div class="k">pass</div><div class="v">The output is good enough to serve. The cascade stops here.</div></div>
   <div class="row"><div class="k">fail</div><div class="v">Not good enough. Escalate one rung and try again.</div></div>
