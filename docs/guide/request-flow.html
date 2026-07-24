@@ -54,14 +54,14 @@
 <button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
 <p class="crumb"><a href="index.html">Docs</a> / Routing, end to end</p>
 <h1>Routing, end to end</h1>
-<p class="page-sub">Point your agent's base URL at Firstpass and every model call flows through one routing engine that serves the cheapest model which can <em>prove</em> its answer. A one-shot question, a fifty-step debugging loop, a tagged subagent, a whole team fanning out in parallel — all of it is the same primitive: an independent HTTP request, routed and proven on its own merits. This page follows a real one from the terminal to the served bytes — with the actual request, the actual response, and the actual receipt — then scales that single request up to every hard case.</p>
+<p class="page-sub">Point your agent at Firstpass and every model call runs through one engine that serves the cheapest model which can <em>prove</em> its answer. A one-shot question, a fifty-step loop, a subagent, a whole team running in parallel — all of it is the same thing: an independent HTTP request, routed and proven on its own. This page follows one real request from the terminal to the served bytes — the actual request, response, and receipt — then scales it up to every hard case.</p>
 
 <div class="note info"><span class="nt">Read this after "How it works"</span> That page explains the gate and the ladder — the machinery. This page is the guided tour: what a <em>request</em> is, how your prompts become requests, and how the same four steps carry you from a trivial question to a dynamic multi-agent workflow.</div>
 
 <h2 id="one-idea">The one idea<a class="anchor" href="#one-idea" aria-label="Link to this section">#</a></h2>
-<p>Firstpass is an HTTP proxy. Your agent — Claude Code, the Agent SDK, or anything that speaks the Anthropic or OpenAI wire format — points its base URL at Firstpass instead of the provider. From that seat, Firstpass sees exactly one kind of thing: a <strong>completion request</strong>, a single <code>POST</code> with a body of messages and tools. That is the entire surface, and it is what makes the model tractable: there is no session object to reason about, no turn counter, no agent graph. There is the next request, and the router earns the right answer for it.</p>
-<p>Everything on this page is a consequence of that seat. The agent loop, subagents, and multi-agent workflows are all built by the client out of many independent requests — and Firstpass routes each one on its own merits, which is exactly why the same small engine handles the trivial and the enormous without special cases.</p>
-<div class="note"><span class="nt">The load-bearing sentence</span> A terminal prompt is <strong>not</strong> a request. It is the start of an agent loop that emits <em>many</em> requests. Firstpass routes requests, not prompts — so scale is just volume, never a new mechanism.</div>
+<p>Firstpass is an HTTP proxy. Your agent — Claude Code, the Agent SDK, or anything that speaks the Anthropic or OpenAI wire format — points its base URL at Firstpass instead of the provider. From that seat, Firstpass sees exactly one kind of thing: a <strong>completion request</strong>, a single <code>POST</code> with a body of messages and tools. That is the entire surface, and it is what makes the model tractable: there is no session object to reason about, no turn counter, no agent graph. There's the next request, and the router earns the right answer for it.</p>
+<p>Everything on this page follows from that seat. The agent loop, subagents, and multi-agent workflows are all built by the client out of many independent requests. Firstpass routes each on its own merits — which is why one small engine handles the trivial and the enormous with no special cases.</p>
+<div class="note"><span class="nt">The key point</span> A terminal prompt is <strong>not</strong> a request. It's the start of an agent loop that emits <em>many</em> requests. Firstpass routes requests, not prompts — so scale is just volume, never a new mechanism.</div>
 
 <h2 id="unit">The unit of routing is one request<a class="anchor" href="#unit" aria-label="Link to this section">#</a></h2>
 <p>When you type a prompt and hit enter, the agent begins a loop: think, call a tool, read the result, think again, maybe spawn a subagent, and eventually answer. <strong>Each "think" is a separate model call — a separate <code>POST</code> to Firstpass.</strong> A single prompt routinely produces five, ten, or fifty requests. Each arrives independently, is routed independently, and is proven independently.</p>
@@ -134,10 +134,10 @@
 <tr><td><code>x-firstpass-key</code></td><td>Tenant key, when multi-tenant auth is on.</td></tr>
 </tbody>
 </table></div>
-<div class="note"><span class="nt">Zero headers is a first-class mode</span> Send none and Firstpass still routes every call — it falls to the wildcard route (<code>match = {}</code>). Headers don't <em>enable</em> routing; they let you split traffic across ladders. No tags means one ladder for everything, which is a perfectly good place to start.</div>
+<div class="note"><span class="nt">No headers still works</span> Send none and Firstpass still routes every call — it falls to the wildcard route (<code>match = {}</code>). Headers don't <em>enable</em> routing; they let you split traffic across ladders. No tags means one ladder for everything, which is a fine place to start.</div>
 
 <h2 id="lifecycle">The life of one request<a class="anchor" href="#lifecycle" aria-label="Link to this section">#</a></h2>
-<p>Every <code>POST</code> — no matter what produced it — travels the same four steps. There is no fast path for "simple" prompts and no special case for subagents; the uniformity is the point, and it is what lets one engine be correct across every scenario below.</p>
+<p>Every <code>POST</code> — no matter what produced it — travels the same four steps. No fast path for "simple" prompts, no special case for subagents. The uniformity is the point: it's what lets one engine stay correct across every case below.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 320" role="img" aria-labelledby="lifeT">
 <title id="lifeT">One request flows through four steps: extract features from headers and body, match a route by those features, then either enforce (cascade cheapest-first with a gate on each rung, escalating on failure) or observe (forward the original request unchanged). Every decision is written to a receipt.</title>
 <defs>
@@ -194,7 +194,7 @@
 <li><strong>Enforce or observe.</strong> The matched route's <code>mode</code> decides. <em>Enforce</em> runs the cascade: open on the cheapest rung, run the gate, serve if it passes, else climb one rung — overwriting the request's <code>model</code> with the rung's model as it goes. <em>Observe</em> forwards the original request byte-identically (also the safe fallback when a request can't be routed faithfully).</li>
 <li><strong>Serve and record.</strong> The winning output is returned in the caller's own dialect. The full decision — every rung tried, every gate verdict, the cost — is written to a hash-chained <a href="receipts.html">receipt</a>.</li>
 </ol>
-<div class="note"><span class="nt">Where "which model answered" lives</span> The response you get back is a normal completion in your dialect — clean, no vendor cruft bolted on. The rung, the gate verdicts, and the cost live in the <strong>receipt</strong>, the auditable record. That split is deliberate: the answer is the product; the proof is the receipt. You'll see both, for a real escalation, in <a href="#complex">the complex case</a>.</div>
+<div class="note"><span class="nt">Where "which model answered" lives</span> The response you get back is a normal completion in your dialect — no vendor cruft bolted on. The rung, the gate verdicts, and the cost live in the <strong>receipt</strong>. The split is deliberate: the answer is the product, the proof is the receipt. You'll see both, for a real escalation, in <a href="#complex">the complex case</a>.</div>
 
 <h2 id="simple">A simple question<a class="anchor" href="#simple" aria-label="Link to this section">#</a></h2>
 <p>Start with the easy case. You ask a one-shot question that needs no tools. The agent sends one request; Firstpass opens it on rung 0 (the cheapest model), the gate passes, and that output is served. One request, one rung, done. Here is the actual call:</p>
@@ -326,7 +326,7 @@ curl localhost:8080/v1/messages \
   },
   &quot;hash&quot;: &quot;sha256:5c02d9…&quot;                    <span class="tk-c">// SHA-256 of this record — the next record's prev_hash</span>
 }</code></pre></div>
-<p>Read that receipt and the routing is fully explained: the cheap rung was tried ($0.0007), its output <em>failed a real test</em> (not a guess — <code>cargo-test</code> ran and returned <code>fail</code>), the cascade escalated exactly once, and the served answer cost $0.0128 against a $0.0630 always-strong baseline. Request 4 in the same loop might pass on rung 0, because "did the edit apply cleanly" is easy. The router never assumes that because turn 2 was hard, turn 4 will be — <strong>it re-earns the answer every time.</strong> A stale routing decision can never be carried forward, because none is kept.</p>
+<p>Read that receipt and the routing is fully explained: the cheap rung was tried ($0.0007), its output <em>failed a real test</em> (not a guess — <code>cargo-test</code> ran and returned <code>fail</code>), the cascade escalated exactly once, and the served answer cost $0.0128 against a $0.0630 always-strong baseline. Request 4 in the same loop might pass on rung 0, because "did the edit apply cleanly" is easy. The router never assumes that because turn 2 was hard, turn 4 will be — <strong>it re-earns the answer every time.</strong> No routing decision is ever carried forward, because none is kept.</p>
 
 <h2 id="subagents">Subagents<a class="anchor" href="#subagents" aria-label="Link to this section">#</a></h2>
 <p>When the main agent spawns a subagent, the subagent runs its <em>own</em> loop — and every call in that loop is, again, an independent <code>POST</code> to Firstpass. Nothing about a subagent call is structurally different from a main-loop call. So how does Firstpass route a planner subagent to a strong model and a mechanical one to a cheap model? <strong>You tag the request.</strong> The orchestrator sets <code>x-firstpass-subagent</code> on the subagent's calls, and a route matches on it:</p>
@@ -348,7 +348,7 @@ ladder = ["anthropic/claude-haiku-4-5"]
 [[route]]
 match = {}
 mode  = "observe"</code></pre></div>
-<p>Two schema details worth internalizing, because they are the whole steering wheel: <code>mode</code> is <code>enforce</code> or <code>observe</code> — whether the route acts or shadows — and <code>routing_mode</code> is the cost/quality preset on top of that. A <code>match</code> value can be a single string or a <em>list</em> (any-of), so a batch of mechanical subagents shares one route.</p>
+<p>Two schema details do most of the work here. <code>mode</code> is <code>enforce</code> or <code>observe</code> — whether the route acts or just shadows. <code>routing_mode</code> is the cost/quality preset on top of that. And a <code>match</code> value can be a single string or a <em>list</em> (any-of), so a batch of mechanical subagents shares one route.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="subT">
 <title id="subT">The main agent's calls and each subagent's calls arrive as independent requests. Firstpass matches each to a route by its subagent tag: the architect subagent to a tall quality ladder, the test-runner to a single cheap rung, and untagged main-loop calls to the wildcard route.</title>
 <defs>
@@ -394,7 +394,7 @@ mode  = "observe"</code></pre></div>
 <line x1="220" y1="151" x2="378" y2="150" class="flow p s" stroke-width="2"/>
 <line x1="530" y1="150" x2="688" y2="151" class="flow p s d3" stroke-width="2"/>
 </svg>
-  <figcaption>The subagent's requested model does not decide what runs — the matched route's ladder does, and the gate decides where on that ladder it stops. The tag is the whole steering wheel.</figcaption>
+  <figcaption>The subagent's requested model does not decide what runs. The matched route's ladder does, and the gate decides where on that ladder it stops.</figcaption>
 </div>
 
 <h2 id="teams">Agent teams &amp; dynamic workflows<a class="anchor" href="#teams" aria-label="Link to this section">#</a></h2>
@@ -471,7 +471,7 @@ const client = new Anthropic({ baseURL: "http://localhost:8080" });
 <div class="note"><span class="nt">The safe default when routing can't apply</span> If a request can't be routed faithfully — an unknown dialect quirk, a translation Firstpass won't risk — it falls back to <em>observe</em> and forwards the original untouched. The served-failure guarantee holds: you never get a worse answer than the provider would have given, only a proven-cheaper one when the gate allows.</div>
 
 <h2 id="tackle">How Firstpass tackles all of it<a class="anchor" href="#tackle" aria-label="Link to this section">#</a></h2>
-<p>Every scenario on this page reduces to the same handful of moves. The power is in how little there is:</p>
+<p>Every scenario on this page reduces to the same handful of moves. There is not much to it:</p>
 <div class="tblwrap"><table>
 <thead><tr><th>You have…</th><th>Firstpass sees…</th><th>You steer it with…</th></tr></thead>
 <tbody>
@@ -482,7 +482,7 @@ const client = new Anthropic({ baseURL: "http://localhost:8080" });
 <tr><td>Multi-turn conversation</td><td>Independent turns; history rides in the body</td><td><code>x-firstpass-session</code> → <code>per_session_usd</code></td></tr>
 </tbody>
 </table></div>
-<p>The design holds because it refuses to be clever about state. It does not predict what your conversation will need; it <strong>proves</strong> each request against a gate and serves the cheapest output that clears it. Statelessness is what makes that safe to run on every call, differentiation comes from the tags you choose to send, and the one thing carried across a conversation — the budget — is a guardrail, never a guess. That is the whole model: <em>proof over prediction</em>, one request at a time.</p>
+<p>The design holds because it is not clever about state. It does not predict what your conversation will need. It <strong>proves</strong> each request against a gate and serves the cheapest output that clears it. Statelessness is what makes that safe to run on every call. Differentiation comes from the tags you send. The one thing carried across a conversation — the budget — is a guardrail, not a guess. That is the whole model: <em>proof over prediction</em>, one request at a time.</p>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="how-it-works.html"><span class="dir">← Previous</span><span class="t">How it works</span></a><a class="next" href="gates.html"><span class="dir">Next →</span><span class="t">Gates</span></a></nav>
 </main>
