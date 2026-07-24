@@ -246,7 +246,7 @@ Multi-tenant deployments add per-tenant auth (Argon2id), rate limits, gate-healt
 
 ## Status
 
-**v0.2.0 — pre-GA, shipped in the open.** Honest about the line between shipped and researched.
+**v0.2.1 — pre-GA, shipped in the open.** Honest about the line between shipped and researched.
 
 | ✅ Shipped & verified | 🔬 Next / research |
 |---|---|
