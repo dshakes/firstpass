@@ -621,7 +621,7 @@ pip install firstpass    # or install it</code></pre></div></div>
       <ul>
         <li><b>Constraint-form modes.</b> explicit cost / latency / quality constraints behind a validation gate — the presets above ship today.</li>
         <li><b>Elastic verification.</b> verify proportional to doubt, with a conformal guarantee over the verify/skip decision — signal validated, the serving path go/no-go gated.</li>
-        <li><b>Per-rung P(gate-pass | features)</b> prediction, and joint (rung, sample-count) routing on the easy slice.</li>
+        <li><b>Per-rung P(gate-pass | features).</b> The predictor ships today — default-off, shadow-only, recorded on every receipt; <em>acting</em> on it (and joint rung / sample-count routing on the easy slice) is gated on an offline AUC&nbsp;/&nbsp;Brier eval.</li>
         <li><b>Session / trajectory routing</b> across a whole agent run, not one turn.</li>
         <li><b>Live wire verification</b> for the OpenAI-compatible, Gemini, Bedrock, and Vertex adapters (smoke jobs activate when repo secrets are set).</li>
         <li><b>Benchmark vs the unified routing + cascading baseline</b>, including a drift scenario the bound must survive.</li>
