@@ -357,6 +357,18 @@ h1.title{font-size:clamp(40px,6vw,72px);font-weight:680;letter-spacing:-.04em;li
 .note.info{border-left-color:var(--blue)}
 .note .nt{display:block;font-weight:640;color:var(--text);margin-bottom:4px;font-size:13.5px}
 
+/* layered-doc devices — scannable spine + deep detail (Requests-101 style system) */
+.tldr{margin:2px 0 20px;padding:12px 16px;border-radius:var(--r);
+  background:var(--accent-soft);border:1px solid var(--accent-line);font-size:14.5px;line-height:1.6;color:var(--text-2)}
+.tldr::before{content:"TL;DR";display:inline-block;margin-right:10px;font:600 10.5px/1.75 var(--mono);letter-spacing:.05em;color:var(--accent-strong);text-transform:uppercase;vertical-align:1px}
+.tldr b{color:var(--text);font-weight:620}
+.recap{margin:22px 0 4px;padding:12px 16px;border-left:3px solid var(--border-2);background:var(--surface-2);
+  border-radius:0 var(--r) var(--r) 0;font-size:13.5px;color:var(--text-3);line-height:1.55}
+.recap::before{content:"In one line";display:block;font:600 10.5px/1.6 var(--mono);letter-spacing:.05em;color:var(--text-3);text-transform:uppercase;margin-bottom:3px}
+.recap b{color:var(--text-2);font-weight:620}
+.modnum{display:inline-block;font:600 13px/1 var(--mono);color:var(--accent-strong);margin-right:9px;vertical-align:2px}
+.subh{font-size:15.5px;font-weight:620;color:var(--text);margin:26px 0 8px;letter-spacing:-.01em}
+
 /* tables */
 .tbl{width:100%;border-collapse:collapse;margin:0 0 24px;font-size:14px;display:block;overflow-x:auto}
 .tbl table{width:100%;border-collapse:collapse;min-width:520px}
