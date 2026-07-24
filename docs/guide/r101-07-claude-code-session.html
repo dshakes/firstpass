@@ -143,13 +143,24 @@
 <p class="subh">Subagents spend on their own tab</p>
 <p>When the agent delegates — &ldquo;search the codebase for every caller of <code>parse()</code>&rdquo; — it can spawn a <strong>subagent</strong>. That subagent gets its <em>own</em> base context and its <em>own</em> transcript, runs its own tool loop, and returns only a compact result to the main session. This is deliberate: it keeps the main thread's context lean (the subagent's twenty file-reads never pollute your window). But make no mistake — those tokens are <em>billed</em>. A session that spawns three subagents is running four independent Module-4 loops, four bills, that happen to roll up into one task.</p>
 
-<p class="subh">When the window fills: compaction</p>
-<p>Every model has a context ceiling. As a long session nears it, the harness <strong>compacts</strong> — summarizes older turns into a digest and continues, so the request stops growing without losing the thread. Two costs follow:</p>
+<p class="subh">When the window fills: compact — or clear</p>
+<p>Every model has a context ceiling, and a long session eventually nears it. You have two ways to bring the input back down, and they are opposites.</p>
+<p><strong>Compact</strong> (automatic near the ceiling, or <code>/compact</code>) summarizes older turns into a digest and <em>continues the same task</em> — you keep the thread. Two costs follow:</p>
 <ul>
   <li>Compaction is itself a model call — summarizing isn't free.</li>
   <li>It <em>rewrites the prefix</em>, so the prompt cache from before the event is invalidated — the next request pays fresh reads.</li>
 </ul>
-<p>Net: long sessions cost less than linear growth suggests (the transcript is capped), but they aren't free at the seams.</p>
+<p><strong>Clear</strong> (<code>/clear</code>) does the opposite: it <em>wipes the conversation entirely</em> and starts fresh. The base context (system prompt, <code>CLAUDE.md</code>, tool schemas) reloads, but every turn of history is gone. No summary is made — it's the cheapest possible reset, and the right move when you switch to an <em>unrelated</em> task rather than continue the current one.</p>
+<div class="tblwrap"><table>
+<thead><tr><th></th><th><code>/compact</code></th><th><code>/clear</code></th></tr></thead>
+<tbody>
+<tr><td>Keeps the thread?</td><td><b>Yes</b> — summarized</td><td><b>No</b> — wiped</td></tr>
+<tr><td>Costs a model call?</td><td>Yes (the summary)</td><td>No</td></tr>
+<tr><td>Input right after</td><td>base + summary + new turns</td><td>base + your next turn only</td></tr>
+<tr><td>Reach for it when</td><td>same task, running long</td><td>moving to a new task</td></tr>
+</tbody>
+</table></div>
+<div class="note"><span class="nt">Key idea — both reset the meter, differently</span> Multi-turn cost climbs because the transcript only grows. <strong>Compact</strong> caps it by swapping old turns for a shorter summary — you keep the thread, pay one summarization call, and lose the old prompt cache. <strong>Clear</strong> zeroes it by dropping the thread outright — cheapest, but you start from scratch. So: long sessions cost less than linear growth suggests, but they aren't free at the seams — and a well-timed <code>/clear</code> before an unrelated task is the cheapest context you'll ever send.</div>
 
 <p class="subh">So what does a session cost?</p>
 <p>Put the pieces together for a realistic half-hour of pair-programming — a handful of instructions, each fanning into a tool loop, over a fat base context:</p>
