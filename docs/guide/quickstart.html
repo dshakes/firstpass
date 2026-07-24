@@ -33,7 +33,7 @@
 <a href="quickstart.html" aria-current="page"><span class="num">02</span>Quickstart</a>
 <a href="requests-101.html"><span class="num">03</span>Requests 101</a>
 <a href="how-it-works.html"><span class="num">04</span>How it works</a>
-<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
+<a href="request-flow.html"><span class="num">05</span>Every scenario, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
 <a href="gates.html"><span class="num">06</span>Gates</a>
@@ -102,7 +102,7 @@ cargo run -p firstpass-proxy --example demo</code></pre></div>
   <div class="row"><div class="k">Escalate</div><div class="v">One rung up on gate failure — budget-capped, with cross-provider failover on transport or 5xx errors. The strong model is spent only when the cheap one provably isn't enough. <a href="routing.html#escalation">How escalation is bounded →</a></div></div>
   <div class="row"><div class="k">Learn</div><div class="v">Outcomes feed back through <code>/v1/feedback</code> and move the serve threshold, so the served-failure rate stays bounded even as traffic drifts. <a href="guarantee.html">The guarantee →</a></div></div>
 </div>
-<p><a href="how-it-works.html">How it works</a> follows a single request through all four in detail, and <a href="request-flow.html">Routing, end to end</a> traces a real one hop by hop.</p>
+<p><a href="how-it-works.html">How it works</a> follows a single request through all four in detail, and <a href="request-flow.html">Every scenario, end to end</a> traces a real one hop by hop.</p>
 <div class="recap"><b>Route → Prove → Escalate → Learn</b>, every request, sealed in one tamper-evident receipt — that's the whole system.</div>
 
 <h2 id="your-agent">4 · Point your own agent at it<a class="anchor" href="#your-agent" aria-label="Link to this section">#</a></h2>

@@ -33,7 +33,7 @@
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
 <a href="requests-101.html" aria-current="page"><span class="num">03</span>Requests 101</a>
 <a href="how-it-works.html"><span class="num">04</span>How it works</a>
-<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
+<a href="request-flow.html"><span class="num">05</span>Every scenario, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
 <a href="gates.html"><span class="num">06</span>Gates</a>
@@ -598,7 +598,7 @@ curl https://api.anthropic.com/v1/messages \
 <line x1="370" y1="178" x2="428" y2="178" class="flow s d2" stroke-width="2"/>
 <path d="M550 172 C588 160 600 150 618 148" class="flow p s d3" stroke-width="2"/>
 </svg>
-  <figcaption>Same request in, same dialect out. Firstpass changes only which model actually answers — cheapest-first, proven against a real gate, escalating only on failure. The full mechanism is <a href="how-it-works.html">How it works</a>; the payloads and receipts are <a href="request-flow.html">Routing, end to end</a>.</figcaption>
+  <figcaption>Same request in, same dialect out. Firstpass changes only which model actually answers — cheapest-first, proven against a real gate, escalating only on failure. The full mechanism is <a href="how-it-works.html">How it works</a>; the payloads and receipts for every case are in <a href="request-flow.html">Every scenario, end to end</a>.</figcaption>
 </div>
 <p class="subh">One gated call, over time</p>
 <p>Here is what happens behind the seat for a <em>single</em> call that turns out to be hard — the cheap rung tries first, fails its gate, and only then does the strong rung get involved. This is the Module-4 loop's inner mechanic, on a time axis:</p>
@@ -688,7 +688,7 @@ curl https://api.anthropic.com/v1/messages \
 <h2 id="next">Where to go next<a class="anchor" href="#next" aria-label="Link to this section">#</a></h2>
 <div class="cards g3">
   <a class="card" href="how-it-works.html"><div class="step-n">next</div><h3>How it works →</h3><p>The gate and the ladder that make cheapest-first safe — the machinery under Part B, built from the ground up.</p></a>
-  <a class="card" href="request-flow.html"><div class="step-n">deep dive</div><h3>Routing, end to end →</h3><p>Every scenario as a real request, response, and receipt: simple, complex, exhausted, failover, observe, subagents, teams, multi-turn.</p></a>
+  <a class="card" href="request-flow.html"><div class="step-n">deep dive</div><h3>Every scenario, end to end →</h3><p>Simple, complex, exhausted, failover, observe, subagents, teams, multi-turn — each as a real request, response, and receipt.</p></a>
   <a class="card" href="quickstart.html"><div class="step-n">hands-on</div><h3>Quickstart →</h3><p>Point your agent at Firstpass in observe mode — zero behavior change — and watch the receipts price your real traffic.</p></a>
 </div>
 

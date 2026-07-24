@@ -33,7 +33,7 @@
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
 <a href="requests-101.html"><span class="num">03</span>Requests 101</a>
 <a href="how-it-works.html"><span class="num">04</span>How it works</a>
-<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
+<a href="request-flow.html"><span class="num">05</span>Every scenario, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
 <a href="gates.html" aria-current="page"><span class="num">06</span>Gates</a>
@@ -232,7 +232,7 @@ threshold = 0.8</code></pre></div>
 <div class="note"><span class="nt">Key idea</span> <code>gate_cost_usd</code> is additive, not amortized. A judge gate on a rung that ultimately escalates still records the judge's token cost on that attempt — even though the model output it checked was discarded. This is the honest accounting: verification cost is owed regardless of whether the output it checked turned out to be good enough. You can't optimize what you can't see.</div>
 <div class="recap">Gate costs land on the receipt as <code>gate_cost_usd</code> — separate from model spend, always visible in <code>firstpass savings</code>, never hidden.</div>
 
-<nav class="pager" aria-label="Pagination"><a class="prev" href="request-flow.html"><span class="dir">← Previous</span><span class="t">Routing, end to end</span></a><a class="next" href="routing.html"><span class="dir">Next →</span><span class="t">Routing & escalation</span></a></nav>
+<nav class="pager" aria-label="Pagination"><a class="prev" href="request-flow.html"><span class="dir">← Previous</span><span class="t">Every scenario, end to end</span></a><a class="next" href="routing.html"><span class="dir">Next →</span><span class="t">Routing & escalation</span></a></nav>
 </main>
 <nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#what" class="">What a gate is</a><a href="#builtin" class="">Built-in inline</a><a href="#schema" class="">schema</a><a href="#subprocess" class="">subprocess — bring your own</a><a href="#judge" class="">judge — native LLM</a><a href="#consistency" class="">consistency</a><a href="#abstain" class="">Abstain &amp; error budget</a><a href="#cost" class="">Gate cost on the receipt</a></nav>
 </div>
