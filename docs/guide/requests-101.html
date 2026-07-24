@@ -56,7 +56,7 @@
 <button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
 <p class="crumb"><a href="index.html">Docs</a> / Requests 101</p>
 <h1>Requests 101 — how agents talk to models, and what it costs</h1>
-<p class="page-sub">An agent doesn't &ldquo;use an AI.&rdquo; It makes a stream of ordinary HTTP calls, each one stateless and metered by the token. This page builds that picture from first principles — one request, then the token meter, then the things that quietly multiply the bill: multi-turn history, tool loops, MCP, and prompt caching. <strong>Part A is pure fundamentals — no Firstpass.</strong> <strong>Part B</strong> then walks the same modules again and shows exactly where Firstpass changes the number.</p>
+<p class="page-sub">An agent doesn't &ldquo;use an AI.&rdquo; It makes a stream of ordinary HTTP calls, each one stateless and metered by the token. This guide builds the whole picture by following <strong>one real task</strong> — a coding agent fixing an endpoint — from its very first request out to a full tool-using, cached, multi-turn session, then through streaming, structured outputs, images, MCP, and error handling. <strong>Part A is pure fundamentals — no Firstpass.</strong> <strong>Part B</strong> then walks the same ground and shows exactly where Firstpass changes the number.</p>
 
 <div class="tldr">A model call is <b>one stateless HTTP POST</b>, billed by the token — input (what it reads) plus output (what it writes, ~5× dearer). Because the model remembers nothing, an agent <b>resends the whole conversation every turn</b>, and a single task fans out into <b>many</b> tool-loop calls — so cost is driven by three levers: <b>which tier</b> answers, <b>how many input tokens</b> you make it re-read, and <b>how many output tokens</b> it writes. Part A builds that picture from one request up to a full Claude Code session; Part B walks the same modules and shows where Firstpass moves each lever.</div>
 
@@ -69,8 +69,17 @@
   <div class="chip good"><div class="cn">5×</div><div class="cl">output tokens cost vs input, typically</div></div>
 </div>
 
-<p class="eyebrow" style="margin-top:8px">Part A · the fundamentals</p>
-<h2 id="anatomy">Module 1 — One request, one response<a class="anchor" href="#anatomy" aria-label="Link to this section">#</a></h2>
+<p class="eyebrow" style="margin-top:34px">The map · what you'll learn</p>
+<div class="cards g3">
+  <div class="card"><div class="step-n">core path</div><h3>Follow one task</h3><p>One request → its cost → memory → tools → cache → shapes → a full session. The main story, on one thread.</p><p><a href="#anatomy">1 · One request</a> &nbsp; <a href="#meter">2 · The meter</a> &nbsp; <a href="#multiturn">3 · Multi-turn</a> &nbsp; <a href="#tools">4 · Tools</a> &nbsp; <a href="#cache">5 · Caching</a> &nbsp; <a href="#shapes">6 · Client shapes</a> &nbsp; <a href="#ccsession">7 · A Claude Code session</a></p></div>
+  <div class="card"><div class="step-n">beyond</div><h3>Every other shape</h3><p>The scenarios a real agent hits once it leaves the happy path — each a dedicated module.</p><p><a href="#streaming">Streaming</a> &nbsp; <a href="#structured">Structured output</a> &nbsp; <a href="#images">Images</a> &nbsp; <a href="#mcp">MCP, in depth</a> &nbsp; <a href="#errors">Errors &amp; retries</a></p></div>
+  <div class="card"><div class="step-n">part B</div><h3>Where Firstpass fits</h3><p>The same task, re-priced — cheapest-first, proven against a gate, with a receipt.</p><p><a href="#bridge">The bridge</a> &nbsp; <a href="#correlate">Module by module</a> &nbsp; <a href="#together">The task, end to end</a> &nbsp; <a href="#next">Where next</a></p></div>
+</div>
+
+<div class="note"><span class="nt">The task we'll follow</span> Part A traces <strong>one job</strong> a developer hands a coding agent: <em>&ldquo;Make <code>POST /orders</code> reject a request with no <code>total</code> field, and add a test.&rdquo;</em> You'll watch the <em>actual HTTP requests</em> that one task produces — a single call becomes a conversation, then a tool loop, then a whole session — and see the bill build up on a single thread instead of a new throwaway example each time.</div>
+
+<p class="eyebrow" style="margin-top:34px">Part A · the core path</p>
+<h2 id="anatomy">One request, one response<a class="anchor" href="#anatomy" aria-label="Link to this section">#</a></h2>
 <div class="tldr">One model call is a single HTTP <code>POST</code> carrying a <b>model name</b> and a <b>messages</b> array. The reply is one JSON object whose <code>usage</code> field is the meter: <b>input_tokens</b> read, <b>output_tokens</b> written. The model keeps <b>no memory</b> of the call — that one fact drives every cost in this page.</div>
 <p class="subh">The wire, in full</p>
 <p>A language model is a <strong>stateless function</strong>: text in, text out, no memory of the last call. You talk to it over HTTP. The two dialects you'll meet are Anthropic's <code>POST /v1/messages</code> and OpenAI's <code>POST /v1/chat/completions</code> — same idea, different field names. Here is the whole thing, provider-direct, nothing clever:</p>
@@ -81,17 +90,22 @@ curl https://api.anthropic.com/v1/messages \
   -d '{
     "model": "claude-haiku-4-5",
     "max_tokens": 256,
-    "messages": [{"role": "user", "content": "Capital of France?"}]
+    "system": "You are a terse senior engineer. Answer in one line.",
+    "messages": [{"role": "user", "content": "Does POST /orders reject a request with no total field?"}]
   }'</code></pre></div>
+<p>That is the developer's first move on our running task — just <em>asking</em>, before any agent touches the code. Two fields beyond <code>messages</code> are worth naming now. <code>max_tokens</code> is the hard ceiling on the <em>output</em> — the model will be cut off there (more on that below). The optional <code>system</code> field is the <strong>system prompt</strong>: standing instructions, separate from the conversation, that ride along as input on every call. It's the first thing loaded and the last thing that changes — which (jump to <a href="#cache">caching</a>) makes it prime cache material.</p>
 <p>The response is one JSON object. The part that matters for cost is <code>usage</code> — the model reports how many tokens it <em>read</em> (input) and how many it <em>wrote</em> (output):</p>
 <div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
   &quot;id&quot;: &quot;msg_01F3k…&quot;,
   &quot;role&quot;: &quot;assistant&quot;,
   &quot;model&quot;: &quot;claude-haiku-4-5&quot;,
-  &quot;content&quot;: [{ &quot;type&quot;: &quot;text&quot;, &quot;text&quot;: &quot;Paris.&quot; }],
+  &quot;content&quot;: [{ &quot;type&quot;: &quot;text&quot;, &quot;text&quot;: &quot;No — it reads req.body.total without a presence check.&quot; }],
   &quot;stop_reason&quot;: &quot;end_turn&quot;,
-  &quot;usage&quot;: { &quot;input_tokens&quot;: 14, &quot;output_tokens&quot;: 4 }   <span class="tk-c">// ← the meter</span>
+  &quot;usage&quot;: { &quot;input_tokens&quot;: 32, &quot;output_tokens&quot;: 14 }   <span class="tk-c">// ← the meter</span>
 }</code></pre></div>
+<p class="subh">When the model stops: <code>stop_reason</code></p>
+<p>Every response says <em>why</em> it ended. <code>end_turn</code> — the model finished naturally (above). <code>tool_use</code> — it wants you to run a tool and call again (<a href="#tools">the tool loop</a>). <code>max_tokens</code> — it hit your output ceiling and was <strong>cut off mid-sentence</strong>. That last one is the quiet failure mode: a truncated reply still <em>looks</em> like a reply, and you were billed for every token it wrote before the cut. It bites hardest with structured output — half a JSON object doesn't parse (<a href="#structured">structured outputs</a>).</p>
+<div class="note warn"><span class="nt">Common mistake</span> Treating <code>max_tokens</code> as &ldquo;how long an answer I want&rdquo; and setting it low to save money. It's a <em>guillotine</em>, not a hint — the model doesn't aim to finish under it, it just stops when it hits it. Set it comfortably above the longest valid answer and always check <code>stop_reason == "max_tokens"</code> before trusting the body.</div>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 250" role="img" aria-labelledby="wireT">
 <title id="wireT">A request is a single HTTP POST carrying a model name and a messages array. The provider runs the model, which reads the input tokens and writes the output tokens, and returns one JSON response whose usage field reports input_tokens and output_tokens. The model keeps no memory of the call.</title>
 <defs><marker id="wrA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
@@ -102,8 +116,8 @@ curl https://api.anthropic.com/v1/messages \
 <text x="50" y="100" class="ink m" font-size="11" font-weight="640">POST /v1/messages</text>
 <line x1="50" y1="110" x2="248" y2="110" class="grid" stroke-width="1"/>
 <text x="50" y="130" class="ink-mut m" font-size="10.5">"model": "claude-haiku-4-5"</text>
-<text x="50" y="150" class="ink-mut m" font-size="10.5">"messages": [ user: "Capital…" ]</text>
-<text x="50" y="170" class="accent-ink m" font-size="10.5" font-weight="600">input · 14 tokens read</text>
+<text x="50" y="150" class="ink-mut m" font-size="10.5">"messages": [ user: "Does /orders…" ]</text>
+<text x="50" y="170" class="accent-ink m" font-size="10.5" font-weight="600">input · 32 tokens read</text>
 <!-- model -->
 <rect x="392" y="86" width="150" height="84" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
 <text x="467" y="122" text-anchor="middle" class="ink" font-size="13" font-weight="700">the model</text>
@@ -112,9 +126,9 @@ curl https://api.anthropic.com/v1/messages \
 <rect x="670" y="76" width="296" height="104" rx="12" class="n-fill pass-s glow-p" stroke-width="1.6"/>
 <text x="686" y="100" class="ink m" font-size="11" font-weight="640">200 · completion JSON</text>
 <line x1="686" y1="110" x2="950" y2="110" class="grid" stroke-width="1"/>
-<text x="686" y="130" class="ink-mut m" font-size="10.5">content: [{ text: "Paris." }]</text>
-<text x="686" y="150" class="pass m" font-size="10.5" font-weight="600">output · 4 tokens written</text>
-<text x="686" y="170" class="ink-mut m" font-size="10.5">usage: { input 14, output 4 }</text>
+<text x="686" y="130" class="ink-mut m" font-size="10.5">content: [{ text: "No — no check." }]</text>
+<text x="686" y="150" class="pass m" font-size="10.5" font-weight="600">output · 14 tokens written</text>
+<text x="686" y="170" class="ink-mut m" font-size="10.5">usage: { input 32, output 14 }</text>
 <!-- connectors -->
 <line x1="264" y1="128" x2="390" y2="128" class="n-stroke" stroke-width="1.6" marker-end="url(#wrA)"/>
 <line x1="542" y1="128" x2="668" y2="128" class="pass-s" stroke-width="1.6" marker-end="url(#wrP)"/>
@@ -126,13 +140,13 @@ curl https://api.anthropic.com/v1/messages \
 <line x1="264" y1="128" x2="390" y2="128" class="flow s" stroke-width="2.2"/>
 <line x1="542" y1="128" x2="668" y2="128" class="flow p s d2" stroke-width="2.2"/>
 </svg>
-  <figcaption>One request, one response, metered two ways: tokens read (input) and tokens written (output). The model forgets the call the instant it returns — Module 3 is about the bill that fact creates.</figcaption>
+  <figcaption>One request, one response, metered two ways: tokens read (input) and tokens written (output). The model forgets the call the instant it returns — multi-turn is about the bill that fact creates.</figcaption>
 </div>
 <div class="note"><span class="nt">Key idea</span> The <code>usage</code> object is the only cost signal you get, and the provider hands it to you on every response. <code>input_tokens</code> is everything the model read — your system prompt, tools, the whole message history, this turn's text — and <code>output_tokens</code> is only what it just wrote. If you log one thing per call, log <code>usage</code>.</div>
-<div class="note info"><span class="nt">Under the hood</span> Tokens aren't words. A tokenizer splits text into sub-word pieces — <code>&quot;handler.rs&quot;</code> might be three tokens, a curly brace one, a run of whitespace one. Rough rule of thumb for English prose and code: <b>~4 characters per token</b>, or ~0.75 tokens per word. Punctuation-dense code trends higher. You never count them by hand — <code>usage</code> is ground truth — but the 4-chars mental model tells you why a 300-line file lands around 3–4k input tokens.</div>
+<div class="note info"><span class="nt">Under the hood</span> Tokens aren't words. A tokenizer splits text into sub-word pieces — <code>&quot;orders.py&quot;</code> might be three tokens, a curly brace one, a run of whitespace one. Rough rule of thumb for English prose and code: <b>~4 characters per token</b>, or ~0.75 tokens per word. Punctuation-dense code trends higher. You never count them by hand — <code>usage</code> is ground truth — but the 4-chars mental model tells you why a 300-line file lands around 3–4k input tokens.</div>
 <div class="recap">A model call is a stateless <code>POST</code>; the reply's <b>usage</b> field reports input vs output tokens, and the model forgets everything the instant it answers.</div>
 
-<h2 id="meter">Module 2 — The token meter: why it costs what it costs<a class="anchor" href="#meter" aria-label="Link to this section">#</a></h2>
+<h2 id="meter">The token meter: why it costs what it costs<a class="anchor" href="#meter" aria-label="Link to this section">#</a></h2>
 <div class="tldr">You pay <b>per token</b>, quoted per-million (per&nbsp;Mtok), at two rates: input (read) and output (written, ~5× dearer). Two ratios run the whole page — <b>output ≈ 5× input</b>, and the <b>strong tier costs 15–75× the cheap tier</b>. Every cost lever below is one of three numbers getting bigger: tier, input tokens, output tokens.</div>
 <p>Every provider prices by the token, quoted <strong>per million tokens (per&nbsp;Mtok)</strong>, with two rates: one for input (tokens the model reads) and a higher one for output (tokens it writes). The bill for one call is just:</p>
 <div class="codeblock"><div class="cb-head"><span>text</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>cost = input_tokens/1e6 × input_rate  +  output_tokens/1e6 × output_rate</code></pre></div>
@@ -149,29 +163,29 @@ curl https://api.anthropic.com/v1/messages \
 <tr><td><code>google/gemini-3.1-pro</code></td><td>3.50</td><td>10.50</td><td>mid</td></tr>
 </tbody>
 </table></div>
-<p>Put numbers on it. That trivial &ldquo;Capital of France?&rdquo; call — 14 in, 4 out — costs almost nothing on <em>any</em> model. But the <em>ratio</em> between tiers is the whole game: send it to the strong model instead of the cheap one and you pay ~15× more for a one-word answer you'd have gotten either way.</p>
+<p>Put numbers on it. That first <code>/orders</code> question — 32 in, 14 out — costs almost nothing on <em>any</em> model. But the <em>ratio</em> between tiers is the whole game: send it to the strong model instead of the cheap one and you pay ~15× more for a one-line answer you'd have gotten either way.</p>
 <div class="chips">
-  <div class="chip good"><div class="cn">$0.00003<span class="u"></span></div><div class="cl">&ldquo;Capital of France?&rdquo; on haiku (14 in · 4 out)</div></div>
-  <div class="chip"><div class="cn">$0.0005<span class="u"></span></div><div class="cl">same call on opus — ~15× more, same answer</div></div>
+  <div class="chip good"><div class="cn">$0.0001<span class="u"></span></div><div class="cl">the <code>/orders</code> question on haiku (32 in · 14 out)</div></div>
+  <div class="chip"><div class="cn">$0.0015<span class="u"></span></div><div class="cl">same question on opus — ~15× more, same answer</div></div>
   <div class="chip"><div class="cn">$0.0102<span class="u"></span></div><div class="cl">a 200-in / 2 000-out reply on haiku</div></div>
   <div class="chip"><div class="cn">98%<span class="u"></span></div><div class="cl">of that reply's cost is the output half</div></div>
 </div>
 <div class="note"><span class="nt">The lesson that carries the whole page</span> A model call's cost is set by three numbers you can influence: <strong>which tier</strong> you send it to, <strong>how many input tokens</strong> you make it re-read, and <strong>how many output tokens</strong> it writes. Every module below is one of those three quietly getting bigger — and every Firstpass move in Part B is one of them getting smaller.</div>
-<div class="note warn"><span class="nt">Common mistake</span> &ldquo;Send everything to the best model, it's only fractions of a cent.&rdquo; True for <em>one</em> call — that opus answer above is $0.0005. But an agent makes hundreds of calls, each re-reading a growing transcript (Module 3), and the easy calls vastly outnumber the hard ones. Paying the 15–75× tier premium on every one of them is how a fractions-of-a-cent call becomes a four-figure monthly bill. The premium is only worth it on the calls that actually need it.</div>
+<div class="note warn"><span class="nt">Common mistake</span> &ldquo;Send everything to the best model, it's only fractions of a cent.&rdquo; True for <em>one</em> call — that opus answer above is $0.0005. But an agent makes hundreds of calls, each re-reading a growing transcript (multi-turn), and the easy calls vastly outnumber the hard ones. Paying the 15–75× tier premium on every one of them is how a fractions-of-a-cent call becomes a four-figure monthly bill. The premium is only worth it on the calls that actually need it.</div>
 <div class="recap">Cost = tier × (input tokens + ~5× output tokens); the strong tier is 15–75× the cheap one, so <b>which model answers</b> is the biggest single lever.</div>
 
-<h2 id="multiturn">Module 3 — Statelessness &amp; multi-turn: the bill compounds<a class="anchor" href="#multiturn" aria-label="Link to this section">#</a></h2>
+<h2 id="multiturn">Statelessness &amp; multi-turn: the bill compounds<a class="anchor" href="#multiturn" aria-label="Link to this section">#</a></h2>
 <div class="tldr">The model is stateless, so a chat &ldquo;remembers&rdquo; only because the client <b>resends the entire conversation every turn</b>. Turn N re-reads all of turns 1…N−1 as input. Summed over a session, input cost grows with the <b>square</b> of the turn count — the real reason long agent sessions bill far more than their answers suggest.</div>
 <p>Here's the twist that surprises people. The model is stateless — it remembers nothing between calls. So how does a chat &ldquo;remember&rdquo; what you said three turns ago? <strong>The client resends the entire conversation every single turn.</strong> Turn 2's request is turn 1's request with the last exchange appended. Turn 12 carries all of turns 1–11 in its body. Continuity lives in the bytes you resend, not in the model.</p>
 <div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// TURN 1 — one message in the body</span>
-"messages": [ { "role": "user", "content": "Explain this stack trace." } ]
+"messages": [ { "role": "user", "content": "Does POST /orders reject a missing total?" } ]
 
 <span class="tk-c">// TURN 2 — turn 1 kept verbatim, the reply + your follow-up appended.</span>
 <span class="tk-c">// The model re-reads ALL of it as input, and you pay for it again.</span>
 "messages": [
-  { "role": "user",      "content": "Explain this stack trace." },
-  { "role": "assistant", "content": "It's a null deref in parse()…" },
-  { "role": "user",      "content": "Now write the fix." }
+  { "role": "user",      "content": "Does POST /orders reject a missing total?" },
+  { "role": "assistant", "content": "No — it reads req.body.total unchecked." },
+  { "role": "user",      "content": "Now add the guard and a test." }
 ]</code></pre></div>
 <p>Because the transcript only grows, the <strong>input</strong> tokens on turn N are roughly N times a single turn's worth. Summed across a conversation, input cost grows with the <em>square</em> of the turn count — the classic reason a long agent session bills far more than its individual answers would suggest.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 320" role="img" aria-labelledby="growT">
@@ -214,9 +228,9 @@ curl https://api.anthropic.com/v1/messages \
 <div class="note info"><span class="nt">Under the hood</span> The client isn't obliged to resend <em>everything</em> — it resends whatever it wants the model to still &ldquo;know.&rdquo; That's a client decision, not a model feature. Trim the array and the model genuinely forgets: drop the early turns and it can't reference them. Every &ldquo;memory&rdquo; strategy — full replay, sliding window, summarize-and-truncate — is just a different rule for <em>which bytes to resend</em>. Keep this in your pocket for Part B: shrinking the resent history is the client's job, not the router's.</div>
 <div class="recap">Continuity is an illusion the client pays for: it resends the whole transcript each turn, so input — and the bill — grows quadratically over a long session.</div>
 
-<h2 id="tools">Module 4 — Tool calls: one task, many round-trips<a class="anchor" href="#tools" aria-label="Link to this section">#</a></h2>
+<h2 id="tools">Tool calls: one task, many round-trips<a class="anchor" href="#tools" aria-label="Link to this section">#</a></h2>
 <div class="tldr">A tool-using agent runs a <b>loop</b>: send <code>tools</code> → model replies with a <code>tool_use</code> → <b>your code</b> runs it → you send a <code>tool_result</code> in a <b>new</b> request → repeat until the model answers. Each trip is a <b>separate billed call</b>, and every call re-reads the growing transcript <em>and</em> the whole tools list. One &ldquo;fix the bug&rdquo; becomes four to a dozen calls.</div>
-<p>An agent that can read files, run tests, or hit an API does it through <strong>tool calls</strong>, and this is where call counts explode. You send the model a list of <code>tools</code> (name + JSON schema) in the request. Instead of a final answer, the model can reply with a <code>tool_use</code> block: &ldquo;call <code>Read</code> with <code>path=handler.rs</code>.&rdquo; <strong>Your code</strong> — not the model — runs the tool, then you send the result back as a <code>tool_result</code> in a <em>new</em> request. The model reads it and continues. That's the agent loop:</p>
+<p>An agent that can read files, run tests, or hit an API does it through <strong>tool calls</strong>, and this is where call counts explode. You send the model a list of <code>tools</code> (name + JSON schema) in the request. Instead of a final answer, the model can reply with a <code>tool_use</code> block: &ldquo;call <code>Read</code> with <code>path=orders.py</code>.&rdquo; <strong>Your code</strong> — not the model — runs the tool, then you send the result back as a <code>tool_result</code> in a <em>new</em> request. The model reads it and continues. That's the agent loop:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="loopT">
 <title id="loopT">The agent loop. A request goes to the model with a list of tools. The model replies with a tool_use block naming a tool and arguments. The client runs the tool and sends the output back as a tool_result in a new request that also resends the whole growing transcript. The model reads it and either calls another tool or returns a final answer. Each pass around the loop is a separate billed model call.</title>
 <defs><marker id="lpA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
@@ -229,7 +243,7 @@ curl https://api.anthropic.com/v1/messages \
 <!-- tool_use -->
 <rect x="330" y="60" width="200" height="64" rx="11" class="n-fill n-stroke" stroke-width="1.5"/>
 <text x="430" y="86" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">reply: tool_use</text>
-<text x="430" y="104" text-anchor="middle" class="ink-mut m" font-size="10">Read( path="handler.rs" )</text>
+<text x="430" y="104" text-anchor="middle" class="ink-mut m" font-size="10">Read( path="orders.py" )</text>
 <!-- your code -->
 <rect x="620" y="60" width="200" height="64" rx="11" class="n-fill n-stroke" stroke-width="1.5"/>
 <text x="720" y="86" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">your code runs it</text>
@@ -270,7 +284,7 @@ curl https://api.anthropic.com/v1/messages \
     { "name": "Edit", "description": "Replace text in a file", "input_schema": { "...": "..." } }
   ],
   "messages": [
-    { "role": "user", "content": "Fix the failing test in handler.rs." }
+    { "role": "user", "content": "Make POST /orders reject a missing total, with a test." }
   ]
 }
 
@@ -280,7 +294,7 @@ curl https://api.anthropic.com/v1/messages \
   "content": [
     { "type": "text", "text": "Let me read the file first." },
     { "type": "tool_use", "id": "toolu_01A",
-      "name": "Read", "input": { "path": "handler.rs" } }
+      "name": "Read", "input": { "path": "orders.py" } }
   ],
   "usage": { "input_tokens": 480, "output_tokens": 38 }
 }
@@ -291,13 +305,13 @@ curl https://api.anthropic.com/v1/messages \
   "model": "claude-sonnet-5",
   "tools": [ "...the same two tools, sent again..." ],
   "messages": [
-    { "role": "user",      "content": "Fix the failing test in handler.rs." },
+    { "role": "user",      "content": "Make POST /orders reject a missing total, with a test." },
     { "role": "assistant", "content": [
       { "type": "tool_use", "id": "toolu_01A",
-        "name": "Read", "input": { "path": "handler.rs" } } ] },
+        "name": "Read", "input": { "path": "orders.py" } } ] },
     { "role": "user",      "content": [
       { "type": "tool_result", "tool_use_id": "toolu_01A",
-        "content": "fn handle(req: Req) -> Resp { req.body.unwrap() /* ...60 lines... */ }" } ] }
+        "content": "def create_order(req): total = req.body['total']  # no presence check ...60 lines..." } ] }
   ]
 }
 
@@ -306,11 +320,11 @@ curl https://api.anthropic.com/v1/messages \
   "stop_reason": "tool_use",
   "content": [
     { "type": "tool_use", "id": "toolu_02B", "name": "Edit",
-      "input": { "path": "handler.rs", "old": "req.body.unwrap()", "new": "req.body.unwrap_or_default()" } }
+      "input": { "path": "orders.py", "old": "total = req.body['total']", "new": "if 'total' not in req.body: abort(400)" } }
   ],
   "usage": { "input_tokens": 690, "output_tokens": 52 }   <span class="tk-c">// ← input grew: transcript is longer now</span>
 }</code></pre></div>
-<p>The loop runs once more past ④ — you apply the <code>Edit</code>, run <code>cargo test</code>, and send the pass/fail back as one more <code>tool_result</code>. Only then does the model return a plain-text answer with <code>stop_reason: end_turn</code>. That's <strong>four model calls</strong> for one &ldquo;fix the bug,&rdquo; each re-reading the tools array and a transcript that was longer than the last.</p>
+<p>The loop runs once more past ④ — you apply the <code>Edit</code>, run <code>pytest</code>, and send the pass/fail back as one more <code>tool_result</code>. Only then does the model return a plain-text answer with <code>stop_reason: end_turn</code>. That's <strong>four model calls</strong> for one &ldquo;fix the bug,&rdquo; each re-reading the tools array and a transcript that was longer than the last.</p>
 <p class="subh">The same loop on a time axis</p>
 <p>The loop diagram shows <em>who talks to whom</em>. This sequence view shows <em>when</em>, and marks exactly which arrows cost money — the two model round-trips are billed, the local tool run between them is not:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 470" role="img" aria-labelledby="seqToolT">
@@ -332,7 +346,7 @@ curl https://api.anthropic.com/v1/messages \
 <text x="620" y="124" class="accent-ink m" font-size="10" font-weight="600">$ input</text>
 <rect x="514" y="120" width="12" height="46" rx="2" class="accent"/>
 <line x1="520" y1="170" x2="156" y2="170" class="pass-s" stroke-width="1.6" marker-end="url(#sq1P)"/>
-<text x="338" y="162" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">② tool_use · Read(handler.rs)</text>
+<text x="338" y="162" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">② tool_use · Read(orders.py)</text>
 <text x="620" y="174" class="pass m" font-size="10" font-weight="600">$ output</text>
 <line x1="150" y1="220" x2="854" y2="220" class="n-stroke" stroke-width="1.5" marker-end="url(#sq1A)"/>
 <text x="505" y="212" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">③ run Read locally</text>
@@ -361,53 +375,13 @@ curl https://api.anthropic.com/v1/messages \
   <div class="chip"><div class="cn">×N</div><div class="cl">the tools list billed as input every call</div></div>
   <div class="chip"><div class="cn">$0.063<span class="u"></span></div><div class="cl">4-call bugfix, all on the strong model (illustrative)</div></div>
 </div>
-<div class="note"><span class="nt">Key idea</span> The loop is where Modules 2 and 3 <em>compound</em>. Every tool round-trip is a full billed call (Module 2) that re-reads a transcript which is longer than the last (Module 3) plus the entire tools list. Call count × growing input is the multiplier that turns a one-cent question into a real bill — and the calls in a loop are wildly uneven in difficulty, which is the whole opening for Part B.</div>
+<div class="note"><span class="nt">Key idea</span> The loop is where the meter and multi-turn <em>compound</em>. Every tool round-trip is a full billed call (the token meter) that re-reads a transcript which is longer than the last (multi-turn) plus the entire tools list. Call count × growing input is the multiplier that turns a one-cent question into a real bill — and the calls in a loop are wildly uneven in difficulty, which is the whole opening for Part B.</div>
 <div class="note warn"><span class="nt">Common mistake</span> Reading <code>stop_reason: tool_use</code> as an error or a finished answer. It's neither — it's the model handing control back to <em>you</em> to run the named tool and call again with the result. If your client stops there, the agent simply halts mid-task; if it forgets to echo the assistant's <code>tool_use</code> block into the next request, the provider rejects the <code>tool_result</code> as unmatched.</div>
 <div class="recap">A tool-using task is a loop of billed round-trips — model asks, your code runs the tool, you resend the result — so one task costs like many, each re-reading a bigger transcript and the full tools list.</div>
 
-<h2 id="mcp">Module 5 — MCP: it's just more tools on the wire<a class="anchor" href="#mcp" aria-label="Link to this section">#</a></h2>
-<div class="tldr">MCP is a protocol between your <b>agent</b> and external <b>tool servers</b> — it lives entirely above the model API. By the time anything reaches the model, an MCP tool is <b>indistinguishable from any other tool</b>: an entry in the <code>tools</code> array in, a <code>tool_use</code>/<code>tool_result</code> pair in the transcript out. For cost, the rule is simple: every server you connect fattens the <code>tools</code> array billed as input on <b>every</b> call.</div>
-<p>MCP (the Model Context Protocol) gets talked about as if the model &ldquo;speaks MCP.&rdquo; It doesn't. MCP is a protocol between your <em>agent</em> and external <strong>tool servers</strong> — a standard way for the agent to discover what tools a server offers and to invoke them. It lives entirely <em>above</em> the model API. By the time anything reaches the model, an MCP tool is indistinguishable from any other tool: an entry in the <code>tools</code> array on the way in, a <code>tool_use</code> / <code>tool_result</code> pair in the transcript on the way back.</p>
-<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 240" role="img" aria-labelledby="mcpT">
-<title id="mcpT">MCP sits between the agent and external tool servers, above the model API. The agent connects to MCP servers, discovers their tools, and folds them into the ordinary tools array of the model request. To the model, an MCP-backed tool looks exactly like any other tool. The model never speaks MCP directly.</title>
-<defs><marker id="mcA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
-<text x="40" y="30" class="ink" font-size="13" font-weight="640">MCP is an agent-to-server protocol — the model only ever sees plain tools</text>
-<!-- mcp servers -->
-<rect x="40" y="70" width="150" height="46" rx="10" class="n-fill n-stroke" stroke-width="1.5"/>
-<text x="115" y="90" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">MCP server: github</text>
-<text x="115" y="106" text-anchor="middle" class="ink-mut" font-size="9.5">exposes: list_prs, …</text>
-<rect x="40" y="128" width="150" height="46" rx="10" class="n-fill n-stroke" stroke-width="1.5"/>
-<text x="115" y="148" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">MCP server: db</text>
-<text x="115" y="164" text-anchor="middle" class="ink-mut" font-size="9.5">exposes: query, …</text>
-<!-- agent -->
-<rect x="330" y="92" width="170" height="80" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
-<text x="415" y="126" text-anchor="middle" class="ink" font-size="12.5" font-weight="700">your agent</text>
-<text x="415" y="146" text-anchor="middle" class="ink-mut m" font-size="10">MCP client · folds tools in</text>
-<!-- model request -->
-<rect x="630" y="70" width="330" height="104" rx="12" class="n-fill n-stroke" stroke-width="1.6"/>
-<text x="648" y="94" class="ink m" font-size="11" font-weight="640">the model request — nothing MCP about it</text>
-<line x1="648" y1="104" x2="944" y2="104" class="grid" stroke-width="1"/>
-<text x="648" y="126" class="ink-mut m" font-size="10.5">"tools": [ Read, Edit,</text>
-<text x="648" y="146" class="accent-ink m" font-size="10.5" font-weight="600">    list_prs, query ]  ← from MCP</text>
-<text x="648" y="164" class="ink-mut m" font-size="10">just more entries in the same array</text>
-<!-- connectors -->
-<line x1="190" y1="93" x2="328" y2="120" class="n-stroke" stroke-width="1.4" marker-end="url(#mcA)"/>
-<line x1="190" y1="151" x2="328" y2="140" class="n-stroke" stroke-width="1.4" marker-end="url(#mcA)"/>
-<line x1="500" y1="132" x2="628" y2="122" class="accent-s" stroke-width="1.6" marker-end="url(#mcA)"/>
-<text x="527" y="112" class="ink-mut" font-size="9.5">MCP ends here</text>
-<!-- pulses -->
-<line x1="190" y1="93" x2="328" y2="120" class="flow s" stroke-width="1.8"/>
-<line x1="500" y1="132" x2="628" y2="122" class="flow s d2" stroke-width="2"/>
-</svg>
-  <figcaption>MCP's value is discovery and standardization for the agent — not a new thing the model understands. For cost, the rule is simple: every MCP tool you connect adds its schema to the <code>tools</code> array, which is billed as input on every call. More MCP servers, fatter requests.</figcaption>
-</div>
-<div class="note"><span class="nt">Why this matters for the bill</span> Connecting ten MCP servers can add hundreds of tokens of tool schemas to <em>every single request</em> for the whole session — multiplied by Module 3's compounding and Module 4's call count. MCP is powerful; it is not free, and the cost is paid in input tokens you resend on each call.</div>
-<div class="note info"><span class="nt">Under the hood</span> There are two unrelated things both called &ldquo;MCP&rdquo; and it's worth separating them. <b>Data-plane MCP</b> is what this module describes: tool servers the agent folds into requests, invisible to the model as anything special. <b>Firstpass's own <code>firstpass mcp</code></b> (you'll meet it in <a href="api.html">API &amp; MCP</a>) is a different beast entirely — an MCP server that exposes your <em>receipts</em> to an agent so it can answer &ldquo;what did I spend and why.&rdquo; It sits beside the router, not on the routed traffic. Same acronym, opposite side of the wire.</div>
-<div class="recap">MCP is discovery-and-standardization for the agent, not a model feature; its cost is simply the extra tool schemas it adds to the input on every call.</div>
-
-<h2 id="cache">Module 6 — Prompt caching: bending the curve back down<a class="anchor" href="#cache" aria-label="Link to this section">#</a></h2>
-<div class="tldr">Caching attacks the one cost Modules 3–5 all create: the <b>repeated prefix</b>. Mark a stable prefix with <code>cache_control</code>; the first call pays a one-time <b>write</b> (~1.25× input), every later reuse pays a <b>read</b> (~0.1× input) instead of full price. It cuts input, not output or call count — but on a long, tool-heavy session it takes most of the input bill off the table. It only helps if your prefix is actually stable.</div>
-<p>Modules 3–5 all inflate <em>input</em> tokens — the same long prefix (system prompt, tools, early history) re-read on every call. Prompt caching is the provider's fix. You mark a stable prefix with <code>cache_control</code>; the first call pays a one-time <strong>cache write</strong> (~1.25× the input rate) to store it, and every later call that reuses that prefix pays a <strong>cache read</strong> (~0.1× the input rate) instead of the full price. The response's <code>usage</code> splits the input into fresh vs cached so you can see it working:</p>
+<h2 id="cache">Prompt caching: bending the curve back down<a class="anchor" href="#cache" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Caching attacks the one cost history, tools, and MCP all create: the <b>repeated prefix</b>. Mark a stable prefix with <code>cache_control</code>; the first call pays a one-time <b>write</b> (~1.25× input), every later reuse pays a <b>read</b> (~0.1× input) instead of full price. It cuts input, not output or call count — but on a long, tool-heavy session it takes most of the input bill off the table. It only helps if your prefix is actually stable.</div>
+<p>history, tools, and MCP all inflate <em>input</em> tokens — the same long prefix (system prompt, tools, early history) re-read on every call. Prompt caching is the provider's fix. You mark a stable prefix with <code>cache_control</code>; the first call pays a one-time <strong>cache write</strong> (~1.25× the input rate) to store it, and every later call that reuses that prefix pays a <strong>cache read</strong> (~0.1× the input rate) instead of the full price. The response's <code>usage</code> splits the input into fresh vs cached so you can see it working:</p>
 <div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// request: mark the stable prefix cacheable (system + tools + old turns)</span>
 "system": [ { "type": "text", "text": "You are…",
              "cache_control": { "type": "ephemeral" } } ]
@@ -448,16 +422,16 @@ curl https://api.anthropic.com/v1/messages \
 <!-- pulse -->
 <path d="M84 214 L154 234 L224 232 L294 231 L364 230 L434 229 L504 228 L574 227 L644 226 L706 225" class="flow p l" stroke-width="2.6"/>
 </svg>
-  <figcaption>Caching attacks exactly the cost Module 3 creates: the repeated prefix. It doesn't reduce output tokens or call count — but on a long, tool-heavy session it can take most of the input bill off the table. Whether it helps depends on how stable your prefix is.</figcaption>
+  <figcaption>Caching attacks exactly the cost multi-turn creates: the repeated prefix. It doesn't reduce output tokens or call count — but on a long, tool-heavy session it can take most of the input bill off the table. Whether it helps depends on how stable your prefix is.</figcaption>
 </div>
 <div class="note warn"><span class="nt">Common mistake</span> Assuming caching &ldquo;just works&rdquo; once you set <code>cache_control</code>. The cache keys on an <em>exact prefix match</em> and entries are short-lived (minutes). Change one byte early in the prompt — a rotating timestamp in the system prompt, a reordered tools array, a per-request id — and every downstream token becomes a fresh full-price read again. Caching rewards a <em>stable</em> prefix; a prompt that mutates near the top quietly pays full price while looking cached.</div>
-<div class="recap">Prompt caching re-prices the repeated prefix from full rate to ~0.1×, flattening Module 3's climb — but only for the bytes that stay byte-identical across calls.</div>
+<div class="recap">Prompt caching re-prices the repeated prefix from full rate to ~0.1×, flattening multi-turn's climb — but only for the bytes that stay byte-identical across calls.</div>
 
-<h2 id="shapes">Module 7 — Three client shapes, three cost profiles<a class="anchor" href="#shapes" aria-label="Link to this section">#</a></h2>
+<h2 id="shapes">Three client shapes, three cost profiles<a class="anchor" href="#shapes" aria-label="Link to this section">#</a></h2>
 <div class="tldr">The same wire powers three very different agents. A <b>coding agent</b> (Claude Code) — long multi-turn sessions, heavy tools; cost is transcript × call count. A <b>headless agent</b> — CI/cron, short loop run over many items; cost is volume × per-run. An <b>SDK app</b> — you own the loop, so you control all three levers directly. What changes isn't the wire, it's <b>who drives the loop and what dominates the bill</b>.</div>
 <p>The same wire — stateless calls, tokens, tools, cache — powers very different agents. What changes is <em>who drives the loop</em> and <em>what dominates the bill</em>:</p>
 <div class="cards g3">
-  <div class="card"><div class="step-n">interactive</div><h3>Coding agent</h3><p>A human-in-the-loop tool like Claude Code. Long multi-turn sessions, heavy tool use, subagents. Cost is dominated by <strong>Module 3 + 4</strong>: a growing transcript re-read across dozens of tool calls. Prime candidate for caching.</p></div>
+  <div class="card"><div class="step-n">interactive</div><h3>Coding agent</h3><p>A human-in-the-loop tool like Claude Code. Long multi-turn sessions, heavy tool use, subagents. Cost is dominated by <strong>the growing transcript × the tool-call count</strong>: re-read across dozens of round-trips. Prime candidate for caching.</p></div>
   <div class="card"><div class="step-n">headless</div><h3>Automation / batch agent</h3><p>CI jobs, cron, pipelines — no human waiting. Usually a fixed, shorter loop per item, run over <strong>many items</strong>. Cost is dominated by <strong>volume × per-run</strong>: the per-run bill is small, but you pay it thousands of times.</p></div>
   <div class="card"><div class="step-n">sdk</div><h3>Your own SDK app</h3><p>You own the loop with the Anthropic/OpenAI SDK. You decide how much history to resend, how many tools to attach, and whether to cache — so <strong>you control all three</strong> cost levers directly. Most tuning headroom, most rope.</p></div>
 </div>
@@ -469,24 +443,37 @@ curl https://api.anthropic.com/v1/messages \
 <tr><td>SDK app</td><td>You</td><td>Whatever you build</td><td>Your choices on all three levers</td></tr>
 </tbody>
 </table></div>
-<div class="note"><span class="nt">One safe reflex, one big bill</span> Across all three shapes, the tempting default is &ldquo;send every call to the strongest model, to be safe.&rdquo; That's the single choice that makes an afternoon of agent work bill like a research run — because it pays the top tier on the easy calls too. That reflex is exactly what Part B is about.</div>
-<div class="recap">Same wire, three cost shapes: coding agents pay for long tool-heavy transcripts, headless agents pay per item × volume, SDK apps pay for whatever you choose to send.</div>
+<p class="subh">Headless, end to end: the same task as a CI job</p>
+<p>Take the exact <code>/orders</code> fix and run it with <em>no human</em> — a CI job on every pull request: &ldquo;if this endpoint reads a field without a presence check, add the guard and a test.&rdquo; Same wire, same tool loop as the interactive session, but two things change. There's <strong>no conversation</strong> — the job fires one bounded agent run and exits, so the transcript never grows past the task. And it runs <strong>over volume</strong> — 200 pull requests a day is 200 independent runs. The per-run bill is small; the line item is <strong>per-run × volume</strong>.</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># headless: one bounded agent run per PR, no human, no growing chat</span>
+for pr in $(gh pr list --json number -q '.[].number'); do
+  agent run --task "guard missing fields + add test" --pr "$pr"   <span class="tk-c"># ≈6 model calls, then exits</span>
+done
+<span class="tk-c"># cost is NOT one long session — it's (per-run bill) × (how many PRs)</span></code></pre></div>
+<div class="chips">
+  <div class="chip"><div class="cn">≈6</div><div class="cl">model calls in one bounded <code>/orders</code> run</div></div>
+  <div class="chip"><div class="cn">×200</div><div class="cl">PRs/day — the volume multiplier</div></div>
+  <div class="chip"><div class="cn">≈$0.13</div><div class="cl">per run on sonnet (illustrative)</div></div>
+  <div class="chip good"><div class="cn">≈$26</div><div class="cl">/day = per-run × volume (illustrative)</div></div>
+</div>
+<div class="note"><span class="nt">One safe reflex, one big bill</span> Across all three shapes, the tempting default is &ldquo;send every call to the strongest model, to be safe.&rdquo; That's the single choice that makes an afternoon of agent work bill like a research run — and in the headless case, multiplies straight into the volume: the top tier on 200 runs a day, most of which were easy. That reflex is exactly what Part B is about.</div>
+<div class="recap">Same wire, three cost shapes: coding agents pay for long tool-heavy transcripts, headless agents pay <b>per-run × volume</b>, SDK apps pay for whatever you choose to send.</div>
 
-<h2 id="ccsession">Module 8 — Anatomy of a Claude Code terminal session<a class="anchor" href="#ccsession" aria-label="Link to this section">#</a></h2>
-<div class="tldr">A coding-agent session is Modules 1–7 running at full tilt. At launch the harness assembles a <b>base context</b> — system prompt + your <code>CLAUDE.md</code> + every tool schema — and that base rides along as input on <b>every request</b>. One instruction (&ldquo;add a test&rdquo;) becomes a <b>loop of many requests</b>; subagents run their <b>own</b> transcripts and bills; and when the window fills the harness <b>compacts</b> older turns into a summary. It's the most expensive shape precisely because every earlier module compounds inside it.</div>
-<p>When you run <code>claude</code> in a terminal, it feels like a conversation. Underneath it's the exact machinery of Modules 1–7, just more of it. Nothing here is Firstpass — this is how any capable coding agent spends. Walking one session end to end makes every earlier module concrete.</p>
+<h2 id="ccsession">Anatomy of a Claude Code terminal session<a class="anchor" href="#ccsession" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A coding-agent session is every core-path module running at full tilt. At launch the harness assembles a <b>base context</b> — system prompt + your <code>CLAUDE.md</code> + every tool schema — and that base rides along as input on <b>every request</b>. One instruction (&ldquo;add a test&rdquo;) becomes a <b>loop of many requests</b>; subagents run their <b>own</b> transcripts and bills; and when the window fills the harness <b>compacts</b> older turns into a summary. It's the most expensive shape precisely because every earlier module compounds inside it.</div>
+<p>When you run <code>claude</code> in a terminal, it feels like a conversation. Underneath it's the exact machinery of the core path, just more of it. Nothing here is Firstpass — this is how any capable coding agent spends. Walking one session end to end makes every earlier module concrete.</p>
 
 <p class="subh">What's loaded before you type anything</p>
 <p>The moment a session starts, the harness builds a <strong>base context</strong> it will send on every request for the rest of the session:</p>
 <ul>
   <li><strong>The system prompt</strong> — the harness's own instructions: how to use tools, safety rules, output conventions. Several thousand tokens, fixed for the session.</li>
   <li><strong>Project memory</strong> — your <code>CLAUDE.md</code> / <code>AGENTS.md</code>, loaded verbatim so the agent knows your conventions.</li>
-  <li><strong>Tool schemas</strong> — the name + JSON schema of every tool the agent can call (Read, Edit, Bash, Grep, plus any MCP tools). This is Module 4's <code>tools</code> array and Module 5's MCP additions, together, on the wire.</li>
+  <li><strong>Tool schemas</strong> — the name + JSON schema of every tool the agent can call (Read, Edit, Bash, Grep, plus any MCP tools). This is the <code>tools</code> array from <a href="#tools">Tool calls</a> plus any <a href="#mcp">MCP</a> tools, together, on the wire.</li>
 </ul>
-<p>Add it up and the base context is often <em>several thousand input tokens before your first word</em> — and by Module 3's rule, it is re-sent and re-read on <strong>every</strong> request in the session. That's exactly the stable prefix Module 6 exists to cache, which is why a coding agent is the textbook case for prompt caching.</p>
+<p>Add it up and the base context is often <em>several thousand input tokens before your first word</em> — and by multi-turn's rule, it is re-sent and re-read on <strong>every</strong> request in the session. That's exactly the stable prefix caching exists to cache, which is why a coding agent is the textbook case for prompt caching.</p>
 
 <p class="subh">One instruction becomes many requests</p>
-<p>You type one line — &ldquo;add a null-check test for <code>handle()</code>.&rdquo; That is <em>not</em> one model call. It kicks off the Module 4 loop: the agent reads files, writes a test, runs it, reads the failure, fixes it — each step a separate request, each carrying the base context <em>plus</em> a transcript that grew since the last step. A single instruction routinely spends five, ten, twenty model calls before it reports back:</p>
+<p>You type one line — &ldquo;add a null-check test for <code>handle()</code>.&rdquo; That is <em>not</em> one model call. It kicks off the the tool loop loop: the agent reads files, writes a test, runs it, reads the failure, fixes it — each step a separate request, each carrying the base context <em>plus</em> a transcript that grew since the last step. A single instruction routinely spends five, ten, twenty model calls before it reports back:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 500" role="img" aria-labelledby="seqSessT">
 <title id="seqSessT">A sequence diagram of one Claude Code instruction over time, with three lifelines: you at the terminal, the model, and the local tools. A band across the top shows that at session launch a base context is assembled once — system prompt plus CLAUDE.md plus tool schemas. Then: you type an instruction; the terminal sends request one, which is the base context plus the instruction, billed as input; the model replies with a tool_use, billed as output; the terminal runs the tool locally, unbilled; the tool returns a result; the terminal sends request two, which resends the entire base context again plus the transcript and the result, billed as input; the model replies with an edit tool_use and, after several more such trips, a final answer, billed as output. Two callouts at the bottom note that when the window fills the harness compacts older turns into a summary, and that a spawned subagent runs its own separate transcript and bill and returns only a summary.</title>
 <defs><marker id="sq2A" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
@@ -510,7 +497,7 @@ curl https://api.anthropic.com/v1/messages \
 <text x="600" y="180" class="warn m" font-size="10" font-weight="600">$ input · base ctx billed</text>
 <rect x="499" y="176" width="12" height="42" rx="2" class="accent"/>
 <line x1="505" y1="222" x2="151" y2="222" class="pass-s" stroke-width="1.6" marker-end="url(#sq2P)"/>
-<text x="328" y="214" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">② tool_use · Read(handler.rs)</text>
+<text x="328" y="214" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">② tool_use · Read(orders.py)</text>
 <text x="600" y="226" class="pass m" font-size="10" font-weight="600">$ output</text>
 <line x1="145" y1="258" x2="844" y2="258" class="n-stroke" stroke-width="1.5" marker-end="url(#sq2A)"/>
 <text x="497" y="250" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">③ run tool locally · ④ result back</text>
@@ -521,7 +508,7 @@ curl https://api.anthropic.com/v1/messages \
 <text x="600" y="330" class="warn m" font-size="10" font-weight="600">$ input · base ctx again</text>
 <rect x="499" y="326" width="12" height="42" rx="2" class="accent"/>
 <line x1="505" y1="372" x2="151" y2="372" class="pass-s" stroke-width="1.6" marker-end="url(#sq2P)"/>
-<text x="322" y="364" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑥ Edit · then cargo test · … · final answer</text>
+<text x="322" y="364" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑥ Edit · then pytest · … · final answer</text>
 <text x="600" y="376" class="pass m" font-size="10" font-weight="600">$ output · ×N more trips</text>
 <rect x="40" y="414" width="450" height="70" rx="11" class="n-fill warn-s glow-w" stroke-width="1.4"/>
 <text x="60" y="438" class="ink m" font-size="10.5" font-weight="640">window fills → compaction</text>
@@ -536,7 +523,7 @@ curl https://api.anthropic.com/v1/messages \
 <line x1="145" y1="326" x2="499" y2="326" class="flow s d3" stroke-width="2.6"/>
 <line x1="505" y1="372" x2="151" y2="372" class="flow p s d4" stroke-width="2.2"/>
 </svg>
-  <figcaption>One typed instruction, many billed requests — and every request re-sends the whole base context (system prompt + <code>CLAUDE.md</code> + tools). This is Module 3's compounding and Module 4's call count stacked on top of a fat fixed prefix, which is why coding-agent sessions dominate a bill and why caching (Module 6) matters most here.</figcaption>
+  <figcaption>One typed instruction, many billed requests — and every request re-sends the whole base context (system prompt + <code>CLAUDE.md</code> + tools). This is multi-turn's compounding and the tool loop's call count stacked on top of a fat fixed prefix, which is why coding-agent sessions dominate a bill and why caching (caching) matters most here.</figcaption>
 </div>
 
 <p class="subh">Subagents spend on their own tab</p>
@@ -555,7 +542,407 @@ curl https://api.anthropic.com/v1/messages \
 </div>
 <div class="note"><span class="nt">Key idea</span> A coding-agent session is where all seven earlier modules land at once: a fat fixed prefix (M1/M4/M5), re-read every request (M3), across a high call count (M4), on whatever tier you picked (M2), with caching as the main relief valve (M6). The single biggest knob is still <em>which tier answers each call</em> — and in a session of 50–200 calls, the vast majority are easy (read a file, apply a small edit) while a few are hard (design the fix). Paying the strong tier on all of them is the reflex Part B targets.</div>
 <div class="note info"><span class="nt">Under the hood</span> This is why &ldquo;my Claude Code bill is higher than my chatbot bill&rdquo; is expected, not a bug. A chatbot turn is one call over a short prompt. A coding-agent instruction is <em>dozens</em> of calls, each over a multi-thousand-token base context plus a growing transcript. The per-token price is identical; the token <em>count</em> is one to two orders of magnitude larger. Everything Firstpass does in Part B is aimed at the tier those tokens are billed at.</div>
-<div class="recap">A Claude Code session runs Modules 1–7 at scale: a fat base context re-sent every request, one instruction fanning into many calls, subagents billing separately, and compaction capping the growth — the most expensive shape, and the one with the most to gain from cheaper tiers.</div>
+<div class="recap">A Claude Code session runs the core path at scale: a fat base context re-sent every request, one instruction fanning into many calls, subagents billing separately, and compaction capping the growth — the most expensive shape, and the one with the most to gain from cheaper tiers.</div>
+
+<p class="eyebrow" id="beyond" style="margin-top:44px">Part A2 · beyond the core path</p>
+<p>The seven modules above are the main road — the path our one task actually walked. These five are the turns a real agent takes off it: streaming responses, machine-readable output, images, MCP servers, and the failures that happen when you make hundreds of calls. Each is a dedicated module; take them in any order.</p>
+<h2 id="streaming">Streaming — how the answer arrives<a class="anchor" href="#streaming" aria-label="Link to this section">#</a></h2>
+
+<div class="tldr">Add <code>"stream": true</code> to any request and the answer arrives token by token as <b>Server-Sent Events</b> instead of one big JSON blob at the end. Cost is <b>identical</b> — same tokens, same price — streaming changes <em>delivery</em>, not the bill. The gain is perceived latency: your UI can start rendering before the model finishes writing. The catch: anything that must inspect the whole output first — a JSON parser, a verification gate — still has to buffer the stream to completion.</div>
+
+<p>The wire call changes by exactly one field. Point the same <code>POST</code> at the same endpoint, keep the same headers, add <code>"stream": true</code>:</p>
+
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># same endpoint, same headers — one extra field</span>
+curl https://api.anthropic.com/v1/messages \
+  -H 'content-type: application/json' \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{
+    "model": "claude-haiku-4-5-20251001",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [{"role": "user", "content": "Scan orders.py for validation gaps."}]
+  }'</code></pre></div>
+
+<p>Instead of one JSON blob at the end, the connection stays open and events arrive in a fixed sequence. Each event is a pair of lines — <code>event: &lt;type&gt;</code> then <code>data: &lt;json&gt;</code>. Four events matter most: <code>message_start</code> opens with the input-token count already known; <code>content_block_delta</code> carries one or a few tokens per event and is where you render; <code>message_delta</code> closes with final output-token count and <code>stop_reason</code>; <code>message_stop</code> signals the stream is done.</p>
+
+<div class="codeblock"><div class="cb-head"><span>sse</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># ① message_start — input_tokens known immediately; output_tokens not yet final</span>
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_01XA9g...","role":"assistant",
+      "model":"claude-haiku-4-5-20251001","stop_reason":null,
+      "usage":{"input_tokens":842,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: ping
+data: {"type":"ping"}
+
+<span class="tk-c"># ② content_block_delta — one or a few tokens per event; render as they arrive</span>
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"'ll scan"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" orders.py"}}
+
+<span class="tk-c">  ... more content_block_delta events ...</span>
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+<span class="tk-c"># ③ message_delta — final usage: output_tokens now settled; stop_reason set</span>
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},
+      "usage":{"output_tokens":312}}
+
+<span class="tk-c"># ④ message_stop — stream closed; safe to release the connection</span>
+event: message_stop
+data: {"type":"message_stop"}</code></pre></div>
+
+<figure>
+<svg viewBox="0 0 760 148" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ssT" style="max-width:760px;width:100%;display:block">
+<title id="ssT">Two horizontal timelines comparing non-streaming and streaming. Non-streaming: one long wait bar spanning the full generation time, then the complete response arrives at the end. Streaming: a short bar to time-to-first-token where the user sees the first text, then a longer bar as tokens stream in, with the stream completing at the same wall-clock point as non-streaming. Cost and total time are identical — streaming changes when the first byte appears, not when the last one does.</title>
+<defs>
+<marker id="ssA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+</defs>
+
+<!-- row labels -->
+<text x="0" y="36" class="ink-mut m" font-size="11" dominant-baseline="middle">non-streaming</text>
+<text x="0" y="100" class="ink-mut m" font-size="11" dominant-baseline="middle">streaming</text>
+
+<!-- non-streaming: one long wait bar, response arrives at the end -->
+<rect x="168" y="20" width="516" height="32" rx="4" class="n-fill warn-s"/>
+<text x="426" y="36" text-anchor="middle" class="ink-mut m" font-size="10.5" dominant-baseline="middle">waiting for complete response…</text>
+<!-- response-arrives marker -->
+<line x1="684" y1="14" x2="684" y2="58" stroke="var(--d-warn)" stroke-width="1.5"/>
+<text x="692" y="28" class="warn m" font-size="10" dominant-baseline="middle">response</text>
+<text x="692" y="44" class="warn m" font-size="10" dominant-baseline="middle">arrives</text>
+
+<!-- streaming row -->
+<!-- TTFT segment -->
+<rect x="168" y="84" width="72" height="32" rx="4" class="n-fill glow-p"/>
+<text x="204" y="100" text-anchor="middle" class="accent-ink m" font-size="10" dominant-baseline="middle">TTFT</text>
+<!-- remaining stream segment -->
+<rect x="240" y="84" width="444" height="32" rx="4" class="n-fill"/>
+<text x="462" y="100" text-anchor="middle" class="ink-mut m" font-size="10.5" dominant-baseline="middle">tokens streaming — render as they arrive…</text>
+<!-- TTFT marker (dashed) -->
+<line x1="240" y1="78" x2="240" y2="122" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4,3"/>
+<text x="232" y="132" text-anchor="middle" class="accent-ink m" font-size="10">user sees</text>
+<text x="232" y="144" text-anchor="middle" class="accent-ink m" font-size="10">first text</text>
+<!-- stream-complete marker -->
+<line x1="684" y1="78" x2="684" y2="122" stroke="var(--d-pass)" stroke-width="1.5"/>
+<text x="692" y="92" class="ink m" font-size="10" dominant-baseline="middle">stream</text>
+<text x="692" y="108" class="ink m" font-size="10" dominant-baseline="middle">complete</text>
+</svg>
+<figcaption>Streaming and non-streaming finish at the same wall-clock point — total generation time is identical. What changes is the <em>first</em> byte: streaming surfaces it at TTFT while non-streaming blocks until every token is written. Cost is the same either way.</figcaption>
+</figure>
+
+<div class="note"><span class="nt">Key idea</span> The <code>usage</code> object is split across two events in a stream. <code>message_start</code> reports <code>input_tokens</code> immediately — the model read your whole prompt before writing a word, so input is known at the start. <code>message_delta</code> reports <code>output_tokens</code> at the end, once the model finishes. The bill is the same as if you hadn't streamed: those token counts, those prices.</div>
+
+<div class="note warn"><span class="nt">Common mistake</span> Trying to parse or verify partial stream output. A JSON parser fails on a half-written object. A semantic gate can't rule on an answer the model hasn't finished. If your code needs the complete text — to validate, to parse structured output, to decide on tool calls — you must accumulate every <code>content_block_delta</code> and wait for <code>message_stop</code> before acting. Rendering can happen token by token; <em>reasoning</em> about the output cannot.</div>
+
+<div class="note info"><span class="nt">Under the hood</span> Firstpass sits between your agent and the provider and forwards <code>stream: true</code> transparently — but it must buffer the full stream before the gate can run. Once the gate passes, Firstpass re-emits the buffered content as SSE to your client, so your agent still sees a stream. The practical effect: time-to-first-token is slightly higher through Firstpass (gate latency on top of generation), but the wire contract your agent code observes is identical. See <a href="how-it-works.html">how it works</a> for the full flow.</div>
+
+<div class="recap">Streaming changes <em>when</em> tokens arrive, not how many — cost is identical, time-to-first-token drops, but anything that reasons about the output still needs the complete stream first.</div>
+
+<h2 id="structured">Structured outputs &amp; JSON mode<a class="anchor" href="#structured" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Asking the model to &ldquo;return JSON&rdquo; in the prompt is fragile — you get prose, markdown fences, or truncated objects. Two reliable paths: <b>tool-as-schema</b> (define a single tool whose <code>input_schema</code> is your target shape, force the model to fill it via <code>tool_use</code>) and <b>provider structured/JSON mode</b> (OpenAI&rsquo;s <code>response_format</code>). Either way, the data arrives schema-validated in a predictable field. Token billing is unchanged — same rates, shaped output.</div>
+
+<p>When an agent needs machine-readable output &mdash; a patch plan, a routing decision, a list of findings &mdash; parsing freeform model text is the wrong tool. Two failure modes are common: the model wraps the JSON in a prose sentence or a markdown code fence and the parser breaks; or <code>max_tokens</code> cuts the output mid-object and you receive invalid JSON. Both are avoidable by using the API&rsquo;s structured-output surface instead of prompt engineering.</p>
+
+<p class="subh">Tool-as-schema — the reliable cross-provider approach</p>
+
+<p>Define a single tool whose <code>input_schema</code> is the exact JSON shape you want. Set <code>tool_choice</code> to force the model to call only that tool. The response arrives as a <code>tool_use</code> block — the structured data sits in <code>content[0].input</code>, already validated against the schema, with no freetext prose mixed in. Works on Anthropic and OpenAI.</p>
+
+<p>Here the coding agent plans the <code>POST /orders</code> patch as a typed object before writing a single line:</p>
+
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// ① REQUEST — one tool whose input_schema IS the target shape</span>
+{
+  &quot;model&quot;: &quot;claude-haiku-4-5&quot;,
+  &quot;max_tokens&quot;: 512,
+  &quot;tool_choice&quot;: { &quot;type&quot;: &quot;tool&quot;, &quot;name&quot;: &quot;emit_patch_plan&quot; },
+  &quot;tools&quot;: [{
+    &quot;name&quot;: &quot;emit_patch_plan&quot;,
+    &quot;description&quot;: &quot;Output the patch plan as structured data.&quot;,
+    &quot;input_schema&quot;: {
+      &quot;type&quot;: &quot;object&quot;,
+      &quot;properties&quot;: {
+        &quot;file&quot;:      { &quot;type&quot;: &quot;string&quot; },
+        &quot;old&quot;:       { &quot;type&quot;: &quot;string&quot; },
+        &quot;new&quot;:       { &quot;type&quot;: &quot;string&quot; },
+        &quot;test_name&quot;: { &quot;type&quot;: &quot;string&quot; }
+      },
+      &quot;required&quot;: [&quot;file&quot;, &quot;old&quot;, &quot;new&quot;, &quot;test_name&quot;]
+    }
+  }],
+  &quot;messages&quot;: [{
+    &quot;role&quot;: &quot;user&quot;,
+    &quot;content&quot;: &quot;Plan the fix for POST /orders: reject requests missing ‘total’.&quot;
+  }]
+}
+
+<span class="tk-c">// ② RESPONSE — structured data in content[0].input, stop_reason: tool_use</span>
+{
+  &quot;stop_reason&quot;: &quot;tool_use&quot;,
+  &quot;content&quot;: [{
+    &quot;type&quot;: &quot;tool_use&quot;,
+    &quot;id&quot;:   &quot;toolu_03C&quot;,
+    &quot;name&quot;: &quot;emit_patch_plan&quot;,
+    &quot;input&quot;: {
+      &quot;file&quot;:      &quot;orders.py&quot;,
+      &quot;old&quot;:       &quot;body = await request.json()&quot;,
+      &quot;new&quot;:       &quot;body = await request.json()\n    if ‘total’ not in body:\n        raise HTTPException(422, ‘total required’)&quot;,
+      &quot;test_name&quot;: &quot;test_rejects_missing_total&quot;
+    }
+  }],
+  &quot;usage&quot;: { &quot;input_tokens&quot;: 312, &quot;output_tokens&quot;: 71 }
+}</code></pre></div>
+
+<p>Read <code>response.content[0].input</code> directly as your parsed object. You are using the tool mechanism as a schema, not driving a loop &mdash; there is no <code>tool_result</code> to send back.</p>
+
+<p class="subh">OpenAI structured / JSON mode</p>
+
+<p>OpenAI&rsquo;s <code>POST /v1/chat/completions</code> has a <code>response_format</code> field with two variants. <code>json_object</code> guarantees syntactically valid JSON but doesn&rsquo;t enforce a shape. <code>json_schema</code> with <code>strict: true</code> enforces a full JSON Schema at generation time &mdash; no invalid shapes reach you. Anthropic&rsquo;s <code>POST /v1/messages</code> has no <code>response_format</code> field; use the tool-as-schema approach above.</p>
+
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// OpenAI — strict JSON Schema enforcement at generation time</span>
+{
+  &quot;model&quot;: &quot;gpt-4o&quot;,
+  &quot;response_format&quot;: {
+    &quot;type&quot;: &quot;json_schema&quot;,
+    &quot;json_schema&quot;: {
+      &quot;name&quot;:   &quot;patch_plan&quot;,
+      &quot;strict&quot;: true,
+      &quot;schema&quot;: {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: {
+          &quot;file&quot;:      { &quot;type&quot;: &quot;string&quot; },
+          &quot;old&quot;:       { &quot;type&quot;: &quot;string&quot; },
+          &quot;new&quot;:       { &quot;type&quot;: &quot;string&quot; },
+          &quot;test_name&quot;: { &quot;type&quot;: &quot;string&quot; }
+        },
+        &quot;required&quot;: [&quot;file&quot;, &quot;old&quot;, &quot;new&quot;, &quot;test_name&quot;],
+        &quot;additionalProperties&quot;: false  <span class="tk-c">// required when strict: true</span>
+      }
+    }
+  },
+  &quot;messages&quot;: [{ &quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Plan the fix for POST /orders …&quot; }]
+}
+<span class="tk-c">// response: choices[0].message.content is a JSON string; JSON.parse() it once</span>
+<span class="tk-c">// finish_reason: "stop" on success, "length" on truncation (see below)</span></code></pre></div>
+
+<div class="note warn"><span class="nt">Common mistake</span> Parsing the output without first checking <code>stop_reason</code> (Anthropic) or <code>finish_reason</code> (OpenAI). If the model runs out of tokens mid-JSON &mdash; <code>stop_reason: &quot;max_tokens&quot;</code> / <code>finish_reason: &quot;length&quot;</code> &mdash; the output is a truncated fragment that throws on parse. The fix is to check the stop reason <em>before</em> parsing and either retry with a higher <code>max_tokens</code> or surface the error cleanly. The response anatomy is covered in <a href="#anatomy">Module 1</a>.</div>
+
+<div class="note"><span class="nt">Key idea</span> Structured output is a constraint on <em>how</em> the model writes output tokens &mdash; it is not a different kind of call or a different billing unit. The same per-Mtok input and output rates apply. The schema definition inside <code>input_schema</code> or <code>json_schema</code> is part of the request and is billed as input tokens, the same as any tool definition in Module 4.</div>
+
+<div class="note info"><span class="nt">Under the hood</span> With <code>tool_choice: {type: &quot;tool&quot;, name: &quot;…&quot;}</code> Anthropic guarantees the model calls exactly that tool and nothing else &mdash; no leading prose, no alternative tool. Without <code>tool_choice</code>, the model might emit a text block first or pick a different tool. For structured-output use, always pin <code>tool_choice</code>.</div>
+
+<div class="recap">Structured output works by using the API&rsquo;s own schema surface &mdash; a single forced tool on Anthropic, <code>response_format: json_schema</code> on OpenAI &mdash; so the data arrives validated in a known field. Always check <code>stop_reason</code> before parsing: a <code>max_tokens</code> cut produces a truncated fragment, not valid JSON.</div>
+
+<h2 id="images">Images &amp; multimodal input<a class="anchor" href="#images" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A message's <code>content</code> can be an array mixing <b>text blocks</b> and <b>image blocks</b>. Images — base64 or URL — are billed as <b>input tokens</b>, scaled by resolution: a typical screenshot adds ~1,500–3,200 tokens, as much as a page of text. The cost model (rate per Mtok) doesn't change; only the input-token count does.</div>
+
+<p>Every <code>content</code> value so far has been a plain string. The API also accepts an array of typed blocks, which is how you mix text and images in one turn. In our running example, the agent might be handed a screenshot of the failing CI run rather than raw terminal text — the PNG goes directly into the request alongside the user's question:</p>
+
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
+  &quot;model&quot;: &quot;claude-haiku-4-5&quot;,
+  &quot;max_tokens&quot;: 1024,
+  &quot;messages&quot;: [{
+    &quot;role&quot;: &quot;user&quot;,
+    &quot;content&quot;: [
+      {
+        &quot;type&quot;: &quot;image&quot;,
+        &quot;source&quot;: {
+          &quot;type&quot;: &quot;base64&quot;,        <span class="tk-c">// or "url" → { "url": "https://…" }</span>
+          &quot;media_type&quot;: &quot;image/png&quot;,
+          &quot;data&quot;: &quot;iVBORw0KGgo…&quot;  <span class="tk-c">// base64-encoded PNG</span>
+        }
+      },
+      {
+        &quot;type&quot;: &quot;text&quot;,
+        &quot;text&quot;: &quot;The CI run ended with this screenshot. What's wrong in orders.py?&quot;
+      }
+    ]
+  }]
+}</code></pre></div>
+
+<div class="note info"><span class="nt">Under the hood</span> Images are billed as input tokens using a tile model: the image is resized to fit within a bounding box (2048&nbsp;px on the long edge, 768&nbsp;px on the short), then divided into 512&times;512&nbsp;px tiles. Each tile costs a fixed token budget, plus a small base cost. A 1080&times;800 screenshot typically lands around 1,500&nbsp;tokens — the same as a 300-line Python file. High-resolution images (4K screenshots, multi-page PDFs rendered as images) can exceed 3,000 tokens each.</div>
+
+<div class="note warn"><span class="nt">Common mistake</span> Sending images doesn't change the <em>rate</em> you're charged per token — it changes how many input tokens you consume. An agent that routinely attaches screenshots pays the same per-Mtok price but reads a much larger input on every call. Proxies like Firstpass treat <code>has_images</code> as a routing signal for exactly this reason: a vision-capable cheap model that can handle the image skips the expensive escalation.</div>
+
+<div class="recap">Images land in <code>content</code> as typed blocks with a <code>source</code> (base64 or URL); they're billed as <b>input tokens</b> proportional to resolution — the rate stays flat, the count jumps, and <code>has_images</code> is a real routing signal.</div>
+
+<h2 id="mcp">MCP, in depth<a class="anchor" href="#mcp" aria-label="Link to this section">#</a></h2>
+<div class="tldr">MCP is a protocol your <b>agent</b> speaks to external <b>tool servers</b> — it lives entirely above the model API. The model never speaks MCP. By the time a request reaches the model, MCP has already done its job: <b>tools</b> became entries in the <code>tools</code> array; <b>resources</b> became injected context in <code>messages</code>; <b>prompts</b> became expanded templates. The cost consequence is precise: every connected server's tool schemas ride the <code>tools</code> array as <b>input tokens on every single call</b> — whether those tools are used on that call or not.</div>
+
+<p>The Model Context Protocol gets talked about as if the model &ldquo;understands&rdquo; MCP or &ldquo;speaks&rdquo; it directly. It doesn't. MCP is a JSON-RPC&nbsp;2.0 protocol between your <em>agent</em> — acting as an MCP client — and external <strong>tool servers</strong>. It's a standard way for the agent to discover what a server exposes and invoke it. Everything MCP does happens before the model call. By the time any of it reaches the model, it's ordinary HTTP: a <code>tools</code> array and a <code>messages</code> array, nothing special about them.</p>
+
+<p class="subh">Transports</p>
+<p>MCP defines two transport modes. <strong>stdio</strong> runs the server as a local subprocess: the agent writes newline-delimited JSON-RPC to its stdin and reads responses from stdout — zero network overhead, low latency, the right choice for local tools (a filesystem server, a local database). <strong>Streamable HTTP</strong> connects to a remote process over HTTP with SSE for server-side push; this is the pattern for hosted services (a GitHub integration, a managed Postgres, a SaaS API). In both cases the agent calls <code>tools/list</code> at startup to discover the server's tool schemas and caches them for the session. The transport is entirely the agent's concern — it never appears in the model request.</p>
+
+<p class="subh">Primitives</p>
+<p>An MCP server can expose three kinds of things, and each lands somewhere different in the model request:</p>
+<ul>
+  <li><strong>Tools</strong> are callable functions — <code>query</code>, <code>list_prs</code>, <code>create_file</code>. The agent folds their JSON&nbsp;schemas into the <code>tools</code> array of every subsequent model request. To the model, a postgres MCP tool and a native <code>Read</code> tool are identical: both are entries in the same array.</li>
+  <li><strong>Resources</strong> are data the server can serve on demand — table rows, documents, code files. The agent fetches them explicitly and <em>injects the content into <code>messages</code></em>, typically as a user-turn or <code>tool_result</code>. Resource content never enters the <code>tools</code> array; it becomes ordinary conversation context.</li>
+  <li><strong>Prompts</strong> are server-provided templates — system prompt snippets, few-shot examples, task scaffolding. The agent retrieves them and <em>expands them into <code>messages</code></em> before the call. The model reads prose and turns, not a &ldquo;prompt&rdquo; primitive.</li>
+</ul>
+<p>The key asymmetry: tool schemas are re-sent on <em>every</em> call for the whole session; resources and prompt templates only appear when the agent explicitly fetches them and injects the result.</p>
+
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 252" role="img" aria-labelledby="mcpDpT">
+<title id="mcpDpT">MCP sits above the model API. On the left are two MCP servers: a postgres server connected over stdio that exposes tools (query, schema) and resources (table_doc), and a github server connected over streamable HTTP that exposes tools (list_prs, create_pr) and prompts (pr_template). Arrows lead from both servers to the agent in the center, labeled MCP client. The agent discovers tools, fetches resources, and expands prompts, then builds a single POST to the model API. A dashed vertical separator marks the boundary where MCP ends and the HTTP API begins. On the right is the model request: a tools array containing all four MCP tool schemas (highlighted) alongside native tools, and a messages array where resource content and expanded prompts are injected. A note marks the tools array as billed as input tokens on every call.</title>
+<defs>
+  <marker id="mcpDpA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="mcpDpAc" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/></marker>
+</defs>
+<text x="40" y="26" class="ink" font-size="13" font-weight="640">MCP is above the model API — three server primitives, two slots in the request</text>
+
+<!-- MCP server: postgres (stdio) -->
+<rect x="20" y="42" width="192" height="85" rx="8" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="116" y="63" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">MCP server: postgres</text>
+<text x="116" y="79" text-anchor="middle" class="ink-mut m" font-size="9.5">stdio transport</text>
+<text x="116" y="95" text-anchor="middle" class="ink-mut" font-size="9.5">tools: query, schema</text>
+<text x="116" y="111" text-anchor="middle" class="ink-mut" font-size="9.5">resources: table_doc</text>
+
+<!-- MCP server: github (streamable HTTP) -->
+<rect x="20" y="148" width="192" height="85" rx="8" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="116" y="169" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">MCP server: github</text>
+<text x="116" y="185" text-anchor="middle" class="ink-mut m" font-size="9.5">streamable HTTP</text>
+<text x="116" y="201" text-anchor="middle" class="ink-mut" font-size="9.5">tools: list_prs, create_pr</text>
+<text x="116" y="217" text-anchor="middle" class="ink-mut" font-size="9.5">prompts: pr_template</text>
+
+<!-- Arrows: servers → agent -->
+<line x1="212" y1="84" x2="278" y2="112" class="n-stroke" stroke-width="1.4" marker-end="url(#mcpDpA)"/>
+<line x1="212" y1="190" x2="278" y2="160" class="n-stroke" stroke-width="1.4" marker-end="url(#mcpDpA)"/>
+
+<!-- Agent box -->
+<rect x="278" y="57" width="166" height="158" rx="10" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="361" y="81" text-anchor="middle" class="ink m" font-size="10.5" font-weight="700">Agent (MCP client)</text>
+<text x="361" y="101" text-anchor="middle" class="ink-mut" font-size="9.5">discovers tools</text>
+<text x="361" y="117" text-anchor="middle" class="ink-mut" font-size="9.5">fetches resources</text>
+<text x="361" y="133" text-anchor="middle" class="ink-mut" font-size="9.5">expands prompts</text>
+<line x1="300" y1="146" x2="422" y2="146" class="n-stroke" stroke-width="0.8" opacity="0.4"/>
+<text x="361" y="163" text-anchor="middle" class="ink-mut m" font-size="9.5">↓ build HTTP call</text>
+<text x="361" y="179" text-anchor="middle" class="ink-mut" font-size="9">(no MCP on the wire)</text>
+<text x="361" y="200" text-anchor="middle" class="ink-mut" font-size="9">POST /v1/messages</text>
+
+<!-- Separator: MCP ↔ API boundary -->
+<line x1="502" y1="42" x2="502" y2="238" class="n-stroke" stroke-width="1" stroke-dasharray="5,4" opacity="0.6"/>
+<text x="497" y="57" text-anchor="end" class="ink-mut" font-size="9">MCP ends</text>
+
+<!-- Arrow: agent → model request -->
+<line x1="444" y1="136" x2="508" y2="136" class="accent-s" stroke-width="1.7" marker-end="url(#mcpDpAc)"/>
+
+<!-- Model request box -->
+<rect x="508" y="42" width="470" height="196" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="526" y="64" class="ink m" font-size="11" font-weight="640">POST /v1/messages  (nothing MCP here)</text>
+
+<text x="526" y="84" class="ink-mut m" font-size="10">"tools": [</text>
+<text x="538" y="100" class="ink-mut m" font-size="9.5">{ "name": "Read",      ... },  { "name": "Edit",   ... },</text>
+<text x="538" y="116" class="accent-ink m" font-size="10" font-weight="600">{ "name": "query",     ... },  { "name": "schema", ... },   ← postgres</text>
+<text x="538" y="132" class="accent-ink m" font-size="10" font-weight="600">{ "name": "list_prs",  ... },  { "name": "create_pr", ... } ← github</text>
+<text x="526" y="150" class="ink-mut m" font-size="9.5">],  ← all tool schemas billed as input tokens on every call</text>
+
+<line x1="526" y1="161" x2="962" y2="161" class="n-stroke" stroke-width="0.8" opacity="0.3"/>
+
+<text x="526" y="178" class="ink-mut m" font-size="10">"messages": [</text>
+<text x="538" y="194" class="ink-mut" font-size="9.5">history, task, + resource content + expanded prompts (injected by agent)</text>
+<text x="526" y="210" class="ink-mut m" font-size="10">]  ← resources &amp; prompts live here, not in tools</text>
+<text x="526" y="228" class="ink-mut" font-size="9">resources and prompts cost tokens only when fetched; tool schemas cost every call</text>
+
+<!-- Animated flow overlays -->
+<line x1="212" y1="84" x2="278" y2="112" class="flow s" stroke-width="1.8"/>
+<line x1="212" y1="190" x2="278" y2="160" class="flow s d3" stroke-width="1.8"/>
+<line x1="444" y1="136" x2="508" y2="136" class="flow s d2" stroke-width="2.2"/>
+</svg>
+  <figcaption>Three server primitives, two slots in the model request. Tool schemas enter <code>tools[]</code> and are re-sent on every call; resource content and expanded prompts are injected into <code>messages[]</code> only when the agent explicitly fetches them.</figcaption>
+</div>
+
+<p class="subh">Cost</p>
+<p>Every MCP server's tool schemas enter the <code>tools</code> array and are billed as input tokens on every call for the whole session — whether the model uses those tools on that call or not. For the six-call fix-a-bug task from the tool-loops module, adding two MCP servers looks like this:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// POST /v1/messages — native tools + MCP schemas in one tools array, every call</span>
+{
+  "model": "claude-sonnet-5",
+  "tools": [
+    <span class="tk-c">// native agent tools (always present)</span>
+    { "name": "Read",      "description": "Read a file",          "input_schema": { ... } },
+    { "name": "Edit",      "description": "Apply edits to a file","input_schema": { ... } },
+    <span class="tk-c">// postgres MCP server — ~300 tokens of schema, re-billed on all 6 calls</span>
+    { "name": "query",     "description": "Run a SQL query",      "input_schema": { ... } },
+    { "name": "schema",    "description": "List tables + columns","input_schema": { ... } },
+    <span class="tk-c">// github MCP server — ~260 tokens of schema, re-billed on all 6 calls</span>
+    { "name": "list_prs",  "description": "List pull requests",   "input_schema": { ... } },
+    { "name": "create_pr", "description": "Open a pull request",  "input_schema": { ... } }
+  ],
+  <span class="tk-c">// fetched resources are injected into messages, not tools</span>
+  "messages": [{ "role": "user", "content": "Fix the handler bug and open a PR." }]
+}
+<span class="tk-c">// MCP overhead: ~560 extra input tokens × 6 calls = ~3 400 extra tokens for the task</span>
+<span class="tk-c">// On a strong-tier model at $15/Mtok input: ~$0.05 of MCP overhead per task</span></code></pre></div>
+<p>That overhead is constant — it doesn't grow with the transcript the way multi-turn history does. But it starts on call&nbsp;one, never shrinks during the session, and multiplies with both call count and tier price. Ten servers with detailed input schemas can add thousands of tokens to every call. The pattern is also invisible unless you log <code>usage.input_tokens</code> per call and notice it creeping up from session to session.</p>
+
+<div class="note"><span class="nt">Key idea</span> MCP tool schemas are input tokens that ride the request on every call <em>whether or not those tools are actually used</em>. Connect only the servers a given task needs. Disconnect them when the task is done. Fewer connected servers means a smaller <code>tools</code> array and lower input cost on every call for the rest of the session.</div>
+
+<div class="note warn"><span class="nt">Common mistake</span> Assuming resources are &ldquo;free&rdquo; because they're not in the <code>tools</code> array. They aren't. A fetched resource is injected into <code>messages</code> and re-read on every subsequent call as part of the conversation history — exactly like Module&nbsp;3's multi-turn compounding. A large document fetched early in the session can dominate the input bill by the tenth call, with no tool schemas to blame.</div>
+
+<div class="note info"><span class="nt">Under the hood — two things called MCP</span> There are two unrelated uses of the name and it's worth separating them clearly. <b>Data-plane MCP</b> is what this module describes: external tool servers the agent folds into requests. Firstpass is completely transparent to it — the <code>tools</code> array is forwarded byte-for-byte and Firstpass never reads or rewrites MCP content on the routed path. <b>Firstpass's own <code>firstpass mcp</code></b> is a separate, unrelated thing entirely: a <em>stdio</em> self-audit server that exposes your deployment's trace store to an agent so it can inspect routing decisions. Its nine tools are <code>list_traces</code>, <code>get_trace</code>, <code>get_savings</code>, <code>get_evals</code>, <code>explain_route</code>, <code>verify_receipts</code>, <code>submit_feedback</code>, <code>rehearse_policy</code>, and <code>list_modes</code>. It sits beside the router and reads the audit log — it is not on the routed traffic path. Same acronym, opposite side of the wire.</div>
+
+<div class="recap">MCP is the agent's protocol, not the model's. Its three primitives — tools, resources, prompts — land in the model request as ordinary entries in <code>tools[]</code> and injected context in <code>messages[]</code>. Tool schemas cost input tokens on every call; keep connected servers to the minimum the task requires.</div>
+
+<h2 id="errors">Errors, rate limits &amp; retries<a class="anchor" href="#errors" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Real traffic fails. <b>429</b> rate-limit and <b>529</b> overloaded are transient — back off and retry, respecting the <code>retry-after</code> header. <b>5xx</b> server faults are also retryable with a cap. <b>413</b> request-too-large is not — shrink the payload. The quiet trap: <b>a call can bill output tokens even when it fails</b>; the model may have started writing before the error was signalled. In a hundred-call agent run, a naive retry loop pays for those partial outputs twice.</div>
+
+<p>Take the running example: the coding agent makes six calls to handle the &ldquo;add a <code>total</code> guard and a test&rdquo; task. On call&nbsp;4 — edit <code>orders.py</code>, run the test suite — the provider returns a 429. The tool loop is mid-flight. Crashing here leaves a half-applied change; hammering the endpoint without a delay digs the hole deeper.</p>
+
+<p class="subh">Which errors to retry</p>
+<p>The status code tells you the right move. <strong>429</strong> and <strong>529</strong> are transient quota signals: the provider enforces per-minute request and token caps, and 529 is Anthropic&rsquo;s overloaded variant — treat both identically. Both return a <code>retry-after</code> header in seconds. <strong>5xx</strong> faults are transient server errors, safe to retry a few times. <strong>413</strong> means the prompt itself exceeds the provider&rsquo;s size limit; retrying the same payload changes nothing. <strong>400</strong> and <strong>401</strong> are client errors: a structurally bad or unauthenticated request won&rsquo;t become valid by re-sending it.</p>
+
+<p>Here is a 429 response body (Anthropic format), followed by a minimal retry loop that handles all three transient cases correctly:</p>
+
+<div class="codeblock"><div class="cb-head"><span>http</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># HTTP 429 — provider tells you exactly when to try again</span>
+HTTP/1.1 429 Too Many Requests
+retry-after: 30
+content-type: application/json
+
+{
+  "type": "error",
+  "error": {
+    "type": "rate_limit_error",
+    "message": "Rate limit exceeded. Please retry after 30 seconds."
+  }
+}</code></pre></div>
+
+<div class="codeblock"><div class="cb-head"><span>python</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>import random, time
+
+def call_with_backoff(payload, max_attempts=4):
+    for attempt in range(max_attempts):
+        resp = session.post(ENDPOINT, json=payload)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code in (429, 529) or resp.status_code &gt;= 500:
+            <span class="tk-c"># respect retry-after if present; otherwise exponential + jitter</span>
+            wait = float(resp.headers.get("retry-after", 2 ** attempt))
+            wait += random.uniform(0, wait * 0.25)  <span class="tk-c"># spread retries across clients</span>
+            time.sleep(min(wait, 60))               <span class="tk-c"># cap at 60 s</span>
+            continue
+        resp.raise_for_status()  <span class="tk-c"># 400, 401, 413 → surface immediately, don't retry</span>
+    raise RuntimeError(f"still failing after {max_attempts} attempts")</code></pre></div>
+
+<div class="note warn"><span class="nt">Common mistake — failed &ne; free</span> A call that returns 429 or 5xx <em>after the model started generating</em> can still bill output tokens — the provider writes the usage meter for tokens produced before signalling the error. On a streaming response, every chunk received before the error fires has already been billed. Log <code>usage</code> even on error responses. In a six-call agent loop that retries two calls twice, the retry overhead can add 30–50% to the task cost if the model was mid-stream on both.</div>
+
+<p class="subh">Idempotency in the tool loop</p>
+<p>Retrying a model call is safe at the API level — you are resending the same inputs and getting a fresh generation. The risk is what happens <em>after</em> the model responds. Suppose call&nbsp;4 succeeded at the model layer: the model returned a <code>tool_use</code> block saying &ldquo;edit <code>orders.py</code>&rdquo; — then the network dropped the response before your client received it. Retrying the model call produces another tool request to edit the same file. Apply that edit twice and you&rsquo;ve introduced a duplicate guard. Track which <code>tool_use</code> blocks you have already executed (by the <code>id</code> field on each block) and skip re-execution on a replay. Write-then-test tool calls — file edits, API mutations — are the ones that corrupt silently when replayed without this check.</p>
+
+<div class="note"><span class="nt">Key idea — retry the right layer</span> <em>Re-calling the model</em> (resending the same messages array) is always safe: the model is stateless and doesn&rsquo;t know it&rsquo;s a retry. <em>Re-running a tool</em> may not be: an <code>Edit</code> applied twice corrupts the file; a <code>POST</code> to an external API submits twice. The <code>tool_use.id</code> field exists precisely so the client can de-duplicate executions.</div>
+
+<p class="subh">What Firstpass does on provider errors</p>
+<p>When the provider returns 5xx or 529 on the first-pass rung, Firstpass treats it as a gate <strong>abstain</strong> — the cheap model didn&rsquo;t fail the task, the provider failed to serve it — and automatically fails over to another configured provider or rung without surfacing the error to your agent. The agent sees a clean response. The receipt records which provider actually served the call and the original error, visible in the audit log. For the full request and receipt shape, see <a href="request-flow.html#failover">Every scenario, end to end &rarr; Failover</a>.</p>
+
+<div class="note info"><span class="nt">Under the hood</span> A failover on a 529 is not an escalation in Firstpass&rsquo;s sense. The cheap model never got to answer, so there is no quality comparison to make. The router finds another healthy rung at the same tier (or the next tier if no same-tier rung is healthy) and replays the request. The serving attempt that errored is recorded in the receipt but does not count as a rung escalation in the gate logic.</div>
+
+<div class="recap">Retry 429 / 529 / 5xx with exponential backoff and a <code>retry-after</code>-aware cap; never retry 413 or 4xx client errors. Failed calls can still bill output tokens — log <code>usage</code> on every response including errors. Track <code>tool_use.id</code> to avoid double-executing tools on retry.</div>
 
 <p class="eyebrow" id="partB" style="margin-top:52px">Part B · where Firstpass changes the bill</p>
 <h2 id="bridge">The same wire seat, a different number<a class="anchor" href="#bridge" aria-label="Link to this section">#</a></h2>
@@ -647,6 +1034,33 @@ curl https://api.anthropic.com/v1/messages \
 </svg>
   <figcaption>The cheap attempt (②③) and the gate (④⑦) are the only overhead Firstpass adds; the strong tier (⑤⑥) is paid <em>once</em>, and only because the gate proved it necessary. On the easy majority of calls, the gate passes at step ④ and the strong rung is never touched at all — the call is served cheap and proven, and step ⑧ still leaves a receipt.</figcaption>
 </div>
+<p class="subh">On the wire: the request you send, the receipt you get</p>
+<p>Concretely, for one call of our <code>/orders</code> task. The request is <strong>byte-identical</strong> to a provider call — you changed one thing, the base URL:</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># the ONLY change: base URL points at Firstpass, not the provider</span>
+curl https://firstpass.internal/v1/messages \   <span class="tk-c"># was api.anthropic.com</span>
+  -H 'content-type: application/json' -H 'x-api-key: $KEY' \
+  -d '{ "model": "claude-sonnet-5", "max_tokens": 1024,
+        "tools": [ ... ], "messages": [ ... same body, unchanged ... ] }'</code></pre></div>
+<p>You get back a normal completion — the same shape the provider returns. Separately, Firstpass writes a <strong>receipt</strong> (a hash-chained <code>Trace</code>) recording what actually happened: the cheap rung was tried, its gate passed, and it served — no escalation, and the savings versus an always-strong baseline:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
+  &quot;trace_id&quot;: &quot;tr_7b31…&quot;, &quot;mode&quot;: &quot;enforce&quot;,
+  &quot;request&quot;: { &quot;api&quot;: &quot;anthropic.messages&quot;,
+              &quot;features&quot;: { &quot;tool_count&quot;: 3, &quot;has_images&quot;: false } },
+  &quot;attempts&quot;: [
+    { &quot;rung&quot;: 0, &quot;model&quot;: &quot;anthropic/claude-haiku-4-5&quot;,
+      &quot;in_tokens&quot;: 5120, &quot;out_tokens&quot;: 210, &quot;cost_usd&quot;: 0.0062,
+      &quot;gates&quot;: [{ &quot;name&quot;: &quot;pytest&quot;, &quot;verdict&quot;: &quot;pass&quot; }],
+      &quot;verdict&quot;: &quot;serve&quot; }
+  ],
+  &quot;final&quot;: {
+    &quot;served_rung&quot;: 0, &quot;served_from&quot;: &quot;anthropic/claude-haiku-4-5&quot;,
+    &quot;total_cost_usd&quot;: 0.0062, &quot;escalations&quot;: 0,
+    &quot;counterfactual_baseline_usd&quot;: 0.0185,   <span class="tk-c">// same call, always on sonnet</span>
+    &quot;savings_usd&quot;: 0.0123                     <span class="tk-c">// ← proven, not guessed</span>
+  },
+  &quot;prev_hash&quot;: &quot;sha256:9c1a…&quot;
+}</code></pre></div>
+<div class="note info"><span class="nt">Under the hood</span> Every number in that receipt is measured on the real call, not modeled: the tokens are what the provider reported, the <code>pytest</code> verdict is the actual gate result, and <code>savings_usd</code> is this call's cost against an always-strong baseline. The full anatomy — the hash chain, every field — is <a href="receipts.html">Receipts &amp; audit</a>. <em>(One honest limit: the baseline prices cached input at the full rate, so on heavily-cached traffic the stated savings can run slightly high.)</em></div>
 
 <h2 id="correlate">Module by module: what Firstpass does, and what it doesn't<a class="anchor" href="#correlate" aria-label="Link to this section">#</a></h2>
 <p>Each fundamental from Part A creates a cost. Here is the honest mapping of what Firstpass does about it — and, where there's a limit, exactly what it is. No over-claims:</p>
@@ -664,7 +1078,7 @@ curl https://api.anthropic.com/v1/messages \
 </table></div>
 
 <h2 id="together">The same bugfix, end to end<a class="anchor" href="#together" aria-label="Link to this section">#</a></h2>
-<p>Tie it together with Module 4's four-call bugfix. Run vanilla, all four calls hit the strong model — the Part A baseline. Run through Firstpass, each call opens cheap and only the one that fails its <code>cargo-test</code> gate escalates. Same task, same wire, different number:</p>
+<p>Tie it together with the tool loop's four-call bugfix. Run vanilla, all four calls hit the strong model — the Part A baseline. Run through Firstpass, each call opens cheap and only the one that fails its <code>pytest</code> gate escalates. Same task, same wire, different number:</p>
 <div class="statcols">
   <div class="statcol next"><span class="st-tag">vanilla · Part A</span>
     <ul>
@@ -694,7 +1108,7 @@ curl https://api.anthropic.com/v1/messages \
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="quickstart.html"><span class="dir">← Previous</span><span class="t">Quickstart</span></a><a class="next" href="how-it-works.html"><span class="dir">Next →</span><span class="t">How it works</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#anatomy" class="">1 · One request</a><a href="#meter" class="">2 · The token meter</a><a href="#multiturn" class="">3 · Multi-turn cost</a><a href="#tools" class="">4 · Tool calls</a><a href="#mcp" class="">5 · MCP</a><a href="#cache" class="">6 · Prompt caching</a><a href="#shapes" class="">7 · Client shapes</a><a href="#ccsession" class="">8 · A Claude Code session</a><a href="#bridge" class="">Part B · the bridge</a><a href="#correlate" class="">Module-by-module</a><a href="#together" class="">Same bugfix, e2e</a><a href="#next" class="">Where to go next</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#anatomy" class="">1 · One request</a><a href="#meter" class="">2 · The token meter</a><a href="#multiturn" class="">3 · Multi-turn cost</a><a href="#tools" class="">4 · Tool calls</a><a href="#cache" class="">5 · Prompt caching</a><a href="#shapes" class="">6 · Client shapes</a><a href="#ccsession" class="">7 · A Claude Code session</a><a href="#streaming" class="">Streaming</a><a href="#structured" class="">Structured output</a><a href="#images" class="">Images</a><a href="#mcp" class="">MCP, in depth</a><a href="#errors" class="">Errors &amp; retries</a><a href="#bridge" class="">Part B · the bridge</a><a href="#correlate" class="">Module by module</a><a href="#together" class="">The task, e2e</a><a href="#next" class="">Where next</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">
