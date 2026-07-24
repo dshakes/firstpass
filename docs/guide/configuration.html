@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -31,24 +31,25 @@
 <div class="grp"><p class="grp-t">Getting started</p>
 <a href="index.html"><span class="num">01</span>Overview</a>
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
-<a href="how-it-works.html"><span class="num">03</span>How it works</a>
-<a href="request-flow.html"><span class="num">04</span>Routing, end to end</a>
+<a href="requests-101.html"><span class="num">03</span>Requests 101</a>
+<a href="how-it-works.html"><span class="num">04</span>How it works</a>
+<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
-<a href="gates.html"><span class="num">05</span>Gates</a>
-<a href="routing.html"><span class="num">06</span>Routing &amp; escalation</a>
-<a href="guarantee.html"><span class="num">07</span>The guarantee</a>
-<a href="receipts.html"><span class="num">08</span>Receipts &amp; audit</a>
+<a href="gates.html"><span class="num">06</span>Gates</a>
+<a href="routing.html"><span class="num">07</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">08</span>The guarantee</a>
+<a href="receipts.html"><span class="num">09</span>Receipts &amp; audit</a>
 </div>
 <div class="grp"><p class="grp-t">Reference</p>
-<a href="providers.html"><span class="num">09</span>Providers</a>
-<a href="configuration.html" aria-current="page"><span class="num">10</span>Configuration</a>
-<a href="cli.html"><span class="num">11</span>CLI reference</a>
-<a href="api.html"><span class="num">12</span>API &amp; MCP</a>
+<a href="providers.html"><span class="num">10</span>Providers</a>
+<a href="configuration.html" aria-current="page"><span class="num">11</span>Configuration</a>
+<a href="cli.html"><span class="num">12</span>CLI reference</a>
+<a href="api.html"><span class="num">13</span>API &amp; MCP</a>
 </div>
 <div class="grp"><p class="grp-t">Research &amp; data</p>
-<a href="elastic-verification.html"><span class="num">13</span>Elastic verification</a>
-<a href="benchmarks.html"><span class="num">14</span>Benchmarks</a>
+<a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -56,6 +57,8 @@
 <p class="crumb"><a href="index.html">Docs</a> / Configuration</p>
 <h1>Configuration</h1>
 <p class="page-sub">Firstpass reads a single <code>firstpass.toml</code> plus a handful of environment variables. This is the full reference — ladder, gates, bandit, speculation, budgets, providers, routes and modes — and the multi-tenant options.</p>
+
+<div class="tldr">A working config is a <code>[ladder]</code> and one <code>[[gate]]</code>. <b>Every other section has a default and ships off</b> — an optional feature absent from your config file is byte-invisible to callers. Add sections only when you reach for that behaviour.</div>
 
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 380" role="img" aria-labelledby="cfgT">
 <title id="cfgT">Anatomy of firstpass.toml — a ladder and one gate are required; every other section has a default and ships off</title>
@@ -94,6 +97,7 @@
 </svg><figcaption>A working config is a ladder and one gate. Every other section has a default and ships off — add it only when you reach for it.</figcaption></div>
 
 <h2 id="shape">Config shape<a class="anchor" href="#shape" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Two required blocks (<code>[ladder]</code> and <code>[[gate]]</code>), seven optional ones. Point Firstpass at the file with <code>FIRSTPASS_CONFIG</code> (default: <code>./firstpass.toml</code>).</div>
 <p>A minimal config is a ladder and one gate. Everything else has a default. Point Firstpass at a file with <code>FIRSTPASS_CONFIG</code> (default <code>./firstpass.toml</code>).</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># firstpass.toml — a minimal, working config</span>
 [ladder]
@@ -101,8 +105,11 @@ rungs = [&quot;anthropic/claude-haiku-4-5&quot;, &quot;anthropic/claude-sonnet-5
 
 [[gate]]
 kind = &quot;json-valid&quot;</code></pre></div>
+<div class="note"><span class="nt">Key idea</span> Every section not present in the file keeps its default — and the default for every optional section is <b>off</b>. A request through a minimal config is externally identical to a direct provider call: same body, same model reply, same latency path. The config file is how you opt in to routing, gating, and learning; it does not change anything you do not touch.</div>
+<div class="recap">Two required blocks; every optional section defaults to off and adds no behaviour until you add it.</div>
 
 <h2 id="ladder">[ladder]<a class="anchor" href="#ladder" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The ordered list of models, <b>cheapest first</b>. Firstpass always opens on <code>rungs[0]</code> and escalates up only on a gate failure. <code>max_rungs</code> caps how far a single request may climb.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
   <tbody>
@@ -110,9 +117,13 @@ kind = &quot;json-valid&quot;</code></pre></div>
     <tr><td><code>max_rungs</code></td><td>int</td><td><code>len(rungs)</code></td><td>Cap on how far a request may climb.</td></tr>
   </tbody>
 </table></div>
+<div class="note warn"><span class="nt">Common mistake</span> Listing the strongest model first inverts the ladder. Firstpass always opens on <code>rungs[0]</code>, so that entry must be your cheapest, fastest model. If <code>rungs[0]</code> is <code>anthropic/claude-opus-4-8</code>, every request starts at the top rung and pays the premium rate — there is nothing to escalate to, and the cost benefit disappears entirely.</div>
+<div class="recap">Order matters: cheap → capable. Firstpass opens at <code>rungs[0]</code> every time and only escalates on a gate failure.</div>
 
 <h2 id="gate">[[gate]]<a class="anchor" href="#gate" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Repeatable. Each block adds a gate applied to every rung; <b>all gates must pass</b> for an output to be served from that rung. A gate failure triggers escalation — never an error to the caller.</div>
 <p>Repeatable. Each block adds a gate; all gates on a rung must pass. See <a href="gates.html">Gates</a> for the semantics of each kind.</p>
+<p class="subh">Gate kinds</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Key</th><th>Applies to</th><th>Meaning</th></tr></thead>
   <tbody>
@@ -124,14 +135,22 @@ kind = &quot;json-valid&quot;</code></pre></div>
     <tr><td><code>k</code>, <code>threshold</code></td><td>consistency</td><td>Resample count and agreement bar.</td></tr>
   </tbody>
 </table></div>
+<div class="note info"><span class="nt">Under the hood</span> Gates run after the rung responds but before that response is forwarded to the caller. A gate failure escalates to the next rung silently — the caller never sees the failing output or the gate verdict, only the final served answer. <code>on_abstain = fail_open</code> (the default) treats an inconclusive gate as a pass; <code>fail_closed</code> treats it as a failure and triggers escalation. <code>fail_open</code> is the safe default for gates that may time out or be unavailable.</div>
+<div class="recap">All gates on a rung must pass; failure means escalation, not an error. <code>fail_open</code> is the safe default for gates that may not always resolve.</div>
 
 <h2 id="bandit">[bandit]<a class="anchor" href="#bandit" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Default-off. When enabled, Firstpass learns which start rung tends to win for a given traffic pattern and opens there instead of always at <code>rungs[0]</code>. Gate evaluation and escalation are unchanged.</div>
 <p>The learned start-rung (<a href="routing.html#startrung">detail</a>). Default-off; default algorithm UCB1.</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[bandit]
 enabled = false
 algo    = &quot;ucb1&quot;        # ucb1 (deterministic) | thompson (Beta, discounted)</code></pre></div>
+<div class="note"><span class="nt">Key idea</span> The bandit controls only the <b>start rung</b>. Gate evaluation, escalation, and the served-failure guarantee are unchanged. A request that opens on rung 1 because the bandit says so still escalates to rung 2 if rung 1's gate fails. Bandit off (the default) means every request opens at <code>rungs[0]</code>. Leave it off until you have enough traffic for meaningful signal.</div>
+<div class="recap">The bandit picks the opening rung; everything else — gates, escalation, the guarantee — runs identically. Safe to leave off until you have traffic history.</div>
 
 <h2 id="speculation">[speculation] &amp; budgets<a class="anchor" href="#speculation" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Both default-off. <b>Speculation</b> fires the next rung in parallel while the current rung is being graded, trading tokens for latency in the marginal zone. <b>Budget</b> keys cap spend per request, session, and day.</div>
+<p class="subh">[speculation]</p>
+<p>When enabled and the current rung's gate score falls in <code>speculation_band</code>, Firstpass fires the next rung speculatively. If the current rung passes, the speculative call is discarded. If it fails, the next rung's answer is already in flight — saving one full rung latency at the cost of running (and paying for) a speculative call.</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[speculation]
 enabled          = false
 lookahead        = 1
@@ -141,22 +160,61 @@ speculation_band = [0.35, 0.65]   # only prefetch in the marginal zone
 per_request_usd = 0.05
 per_session_usd = 1.00
 per_day_usd     = 250.00</code></pre></div>
+<p class="subh">[budget]</p>
+<p>Budget limits are hard ceilings enforced before any upstream call. A request that would exceed any ceiling is not forwarded.</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>Key</th><th>Default</th><th>Ceiling scope</th></tr></thead>
+  <tbody>
+    <tr><td><code>per_request_usd</code></td><td><code>0.05</code></td><td>All rungs attempted for a single request</td></tr>
+    <tr><td><code>per_session_usd</code></td><td><code>1.00</code></td><td>Cumulative spend for a session</td></tr>
+    <tr><td><code>per_day_usd</code></td><td><code>250.00</code></td><td>Daily ceiling</td></tr>
+  </tbody>
+</table></div>
+<div class="note warn"><span class="nt">Common mistake</span> Speculation pre-pays for the next rung on every marginal call. If most calls in the <code>speculation_band</code> end up passing the cheap rung anyway, you are paying for two model calls on each one — the latency saving is real, but so is the token cost. Profile your gate's actual flip rate in the band before enabling.</div>
+<div class="note"><span class="nt">Key idea</span> Elastic verification (<code>escalation.elastic</code>) is a separate opt-in feature — config-gated and <b>off by default</b>. It adjusts verification intensity proportional to doubt on the serving path and requires a calibrated λ. Do not enable it without reading <a href="elastic-verification.html">Elastic verification</a> first.</div>
+<div class="recap">Speculation trades tokens for latency; only useful if your gate flip rate in the band is high enough to justify the extra calls. Budget ceilings reject requests before they start.</div>
 
 <h2 id="provider">[[provider]]<a class="anchor" href="#provider" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Repeatable. Each block registers an OpenAI-compatible endpoint as a named provider. Reference it in ladder rungs as <code>name/model-id</code>.</div>
 <p>Repeatable. Adds an OpenAI-compatible endpoint as a provider (<a href="providers.html#custom">detail</a>).</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[provider]]
 name     = &quot;myllm&quot;
 base_url = &quot;https://api.internal.example.com/v1&quot;
 dialect  = &quot;openai&quot;      # openai | anthropic | gemini
 auth     = &quot;api_key&quot;     # api_key | aws_sigv4 | gcp_oauth</code></pre></div>
+<div class="tblwrap"><table>
+  <thead><tr><th>Key</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>name</code></td><td>Identifier used as prefix in ladder rungs: <code>name/model-id</code></td></tr>
+    <tr><td><code>base_url</code></td><td>Base URL of the OpenAI-compatible endpoint</td></tr>
+    <tr><td><code>dialect</code></td><td>Wire format: <code>openai</code> | <code>anthropic</code> | <code>gemini</code></td></tr>
+    <tr><td><code>auth</code></td><td>Auth method: <code>api_key</code> | <code>aws_sigv4</code> | <code>gcp_oauth</code></td></tr>
+  </tbody>
+</table></div>
+<div class="recap">One block per custom provider; reference it in the ladder as <code>name/model-id</code>. See <a href="providers.html#custom">Providers</a> for API key wiring.</div>
 
 <h2 id="routes">[[route]] &amp; modes<a class="anchor" href="#routes" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Routes bind a URL pattern to a ladder and a default <code>routing_mode</code>. The per-request <code>x-firstpass-mode</code> header overrides the route default. Six modes from full passthrough (<code>observe</code>) to always-top (<code>max</code>).</div>
 <p>Routes let different traffic use different ladders and a per-route default <code>routing_mode</code> (overridden by the <code>x-firstpass-mode</code> header — see <a href="routing.html#precedence">mode precedence</a>).</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[route]]
 match        = &quot;/v1/chat/completions&quot;
 routing_mode = &quot;cost&quot;        # observe|cost|balanced|quality|latency|max</code></pre></div>
+<p class="subh">Routing modes</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>Mode</th><th>Behaviour</th></tr></thead>
+  <tbody>
+    <tr><td><code>observe</code></td><td>Byte-passthrough; no routing decisions, receipts recorded only</td></tr>
+    <tr><td><code>cost</code></td><td>Cheapest rung that clears the gate</td></tr>
+    <tr><td><code>balanced</code></td><td>Balance cost against quality</td></tr>
+    <tr><td><code>quality</code></td><td>Prefer quality; climb earlier</td></tr>
+    <tr><td><code>latency</code></td><td>Prefer lowest latency</td></tr>
+    <tr><td><code>max</code></td><td>Pin to the top rung (<code>rungs[len-1]</code>)</td></tr>
+  </tbody>
+</table></div>
+<div class="recap">Routes scope a ladder to a URL path; modes control how aggressively Firstpass optimises within that ladder. See <a href="routing.html">Routing &amp; escalation</a> for full semantics.</div>
 
 <h2 id="env">Environment variables<a class="anchor" href="#env" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Seven variables control listen address, config file, and operating mode. <b>Start with <code>FIRSTPASS_MODE=observe</code></b> — it records receipts and passes every request through unchanged.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Variable</th><th>Values</th><th>Meaning</th></tr></thead>
   <tbody>
@@ -169,10 +227,14 @@ routing_mode = &quot;cost&quot;        # observe|cost|balanced|quality|latency|m
     <tr><td><code>FIRSTPASS_MAX_CONCURRENCY</code></td><td>int</td><td>Max in-flight upstream requests.</td></tr>
   </tbody>
 </table></div>
+<div class="note info"><span class="nt">Under the hood</span> <code>FIRSTPASS_MODE=observe</code> is a byte-passthrough: every request is forwarded verbatim to the upstream, receipts are written, but no routing or gate decisions are made. The model and the caller see no difference from a direct connection — it is the zero-risk way to instrument an existing agent. Switch to <code>enforce</code> once you have validated your ladder and gate config against observe-mode receipts.</div>
+<div class="recap"><code>FIRSTPASS_MODE=observe</code> is shadow mode — zero behaviour change, full receipts. Switch to <code>enforce</code> to activate routing.</div>
 
 <h2 id="tenancy">Multi-tenant<a class="anchor" href="#tenancy" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Opt-in and <b>default-off</b>. When enabled: Argon2id keyed auth, AES-256-GCM key custody, per-tenant rate limits. <b>Not GA</b> — pending external security review. Do not use for tenant isolation in production yet.</div>
 <p>Multi-tenancy is <strong>opt-in and default-off</strong>. When enabled it provides Argon2id keyed auth, AES-256-GCM key custody, and per-tenant rate limits.</p>
 <div class="note warn"><span class="nt">Pre-external-review</span> The multi-tenant path is implemented but <strong>not GA</strong> — it is pending external security review. Do not rely on it for tenant isolation in production until that review lands. See ADR 0004.</div>
+<div class="recap">Multi-tenancy is off until you configure it and not GA until the external security review lands. Do not rely on it for isolation in production today.</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="providers.html"><span class="dir">← Previous</span><span class="t">Providers</span></a><a class="next" href="cli.html"><span class="dir">Next →</span><span class="t">CLI reference</span></a></nav>
 </main>
@@ -188,5 +250,5 @@ routing_mode = &quot;cost&quot;        # observe|cost|balanced|quality|latency|m
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

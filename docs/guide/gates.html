@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -31,24 +31,25 @@
 <div class="grp"><p class="grp-t">Getting started</p>
 <a href="index.html"><span class="num">01</span>Overview</a>
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
-<a href="how-it-works.html"><span class="num">03</span>How it works</a>
-<a href="request-flow.html"><span class="num">04</span>Routing, end to end</a>
+<a href="requests-101.html"><span class="num">03</span>Requests 101</a>
+<a href="how-it-works.html"><span class="num">04</span>How it works</a>
+<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
-<a href="gates.html" aria-current="page"><span class="num">05</span>Gates</a>
-<a href="routing.html"><span class="num">06</span>Routing &amp; escalation</a>
-<a href="guarantee.html"><span class="num">07</span>The guarantee</a>
-<a href="receipts.html"><span class="num">08</span>Receipts &amp; audit</a>
+<a href="gates.html" aria-current="page"><span class="num">06</span>Gates</a>
+<a href="routing.html"><span class="num">07</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">08</span>The guarantee</a>
+<a href="receipts.html"><span class="num">09</span>Receipts &amp; audit</a>
 </div>
 <div class="grp"><p class="grp-t">Reference</p>
-<a href="providers.html"><span class="num">09</span>Providers</a>
-<a href="configuration.html"><span class="num">10</span>Configuration</a>
-<a href="cli.html"><span class="num">11</span>CLI reference</a>
-<a href="api.html"><span class="num">12</span>API &amp; MCP</a>
+<a href="providers.html"><span class="num">10</span>Providers</a>
+<a href="configuration.html"><span class="num">11</span>Configuration</a>
+<a href="cli.html"><span class="num">12</span>CLI reference</a>
+<a href="api.html"><span class="num">13</span>API &amp; MCP</a>
 </div>
 <div class="grp"><p class="grp-t">Research &amp; data</p>
-<a href="elastic-verification.html"><span class="num">13</span>Elastic verification</a>
-<a href="benchmarks.html"><span class="num">14</span>Benchmarks</a>
+<a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -56,6 +57,7 @@
 <p class="crumb"><a href="index.html">Docs</a> / Gates</p>
 <h1>Gates</h1>
 <p class="page-sub">The gate is the mechanism that makes Firstpass proof-based instead of predictive. It reads the actual output and returns a verdict. Firstpass ships five kinds — from a zero-config inline check to your own test suite — and lets you compose them.</p>
+<div class="tldr">A gate reads the <b>real candidate output</b> and returns <b>pass</b>, <b>fail</b>, or <b>abstain</b> — nothing probabilistic, no guessing from the prompt. Firstpass ships five kinds ordered by cost: two free inline checks, a structural <code>schema</code> validator, a <code>subprocess</code> that runs any executable, a <code>judge</code> that uses a structurally different model as grader, and a <code>consistency</code> check that measures self-agreement across resamples. Each gate's cost lands on the receipt separately from the model spend.</div>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 200" role="img" aria-labelledby="gcT">
 <title id="gcT">The five gate kinds ordered by cost, cheapest first: the inline non-empty and json-valid checks and the schema gate are free and add no model calls; the subprocess gate costs your executable's wall time; the judge gate costs one extra model call; the consistency gate is the most expensive, costing k extra resamples.</title>
 <text x="40" y="32" class="ink" font-size="13" font-weight="640">Five kinds, cheapest proof first</text>
@@ -84,6 +86,7 @@
 </svg><figcaption>Every gate's cost lands on the receipt. The cheapest proof that settles the decision is the one worth running.</figcaption></div>
 
 <h2 id="what">What a gate is<a class="anchor" href="#what" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A gate sits between the model's output and the serve decision. It receives the <b>full candidate text</b>, applies a deterministic or model-based check, and emits one of three verdicts. <b>pass</b> stops the cascade and serves the output. <b>fail</b> escalates exactly one rung and retries. <b>abstain</b> defers to <code>on_abstain</code>. Multiple gates on one rung form a conjunction — all must pass for the rung to serve.</div>
 <p>A gate is a check over a candidate output that returns one of three verdicts:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="gvT">
 <title id="gvT">One gate, three verdicts. The gate reads the candidate output and returns pass, fail, or abstain: pass serves and stops the cascade, fail escalates one rung and retries, and abstain is governed by the gate's on_abstain policy — fail_open serves, fail_closed escalates.</title>
@@ -133,16 +136,22 @@
   <div class="row"><div class="k">fail</div><div class="v">Not good enough. Escalate one rung and try again.</div></div>
   <div class="row"><div class="k">abstain</div><div class="v">The gate could not decide (timeout, crash, or genuine uncertainty). Behavior is governed by <code>on_abstain</code>.</div></div>
 </div>
+<div class="note"><span class="nt">Key idea</span> The gate's input is the <em>actual bytes</em> the model wrote — not the prompt, not the request metadata, not a score the model gave itself. The gate is the proof that an answer is good, not a prediction that it probably will be. This is what distinguishes Firstpass from predictive routing: the decision is made on real output, after the fact.</div>
 <p>Gates compose: a rung can carry several, and all must pass. A <code>score</code> in <code>[0,1]</code> is optional; when a gate emits one, the operator's serve threshold governs whether that score clears. Every gate's cost is written onto the receipt.</p>
+<div class="recap">The gate reads the <b>real output</b> and returns pass / fail / abstain; pass serves and stops the cascade, fail escalates one rung, and multiple gates on a rung are a conjunction — all must pass.</div>
 
 <h2 id="builtin">Built-in inline<a class="anchor" href="#builtin" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Two checks run with <b>zero configuration</b> and add <b>no model calls</b>: <code>non-empty</code> rejects blank or whitespace outputs, and <code>json-valid</code> rejects outputs that don't parse as valid JSON. Enable them as a floor on every rung — they cost nothing and catch a surprising share of model failures before pricier checks ever fire.</div>
 <p>Two checks run with zero configuration and no extra model calls:</p>
 <div class="defs">
   <div class="row"><div class="k">non-empty</div><div class="v">The output is not empty or whitespace. The floor.</div></div>
   <div class="row"><div class="k">json-valid</div><div class="v">The output parses as JSON. The first line of defense for structured outputs.</div></div>
 </div>
+<div class="note"><span class="nt">Key idea</span> The inline checks run synchronously inside the router before any subprocess or judge fires. A <code>non-empty</code> or <code>json-valid</code> failure stops the gate chain immediately and escalates — so you never wait for a subprocess timeout on a blank output. Put them first; they're free.</div>
+<div class="recap"><b>non-empty</b> and <b>json-valid</b> are zero-cost, always-on floors — add them to every rung before layering pricier checks.</div>
 
 <h2 id="schema">schema<a class="anchor" href="#schema" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The <code>schema</code> gate validates structural shape — top-level <code>type</code>, <code>required</code>, and per-property <code>type</code> — against a JSON-Schema subset. <b>Free</b> (no extra model calls) and synchronous. It enforces the contract on a structured output without running a full schema engine.</div>
 <p>The <code>schema</code> gate validates against a JSON-Schema subset: top-level <code>type</code>, <code>required</code>, and per-property <code>type</code>. Enough to enforce the shape of a tool call or a structured response without a full schema engine.</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
 kind = &quot;schema&quot;
@@ -150,28 +159,36 @@ schema = { type = &quot;object&quot;, required = [&quot;total&quot;, &quot;items
   total = { type = &quot;number&quot; },
   items = { type = &quot;array&quot; }
 }}</code></pre></div>
+<div class="note warn"><span class="nt">Common mistake</span> Treating <code>schema</code> as a full JSON Schema validator. It covers the subset that matters for LLM structured outputs — top-level <code>type</code> and <code>required</code> — but does not evaluate <code>enum</code>, <code>minimum</code>/<code>maximum</code>, <code>pattern</code>, or nested <code>$ref</code>. For richer structural guarantees, layer a <code>subprocess</code> gate that runs a real schema library after this one.</div>
+<div class="recap">The <b>schema</b> gate is a free structural check on top-level type and required fields — use it before a subprocess for fast, cheap shape enforcement.</div>
 
 <h2 id="subprocess">subprocess — bring your own<a class="anchor" href="#subprocess" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The most powerful gate: <b>any executable you write</b>. Candidate output arrives as JSON on stdin; your program returns a JSON verdict. Non-zero exit or timeout = abstain. This is the "bring your own test suite" gate — <code>cargo test</code>, <code>pytest</code>, an eslint run, whatever you already use to verify correctness.</div>
 <p>The most powerful gate: <strong>any executable</strong>. This is "bring your own tests / linter / judge." The candidate arrives as JSON on <strong>stdin</strong> — never as a command-line argument, which keeps it injection-resistant — and the process prints a verdict as JSON.</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
 kind = &quot;subprocess&quot;
 cmd  = [&quot;python&quot;, &quot;run_tests.py&quot;]
 timeout_ms = 5000</code></pre></div>
+<p class="subh">The stdin / stdout contract</p>
 <p>The contract for the executable:</p>
 <div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// stdin  (what your program reads)</span>
 { &quot;candidate&quot;: &quot;def solve(...): ...&quot;, &quot;prompt&quot;: &quot;...&quot;, &quot;meta&quot;: { } }
 
 <span class="tk-c">// stdout (what your program prints)</span>
 { &quot;verdict&quot;: &quot;pass&quot;, &quot;score&quot;: 0.91, &quot;reason&quot;: &quot;12/12 tests passed&quot; }</code></pre></div>
+<p class="subh">Timeout and error handling</p>
 <ul>
   <li><code>verdict</code> is one of <code>pass</code> | <code>fail</code> | <code>abstain</code>.</li>
   <li><code>score</code> (optional) is a float in <code>[0,1]</code>.</li>
   <li><code>reason</code> (optional) is a human-readable note, recorded on the receipt.</li>
   <li>A non-zero exit code or a timeout is treated as <strong>abstain</strong>.</li>
 </ul>
+<div class="note warn"><span class="nt">Common mistake</span> Exiting with a non-zero code to signal a <em>fail</em> verdict. A non-zero exit maps to <strong>abstain</strong>, not fail — which then obeys <code>on_abstain</code> rather than triggering the expected escalation. Print <code>{"verdict":"fail"}</code> on stdout and exit 0. Reserve non-zero exits for unexpected errors your program can't recover from.</div>
 <div class="note info"><span class="nt">Why stdin, not argv</span> A candidate output is untrusted text. Passing it on the command line invites shell and argument injection. Firstpass hands it to your gate on stdin, so a malicious candidate can't smuggle itself into the command.</div>
+<div class="recap">The <b>subprocess</b> gate runs any executable — candidate on stdin, JSON verdict on stdout, non-zero exit or timeout = abstain — so your existing test suite becomes a first-class gate.</div>
 
 <h2 id="judge">judge — native LLM<a class="anchor" href="#judge" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The <code>judge</code> gate sends the candidate to a <b>different model</b> with a rubric and scores the output. Anti-gaming is structural, not a prompt trick: if the configured judge equals the candidate model, the gate abstains rather than let a model mark its own work. The candidate is fenced as untrusted data under a pinned system prompt.</div>
 <p>The <code>judge</code> gate uses a model to grade the candidate against a rubric. Its anti-gaming design is <strong>structural</strong>, not a prompt trick:</p>
 <ul>
   <li><strong>maker ≠ checker.</strong> A model never grades its own output. If the configured judge equals the candidate's model, the gate <em>abstains</em> rather than let a model mark its own work.</li>
@@ -183,24 +200,37 @@ kind = &quot;judge&quot;
 model = &quot;anthropic/claude-sonnet-5&quot;   # must differ from the candidate model
 rubric = &quot;Is the answer correct, complete, and free of unsupported claims?&quot;
 threshold = 0.7</code></pre></div>
+<div class="note"><span class="nt">Key idea</span> <strong>Maker ≠ checker</strong> is enforced at the config level, not the prompt level. A model that generated the candidate can't be talked into grading itself favorably by the candidate's own text — because Firstpass compares model identifiers and abstains if they match, before the judge call is ever made. The prompt fencing is a defense-in-depth layer on top, not the primary safeguard.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Pointing the judge at the cheapest available model to save money. A judge weaker than the candidate will miss subtle failures and pass them as good enough. Use a model at or above the candidate tier. The cost of one extra judge call is far smaller than the cost of the escalation it should have triggered — or the served failure it silently allowed.</div>
+<div class="recap">The <b>judge</b> gate uses a structurally different model as grader — maker ≠ checker enforced at the config level, candidate fenced as untrusted data, score compared against your threshold.</div>
 
 <h2 id="consistency">consistency<a class="anchor" href="#consistency" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The <code>consistency</code> gate resamples the output <code>k</code> times and scores by agreement across samples. Unlike the judge, <b>maker == checker is intentional</b> — the signal is the model's own stability, not independence from it. Use it when there is no external oracle and you want to measure how confidently the model arrives at its answer.</div>
 <p>The <code>consistency</code> gate measures self-consistency: resample the candidate <code>k</code> times and score by agreement across samples. Unlike the judge, <strong>maker == checker is intentional here</strong> — the signal is the model's own stability. It suits tasks without a crisp oracle, drawing on self-consistency (Wang et al. 2022) and semantic entropy (Farquhar et al., <em>Nature</em> 2024).</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
 kind = &quot;consistency&quot;
 k = 5              # extra samples — this gate costs k additional calls
 threshold = 0.8</code></pre></div>
+<div class="note info"><span class="nt">Under the hood</span> Self-consistency (Wang et al. 2022) scores by majority vote across samples. The gate extends this with semantic entropy (Farquhar et al., <em>Nature</em> 2024), which clusters semantically equivalent answers and measures dispersion rather than exact-match agreement — so paraphrases of the same correct answer are not penalized as disagreements.</div>
 <div class="note warn"><span class="nt">Cost</span> Self-consistency runs the model <code>k</code> extra times. It buys a signal where no external check exists, but it is the most expensive gate — price it against the value of the decision.</div>
+<div class="recap">The <b>consistency</b> gate is the most expensive — <code>k</code> extra model calls — and the right choice only when no external oracle exists; maker == checker is intentional here, not a flaw.</div>
 
 <h2 id="abstain">Abstain &amp; error budget<a class="anchor" href="#abstain" aria-label="Link to this section">#</a></h2>
+<div class="tldr">When a gate can't decide — crash, timeout, genuine uncertainty — it returns <b>abstain</b>. <code>fail_open</code> (default) treats abstain as pass and serves; <code>fail_closed</code> treats it as fail and escalates. A separate <b>error budget</b> tracks gate reliability: once a gate blows its rolling failure rate, Firstpass auto-disables it so one flaky check can't stall every request in the cascade.</div>
 <p>Two safety mechanisms wrap every gate:</p>
 <div class="defs">
   <div class="row"><div class="k">on_abstain</div><div class="v"><code>fail_open</code> (default) treats an inconclusive gate as a pass and serves; <code>fail_closed</code> treats it as a fail and escalates. Choose per gate based on whether a false serve or a wasted escalation is worse for that check.</div></div>
   <div class="row"><div class="k">error budget</div><div class="v">A gate that keeps crashing or timing out is a liability. Firstpass tracks a rolling error rate per gate and <strong>auto-disables</strong> a flaky gate once it blows its budget, so one broken check can't stall the whole cascade.</div></div>
 </div>
+<div class="note"><span class="nt">Key idea</span> <code>fail_open</code> vs <code>fail_closed</code> is a per-gate choice, not a global setting. A <code>non-empty</code> check almost always belongs on <code>fail_closed</code> — an abstain there means the gate itself crashed, and serving a blank response is never right. A subprocess gate that runs optional linting might use <code>fail_open</code> — a timeout is not a reason to stall every request when the output is probably fine.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Setting every gate to <code>fail_closed</code> without monitoring the error budget. A gate that times out repeatedly will blow its budget and get auto-disabled — silently removing a check you were relying on. Watch <code>/metrics</code> for per-gate error rates so you catch flakiness before the budget runs out and the check disappears.</div>
+<div class="recap"><b>fail_open</b> serves on abstain; <b>fail_closed</b> escalates — choose per gate. The error budget auto-disables a persistently failing gate so one broken check can't stall every request.</div>
 
 <h2 id="cost">Gate cost on the receipt<a class="anchor" href="#cost" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Every gate's cost is written to the receipt as <code>gate_cost_usd</code>, separate from the model spend. When you run <code>firstpass savings</code>, the net figure is already net of what verification cost. <b>Proof has a price, and it's on the ticket</b> — you always know what it cost to be sure.</div>
 <p>Verification is not free, and Firstpass refuses to hide it. Every gate's cost — a judge's tokens, a consistency gate's <code>k</code> extra calls, a subprocess's wall time priced in — is written onto the receipt as <code>gate_cost_usd</code>, separate from the model spend. When you run <code>firstpass savings</code>, the net figure already accounts for what verification cost you. Proof has a price, and it's on the ticket.</p>
+<div class="note"><span class="nt">Key idea</span> <code>gate_cost_usd</code> is additive, not amortized. A judge gate on a rung that ultimately escalates still records the judge's token cost on that attempt — even though the model output it checked was discarded. This is the honest accounting: verification cost is owed regardless of whether the output it checked turned out to be good enough. You can't optimize what you can't see.</div>
+<div class="recap">Gate costs land on the receipt as <code>gate_cost_usd</code> — separate from model spend, always visible in <code>firstpass savings</code>, never hidden.</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="request-flow.html"><span class="dir">← Previous</span><span class="t">Routing, end to end</span></a><a class="next" href="routing.html"><span class="dir">Next →</span><span class="t">Routing & escalation</span></a></nav>
 </main>
@@ -216,5 +246,5 @@ threshold = 0.8</code></pre></div>
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

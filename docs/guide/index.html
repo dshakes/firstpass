@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -31,24 +31,25 @@
 <div class="grp"><p class="grp-t">Getting started</p>
 <a href="index.html" aria-current="page"><span class="num">01</span>Overview</a>
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
-<a href="how-it-works.html"><span class="num">03</span>How it works</a>
-<a href="request-flow.html"><span class="num">04</span>Routing, end to end</a>
+<a href="requests-101.html"><span class="num">03</span>Requests 101</a>
+<a href="how-it-works.html"><span class="num">04</span>How it works</a>
+<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
-<a href="gates.html"><span class="num">05</span>Gates</a>
-<a href="routing.html"><span class="num">06</span>Routing &amp; escalation</a>
-<a href="guarantee.html"><span class="num">07</span>The guarantee</a>
-<a href="receipts.html"><span class="num">08</span>Receipts &amp; audit</a>
+<a href="gates.html"><span class="num">06</span>Gates</a>
+<a href="routing.html"><span class="num">07</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">08</span>The guarantee</a>
+<a href="receipts.html"><span class="num">09</span>Receipts &amp; audit</a>
 </div>
 <div class="grp"><p class="grp-t">Reference</p>
-<a href="providers.html"><span class="num">09</span>Providers</a>
-<a href="configuration.html"><span class="num">10</span>Configuration</a>
-<a href="cli.html"><span class="num">11</span>CLI reference</a>
-<a href="api.html"><span class="num">12</span>API &amp; MCP</a>
+<a href="providers.html"><span class="num">10</span>Providers</a>
+<a href="configuration.html"><span class="num">11</span>Configuration</a>
+<a href="cli.html"><span class="num">12</span>CLI reference</a>
+<a href="api.html"><span class="num">13</span>API &amp; MCP</a>
 </div>
 <div class="grp"><p class="grp-t">Research &amp; data</p>
-<a href="elastic-verification.html"><span class="num">13</span>Elastic verification</a>
-<a href="benchmarks.html"><span class="num">14</span>Benchmarks</a>
+<a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -56,6 +57,8 @@
 <p class="crumb"><a href="index.html">Docs</a> / Overview</p>
 <h1>Overview</h1>
 <p class="page-sub">Firstpass is an open-source adaptive LLM router. Every request opens on the cheapest model in a ladder; a gate checks the actual output; it serves the first output that passes and escalates one rung only on gate failure. Every decision gets a tamper-evident, hash-chained receipt.</p>
+
+<div class="tldr">Firstpass is an <b>open-source verification-gated LLM cascade router</b>, v0.2.1, pre-GA. Every request opens on the cheapest model; a gate <b>proves the real output</b> before serving it; on gate failure, it escalates exactly one rung. Four moves — <b>Route → Prove → Escalate → Learn</b> — on every request. It sits as an HTTP reverse proxy between your agent and any provider; your agent code doesn't change.</div>
 
 <div class="chips">
   <div class="chip good"><div class="cn">≤10<span class="u">%</span></div><div class="cl">served-failure, 95% conf.</div></div>
@@ -65,13 +68,18 @@
 </div>
 
 <h2 id="what">What Firstpass is<a class="anchor" href="#what" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Most routers predict quality before any output exists — and when the prediction is wrong, you find out in production with no artifact explaining why. Firstpass <b>proves quality after</b>: open the cheapest model, gate the actual output, serve on pass, escalate one rung on fail. The positioning in one line: <b>proof over prediction</b>.</div>
+<p class="subh">Prediction-based routing and its limits</p>
 <p>Most model gateways route by <em>prediction</em>: a classifier reads the prompt and guesses which model can handle it, before a single token of output exists. If the guess is wrong, you find out in production — and there's no artifact explaining why the request went where it did.</p>
+<p class="subh">How proof routing works</p>
 <p>Firstpass routes by <strong>proof</strong>. It opens on the cheapest model, then <strong>gates the real output</strong> — runs your tests, checks a schema, asks a judge, or measures self-consistency. If the output passes, it serves. If it fails, it escalates exactly one rung and gates again. The cheap model handles most traffic; the expensive model is spent only when the cheap one is provably not enough.</p>
 <p>The positioning is one line: <strong>proof over prediction</strong> — verified cascade routing.</p>
-
+<div class="note"><span class="nt">Key idea</span> The "proof" is your definition of good — a test suite, a JSON schema, a pass/fail judge, or self-consistency across samples. Firstpass supplies the escalation machinery and the audit; you supply the criterion. That means routing is decided by the thing you already trust, not an opaque classifier — and every decision is explained by a gate result on the actual output, captured in a hash-chained receipt.</div>
 <div class="note"><span class="nt">Honest novelty</span> The cascade mechanism itself is prior art. Firstpass is not claiming to have invented cheap-model-first escalation. What is new is the combination in the section below — the audit, the calibration, and the guarantee wrapped around the cascade.</div>
+<div class="recap">Firstpass routes by <b>proof</b> — the cheap model attempts first, the gate decides from the real output, and only a provably failed gate triggers escalation.</div>
 
 <h2 id="moves">The four moves<a class="anchor" href="#moves" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><b>Route</b> opens the cheapest rung — no per-prompt prediction. <b>Prove</b> runs your gate on the real output. <b>Escalate</b> goes one rung on gate failure, budget-capped. <b>Learn</b> feeds outcomes back to self-tune the serve threshold. All four run on every request, in order, and your agent sees a single round-trip.</div>
 <p>Everything the router does reduces to four moves, in order, on every request.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 190" role="img" aria-labelledby="movesT">
 <title id="movesT">The four moves: Route opens on the cheapest model, Prove gates the real output, Escalate goes one rung up only on failure, and Learn feeds outcomes back so the serve threshold self-tunes.</title>
@@ -110,6 +118,7 @@
 <line x1="742" y1="94" x2="796" y2="94" class="n-stroke" stroke-width="1.8" marker-end="url(#m1)"/>
 <defs><marker id="m1" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
 </svg></div>
+<p class="subh">What each move does</p>
 <div class="defs">
   <div class="row"><div class="k">Route</div><div class="v">Open the cheapest rung in the ladder. No per-prompt prediction — the cheap model takes the first pass.</div></div>
   <div class="row"><div class="k">Prove</div><div class="v">Gate the real output, not the prompt. Built-in checks, your test suite, an LLM judge, or self-consistency.</div></div>
@@ -117,9 +126,13 @@
   <div class="row"><div class="k">Learn</div><div class="v">Deferred outcomes feed back through <code>/v1/feedback</code>; adaptive conformal moves the serve threshold under drift.</div></div>
 </div>
 <p><a href="how-it-works.html">How it works</a> follows a single request through all four in detail.</p>
+<div class="note info"><span class="nt">Under the hood</span> Firstpass is an HTTP reverse proxy sitting below your agent. It accepts the same <code>POST /v1/messages</code> (Anthropic dialect) or <code>POST /v1/chat/completions</code> (OpenAI dialect) your agent would send to a provider, swaps only the <code>model</code> field when routing, and forwards everything else verbatim. SSE streaming is buffered so the gate can run, then re-emitted as SSE — your agent sees a normal response. The four moves all happen in that buffer window, transparently.</div>
+<div class="recap">Every request follows Route → Prove → Escalate → Learn in a single round-trip; your agent points at Firstpass the same way it points at any provider.</div>
 
 <h2 id="novelty">What is actually new<a class="anchor" href="#novelty" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The cascade idea — cheap model first, escalate on failure — is prior art. What Firstpass adds: <b>tamper-evident hash-chained audit</b>, <b>outcome-calibrated serve threshold</b>, <b>zero-retrain model onboarding</b>, <b>predict-to-start + verify-to-serve</b>, and a <b>distribution-free served-failure guarantee</b> earned from a real run.</div>
 <p>Five things, and Firstpass is precise about which are novel versus assembled from known parts:</p>
+<p class="subh">The five novelties, precisely stated</p>
 <ol>
   <li><strong>Tamper-evident audit + independent verification.</strong> Every decision is a hash-chained receipt; an external auditor re-derives the whole chain from genesis with no access to the proxy or its database. See <a href="receipts.html">Receipts &amp; audit</a>.</li>
   <li><strong>Outcome-feedback calibration of the serve threshold.</strong> Real outcomes — not prompt features — move the threshold that decides serve-versus-escalate. See <a href="guarantee.html#adaptive">Adaptive conformal</a>.</li>
@@ -127,16 +140,24 @@
   <li><strong>Predict-to-start, verify-to-serve.</strong> A learned start-rung bandit predicts <em>where to begin</em>; the gate still proves <em>what to serve</em>. Prediction sets the entry point; proof sets the exit. See <a href="routing.html#startrung">Learned start-rung</a>.</li>
   <li><strong>A served-failure guarantee.</strong> A distribution-free bound on how often a wrong answer is served, earned from a real run. See <a href="guarantee.html">The guarantee</a>.</li>
 </ol>
+<div class="note"><span class="nt">Key idea</span> "Prediction sets the entry point; proof sets the exit." A learned bandit can pick a smarter starting rung for efficiency — but the gate is still what decides whether that output is served. Speed and correctness are separate problems, solved by separate mechanisms, and neither undermines the other.</div>
+<div class="recap">The five novelties are separable and stackable — audit, calibration, and the guarantee each add value independently and compound when combined.</div>
 
 <h2 id="who">Who it's for<a class="anchor" href="#who" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Three ideal-fit profiles: teams <b>paying frontier prices on tasks a cheap model could handle</b>; anyone who needs a tamper-evident <b>"why" for every routing decision</b>; builders with an existing definition of "good" — tests, schemas, rubrics — who want routing by <b>their</b> criterion instead of a vendor classifier.</div>
+<p class="subh">The three ideal-fit profiles</p>
 <ul>
   <li><strong>Teams running agents at volume</strong> who pay for a frontier model on requests a cheap model could have handled — and want the savings without gambling on quality.</li>
   <li><strong>Anyone who has to answer "why did the model say that?"</strong> — regulated workflows, incident reviews, or a customer dispute. The receipt is the answer.</li>
   <li><strong>Builders who already have a notion of "good"</strong> — a test suite, a schema, a rubric — and want routing decided by that definition instead of a vendor's opaque classifier.</li>
 </ul>
+<div class="note"><span class="nt">Key idea</span> If you already have a test suite that runs in seconds, you already have a gate. Plug it in and every routing decision becomes: "did the cheap model pass your tests?" The receipt that explains the routing decision comes for free — the same artifact that routes also audits.</div>
+<div class="recap">Firstpass fits best when you have a definition of "good" you can run, and a cost problem you can see in the bill.</div>
 
 <h2 id="status">Status<a class="anchor" href="#status" aria-label="Link to this section">#</a></h2>
+<div class="tldr">v0.2.1 is <b>shipped and running</b>. The "Shipped &amp; verified" column is available and on by default. The "Next / research" column is gated on further validation — nothing there ships as a default, and every feature is <b>opt-in only</b>.</div>
 <p>Firstpass is <strong>v0.2.1, pre-GA</strong>, and honest about the line between shipped and researched.</p>
+<p class="subh">Shipped vs. in progress</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Shipped &amp; verified</th><th>Next / research</th></tr></thead>
   <tbody>
@@ -149,8 +170,11 @@
     <tr><td>Modes, provider-smoke CI</td><td></td></tr>
   </tbody>
 </table></div>
+<div class="note info"><span class="nt">Under the hood</span> Elastic verification (ADR 0008) is implemented and config-gated but <strong>off by default</strong>. Enable it by supplying a calibrated λ under <code>escalation.elastic</code> in your config. The conformal guarantee and the served-failure bound hold whether or not elastic mode is on.</div>
+<div class="recap">The shipped column is available today; the next column is gated on further validation — see <a href="benchmarks.html">Benchmarks</a> for the live data behind the guarantee.</div>
 
 <h2 id="next">Where to go next<a class="anchor" href="#next" aria-label="Link to this section">#</a></h2>
+<div class="tldr">New here: start with <a href="how-it-works.html"><b>How it works</b></a> for the full request lifecycle. Evaluating routing quality: go to <a href="guarantee.html"><b>The guarantee</b></a> for the live data. Ready to build: the <a href="quickstart.html"><b>Quickstart</b></a> gets you routed in minutes.</div>
 <ul>
   <li><a href="how-it-works.html">How it works</a> — the full request flow, observe vs enforce, and the anatomy of one decision.</li>
   <li><a href="gates.html">Gates</a> — the mechanism that makes routing proof-based.</li>
@@ -172,5 +196,5 @@
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

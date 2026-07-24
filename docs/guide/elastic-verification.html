@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -31,24 +31,25 @@
 <div class="grp"><p class="grp-t">Getting started</p>
 <a href="index.html"><span class="num">01</span>Overview</a>
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
-<a href="how-it-works.html"><span class="num">03</span>How it works</a>
-<a href="request-flow.html"><span class="num">04</span>Routing, end to end</a>
+<a href="requests-101.html"><span class="num">03</span>Requests 101</a>
+<a href="how-it-works.html"><span class="num">04</span>How it works</a>
+<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
-<a href="gates.html"><span class="num">05</span>Gates</a>
-<a href="routing.html"><span class="num">06</span>Routing &amp; escalation</a>
-<a href="guarantee.html"><span class="num">07</span>The guarantee</a>
-<a href="receipts.html"><span class="num">08</span>Receipts &amp; audit</a>
+<a href="gates.html"><span class="num">06</span>Gates</a>
+<a href="routing.html"><span class="num">07</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">08</span>The guarantee</a>
+<a href="receipts.html"><span class="num">09</span>Receipts &amp; audit</a>
 </div>
 <div class="grp"><p class="grp-t">Reference</p>
-<a href="providers.html"><span class="num">09</span>Providers</a>
-<a href="configuration.html"><span class="num">10</span>Configuration</a>
-<a href="cli.html"><span class="num">11</span>CLI reference</a>
-<a href="api.html"><span class="num">12</span>API &amp; MCP</a>
+<a href="providers.html"><span class="num">10</span>Providers</a>
+<a href="configuration.html"><span class="num">11</span>Configuration</a>
+<a href="cli.html"><span class="num">12</span>CLI reference</a>
+<a href="api.html"><span class="num">13</span>API &amp; MCP</a>
 </div>
 <div class="grp"><p class="grp-t">Research &amp; data</p>
-<a href="elastic-verification.html" aria-current="page"><span class="num">13</span>Elastic verification</a>
-<a href="benchmarks.html"><span class="num">14</span>Benchmarks</a>
+<a href="elastic-verification.html" aria-current="page"><span class="num">14</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -57,10 +58,25 @@
 <h1>Elastic verification</h1>
 <p class="page-sub">Verify <em>proportional to doubt</em>: run a cheap probe, and only pay for expensive verification where the probe is uncertain — with a conformal guarantee over the verify/skip decision itself. The serving path is implemented and off by default; you turn it on with a calibrated threshold.</p>
 
+<div class="tldr">Uniform verification charges the full gate on every output. Elastic verification asks a cheap question first — <b>how uncertain are the samples?</b> — and collapses 77% of traffic to a probe-only decision at ~99% safety, letting the expensive gate concentrate on the 23% that is genuinely mixed. The <b>serving path is implemented, config-gated, and off by default</b>; supply a calibrated <b>λ</b> under <code>escalation.elastic</code> to enable it. The pre-registered entropy signal failed; the page explains what validated instead and why.</div>
+
 <div class="note warn"><span class="nt">Status: implemented, default-off</span> The serving path is <strong>in the code, config-gated, and off by default</strong> — supply a calibrated <span class="mono">λ</span> under <span class="mono">escalation.elastic</span> to enable it; until you do, Firstpass serves exactly as it does today. The go/no-go study below came back GO with a corrected signal. Uniform verification remains the default — elastic verification earns <em>default</em> status only after it replicates on your distribution.</div>
 
+<div class="chips" style="margin-top:26px">
+  <div class="chip good"><div class="cn">77<span class="u">%</span></div><div class="cl">traffic decided by cheap probe alone</div></div>
+  <div class="chip good"><div class="cn">99<span class="u">%</span></div><div class="cl">skip-safety when all 5 probes pass</div></div>
+  <div class="chip"><div class="cn">23<span class="u">%</span></div><div class="cl">uncertain middle — gate concentrates here</div></div>
+  <div class="chip"><div class="cn">k=5</div><div class="cl">cheap samples per request</div></div>
+</div>
+
 <h2 id="idea">The idea<a class="anchor" href="#idea" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Uniform verification pays full gate cost on every output, easy or hard. The elastic alternative inserts a cheap probe step: it runs <b>k cheap samples</b> and counts visible passes. Outputs that are <em>obviously correct</em> (all k pass) skip the gate; outputs that are <em>obviously wrong</em> (none pass) escalate immediately; only the <em>genuinely uncertain</em> middle runs the full gate. The skip/verify decision is placed under a conformal guarantee so that skipping stays safe by construction — not by optimism.</div>
+
+<p class="subh">Uniform vs elastic — the key difference</p>
 <p>Today every served output pays for the gate. But most outputs are obviously fine or obviously broken — uniform verification spends the same effort on both. Elastic verification asks a cheaper question first: <strong>how much doubt is there?</strong> A cheap probe sorts traffic into "clearly serve," "clearly escalate," and "genuinely uncertain," and only the uncertain slice pays for the full gate. The verify/skip decision itself is placed under a conformal guarantee, so skipping stays safe by construction.</p>
+
+<div class="note"><span class="nt">Key idea</span> The probe doesn't decide what is <em>correct</em> — only where <em>doubt</em> lives. A unanimous probe (all k pass, or none pass) tells you something reliable about the output's quality with high probability. A split probe tells you the output is genuinely uncertain, and that is exactly the slice that should pay for the full gate. The insight is that confidence is checkable cheaply even when correctness is not.</div>
+
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 340" role="img" aria-labelledby="probeT">
 <title id="probeT">The elastic-verification probe: one request fans out into k=5 cheap samples; the number of visible passes is tallied, then routed to one of three regimes — 0 of 5 escalate now, 1 to 4 of 5 run the full gate, 5 of 5 serve and skip the expensive gate.</title>
 <defs><marker id="pb" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
@@ -122,7 +138,14 @@
   <figcaption>k=5 cheap probes fan out; the visible-pass count routes each request to escalate now, run the full gate, or serve directly — verification budget collapses onto the uncertain middle.</figcaption>
 </div>
 
+<div class="note info"><span class="nt">Under the hood</span> The conformal guarantee on the skip decision works by bounding the probability of a wrong skip. It isn't a soft heuristic — skipping when all k samples pass is justified by a statistical coverage argument: at k=5 with 99% oracle-correct rate in the study, the probability of a bad skip is bounded by construction. When you calibrate λ on your own distribution in shadow mode you are measuring whether your data meets that same threshold before trusting the skip path.</div>
+
+<div class="recap">Elastic verification sorts traffic by doubt, not by content — only the uncertain 23% pays full gate cost, and the skip decision is covered by a conformal guarantee, not guesswork.</div>
+
 <h2 id="study">The validation study<a class="anchor" href="#study" aria-label="Link to this section">#</a></h2>
+<div class="tldr">ADR 0008 pre-registered a go/no-go: build the skip logic only if a probe signal is meaningfully better than chance <em>and</em> skip-safety is high. <b>k=5</b> samples per task over <b>n=150 MBPP</b> tasks with a cheap model. The pre-registered signal — entropy AUC — failed at 0.431, below the no-signal line. The winning signal is <b>visible-pass count</b>, which was not pre-registered but is reported as such. GO verdict, with the corrected signal. Numbers hold for this distribution; replicate on yours before enabling.</div>
+
+<p class="subh">What was measured, and what wasn't</p>
 <p>ADR 0008 pre-registered a go/no-go: build the skip logic only if a probe signal is meaningfully better than chance <em>and</em> skip-safety is high. The study (<code>docs/benchmarks/probe-study-mbpp.txt</code>) ran <code>k=5</code> samples per task over <code>n=150</code> MBPP tasks with a cheap model.</p>
 <div class="chips">
   <div class="chip"><div class="cn">k=5</div><div class="cl">samples per task</div></div>
@@ -131,7 +154,15 @@
   <div class="chip good"><div class="cn">77<span class="u">%</span></div><div class="cl">traffic decidable by probe alone</div></div>
 </div>
 
+<div class="note info"><span class="nt">Under the hood</span> MBPP (Mostly Basic Programming Problems) is a benchmark of ~370 Python programming tasks with test-suite oracles — a good fit for visible-pass counting because "passes all tests" is a clean boolean gate. The study deliberately chose a distribution where the probe signal could be measured with high confidence. This is also the limitation: MBPP is code-correct, short-output, single-model. The regimes need measurement on your actual distribution — open-ended generation, multi-step reasoning, and longer outputs may produce very different traffic splits.</div>
+
+<div class="note warn"><span class="nt">Common mistake</span> Reading the 77%/99% numbers as if they apply to your workload. They apply to this study's distribution: n=150 MBPP tasks, one cheap model, code-correct gate. For a different task kind — creative writing, multi-hop reasoning, tool-use chains — the regime splits may look entirely different. The point of shadow mode (see <a href="#phase1">Turning it on safely</a>) is to measure your own splits before the skip path touches anything you serve.</div>
+
+<div class="recap">The GO verdict is justified by visible-pass count on n=150 MBPP with a cheap model — the pre-registered entropy signal failed; the corrected signal validated. Replicate before generalizing.</div>
+
 <h2 id="regimes">The three regimes<a class="anchor" href="#regimes" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The winning signal is the <b>visible-pass count</b> across k cheap samples. It cleanly splits traffic: <b>0/5</b> → escalate now (12% of traffic, 0% oracle-correct); <b>5/5</b> → serve, skip gate (65%, 99% oracle-correct); <b>1–4/5</b> → run the gate (23%, mixed). Verification budget collapses onto the 23% that actually needs it — the other 77% is decided by the cheap probe alone, at roughly 99% safety.</div>
+
 <p>The winning signal is the <strong>visible-pass count</strong> across the <code>k</code> cheap samples. It cleanly splits traffic into three regimes:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 360" role="img" aria-labelledby="rgT">
 <title id="rgT">Elastic verification probe study (k=5, n=150 MBPP): 0 of 5 visible passes covers 12% of traffic at 0% oracle-correct, so escalate now; 5 of 5 covers 65% at 99% oracle-correct, so serve without the expensive gate; 1 to 4 of 5 covers 23% and is mixed, so run the gate. 77% of traffic is decidable by the cheap probe alone at about 99% safety.</title>
@@ -170,21 +201,63 @@
     <tr><td>5 / 5 visible passes</td><td>65%</td><td>99%</td><td>Serve — skip the expensive gate.</td></tr>
   </tbody>
 </table></div>
+
+<p class="subh">Why the boundaries work</p>
 <p>The verification budget collapses onto the 23% that actually needs it. The other 77% is decided by the cheap probe alone, at roughly 99% safety.</p>
+<p>The structural reason the extremes are reliable: if <em>none</em> of k independent cheap-model attempts passes the gate, the task is almost certainly beyond what the cheap model can handle — escalation is appropriate and no budget is wasted on a known failure. If <em>all k</em> pass, the consensus of independent samples is a strong positive signal; in the study that unanimity corresponded to 99% oracle-correctness, making a conformal skip safe. The 1–4 range is genuinely ambiguous — cheap samples disagree — and that is exactly where paying for the full gate is worth it.</p>
+
+<div class="note"><span class="nt">Key idea</span> The 0/5 boundary is a hard structural signal, not just low confidence: every independent sample failed, which means the cheap model consistently cannot solve the task. The 5/5 boundary is a strong consensus: every independent attempt found an answer that passes the gate. The middle — where samples disagree — is the only range that carries irreducible uncertainty, and that is where the full gate earns its cost.</div>
+
+<div class="recap">Verification collapses onto the 23% where cheap samples genuinely disagree — the unanimous extremes (0/5 and 5/5) are decided by the probe alone at high reliability.</div>
 
 <h2 id="entropy">Why entropy failed<a class="anchor" href="#entropy" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The pre-registered signal was entropy AUC of self-consistency against oracle-failure. It came back at <b>0.431</b>, below the 0.5 no-signal line. Entropy measures <em>spread</em>, not <em>direction</em> — five samples that all fail look as "confident" as five that all pass. Visible-pass count carries the directional signal entropy discards, and that is the signal that validated. The failed metric is reported as failed.</div>
+
+<p class="subh">The direction problem</p>
 <p>The study is honest about what did <em>not</em> work. The pre-registered continuous metric — the AUC of self-consistency <strong>entropy</strong> against oracle-failure — came back at <strong>0.431</strong>, below the 0.5 no-signal line. Entropy discards <em>direction</em>: it measures how spread the samples are, not whether they agree on the <em>right</em> answer. Five samples that all fail look as "confident" as five that all pass.</p>
+
+<div class="note info"><span class="nt">Under the hood</span> AUC (area under the ROC curve) measures how well a continuous score separates two classes — here, oracle-pass vs oracle-fail. An AUC of 0.5 means the score is no better than random at separating them; 0.431 is slightly <em>worse</em> than random, which can happen when the score carries an inverted signal or pure noise. Entropy carries inverted signal for the extreme regimes: 0/5 and 5/5 are both <em>low entropy</em> (high agreement), but they have opposite oracle-correctness. A metric that treats those two identically will never separate them, and that is exactly what 0.431 reflects.</div>
+
 <div class="note"><span class="nt">The correction</span> The verdict is GO — but justified by the pass-count regime signal, not the entropy AUC. Firstpass ships the signal that validated, and says so plainly. A metric that failed its pre-registration is reported as failed.</div>
 
+<div class="note"><span class="nt">Key idea</span> If you design a new probe signal: measure direction, not just spread. Self-consistency in the sense of "all samples agree" is only useful if you also know what they agree <em>on</em>. Pass-count captures that; entropy does not. This distinction is the lesson that makes visible-pass count the right signal for gate-compatible tasks.</div>
+
+<div class="recap">Entropy AUC = 0.431; it failed because it discards direction. Visible-pass count carries direction and validated — the failed metric is named, not buried.</div>
+
 <h2 id="phase1">Turning it on safely<a class="anchor" href="#phase1" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The serving path is merged, config-gated, and off by default. Supply <code>escalation.elastic</code> with a calibrated <b>λ</b> to enable; leave it absent for byte-identical behavior. The recommended first step is <b>shadow mode</b>: compute the probe signal on live traffic and record it on the receipt without acting on it, so you verify the three regimes hold on your distribution before any skip logic touches what you serve. Measure, then enable.</div>
+
+<p class="subh">Shadow mode — the recommended first step</p>
 <p>The serving path is merged and <strong>config-gated, default-off</strong>: set <span class="mono">escalation.elastic</span> with a calibrated <span class="mono">λ</span> and the expensive gates to skip, and elastic verification takes effect; leave it unset and behavior is byte-identical to today. The recommended first move is <strong>shadow measurement</strong> — compute the probe signal on live traffic and record it on the receipt <em>without acting on it</em> — so you confirm the three regimes hold on your own distribution before any skip logic touches what you serve. Measure, then enable.</p>
 
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># firstpass.toml</span>
+<span class="tk-c"># Step 1 — shadow: record the probe signal on receipts without acting on it.</span>
+<span class="tk-c"># Leave escalation.elastic absent. Run traffic. Inspect your regime splits.</span>
+<span class="tk-c">#</span>
+<span class="tk-c"># Step 2 — enable: once your own 5/5 regime shows ≥99% oracle-correct,</span>
+<span class="tk-c"># supply a calibrated λ to activate the skip path.</span>
+
+[escalation.elastic]
+lambda = 0.9      <span class="tk-c"># example — calibrate this on YOUR distribution's shadow data</span></code></pre></div>
+
+<div class="note info"><span class="nt">Under the hood</span> "Config-gated, default-off" means exactly that: the serving path code is compiled in and present; when <code>escalation.elastic</code> is absent from the config, the router skips the elastic branch entirely and falls through to uniform verification as if the branch does not exist. Byte-for-byte identical behavior. Setting <code>escalation.elastic</code> activates the probe on every request for that escalation tier, runs k cheap samples in parallel, and routes by visible-pass count. The probe result is also written to the receipt so you can audit which requests were skipped, which were escalated, and which ran the full gate.</div>
+
+<div class="note warn"><span class="nt">Common mistake</span> Enabling elastic verification without first running shadow measurement on your own traffic. The regime splits in this page come from MBPP with a cheap model. Your distribution may have a smaller 5/5 block, a different mix in the uncertain middle, or task types where the cheap probe cannot form a meaningful signal at all. Enabling without validation risks skipping the gate on a 5/5 cohort that is not actually 99% oracle-correct on your data. Shadow mode costs only the probe samples — it does not change what you serve — so there is no reason to skip it.</div>
+
+<div class="recap">Supply <code>escalation.elastic</code> with a calibrated λ to enable; leave it absent for byte-identical uniform verification. Always validate the regime splits on your distribution in shadow mode first.</div>
+
 <h2 id="caveats">Caveats<a class="anchor" href="#caveats" aria-label="Link to this section">#</a></h2>
+<div class="tldr">One model, one distribution, n=150. The regimes need replication on other task kinds before elastic verification earns default status. Probe cost is real — k=5 cheap samples cost something, and that cost must be covered by the gate savings on the 77% skip path. Not a default today; uniform verification is the shipped behavior.</div>
+
 <ul>
   <li><strong>One model, one distribution.</strong> The study is <code>n=150</code>, a single cheap model, MBPP only. The regimes must replicate on other task kinds before default-on.</li>
   <li><strong>Probe cost is real.</strong> <code>k=5</code> cheap samples cost something; the win is that they're far cheaper than the expensive gate they replace on 77% of traffic.</li>
   <li><strong>Not a default.</strong> Uniform verification remains the shipped behavior. Elastic verification earns default status only after replication.</li>
 </ul>
+
+<div class="note"><span class="nt">Key idea</span> The savings case holds when two things are true simultaneously: the 5/5 block on your distribution is large enough and reliable enough (close to 99% oracle-correct), and the gate cost being skipped is substantially more expensive than k cheap probe samples. If your traffic lands mostly in the uncertain middle, or if your task type defeats cheap-probe signal, elastic verification may add probe cost without meaningful gate savings. Shadow mode tells you which case you are in before you commit.</div>
+
+<div class="recap">Elastic verification is implemented and off by default — it earns its place on your stack through shadow validation on your distribution, not by inheriting the study's numbers.</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="api.html"><span class="dir">← Previous</span><span class="t">API & MCP</span></a><a class="next" href="benchmarks.html"><span class="dir">Next →</span><span class="t">Benchmarks</span></a></nav>
 </main>
@@ -200,5 +273,5 @@
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

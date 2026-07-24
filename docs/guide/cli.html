@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -31,24 +31,25 @@
 <div class="grp"><p class="grp-t">Getting started</p>
 <a href="index.html"><span class="num">01</span>Overview</a>
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
-<a href="how-it-works.html"><span class="num">03</span>How it works</a>
-<a href="request-flow.html"><span class="num">04</span>Routing, end to end</a>
+<a href="requests-101.html"><span class="num">03</span>Requests 101</a>
+<a href="how-it-works.html"><span class="num">04</span>How it works</a>
+<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
-<a href="gates.html"><span class="num">05</span>Gates</a>
-<a href="routing.html"><span class="num">06</span>Routing &amp; escalation</a>
-<a href="guarantee.html"><span class="num">07</span>The guarantee</a>
-<a href="receipts.html"><span class="num">08</span>Receipts &amp; audit</a>
+<a href="gates.html"><span class="num">06</span>Gates</a>
+<a href="routing.html"><span class="num">07</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">08</span>The guarantee</a>
+<a href="receipts.html"><span class="num">09</span>Receipts &amp; audit</a>
 </div>
 <div class="grp"><p class="grp-t">Reference</p>
-<a href="providers.html"><span class="num">09</span>Providers</a>
-<a href="configuration.html"><span class="num">10</span>Configuration</a>
-<a href="cli.html" aria-current="page"><span class="num">11</span>CLI reference</a>
-<a href="api.html"><span class="num">12</span>API &amp; MCP</a>
+<a href="providers.html"><span class="num">10</span>Providers</a>
+<a href="configuration.html"><span class="num">11</span>Configuration</a>
+<a href="cli.html" aria-current="page"><span class="num">12</span>CLI reference</a>
+<a href="api.html"><span class="num">13</span>API &amp; MCP</a>
 </div>
 <div class="grp"><p class="grp-t">Research &amp; data</p>
-<a href="elastic-verification.html"><span class="num">13</span>Elastic verification</a>
-<a href="benchmarks.html"><span class="num">14</span>Benchmarks</a>
+<a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -57,14 +58,21 @@
 <h1>CLI reference</h1>
 <p class="page-sub">One binary, <code>firstpass</code>, covers the whole lifecycle — from agentic one-command setup to independent receipt verification. Every subcommand, grouped by what it's for.</p>
 
+<div class="tldr">One binary: <b><code>firstpass</code></b>. Three moves to get running — <b><code>onboard --apply</code></b> wires the proxy, <b><code>doctor</code></b> confirms it, <b><code>up</code></b> starts it. Every other subcommand (<code>trace</code>, <code>explain</code>, <code>savings</code>, <code>evals</code>, <code>verify</code>, <code>calibrate</code>, <code>ope</code>) is for understanding what the router already did and tuning it from evidence.</div>
+
 <h2 id="install">Install<a class="anchor" href="#install" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Four install paths — <b>script installer</b> (fastest for most), <b>pip/uvx</b> (works wherever Python does), <b>Homebrew</b> (macOS), <b>Docker</b> (isolation). All four land the same binary.</div>
+<p class="subh">Pick one installer</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh   # or:
 pip install firstpass          # or: uvx firstpass
 brew install dshakes/tap/firstpass-proxy
 docker run -p 8080:8080 ghcr.io/dshakes/firstpass
 cargo install --git https://github.com/dshakes/firstpass</code></pre></div>
+<div class="note warn"><span class="nt">Common mistake</span> Skipping <code>firstpass doctor</code> after install and going straight to <code>firstpass up</code>. Doctor validates your provider keys, config file, and network connectivity — problems that would cause a confusing crash or silent failure at startup show up cleanly there instead.</div>
+<div class="recap">Install with one command; run <b><code>firstpass doctor</code></b> before anything else to confirm everything is wired.</div>
 
 <h2 id="lifecycle">Lifecycle<a class="anchor" href="#lifecycle" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><b><code>onboard --apply</code></b> is a one-time agentic setup — it detects your existing provider config and wires the proxy in front of it. After that: <b><code>doctor</code></b> to confirm health, <b><code>up</code></b> to start routing. <b><code>offboard</code></b> cleanly undoes all of it.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Command</th><th>Does</th></tr></thead>
   <tbody>
@@ -74,11 +82,14 @@ cargo install --git https://github.com/dshakes/firstpass</code></pre></div>
     <tr><td><code>firstpass doctor</code></td><td>Diagnose config, keys, connectivity, and sandbox readiness.</td></tr>
   </tbody>
 </table></div>
+<div class="note"><span class="nt">Key idea</span> <code>firstpass onboard</code> without <code>--apply</code> is a <strong>dry run</strong> — it shows you exactly what it would change without writing anything. Add <code>--apply</code> to commit. This is the only command that modifies your environment; every other subcommand is read-only against your receipts and config.</div>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass onboard --apply
 firstpass doctor
 firstpass up</code></pre></div>
+<div class="recap">Onboard once, doctor to confirm, <b><code>up</code></b> to start — <b><code>offboard</code></b> if you ever need to cleanly remove the proxy.</div>
 
 <h2 id="inspect">Inspect<a class="anchor" href="#inspect" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Two concerns: <b>per-request visibility</b> (<code>trace</code>, <code>explain</code>) and <b>aggregate performance</b> (<code>savings</code>, <code>evals</code>, <code>modes</code>). Reach for <code>trace &lt;id&gt;</code> when a specific decision looks wrong; reach for <code>savings</code> to see whether routing is paying off overall.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Command</th><th>Does</th></tr></thead>
   <tbody>
@@ -89,8 +100,11 @@ firstpass up</code></pre></div>
     <tr><td><code>firstpass modes</code></td><td>Show the resolved preset for each mode.</td></tr>
   </tbody>
 </table></div>
+<div class="note"><span class="nt">Key idea</span> <code>trace &lt;id&gt;</code> gives you the raw receipt — rungs attempted, gate verdicts, per-rung cost and latency, hash chain link. <code>explain</code> translates that same receipt into a sentence: why the cheap rung, why this gate triggered, why escalation fired. Start with <code>explain</code> for the human answer; use <code>trace</code> when you want to verify the numbers or export the receipt.</div>
+<div class="recap">Use <b><code>trace</code></b> for the raw numbers, <b><code>explain</code></b> for the plain-English why, <b><code>savings</code></b> to see if it's paying off in aggregate.</div>
 
 <h2 id="audit">Audit &amp; calibrate<a class="anchor" href="#audit" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><b><code>export</code></b> seals receipts to portable JSONL; <b><code>verify</code></b> re-derives the hash chain offline (no proxy or database needed); <b><code>calibrate</code></b> computes a statistically-sound serve threshold from your own traffic in two flavors: split-conformal or Learn-then-Test.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Command</th><th>Does</th></tr></thead>
   <tbody>
@@ -100,11 +114,16 @@ firstpass up</code></pre></div>
     <tr><td><code>firstpass calibrate --method ltt</code></td><td>Learn-then-Test / RCPS — exact-binomial false-accept control.</td></tr>
   </tbody>
 </table></div>
+<div class="note"><span class="nt">Key idea</span> <code>firstpass verify --file receipts.jsonl</code> needs no running proxy and no database — it re-derives the hash chain from genesis purely from the exported JSONL. A third party (auditor, regulator, customer) can independently confirm the receipt log was not tampered with using only the file and the binary.</div>
+<div class="note info"><span class="nt">Under the hood</span> The receipt log is a hash chain: each receipt records a hash of the prior one. Tampering with any record breaks all subsequent links, so <code>verify</code> exits non-zero the moment the chain fails — no need to trust the storage layer.</div>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass export --out receipts.jsonl
 firstpass verify --file receipts.jsonl &amp;&amp; echo &quot;chain intact&quot;
 firstpass calibrate --method conformal --alpha 0.10 --delta 0.05</code></pre></div>
+<div class="note warn"><span class="nt">Common mistake</span> Running <code>calibrate</code> on too little traffic. Both methods produce valid bounds with small samples, but the confidence interval widens — the threshold may be set conservatively. A few hundred calls is workable; a few thousand is comfortable. Check <code>firstpass evals</code> to see how many gate samples you have before calibrating.</div>
+<div class="recap"><b><code>verify</code></b> is the tamper-check (offline, no proxy needed); <b><code>calibrate</code></b> sets the serve threshold from your own traffic data, not a guess.</div>
 
 <h2 id="rehearse">Rehearse &amp; modes<a class="anchor" href="#rehearse" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><b><code>ope</code></b> runs off-policy evaluation of a routing policy change against your recorded traffic — see the impact on cost and quality <em>before</em> you touch live traffic. <b><code>modes</code></b> shows what each named mode resolves to in practice.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Command</th><th>Does</th></tr></thead>
   <tbody>
@@ -112,9 +131,13 @@ firstpass calibrate --method conformal --alpha 0.10 --delta 0.05</code></pre></d
     <tr><td><code>firstpass modes</code></td><td>List modes and their resolved knobs.</td></tr>
   </tbody>
 </table></div>
+<div class="note"><span class="nt">Key idea</span> You don't need new live traffic to test a policy change. <code>ope</code> uses your existing receipts as a dataset and importance-weights them to correct for the fact that your current policy selected which requests ran where. This means you can safely evaluate "what if I added a second rung" or "what if I raised the gate threshold" without any live experiment.</div>
+<div class="recap"><b><code>ope</code></b> gives you evidence before you ship a policy change; <b><code>modes</code></b> tells you what the current config actually resolves to.</div>
 
 <h2 id="mcp">MCP server<a class="anchor" href="#mcp" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><b><code>firstpass mcp</code></b> starts a stdio MCP server exposing routing decisions, savings, evals, and receipts as tools. This is a <b>receipts-audit surface</b> — it runs alongside the proxy, not on the routed traffic path.</div>
 <p><code>firstpass mcp</code> starts a stdio MCP server so an agent can inspect routing, savings, evals, and receipts as tools. See <a href="api.html#mcp">API &amp; MCP</a> for the tool list.</p>
+<div class="note info"><span class="nt">Under the hood</span> <code>firstpass mcp</code> speaks stdio MCP — your agent connects to it as an MCP client and discovers its tools (<code>trace</code>, <code>savings</code>, <code>evals</code>, and others) automatically. It reads from the same receipt store the proxy writes to, but it is <strong>not in the request-handling path</strong>: routed traffic never passes through it. Use it when you want an agent to reason about its own routing history or audit its own receipts.</div>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass mcp        # stdio MCP server</code></pre></div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="configuration.html"><span class="dir">← Previous</span><span class="t">Configuration</span></a><a class="next" href="api.html"><span class="dir">Next →</span><span class="t">API & MCP</span></a></nav>
@@ -131,5 +154,5 @@ firstpass calibrate --method conformal --alpha 0.10 --delta 0.05</code></pre></d
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

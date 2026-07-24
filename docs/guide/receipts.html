@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -31,24 +31,25 @@
 <div class="grp"><p class="grp-t">Getting started</p>
 <a href="index.html"><span class="num">01</span>Overview</a>
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
-<a href="how-it-works.html"><span class="num">03</span>How it works</a>
-<a href="request-flow.html"><span class="num">04</span>Routing, end to end</a>
+<a href="requests-101.html"><span class="num">03</span>Requests 101</a>
+<a href="how-it-works.html"><span class="num">04</span>How it works</a>
+<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
-<a href="gates.html"><span class="num">05</span>Gates</a>
-<a href="routing.html"><span class="num">06</span>Routing &amp; escalation</a>
-<a href="guarantee.html"><span class="num">07</span>The guarantee</a>
-<a href="receipts.html" aria-current="page"><span class="num">08</span>Receipts &amp; audit</a>
+<a href="gates.html"><span class="num">06</span>Gates</a>
+<a href="routing.html"><span class="num">07</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">08</span>The guarantee</a>
+<a href="receipts.html" aria-current="page"><span class="num">09</span>Receipts &amp; audit</a>
 </div>
 <div class="grp"><p class="grp-t">Reference</p>
-<a href="providers.html"><span class="num">09</span>Providers</a>
-<a href="configuration.html"><span class="num">10</span>Configuration</a>
-<a href="cli.html"><span class="num">11</span>CLI reference</a>
-<a href="api.html"><span class="num">12</span>API &amp; MCP</a>
+<a href="providers.html"><span class="num">10</span>Providers</a>
+<a href="configuration.html"><span class="num">11</span>Configuration</a>
+<a href="cli.html"><span class="num">12</span>CLI reference</a>
+<a href="api.html"><span class="num">13</span>API &amp; MCP</a>
 </div>
 <div class="grp"><p class="grp-t">Research &amp; data</p>
-<a href="elastic-verification.html"><span class="num">13</span>Elastic verification</a>
-<a href="benchmarks.html"><span class="num">14</span>Benchmarks</a>
+<a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -57,10 +58,23 @@
 <h1>Receipts &amp; audit</h1>
 <p class="page-sub">Every decision becomes a SHA-256 hash-chained, append-only receipt. Export the sealed log and an external auditor re-derives the whole chain from genesis — with no access to the proxy or its database. Tamper or reorder, and verification breaks at that index and exits non-zero.</p>
 
+<div class="tldr">Every Firstpass call produces a <b>Trace</b> — a JSON receipt carrying the full routing decision: every rung attempted, each gate verdict, tokens and cost per attempt, and the model that served. Receipts are <b>SHA-256 hash-chained</b> from a genesis record, so the log is <b>tamper-evident by construction</b>. Export the sealed log and any auditor re-derives the whole chain from genesis — no proxy, no database, just math over a JSONL file.</div>
+
+<div class="chips" style="margin-top:26px">
+  <div class="chip good"><div class="cn">1</div><div class="cl">receipt written per call, atomically</div></div>
+  <div class="chip"><div class="cn">SHA-256</div><div class="cl">each record hashes its predecessor</div></div>
+  <div class="chip"><div class="cn">JSONL</div><div class="cl">portable, self-contained export</div></div>
+  <div class="chip good"><div class="cn">0</div><div class="cl">external dependencies to verify</div></div>
+</div>
+
 <h2 id="why">Why receipts<a class="anchor" href="#why" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A router that decides what your users see must be <b>answerable</b> — not just correct. Regulators, incident reviews, and customer disputes need proof of the <em>decision</em>, not just the outcome. A receipt names every rung tried, every gate verdict, the mode, the cost — and a cryptographic link to every prior decision — so accountability is provable, not asserted.</div>
 <p>A router that decides what your users see needs to be answerable. "The model chose it" is not an answer a regulator, an incident review, or a customer dispute will accept. Firstpass makes every decision <strong>independently checkable after the fact</strong>: the rungs tried, each gate verdict, the mode, the cost, and a cryptographic link to the decision before it.</p>
+<div class="note"><span class="nt">Key idea</span> "The model chose it" is not an audit trail. A receipt names the <em>routing decision</em>: which rungs were tried, which gates fired, what each one returned, what the final choice cost — and a cryptographic chain that lets anyone confirm the record hasn't been altered. The math replaces trust in the vendor.</div>
+<div class="recap">Receipts turn "the router did it" into a provable record — independently checkable, long after the call, without access to the running system.</div>
 
 <h2 id="chain">The hash chain<a class="anchor" href="#chain" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Each receipt stores the <b>SHA-256 of the previous receipt</b> in <code>prev_hash</code>, linking records from a genesis block to the head. Edit any record — its hash changes, and the <em>next</em> record's <code>prev_hash</code> no longer matches. <code>firstpass verify</code> re-derives the chain from genesis and <b>exits non-zero at the first broken index</b>. Everything before the break still verifies; the failure is localized and provable.</div>
 <p>Each receipt stores the SHA-256 hash of the previous record in <code>prev_hash</code>, forming an append-only chain from a genesis record. Because each hash covers the record's contents <em>and</em> its predecessor's hash, editing any record changes its hash — which no longer matches the next record's <code>prev_hash</code>. The chain is tamper-evident by construction.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="hcT">
 <title id="hcT">Hash chain: each receipt stores the SHA-256 of the previous record in prev_hash, so records link genesis to head. Tampering with one block changes its hash, so the next block's prev_hash no longer matches and verification fails at that index.</title>
@@ -113,31 +127,66 @@
 </svg>
   <figcaption>Edit one record and the break is localized and provable: everything before it still verifies, and the verifier exits non-zero at the exact index that was altered.</figcaption>
 </div>
+<div class="note info"><span class="nt">Under the hood</span> The hash is SHA-256 over the canonicalized record JSON — deterministic serialization ensures any two parties computing the same record reach the same digest. The genesis record's <code>prev_hash</code> is all zeros, the fixed starting point every verifier agrees on. Edit, reorder, or delete a record in place and verification fails at the next record whose <code>prev_hash</code> no longer matches its predecessor's hash.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Assuming the hash chain detects dropped receipts. It catches <em>tampering with written records</em> — any edit, reorder, or in-place deletion breaks a <code>prev_hash</code> link. But a receipt that was <em>never written</em> leaves the chain over the surviving records perfectly intact: there is no mismatch to find, because the missing record was never a link. The chain proves the integrity of what's there, not the completeness of what should be. Use <a href="#durable">durable mode</a> to close that write gap first; the chain handles everything else.</div>
+<div class="recap">Each receipt's SHA-256 hash covers its content and its predecessor's hash — edit, reorder, or delete any record and the break is localized and provable at the exact index.</div>
 
 <h2 id="record">A real receipt<a class="anchor" href="#record" aria-label="Link to this section">#</a></h2>
-<p>A receipt is a JSON object. The load-bearing fields are the sequence number, the attempts (each with its gate verdicts and cost), the mode, the total cost, and the two hashes:</p>
+<div class="tldr">A receipt (internally a <b>Trace</b>) carries: an <code>attempts[]</code> array — one entry per rung tried, with model, provider, in/out tokens, cost, latency, each gate's verdict, and the overall verdict — and a <code>final{}</code> block with the served rung and model, total cost, gate overhead, total latency, escalation count, the counterfactual baseline, and savings. The two hashes at the root are the chain links that make every record auditable.</div>
+<p>A receipt is a JSON object. The load-bearing fields are the trace id, the attempts (each with its gate verdicts and cost), the mode, the total cost, and the two hashes.</p>
+<p class="subh">The attempts array — one entry per rung tried</p>
+<p>Each entry in <code>attempts</code> records one model call end-to-end: which rung, which model and provider, how many tokens were consumed and at what cost, the latency, each gate's name and verdict, and the overall verdict (<code>"serve"</code> or <code>"escalate"</code>). If there are two attempts, the first rung failed a gate and the router escalated to the next rung automatically.</p>
+<p class="subh">The final block — the decision summary</p>
+<p>The <code>final</code> block summarizes what the caller received. <code>served_rung</code> and <code>served_from</code> name the winning attempt. <code>counterfactual_baseline_usd</code> is what the same call would have cost routed straight to the configured strong model; <code>savings_usd</code> is the difference. These two fields are how you audit the router's cost claim — per call, in the log, not in a dashboard you have to trust.</p>
 <div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
-  &quot;seq&quot;: 4021,
+  &quot;trace_id&quot;: &quot;tr_9f2c8a41d3e7&quot;,
   &quot;ts&quot;: &quot;2026-07-20T18:42:07Z&quot;,
-  &quot;request_id&quot;: &quot;req_9f2c8a41&quot;,
+  &quot;tenant_id&quot;: &quot;acme-prod&quot;,
+  &quot;session_id&quot;: &quot;sess_8821b&quot;,
   &quot;mode&quot;: &quot;balanced&quot;,
+  &quot;policy&quot;: &quot;default&quot;,
+  &quot;request&quot;: { &quot;api&quot;: &quot;anthropic.messages&quot;, &quot;prompt_hash&quot;: &quot;sha256:1a2b3c…&quot;,
+               &quot;features&quot;: { &quot;tool_count&quot;: 0, &quot;has_images&quot;: false } },
   &quot;attempts&quot;: [
-    { &quot;rung&quot;: 0, &quot;model&quot;: &quot;anthropic/claude-haiku-4-5&quot;,
-      &quot;gate&quot;: [{&quot;name&quot;: &quot;json-valid&quot;, &quot;verdict&quot;: &quot;pass&quot;},
-               {&quot;name&quot;: &quot;schema&quot;, &quot;verdict&quot;: &quot;fail&quot;, &quot;reason&quot;: &quot;missing &#x27;total&#x27;&quot;}],
-      &quot;cost_usd&quot;: 0.0003, &quot;escalated&quot;: true },
-    { &quot;rung&quot;: 1, &quot;model&quot;: &quot;openai/gpt-mini&quot;,
-      &quot;gate&quot;: [{&quot;name&quot;: &quot;json-valid&quot;, &quot;verdict&quot;: &quot;pass&quot;},
-               {&quot;name&quot;: &quot;schema&quot;, &quot;verdict&quot;: &quot;pass&quot;, &quot;score&quot;: 0.83}],
-      &quot;cost_usd&quot;: 0.0018, &quot;served&quot;: true }
+    {
+      &quot;rung&quot;: 0, &quot;model&quot;: &quot;anthropic/claude-haiku-4-5&quot;, &quot;provider&quot;: &quot;anthropic&quot;,
+      &quot;in_tokens&quot;: 312, &quot;out_tokens&quot;: 84, &quot;cost_usd&quot;: 0.0003, &quot;latency_ms&quot;: 418,
+      &quot;gates&quot;: [
+        { &quot;name&quot;: &quot;json-valid&quot;, &quot;verdict&quot;: &quot;pass&quot; },
+        { &quot;name&quot;: &quot;schema&quot;,     &quot;verdict&quot;: &quot;fail&quot;, &quot;reason&quot;: &quot;missing &#x27;total&#x27;&quot; }
+      ],
+      &quot;verdict&quot;: &quot;escalate&quot;
+    },
+    {
+      &quot;rung&quot;: 1, &quot;model&quot;: &quot;openai/gpt-4.1-mini&quot;, &quot;provider&quot;: &quot;openai&quot;,
+      &quot;in_tokens&quot;: 398, &quot;out_tokens&quot;: 91, &quot;cost_usd&quot;: 0.0018, &quot;latency_ms&quot;: 631,
+      &quot;gates&quot;: [
+        { &quot;name&quot;: &quot;json-valid&quot;, &quot;verdict&quot;: &quot;pass&quot; },
+        { &quot;name&quot;: &quot;schema&quot;,     &quot;verdict&quot;: &quot;pass&quot;, &quot;score&quot;: 0.83 }
+      ],
+      &quot;verdict&quot;: &quot;serve&quot;
+    }
   ],
-  &quot;gate_cost_usd&quot;: 0.0000,
-  &quot;total_cost_usd&quot;: 0.0021,
+  &quot;final&quot;: {
+    &quot;served_rung&quot;: 1,
+    &quot;served_from&quot;: &quot;openai/gpt-4.1-mini&quot;,
+    &quot;total_cost_usd&quot;: 0.0021,
+    &quot;gate_cost_usd&quot;: 0.0000,
+    &quot;total_latency_ms&quot;: 1049,
+    &quot;escalations&quot;: 1,
+    &quot;counterfactual_baseline_usd&quot;: 0.0089,
+    &quot;savings_usd&quot;: 0.0068
+  },
   &quot;prev_hash&quot;: &quot;sha256:a91f7c…&quot;,
   &quot;hash&quot;: &quot;sha256:5c02d9…&quot;
 }</code></pre></div>
+<div class="note"><span class="nt">Key idea</span> The receipt tells you <em>what would have happened</em> alongside what did. <code>counterfactual_baseline_usd</code> is the cost if every call had gone straight to the strong model; <code>savings_usd</code> is the difference. This is how you audit the router's savings claim — per call, in the log, without trusting a dashboard.</div>
+<div class="note info"><span class="nt">Under the hood</span> The savings counterfactual counts cache-read tokens at full input price — a known modeling gap if your workload is heavily cached. <code>total_cost_usd</code> is what Firstpass actually spent; what you would have spent unrouted depends on your provider's cache pricing, which Firstpass does not model.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Reading only <code>total_cost_usd</code> and ignoring <code>gate_cost_usd</code>. Gate cost is the overhead Firstpass added to verify the output; it is already folded into <code>total_cost_usd</code>, but isolating it lets you measure the verification tax against the savings shown in <code>savings_usd</code>.</div>
+<div class="recap">A receipt is a <b>Trace</b> — an <code>attempts[]</code> array with per-rung costs and gate verdicts, and a <code>final{}</code> block with savings accounting — plus the two hash links that make it chain-verifiable.</div>
 
 <h2 id="export">Export &amp; verify<a class="anchor" href="#export" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><code>firstpass export</code> seals the live log to a portable JSONL file; <code>firstpass verify</code> re-derives every hash from genesis and <b>exits non-zero at the first broken link</b>. The verifier needs only the file — no proxy, no database, no Firstpass running. Hand it to any third party and the math delivers the same verdict.</div>
 <p>Two commands, and the guarantee is independent of the running system:</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># 1. seal the log to portable JSONL</span>
 firstpass export --out receipts.jsonl
@@ -188,13 +237,18 @@ firstpass verify --file receipts.jsonl</code></pre></div>
 </div>
 <p><code>verify</code> reads only the file. It recomputes every hash from the genesis record forward and confirms each <code>prev_hash</code> link. If a record was edited, inserted, deleted, or reordered, the recomputed hash diverges and <code>verify</code> <strong>exits non-zero at the first broken index</strong> — a clean signal for CI or an external auditor. There is nothing to trust except the math and the file.</p>
 <div class="note"><span class="nt">Independent by design</span> The whole point is that verification needs nothing from Firstpass. Hand the JSONL to a third party; they run <code>firstpass verify</code> (or reimplement the check — it is just SHA-256 over a documented record) and get the same yes/no. The proxy could be offline, compromised, or gone.</div>
+<div class="recap">Export to JSONL, hand the file to any auditor with <code>firstpass verify</code>, and the math alone delivers the verdict — no proxy, no database required.</div>
 
 <h2 id="durable">Durable never-drop<a class="anchor" href="#durable" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The default write mode is <code>best_effort</code>. Under load, a dropped write creates a <b>gap in the chain</b> — indistinguishable from a deletion if you need a complete audit trail. <code>FIRSTPASS_RECEIPTS=durable</code> spills receipts to disk under backpressure and drains on boot, so <b>no decision is silently lost</b> and the chain stays valid across restarts and load spikes.</div>
 <p>Under load, a best-effort writer might drop a receipt — and a gap in the chain is as bad as a tamper. Durable mode closes that hole:</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>FIRSTPASS_RECEIPTS=durable firstpass up</code></pre></div>
 <p>With <code>FIRSTPASS_RECEIPTS=durable</code>, receipts <strong>spill to disk under backpressure</strong> and <strong>drain on boot</strong>, so no decision is lost and the chain stays valid across restarts and load spikes. The default is <code>best_effort</code>; switch to <code>durable</code> when an unbroken audit trail is a requirement, not a nicety.</p>
+<div class="note warn"><span class="nt">Common mistake</span> Relying on the hash chain alone to detect dropped receipts. A receipt that was never written leaves no hash mismatch — the chain over the surviving records stays intact, so <code>verify</code> reports success even though a record is missing. The chain attests integrity, not completeness; use durable mode when a gapless audit trail is a hard requirement.</div>
+<div class="recap">Durable mode closes the write gap: receipts spill to disk under backpressure and drain on restart — the hash chain then handles everything else.</div>
 
 <h2 id="compliance">Compliance<a class="anchor" href="#compliance" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The receipt chain is the foundation for compliance workflows: every served output traces to a full decision record, cost is itemized per call, tampering is provably detectable at a specific index, and the check runs <b>without the vendor in the loop</b>.</div>
 <p>The receipt chain is the substrate for audit and compliance workflows:</p>
 <ul>
   <li><strong>Answerability</strong> — every served output traces to a decision with its full rationale.</li>
@@ -203,6 +257,8 @@ firstpass verify --file receipts.jsonl</code></pre></div>
   <li><strong>Independence</strong> — the check runs without the vendor in the loop.</li>
 </ul>
 <p>Verify receipts programmatically over MCP with the <code>verify_receipts</code> tool — see <a href="api.html#mcp">API &amp; MCP</a>.</p>
+<div class="note"><span class="nt">Key idea</span> The MCP <code>verify_receipts</code> tool exposes the same chain-check over an API surface — useful for programmatic audits, CI pipelines, or regulatory exports where a human-run CLI is not the right integration point.</div>
+<div class="recap">The receipt log is independently auditable, cost-attributable per decision, and tamper-evident — the substrate for any compliance workflow that needs more than "trust the vendor."</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="guarantee.html"><span class="dir">← Previous</span><span class="t">The guarantee</span></a><a class="next" href="providers.html"><span class="dir">Next →</span><span class="t">Providers</span></a></nav>
 </main>
@@ -218,5 +274,5 @@ firstpass verify --file receipts.jsonl</code></pre></div>
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

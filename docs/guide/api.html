@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -31,24 +31,25 @@
 <div class="grp"><p class="grp-t">Getting started</p>
 <a href="index.html"><span class="num">01</span>Overview</a>
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
-<a href="how-it-works.html"><span class="num">03</span>How it works</a>
-<a href="request-flow.html"><span class="num">04</span>Routing, end to end</a>
+<a href="requests-101.html"><span class="num">03</span>Requests 101</a>
+<a href="how-it-works.html"><span class="num">04</span>How it works</a>
+<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
-<a href="gates.html"><span class="num">05</span>Gates</a>
-<a href="routing.html"><span class="num">06</span>Routing &amp; escalation</a>
-<a href="guarantee.html"><span class="num">07</span>The guarantee</a>
-<a href="receipts.html"><span class="num">08</span>Receipts &amp; audit</a>
+<a href="gates.html"><span class="num">06</span>Gates</a>
+<a href="routing.html"><span class="num">07</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">08</span>The guarantee</a>
+<a href="receipts.html"><span class="num">09</span>Receipts &amp; audit</a>
 </div>
 <div class="grp"><p class="grp-t">Reference</p>
-<a href="providers.html"><span class="num">09</span>Providers</a>
-<a href="configuration.html"><span class="num">10</span>Configuration</a>
-<a href="cli.html"><span class="num">11</span>CLI reference</a>
-<a href="api.html" aria-current="page"><span class="num">12</span>API &amp; MCP</a>
+<a href="providers.html"><span class="num">10</span>Providers</a>
+<a href="configuration.html"><span class="num">11</span>Configuration</a>
+<a href="cli.html"><span class="num">12</span>CLI reference</a>
+<a href="api.html" aria-current="page"><span class="num">13</span>API &amp; MCP</a>
 </div>
 <div class="grp"><p class="grp-t">Research &amp; data</p>
-<a href="elastic-verification.html"><span class="num">13</span>Elastic verification</a>
-<a href="benchmarks.html"><span class="num">14</span>Benchmarks</a>
+<a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -57,7 +58,19 @@
 <h1>API &amp; MCP</h1>
 <p class="page-sub">Firstpass exposes a small HTTP surface — both inbound dialects, deferred feedback, capabilities, health, and Prometheus metrics — plus an MCP stdio server so agents can inspect the router as native tools.</p>
 
+<div class="tldr">Six HTTP endpoints total: <b>two inbound dialects</b> (<code>POST /v1/messages</code> and <code>POST /v1/chat/completions</code>) that are <b>drop-in replacements</b> for direct provider calls, plus feedback, capabilities, health, and Prometheus metrics. Separately, <code>firstpass mcp</code> is a <b>stdio MCP server for self-audit</b> — it reads the router's own trace store so agents can inspect routing decisions, verify receipts, and rehearse policy changes. It is <b>not</b> an MCP proxy on the routed data plane.</div>
+
+<div class="note"><span class="nt">How to read this page</span> The first four sections cover the HTTP surface you point your client at. The <a href="#mcp">MCP server</a> section covers the audit-and-inspection tool — a distinct surface that is easy to confuse with the inbound proxy. Each section has a TL;DR up top and a one-line recap at the bottom.</div>
+
+<div class="chips" style="margin-top:26px">
+  <div class="chip good"><div class="cn">2</div><div class="cl">inbound dialects — Anthropic + OpenAI, drop-in</div></div>
+  <div class="chip"><div class="cn">POST</div><div class="cl">/v1/feedback closes the calibration loop</div></div>
+  <div class="chip"><div class="cn">stdio</div><div class="cl">firstpass mcp — self-audit, not a data-plane proxy</div></div>
+  <div class="chip good"><div class="cn">9</div><div class="cl">MCP tools for inspection, rehearsal, and audit</div></div>
+</div>
+
 <h2 id="endpoints">HTTP endpoints<a class="anchor" href="#endpoints" aria-label="Link to this section">#</a></h2>
+<div class="tldr">All six endpoints at a glance. The two inbound endpoints are <b>protocol-preserving drop-ins</b> — change the base URL, keep the rest of your request body exactly as it is. Feedback, capabilities, health, and metrics are separate paths.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Method &amp; path</th><th>Purpose</th></tr></thead>
   <tbody>
@@ -69,8 +82,11 @@
     <tr><td><code>GET /metrics</code></td><td>Prometheus exposition.</td></tr>
   </tbody>
 </table></div>
+<div class="recap">Six endpoints: <b>two inbound proxies</b>, one feedback intake, one capability query, and the standard health + metrics pair.</div>
 
 <h2 id="messages">Chat &amp; messages<a class="anchor" href="#messages" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Both inbound endpoints are <b>drop-in replacements</b> for direct provider calls. Send the exact same request body you were already sending; Firstpass rewrites only the <code>model</code> field to whichever rung is selected and forwards everything else verbatim — tools, <code>cache_control</code>, streaming, all of it.</div>
+<p class="subh">Drop-in for both dialects</p>
 <p>Both inbound endpoints are drop-in: keep your existing request body, point it at Firstpass, and it routes, gates, and serves. Override the mode per request with a header (<a href="routing.html#precedence">precedence</a>).</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl http://localhost:8080/v1/messages \
   -H &quot;content-type: application/json&quot; \
@@ -79,34 +95,54 @@
     &quot;model&quot;: &quot;auto&quot;,
     &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Write a function to merge two sorted lists.&quot;}]
   }&#x27;</code></pre></div>
+<div class="note"><span class="nt">Key idea</span> The forwarding is <strong>verbatim except for <code>model</code></strong>. Firstpass reads <code>model</code>, <code>tools</code> count, and image blocks to decide the rung; it then rewrites <code>model</code> to the selected rung's model string and forwards the entire request body unchanged. Tool schemas, <code>cache_control</code> blocks, and all other fields pass through byte-for-byte. If you set <code>cache_control</code>, provider-side prompt caching still works — Firstpass doesn't interfere with it.</div>
+<div class="note info"><span class="nt">Under the hood</span> SSE streaming is <strong>buffered to the gate</strong> before the response is served, then <strong>re-emitted as SSE</strong>. From the client's perspective the response format is identical to what the provider would send — you see the same streaming chunks. The buffering is what lets the gate run on the complete output before it is committed as the served answer.</div>
+<div class="recap">Both inbound endpoints are <b>drop-in</b>: change only the base URL; the request body is forwarded verbatim with only the <code>model</code> field rewritten to the selected rung.</div>
 
 <h2 id="feedback">Feedback<a class="anchor" href="#feedback" aria-label="Link to this section">#</a></h2>
+<div class="tldr">When a request's true outcome becomes known after the fact — CI green, reviewer approved, user rejected — <b>report it via <code>POST /v1/feedback</code></b>. This is what drives adaptive calibration: without outcome signals the serve threshold is static; with them it self-tunes to your real workload.</div>
+<p class="subh">Closing the calibration loop</p>
 <p>When a request's true outcome becomes known later — CI went green, a reviewer approved, a user rejected — report it. This is what makes the serve threshold self-tune.</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl http://localhost:8080/v1/feedback \
   -H &quot;content-type: application/json&quot; \
   -d &#x27;{ &quot;request_id&quot;: &quot;req_9f2c8a41&quot;, &quot;outcome&quot;: &quot;correct&quot; }&#x27;</code></pre></div>
+<div class="note"><span class="nt">Key idea</span> The gate alone gives you a proxy quality signal; feedback gives you the <em>real</em> one. The more outcome signals you send, the tighter the conformal calibration gets. High-volume pipelines with reliable automated outcomes (CI pass/fail, unit tests, structured evaluators) benefit most — the threshold tracks your actual workload rather than a generic prior.</div>
+<div class="recap"><code>POST /v1/feedback</code> ties a deferred real-world outcome to a past <code>request_id</code> and lets the <b>serve threshold self-tune</b> toward your workload.</div>
 
 <h2 id="caps">Capabilities &amp; health<a class="anchor" href="#caps" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><code>GET /v1/capabilities</code> returns what this instance supports — configured providers, available gates, and enabled modes. <code>GET /healthz</code> returns <code>200</code> when the instance is ready to serve.</div>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl http://localhost:8080/v1/capabilities   # providers, gates, modes
 curl http://localhost:8080/healthz           # 200 when ready</code></pre></div>
+<div class="note info"><span class="nt">Under the hood</span> Capabilities reflects the <em>resolved</em> configuration — what is actually active at runtime, not just what is configured. Use it to confirm that the providers and gates you expect are wired up before running a workload. Healthz is a simple liveness probe; wire it to your load-balancer or orchestrator readiness check.</div>
+<div class="recap"><code>/v1/capabilities</code> shows resolved runtime config; <code>/healthz</code> is the liveness probe — returns <b>200</b> when ready.</div>
 
 <h2 id="metrics">Metrics<a class="anchor" href="#metrics" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><code>GET /metrics</code> is standard Prometheus exposition. The two key gauges make the served-failure <b>guarantee observable</b>: the current serve threshold and the measured served-failure rate from reported outcomes. Alert on the latter.</div>
 <p><code>GET /metrics</code> is Prometheus exposition. The two gauges that make the guarantee observable:</p>
 <div class="defs">
   <div class="row"><div class="k">firstpass_serve_threshold</div><div class="v">Current serve threshold; moves with adaptive conformal.</div></div>
   <div class="row"><div class="k">firstpass_realized_served_failure</div><div class="v">Measured served-failure rate from reported outcomes — alert on this.</div></div>
 </div>
+<div class="note warn"><span class="nt">Common mistake</span> Watching only <code>firstpass_serve_threshold</code> and assuming it means the guarantee is holding. The threshold is the <em>target</em>; <code>firstpass_realized_served_failure</code> is the <em>measured outcome</em>. They diverge when the gate is mis-calibrated or feedback volume is low. Alert on the realized rate, not the threshold.</div>
+<div class="recap"><code>GET /metrics</code> is Prometheus; alert on <b>firstpass_realized_served_failure</b> — that is the actual served-failure rate from outcomes you reported, not just the target threshold.</div>
 
 <h2 id="headers">Request headers<a class="anchor" href="#headers" aria-label="Link to this section">#</a></h2>
+<div class="tldr">One header controls routing on a per-request basis: <code>x-firstpass-mode</code> overrides the mode for this request only and takes <b>highest precedence</b> over policy and config defaults.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Header</th><th>Effect</th></tr></thead>
   <tbody>
     <tr><td><code>x-firstpass-mode</code></td><td>Override the routing mode for this request (highest precedence).</td></tr>
   </tbody>
 </table></div>
+<div class="note"><span class="nt">Key idea</span> The mode header is useful for <strong>testing and pinning</strong>: set <code>x-firstpass-mode: observe</code> on a request to run it as a byte-passthrough without touching routing logic, or <code>quality</code> to force the strong rung for a specific call. See <a href="routing.html#precedence">routing precedence</a> for the full override order. Mode headers are not forwarded to the upstream provider — they are consumed by Firstpass and stripped before the call goes out.</div>
+<div class="recap"><code>x-firstpass-mode</code> overrides routing for <b>one request</b> and takes highest precedence — useful for testing, pinning, or bypassing the cascade entirely with <code>observe</code>.</div>
 
 <h2 id="mcp">MCP server tools<a class="anchor" href="#mcp" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><code>firstpass mcp</code> is a <b>stdio MCP server that reads the router's own trace store</b> — inspection, audit, explanation, and off-policy rehearsal as native agent tools. It is a <b>self-audit surface</b>, not an MCP proxy on the routed data plane. Your agent's MCP tool traffic passes through the HTTP inbound endpoints byte-for-byte; <code>firstpass mcp</code> is a separate server you wire up to <em>inspect</em> what the router did.</div>
+<p class="subh">Audit server, not data-plane proxy</p>
+<div class="note"><span class="nt">Key idea — audit vs data-plane</span> <code>firstpass mcp</code> and the Firstpass inbound proxy are <strong>two separate things</strong>. When your agent issues a model call that includes MCP-backed tools, that call arrives at <code>POST /v1/messages</code> or <code>POST /v1/chat/completions</code> as ordinary HTTP. Firstpass forwards the <code>tools</code> array verbatim — it does not speak MCP, intercept MCP connections, or manage MCP servers on your behalf. The <code>firstpass mcp</code> stdio server is a completely separate process you optionally wire up so that an agent can query the router's trace store, verify receipt integrity, and rehearse policy changes as native tool calls — it reads what the router already recorded, after the fact.</div>
 <p><code>firstpass mcp</code> is a stdio MCP server. It gives an agent first-class access to the router's state and controls — inspection, rehearsal, and audit, no HTTP glue:</p>
+<p class="subh">Tool reference</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Tool</th><th>Does</th></tr></thead>
   <tbody>
@@ -121,6 +157,8 @@ curl http://localhost:8080/healthz           # 200 when ready</code></pre></div>
     <tr><td><code>submit_feedback</code></td><td>Report a deferred outcome.</td></tr>
   </tbody>
 </table></div>
+<div class="note info"><span class="nt">Under the hood</span> Each routing decision is stored as a hash-chained <code>Trace</code> — every trace includes a <code>prev_hash</code> linking it to the one before, forming a tamper-evident chain over the full history. <code>verify_receipts</code> re-derives this chain end to end and surfaces any break. <code>rehearse_policy</code> runs off-policy evaluation on historical traces using importance-weighted estimators (IPS/SNIPS/DR) so you can estimate what a proposed routing change would have cost and what its served-failure rate would have been, before you deploy it. See <a href="receipts.html">Receipts &amp; audit</a> for the full trace schema.</div>
+<div class="recap"><code>firstpass mcp</code> is a <b>self-audit stdio server</b> over the trace store — nine tools for inspection, audit, and off-policy rehearsal. It is not on the routed data plane; inbound HTTP traffic flows through the proxy endpoints, not through this server.</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="cli.html"><span class="dir">← Previous</span><span class="t">CLI reference</span></a><a class="next" href="elastic-verification.html"><span class="dir">Next →</span><span class="t">Elastic verification</span></a></nav>
 </main>
@@ -136,5 +174,5 @@ curl http://localhost:8080/healthz           # 200 when ready</code></pre></div>
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

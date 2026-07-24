@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -31,24 +31,25 @@
 <div class="grp"><p class="grp-t">Getting started</p>
 <a href="index.html"><span class="num">01</span>Overview</a>
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
-<a href="how-it-works.html"><span class="num">03</span>How it works</a>
-<a href="request-flow.html"><span class="num">04</span>Routing, end to end</a>
+<a href="requests-101.html"><span class="num">03</span>Requests 101</a>
+<a href="how-it-works.html"><span class="num">04</span>How it works</a>
+<a href="request-flow.html"><span class="num">05</span>Routing, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
-<a href="gates.html"><span class="num">05</span>Gates</a>
-<a href="routing.html"><span class="num">06</span>Routing &amp; escalation</a>
-<a href="guarantee.html"><span class="num">07</span>The guarantee</a>
-<a href="receipts.html"><span class="num">08</span>Receipts &amp; audit</a>
+<a href="gates.html"><span class="num">06</span>Gates</a>
+<a href="routing.html"><span class="num">07</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">08</span>The guarantee</a>
+<a href="receipts.html"><span class="num">09</span>Receipts &amp; audit</a>
 </div>
 <div class="grp"><p class="grp-t">Reference</p>
-<a href="providers.html" aria-current="page"><span class="num">09</span>Providers</a>
-<a href="configuration.html"><span class="num">10</span>Configuration</a>
-<a href="cli.html"><span class="num">11</span>CLI reference</a>
-<a href="api.html"><span class="num">12</span>API &amp; MCP</a>
+<a href="providers.html" aria-current="page"><span class="num">10</span>Providers</a>
+<a href="configuration.html"><span class="num">11</span>Configuration</a>
+<a href="cli.html"><span class="num">12</span>CLI reference</a>
+<a href="api.html"><span class="num">13</span>API &amp; MCP</a>
 </div>
 <div class="grp"><p class="grp-t">Research &amp; data</p>
-<a href="elastic-verification.html"><span class="num">13</span>Elastic verification</a>
-<a href="benchmarks.html"><span class="num">14</span>Benchmarks</a>
+<a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -57,7 +58,10 @@
 <h1>Providers</h1>
 <p class="page-sub">A rung is <code>provider/model</code>. Firstpass ships built-in Anthropic and OpenAI providers and lets you add any OpenAI-compatible endpoint with a dialect and auth mode. Bring your own keys; Firstpass adds zero markup.</p>
 
+<div class="tldr">A rung is <b><code>provider/model</code></b>. Firstpass resolves the prefix at call time, calls the vendor API with <b>your own key</b>, and adds zero markup. <b>Anthropic and OpenAI are built in</b> — just set the env var and name the rung. Any other endpoint (Gemini, Bedrock, Vertex, self-hosted) becomes a rung with <b>four config lines</b> — a name, a base URL, a dialect, and an auth mode. Adding a new model is naming a new rung; <b>no classifier to retrain</b>.</div>
+
 <h2 id="model">The provider model<a class="anchor" href="#model" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Every rung has the form <b><code>provider/model</code></b>. The <code>provider</code> prefix is a routing namespace Firstpass resolves at call time to an HTTP endpoint and an auth scheme. The <code>model</code> part is forwarded in the outbound request body. <b>No retraining, no classifier</b> — onboarding a new model is a config line.</div>
 <p>Providers are the vendors behind the rungs. When you write <code>anthropic/claude-haiku-4-5</code> in a ladder, <code>anthropic</code> is the provider and <code>claude-haiku-4-5</code> is the model. Adding a new model is just naming a new rung — there is <strong>no classifier to retrain</strong>, which is what makes zero-retrain onboarding possible.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 360" role="img" aria-labelledby="fanT">
 <title id="fanT">Provider fan-out: one ladder of provider/model rungs routes through the Firstpass proxy, which resolves each rung to its provider and calls it with your own key. Built-in Anthropic and OpenAI, plus any OpenAI-compatible host, Gemini, AWS Bedrock via SigV4, Google Vertex via OAuth, and local runtimes — all bring-your-own-key, zero markup.</title>
@@ -110,8 +114,11 @@
 </svg>
   <figcaption>A rung is <code>provider/model</code>. The proxy resolves each rung to its provider and calls it with your own key — Anthropic and OpenAI built in, any OpenAI-compatible host, Gemini, Bedrock (SigV4), Vertex (OAuth), and local runtimes. Adding one is naming a rung; no classifier to retrain.</figcaption>
 </div>
+<div class="note"><span class="nt">Key idea</span> The <code>provider</code> prefix is a routing namespace resolved at call time — not at startup, not by a model classifier. Firstpass looks up the provider's <code>base_url</code>, <code>dialect</code>, and <code>auth</code> in config and calls the endpoint directly. That's what makes zero-retrain onboarding possible: a new model is a new string in a ladder, not a training run.</div>
+<div class="recap">A rung is <code>provider/model</code>; adding a provider is naming a config block, <b>not retraining anything</b>.</div>
 
 <h2 id="builtin">Built-in providers<a class="anchor" href="#builtin" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Anthropic and OpenAI require <b>no <code>[[provider]]</code> block</b> — just set the env var and name the rung. Firstpass reads the key from your environment, forwards it to the provider, and <b>never touches your billing</b>.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Provider</th><th>Prefix</th><th>Notes</th></tr></thead>
   <tbody>
@@ -120,18 +127,26 @@
   </tbody>
 </table></div>
 <p>Keys come from your environment; Firstpass never proxies through a billing account of its own. <strong>BYOK, zero markup</strong> — you pay the provider exactly what you would without Firstpass in the path.</p>
+<div class="note info"><span class="nt">Under the hood</span> Keys are read from environment variables (<code>ANTHROPIC_API_KEY</code>, <code>OPENAI_API_KEY</code>). Firstpass injects the key into the outbound request's auth header and never logs or stores it. The call goes directly from the proxy to the provider — no intermediate billing account.</div>
+<div class="recap">BYOK: <b>your key, your provider bill</b>, zero Firstpass markup.</div>
 
 <h2 id="custom">Custom providers<a class="anchor" href="#custom" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Any OpenAI-compatible endpoint becomes a rung with <b>four config lines</b>: a name, a base URL, a dialect, and an auth mode. Once declared, reference it as <code>name/model</code> in any ladder — same as a built-in.</div>
 <p>Any OpenAI-compatible endpoint becomes a provider with a <code>[[provider]]</code> block — self-hosted models, a gateway, or a cloud-managed endpoint:</p>
+<p class="subh">The four required fields</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[provider]]
 name     = &quot;myllm&quot;
 base_url = &quot;https://api.internal.example.com/v1&quot;
 dialect  = &quot;openai&quot;        # openai | anthropic | gemini
 auth     = &quot;api_key&quot;       # api_key | aws_sigv4 | gcp_oauth</code></pre></div>
 <p>Then use it in a ladder like any other: <code>myllm/mixtral-8x22b</code>.</p>
+<div class="note warn"><span class="nt">Common mistake</span> Setting <code>dialect</code> based on the model <em>brand</em> rather than what the <em>endpoint</em> actually speaks. <code>dialect</code> controls how Firstpass serializes the outbound request body — it's an endpoint property, not a model property. A Bedrock endpoint that hosts a Claude model but exposes the Anthropic Messages wire format needs <code>dialect = "anthropic"</code>; an OpenAI-compatible gateway fronting any model needs <code>dialect = "openai"</code>. Wrong dialect = serialization mismatch at the provider, not a Firstpass error.</div>
+<div class="recap">Four fields — <code>name</code>, <code>base_url</code>, <code>dialect</code>, <code>auth</code> — is all it takes to onboard <b>any endpoint</b> as a rung.</div>
 
 <h2 id="dialects">Wire dialects<a class="anchor" href="#dialects" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A dialect is the HTTP wire format a provider endpoint speaks. <b>Outbound</b>: set <code>dialect</code> to match the provider's expected format. <b>Inbound</b>: Firstpass accepts both Anthropic and OpenAI dialects from your client and translates — your client keeps whichever it already uses.</div>
 <p>A dialect is the request/response wire format a provider speaks. Firstpass translates so your ladder can mix vendors freely.</p>
+<p class="subh">Outbound dialects</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Dialect</th><th>Speaks</th></tr></thead>
   <tbody>
@@ -140,13 +155,17 @@ auth     = &quot;api_key&quot;       # api_key | aws_sigv4 | gcp_oauth</code></p
     <tr><td><code>gemini</code></td><td>Gemini wire format.</td></tr>
   </tbody>
 </table></div>
+<p class="subh">Inbound dialects</p>
 <p>Firstpass also accepts <strong>both inbound dialects</strong>, so your client keeps whichever it already uses:</p>
 <div class="defs">
   <div class="row"><div class="k">POST /v1/messages</div><div class="v">Anthropic-style inbound. Live-verified.</div></div>
   <div class="row"><div class="k">POST /v1/chat/completions</div><div class="v">OpenAI-style inbound. Live-verified.</div></div>
 </div>
+<div class="note info"><span class="nt">Under the hood</span> Firstpass forwards the request body verbatim to same-dialect endpoints, swapping <em>only</em> the <code>model</code> field. Cross-dialect translation — for example, an Anthropic-style inbound request routed to an OpenAI-compatible outbound provider — happens at the proxy layer. The model always receives the format it expects; your client never needs to change.</div>
+<div class="recap">Set <code>dialect</code> to match the <b>endpoint's wire format</b>; Firstpass handles inbound translation so your client doesn't need to change.</div>
 
 <h2 id="auth">Auth modes<a class="anchor" href="#auth" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><code>auth</code> tells Firstpass how to sign the outbound request. <b><code>api_key</code></b> covers standard bearer-token endpoints. <b><code>aws_sigv4</code></b> covers Bedrock. <b><code>gcp_oauth</code></b> covers Vertex. The mode is a property of the endpoint, not the model.</div>
 <p>Custom providers pick an auth mode to match the endpoint — including the cloud-managed model services:</p>
 <div class="tblwrap"><table>
   <thead><tr><th>auth</th><th>For</th></tr></thead>
@@ -157,8 +176,11 @@ auth     = &quot;api_key&quot;       # api_key | aws_sigv4 | gcp_oauth</code></p
   </tbody>
 </table></div>
 <p>Provider auth extensibility is specified in ADR 0006.</p>
+<div class="note"><span class="nt">Key idea</span> Auth mode is a property of the <em>endpoint</em>, not the model. Two endpoints serving the same model can require different auth: a direct Anthropic API call uses <code>api_key</code>, the same Claude model accessed via Bedrock requires <code>aws_sigv4</code>. Match the mode to where the request is going, not to what model answers it.</div>
+<div class="recap">Pick the auth mode that matches the <b>endpoint</b> — Bedrock needs SigV4, Vertex needs GCP OAuth, everything else is <code>api_key</code>.</div>
 
 <h2 id="verify">Verification status<a class="anchor" href="#verify" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Anthropic end-to-end and both inbound dialects are <b>live-verified</b> — tested on real traffic against real provider APIs. Other outbound dialects are <b>implemented</b> and exercised by nightly CI, but have not yet been proven on live production traffic.</div>
 <p>Firstpass is precise about what has been proven on live wires versus what is implemented and pending verification:</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Path</th><th>Status</th></tr></thead>
@@ -169,6 +191,8 @@ auth     = &quot;api_key&quot;       # api_key | aws_sigv4 | gcp_oauth</code></p
   </tbody>
 </table></div>
 <p>A nightly per-provider smoke CI exercises each dialect so regressions surface before they reach you.</p>
+<div class="note"><span class="nt">Key idea</span> "Live-verified" means tested on real traffic against the actual provider API, not just unit tests. "Awaiting live wire verification" means the code ships and nightly CI runs the dialect's serialization, but it hasn't been stress-proven on production traffic yet. Anthropic is the proven path today; other dialects gain live-verified status as nightly CI accumulates signal.</div>
+<div class="recap">Anthropic is the <b>proven path</b>; other dialects are implemented and CI-exercised, gaining live-verified status as signal accumulates.</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="receipts.html"><span class="dir">← Previous</span><span class="t">Receipts & audit</span></a><a class="next" href="configuration.html"><span class="dir">Next →</span><span class="t">Configuration</span></a></nav>
 </main>
@@ -184,5 +208,5 @@ auth     = &quot;api_key&quot;       # api_key | aws_sigv4 | gcp_oauth</code></p
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>
