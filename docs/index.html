@@ -609,6 +609,7 @@ pip install firstpass    # or install it</code></pre></div></div>
         <li><b>Enforce through tools &amp; streaming.</b> Structured (tool/image) enforce is default-on with verbatim per-rung carry; SSE opens instantly and streams the gated result.</li>
         <li><b>The earned guarantee.</b> ≤10%@95% distribution-free bound on 974 real MBPP tasks (committed artifact), Learn-then-Test calibration, live adaptive threshold.</li>
         <li><b>Learned start-rung.</b> UCB1 or discounted Thompson with logged propensities and a speculative-deferral band — default-off, honest policy stamp on every receipt.</li>
+        <li><b>Selectable modes.</b> cost / balanced / quality / latency / max presets, per route or per request via <span class="mono">x-firstpass-mode</span>.</li>
         <li><b>Five gate kinds.</b> inline · schema · subprocess · LLM-judge (maker ≠ checker) · k-sample self-consistency, each with an error budget and gate cost priced onto the receipt.</li>
         <li><b>Receipts.</b> hash-chained; <span class="mono">export</span> + <span class="mono">verify</span> re-derive with no proxy or DB; durable never-drop mode.</li>
         <li><b>Policy rehearsal.</b> <span class="mono">firstpass ope</span> replays your logs with IPS / SNIPS / DR and bootstrap CIs before you enforce.</li>
@@ -618,7 +619,7 @@ pip install firstpass    # or install it</code></pre></div></div>
     <div class="statcol next">
       <span class="st-tag">◇ Next &amp; research</span>
       <ul>
-        <li><b>Selectable modes.</b> cost / balanced / quality / latency / max via <span class="mono">x-firstpass-mode</span> — presets first, the constraint form behind a validation gate.</li>
+        <li><b>Constraint-form modes.</b> explicit cost / latency / quality constraints behind a validation gate — the presets above ship today.</li>
         <li><b>Elastic verification.</b> verify proportional to doubt, with a conformal guarantee over the verify/skip decision — signal validated, the serving path go/no-go gated.</li>
         <li><b>Per-rung P(gate-pass | features)</b> prediction, and joint (rung, sample-count) routing on the easy slice.</li>
         <li><b>Session / trajectory routing</b> across a whole agent run, not one turn.</li>
