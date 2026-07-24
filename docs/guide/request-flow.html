@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Routing, end to end — Firstpass docs</title>
+<title>Every scenario, end to end — Firstpass docs</title>
 <meta name="description" content="Point your agent at Firstpass and every model call — a one-shot question, a fifty-step debugging loop, a subagent, a whole parallel team — flows through one routing engine that serves the cheapest model that can prove its answer. Follow a real request from terminal to served bytes, with the actual payloads and receipt.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
@@ -33,7 +33,7 @@
 <a href="quickstart.html"><span class="num">02</span>Quickstart</a>
 <a href="requests-101.html"><span class="num">03</span>Requests 101</a>
 <a href="how-it-works.html"><span class="num">04</span>How it works</a>
-<a href="request-flow.html" aria-current="page"><span class="num">05</span>Routing, end to end</a>
+<a href="request-flow.html" aria-current="page"><span class="num">05</span>Every scenario, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
 <a href="gates.html"><span class="num">06</span>Gates</a>
@@ -54,15 +54,14 @@
 </nav></aside>
 <main class="content" id="main">
 <button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
-<p class="crumb"><a href="index.html">Docs</a> / Routing, end to end</p>
-<h1>Routing, end to end</h1>
+<p class="crumb"><a href="index.html">Docs</a> / Every scenario, end to end</p>
+<h1>Every scenario, end to end</h1>
 <p class="page-sub">An agent doesn't make one model call — it makes hundreds, and the safe reflex of sending every one to the strongest model is why an afternoon of agent work bills like a research run. Firstpass runs the <em>cheapest</em> model first, proves its output against a real check, and escalates only when the proof fails. You pay for strength exactly when strength is needed — and every decision leaves a receipt that says why.</p>
 <div class="tldr">Every request Firstpass sees — a one-shot question, a tool-loop step, a subagent call, turn 17 of a long conversation — travels the same four steps: <b>extract features → match route → prove the output → write a receipt.</b> This page walks every outcome as a real payload, escalation diagram, and receipt. Scan the TL;DRs to see the shape; read the JSON to see the mechanics.</div>
 
 <h2 id="why">Why routing, and why proof<a class="anchor" href="#why" aria-label="Link to this section">#</a></h2>
-<div class="tldr">Two broken fixes frame the problem: send everything cheap and ship wrong answers; predict which prompt needs strength and you're guessing before you've seen the answer. Firstpass does neither — it <b>runs cheap first, proves the real output</b> against a gate (a unit test, a JSON schema, a judge), and escalates one rung only when the proof fails. The gate verdict is the routing decision.</div>
-<p>Point your agent — Claude Code, the Agent SDK, anything speaking the Anthropic or OpenAI wire format — at Firstpass instead of the provider, and it sees exactly one kind of thing: a <strong>completion request</strong>, a single <code>POST</code> of messages and tools. An agent loop emits these by the hundred — every reasoning step, every tool-result read, every subagent is its own request, and the whole growing transcript rides along on each. Bill all of it to a frontier model &ldquo;to be safe&rdquo; and the cost compounds three ways at once: many calls per prompt, a transcript that only grows, and the top model spent on the easy calls too.</p>
-<p>The two obvious fixes both break. Send everything to a cheap model and <em>hope</em>, and you ship wrong answers you won't catch until production. <strong>Predict</strong> which prompt needs which model, and you're guessing from the question — before you've seen the answer — and you learn you guessed wrong the expensive way. Firstpass does neither. It runs the cheapest rung first, <strong>proves the actual output</strong> against your gate — a test, a schema, a judge — and serves it only if the proof holds. If it doesn't, it escalates one rung and proves again. That is the whole product, in one picture:</p>
+<div class="tldr"><a href="how-it-works.html">How it works</a> showed the four moves on <em>one</em> abstract request. Real agent traffic is never one request — it's <b>hundreds, in a dozen shapes</b>: tool-loop steps, subagent calls, agent teams, turn 17 of a conversation, a provider mid-outage. This page's job is to prove the same four moves hold for <b>every</b> one of them — each as a real payload, escalation, and receipt.</div>
+<p>You've seen the idea: run the cheapest rung first, <strong>prove the actual output</strong> against a gate, escalate one rung only when the proof fails — cheap-and-proven for the easy majority, strong exactly when strength is earned. The reason that's worth a whole page of scenarios is that agent traffic is <em>messy</em>. Point Claude Code, the Agent SDK, or anything speaking the Anthropic or OpenAI wire at Firstpass, and it emits completion requests <strong>by the hundred</strong> — every reasoning step, every tool-result read, every subagent its own <code>POST</code>, the whole growing transcript riding along on each. A clean idea is easy to state on one request; the test is whether it stays clean when the shapes get real. It does — and the rest of this page is that idea holding its shape, in one picture first:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 400" role="img" aria-labelledby="heroT">
 <title id="heroT">One request opens on the cheapest rung; its real output is proved against a gate. When the gate passes — measured at 82 percent of requests on a live coding run — the cheap answer is served and no strong model is ever called. When it fails, the cascade escalates one rung and proves again, serving only a proven answer. The routing decision is proof of the output, never a prediction from the prompt.</title>
 <defs>
@@ -244,7 +243,7 @@ x-firstpass-session: agent-run-4417     <span class="tk-c"># optional — budget
 
 <h2 id="lifecycle">The life of one request<a class="anchor" href="#lifecycle" aria-label="Link to this section">#</a></h2>
 <div class="tldr">Every <code>POST</code> — one-shot question, tool-loop step, subagent call, turn 17 of a conversation — travels the same four steps: <b>extract features → match route → enforce or observe → serve and record.</b> No fast path, no special cases. Uniformity is what makes per-request proof safe to run on every call.</div>
-<p>Every <code>POST</code> — no matter what produced it — travels the same four steps. No fast path for "simple" prompts, no special case for subagents. The uniformity is the point: it's what lets one engine stay correct across every case below.</p>
+<p>This is the concrete pipeline behind the four moves — the same route → prove → escalate → serve you met in <a href="how-it-works.html">How it works</a>, drawn as the exact steps a request takes on the wire. <strong>Every scenario below is this one spine with different inputs</strong>: no fast path for "simple" prompts, no special case for subagents. The uniformity is the point — it's what lets one engine stay correct across every case that follows.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 320" role="img" aria-labelledby="lifeT">
 <title id="lifeT">One request flows through four steps: extract features from headers and body, match a route by those features, then either enforce (cascade cheapest-first with a gate on each rung, escalating on failure) or observe (forward the original request unchanged). Every decision is written to a receipt.</title>
 <defs>
@@ -304,7 +303,7 @@ x-firstpass-session: agent-run-4417     <span class="tk-c"># optional — budget
 <div class="note"><span class="nt">Where "which model answered" lives</span> The response you get back is a normal completion in your dialect — no vendor cruft bolted on. The rung, the gate verdicts, and the cost live in the <strong>receipt</strong>. The split is deliberate: the answer is the product, the proof is the receipt. You'll see both, for a real escalation, in <a href="#complex">the complex case</a>.</div>
 <div class="recap">Four deterministic steps, every time — the gate verdict and the provider response decide which of the five endings you land on.</div>
 
-<h2 id="scenarios">Every scenario, end to end<a class="anchor" href="#scenarios" aria-label="Link to this section">#</a></h2>
+<h2 id="scenarios">The scenarios, one by one<a class="anchor" href="#scenarios" aria-label="Link to this section">#</a></h2>
 <div class="tldr">Four steps, five outcomes. <b>The `served_from` field on the receipt — `attempt`, `best_attempt`, `error` — is the machine-readable branch point</b> that tells your pipeline which ending it got. Scan the map here; read the next five sections for the real payloads.</div>
 <p>Those four steps produce exactly <strong>five outcomes</strong> — and every request Firstpass serves is one of them. Scan the map, then follow any row to its real request, response, and receipt. The <code>served_from</code> field on the receipt is how your pipeline tells the outcomes apart after the fact.</p>
 <div class="tblwrap"><table>
@@ -921,7 +920,7 @@ const client = new Anthropic({ baseURL: "http://localhost:8080" });
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="how-it-works.html"><span class="dir">← Previous</span><span class="t">How it works</span></a><a class="next" href="gates.html"><span class="dir">Next →</span><span class="t">Gates</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#why" class="">Why routing &amp; proof</a><a href="#request-shape" class="">What a request looks like</a><a href="#lifecycle" class="">Life of one request</a><a href="#scenarios" class="">Every scenario</a><a href="#simple" class="">A simple question</a><a href="#complex" class="">A complex question</a><a href="#exhausted" class="">Nothing clears the gate</a><a href="#failover" class="">A provider is down</a><a href="#observe" class="">Observe mode</a><a href="#subagents" class="">Subagents</a><a href="#teams" class="">Teams &amp; workflows</a><a href="#multiturn" class="">Multi-turn &amp; context</a><a href="#modes" class="">Claude Code vs SDK</a><a href="#limits" class="">Configure vs automatic</a><a href="#tackle" class="">How we tackle it</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#why" class="">Why routing &amp; proof</a><a href="#request-shape" class="">What a request looks like</a><a href="#lifecycle" class="">Life of one request</a><a href="#scenarios" class="">The scenarios</a><a href="#simple" class="">A simple question</a><a href="#complex" class="">A complex question</a><a href="#exhausted" class="">Nothing clears the gate</a><a href="#failover" class="">A provider is down</a><a href="#observe" class="">Observe mode</a><a href="#subagents" class="">Subagents</a><a href="#teams" class="">Teams &amp; workflows</a><a href="#multiturn" class="">Multi-turn &amp; context</a><a href="#modes" class="">Claude Code vs SDK</a><a href="#limits" class="">Configure vs automatic</a><a href="#tackle" class="">How we tackle it</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">
