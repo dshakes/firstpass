@@ -561,3 +561,9 @@ hr.rule{border:0;border-top:1px solid var(--border);margin:40px 0}
 .sidebar .lnav a .num{flex:none}
 .sidebar .lnav a.done .num{color:var(--accent-strong)}
 .sidebar .lnav a.done::after{content:"✓";margin-left:auto;color:var(--accent-strong);font-size:11px}
+
+
+/* course pages (How Agents Talk to Models) have no right-hand TOC — reclaim the space */
+.docs.docs-course{grid-template-columns:264px minmax(0,1fr)}
+.docs.docs-course .content{max-width:1040px}
+@media (max-width:900px){.docs.docs-course{grid-template-columns:1fr}}

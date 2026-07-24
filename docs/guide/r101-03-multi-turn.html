@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=4">
+<link rel="stylesheet" href="../assets/docs.css?v=5">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -26,7 +26,7 @@
 <div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
 </header>
 <div class="scrim"></div>
-<div class="docs">
+<div class="docs docs-course">
 <aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
@@ -71,42 +71,46 @@
   { "role": "user",      "content": "Now add the guard and a test." }
 ]</code></pre></div>
 <p>Because the transcript only grows, the <strong>input</strong> tokens on turn N are roughly N times a single turn's worth. Summed across a conversation, input cost grows with the <em>square</em> of the turn count — the classic reason a long agent session bills far more than its individual answers would suggest.</p>
-<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 320" role="img" aria-labelledby="growT">
-<title id="growT">A ten-turn conversation. Each turn resends the whole transcript so far as input, so the input tokens per turn climb roughly linearly from turn one to turn ten. The bars grow left to right. Because every turn re-pays for all prior turns, the total input cost of the conversation grows with the square of the turn count.</title>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="grMT">
+<title id="grMT">Across a ten-turn conversation the client resends the entire transcript every turn, so the input tokens billed per turn climb steadily from turn one to turn ten. Small stacks above turns one, five and ten show the transcript growing — turn N carries all of turns one through N. Because each turn re-pays for every earlier turn, the conversation's total input cost grows with the square of the turn count.</title>
 <defs><marker id="grA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
-<text x="40" y="30" class="ink" font-size="13" font-weight="640">Input tokens per turn — the transcript rides along and only grows</text>
-<text x="40" y="50" class="ink-mut" font-size="11">each turn re-reads every earlier turn · cost per turn climbs with the conversation</text>
-<line x1="60" y1="268" x2="748" y2="268" class="n-stroke" stroke-width="1.3"/>
-<line x1="60" y1="92" x2="60" y2="268" class="n-stroke" stroke-width="1.3"/>
-<text x="46" y="96" text-anchor="end" class="ink-mut" font-size="9.5">tok</text>
-<!-- bars: 10 turns, climbing -->
-<g>
-<rect x="76" y="252" width="46" height="16" rx="3" class="pass"/>
-<rect x="144" y="238" width="46" height="30" rx="3" class="pass"/>
-<rect x="212" y="222" width="46" height="46" rx="3" class="accent"/>
-<rect x="280" y="206" width="46" height="62" rx="3" class="accent"/>
-<rect x="348" y="188" width="46" height="80" rx="3" class="accent"/>
-<rect x="416" y="170" width="46" height="98" rx="3" class="warn"/>
-<rect x="484" y="152" width="46" height="116" rx="3" class="warn"/>
-<rect x="552" y="134" width="46" height="134" rx="3" class="warn"/>
-<rect x="620" y="116" width="46" height="152" rx="3" class="fail"/>
-<rect x="688" y="98" width="46" height="170" rx="3" class="fail"/>
+<text x="40" y="26" class="ink" font-size="13" font-weight="640">Every turn resends the whole transcript &mdash; so input billed per turn only climbs</text>
+<text x="40" y="45" class="ink-mut" font-size="11">turn N carries all of turns 1&hellip;N &middot; summed, the total grows with the <tspan font-style="italic">square</tspan> of the turn count</text>
+<line x1="62" y1="264" x2="724" y2="264" class="n-stroke" stroke-width="1.3"/>
+<line x1="62" y1="92" x2="62" y2="264" class="n-stroke" stroke-width="1.3"/>
+<text x="52" y="96" text-anchor="end" class="ink-mut" font-size="9.5">input</text>
+<text x="52" y="258" text-anchor="end" class="ink-mut" font-size="9.5">tok</text>
+<rect x="78" y="248" width="48" height="16" rx="3" class="pass"/>
+<rect x="146" y="234" width="48" height="30" rx="3" class="pass"/>
+<rect x="214" y="218" width="48" height="46" rx="3" class="accent-s"/>
+<rect x="282" y="202" width="48" height="62" rx="3" class="accent-s"/>
+<rect x="350" y="184" width="48" height="80" rx="3" class="accent"/>
+<rect x="418" y="166" width="48" height="98" rx="3" class="warn"/>
+<rect x="486" y="148" width="48" height="116" rx="3" class="warn"/>
+<rect x="554" y="130" width="48" height="134" rx="3" class="fail-s"/>
+<rect x="622" y="112" width="48" height="152" rx="3" class="fail"/>
+<rect x="690" y="94" width="48" height="170" rx="3" class="fail"/>
+<text x="102" y="280" text-anchor="middle" class="ink-mut" font-size="9">t1</text>
+<text x="374" y="280" text-anchor="middle" class="ink-mut" font-size="9">t5</text>
+<text x="714" y="280" text-anchor="middle" class="ink-mut" font-size="9">t10</text>
+<g opacity="0.9">
+<rect x="86" y="212" width="30" height="7" rx="1.5" class="pass-s"/>
+<rect x="358" y="176" width="30" height="7" rx="1.5" class="accent-s"/><rect x="358" y="167" width="30" height="7" rx="1.5" class="accent-s"/><rect x="358" y="158" width="30" height="7" rx="1.5" class="accent-s"/>
+<rect x="698" y="86" width="30" height="6" rx="1.5" class="fail-s"/><rect x="698" y="78" width="30" height="6" rx="1.5" class="fail-s"/><rect x="698" y="70" width="30" height="6" rx="1.5" class="fail-s"/><rect x="698" y="62" width="30" height="6" rx="1.5" class="fail-s"/><rect x="698" y="54" width="30" height="6" rx="1.5" class="fail-s"/>
 </g>
-<text x="99" y="284" text-anchor="middle" class="ink-mut" font-size="9">t1</text>
-<text x="371" y="284" text-anchor="middle" class="ink-mut" font-size="9">t5</text>
-<text x="711" y="284" text-anchor="middle" class="ink-mut" font-size="9">t10</text>
-<!-- callout -->
+<text x="101" y="205" text-anchor="middle" class="ink-mut" font-size="8">1 turn</text>
+<text x="373" y="150" text-anchor="middle" class="ink-mut" font-size="8">5 turns</text>
+<text x="713" y="46" text-anchor="middle" class="ink-mut" font-size="8">10 turns resent</text>
 <rect x="784" y="112" width="188" height="140" rx="12" class="n-fill warn-s glow-w" stroke-width="1.5"/>
 <text x="800" y="138" class="ink m" font-size="11.5" font-weight="640">10-turn coding session</text>
 <text x="800" y="162" class="ink-mut m" font-size="10.5">~1.5k tokens added / turn</text>
-<text x="800" y="182" class="ink-mut m" font-size="10.5">history re-read ≈ 82k tok</text>
-<text x="800" y="206" class="warn m" font-size="11" font-weight="640">≈ $0.25 just to re-read</text>
+<text x="800" y="182" class="ink-mut m" font-size="10.5">history re-read &asymp; 82k tok</text>
+<text x="800" y="206" class="warn m" font-size="11" font-weight="640">&asymp; $0.25 just to re-read</text>
 <text x="800" y="224" class="ink-mut m" font-size="10">the past, on sonnet input</text>
-<text x="800" y="244" class="ink-mut m" font-size="9.5">illustrative — your tokens vary</text>
-<!-- pulse -->
-<line x1="76" y1="260" x2="734" y2="260" class="flow w l" stroke-width="2"/>
+<text x="800" y="244" class="ink-mut m" font-size="9.5">illustrative &mdash; your tokens vary</text>
+<line x1="78" y1="256" x2="736" y2="256" class="flow w l" stroke-width="2"/>
 </svg>
-  <figcaption>Statelessness is why context works and why it costs: the client resends the whole thread each turn, so input tokens — and the bill — climb with every message. Nothing here is Firstpass; this is just how chat with a stateless model works.</figcaption>
+  <figcaption>Statelessness is why context works and why it costs: the client resends the whole thread each turn, so input tokens &mdash; and the bill &mdash; climb with every message. The stacks show why: turn 10's request carries all ten turns. Nothing here is Firstpass; this is just how chat with a stateless model works.</figcaption>
 </div>
 <div class="note info"><span class="nt">Under the hood</span> The client isn't obliged to resend <em>everything</em> — it resends whatever it wants the model to still &ldquo;know.&rdquo; That's a client decision, not a model feature. Trim the array and the model genuinely forgets: drop the early turns and it can't reference them. Every &ldquo;memory&rdquo; strategy — full replay, sliding window, summarize-and-truncate — is just a different rule for <em>which bytes to resend</em>. Keep this in your pocket for Part B: shrinking the resent history is the client's job, not the router's.</div>
 <div class="recap">Continuity is an illusion the client pays for: it resends the whole transcript each turn, so input — and the bill — grows quadratically over a long session.</div>
@@ -123,5 +127,5 @@
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=4"></script>
+<script src="../assets/docs.js?v=5"></script>
 </body></html>
