@@ -14,7 +14,7 @@
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <header class="topnav"><div class="bar">
-  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.0</span></a>
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
   <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
   <span class="nav-sp"></span>
   <div class="nav-right">
@@ -30,24 +30,25 @@
 <aside class="sidebar" aria-label="Docs navigation"><nav>
 <div class="grp"><p class="grp-t">Getting started</p>
 <a href="index.html" aria-current="page"><span class="num">01</span>Overview</a>
-<a href="how-it-works.html"><span class="num">02</span>How it works</a>
-<a href="request-flow.html"><span class="num">03</span>Routing, end to end</a>
+<a href="quickstart.html"><span class="num">02</span>Quickstart</a>
+<a href="how-it-works.html"><span class="num">03</span>How it works</a>
+<a href="request-flow.html"><span class="num">04</span>Routing, end to end</a>
 </div>
 <div class="grp"><p class="grp-t">Core mechanics</p>
-<a href="gates.html"><span class="num">04</span>Gates</a>
-<a href="routing.html"><span class="num">05</span>Routing & escalation</a>
-<a href="guarantee.html"><span class="num">06</span>The guarantee</a>
-<a href="receipts.html"><span class="num">07</span>Receipts & audit</a>
+<a href="gates.html"><span class="num">05</span>Gates</a>
+<a href="routing.html"><span class="num">06</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">07</span>The guarantee</a>
+<a href="receipts.html"><span class="num">08</span>Receipts &amp; audit</a>
 </div>
 <div class="grp"><p class="grp-t">Reference</p>
-<a href="providers.html"><span class="num">08</span>Providers</a>
-<a href="configuration.html"><span class="num">09</span>Configuration</a>
-<a href="cli.html"><span class="num">10</span>CLI reference</a>
-<a href="api.html"><span class="num">11</span>API & MCP</a>
+<a href="providers.html"><span class="num">09</span>Providers</a>
+<a href="configuration.html"><span class="num">10</span>Configuration</a>
+<a href="cli.html"><span class="num">11</span>CLI reference</a>
+<a href="api.html"><span class="num">12</span>API &amp; MCP</a>
 </div>
-<div class="grp"><p class="grp-t">Research & data</p>
-<a href="elastic-verification.html"><span class="num">12</span>Elastic verification</a>
-<a href="benchmarks.html"><span class="num">13</span>Benchmarks</a>
+<div class="grp"><p class="grp-t">Research &amp; data</p>
+<a href="elastic-verification.html"><span class="num">13</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">14</span>Benchmarks</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -60,7 +61,7 @@
   <div class="chip good"><div class="cn">≤10<span class="u">%</span></div><div class="cl">served-failure, 95% conf.</div></div>
   <div class="chip"><div class="cn">82<span class="u">%</span></div><div class="cl">served from cheap tier</div></div>
   <div class="chip"><div class="cn">974</div><div class="cl">real tasks in the live bound</div></div>
-  <div class="chip"><div class="cn">v0.2.0</div><div class="cl">pre-GA, open source</div></div>
+  <div class="chip"><div class="cn">v0.2.1</div><div class="cl">pre-GA, open source</div></div>
 </div>
 
 <h2 id="what">What Firstpass is<a class="anchor" href="#what" aria-label="Link to this section">#</a></h2>
@@ -135,7 +136,7 @@
 </ul>
 
 <h2 id="status">Status<a class="anchor" href="#status" aria-label="Link to this section">#</a></h2>
-<p>Firstpass is <strong>v0.2.0, pre-GA</strong>, and honest about the line between shipped and researched.</p>
+<p>Firstpass is <strong>v0.2.1, pre-GA</strong>, and honest about the line between shipped and researched.</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Shipped &amp; verified</th><th>Next / research</th></tr></thead>
   <tbody>
@@ -157,7 +158,7 @@
   <li><a href="cli.html">CLI reference</a> — every subcommand, from <code>onboard</code> to <code>verify</code>.</li>
 </ul>
 
-<nav class="pager" aria-label="Pagination"><span></span><a class="next" href="how-it-works.html"><span class="dir">Next →</span><span class="t">How it works</span></a></nav>
+<nav class="pager" aria-label="Pagination"><span></span><a class="next" href="quickstart.html"><span class="dir">Next →</span><span class="t">Quickstart</span></a></nav>
 </main>
 <nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#what" class="">What Firstpass is</a><a href="#moves" class="">The four moves</a><a href="#novelty" class="">What is actually new</a><a href="#who" class="">Who it&#x27;s for</a><a href="#status" class="">Status</a><a href="#next" class="">Where to go next</a></nav>
 </div>
@@ -169,7 +170,7 @@
     <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
     <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
   </div>
-  <div class="legal"><span>Firstpass v0.2.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+  <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
 <script src="../assets/docs.js?v=2"></script>
 </body></html>

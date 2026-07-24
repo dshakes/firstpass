@@ -1,6 +1,6 @@
 # GA handoff — what only a human can close
 
-Everything in Phases 0–3 that is **code** has shipped and is on `main` at v0.2.0, gate-green
+Everything in Phases 0–3 that is **code** has shipped and is on `main` at v0.2.1, gate-green
 (365 tests, clippy `-D warnings`, fmt clean). What remains between here and a GA stamp is, by
 [ADR 0003](adr/0003-ga-readiness.md), deliberately **not** a code task — it needs a person,
 a clock, a credential, or an external party. This is that list.

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/hero.svg" alt="Firstpass — cheap until proven otherwise. It routes every request to the cheapest model, gates the real output, escalates only on proof of need, and cuts your AI bill from $$$$ to $ at the same quality — with a distribution-free guarantee of ≤10% wrong answers served at 95% confidence and a signed receipt every call." width="900">
+<img src="assets/hero.svg" alt="Firstpass — cheap until proven otherwise. It routes every request to the cheapest model, gates the real output, escalates only on proof of need, and cuts your AI bill from $$$$ to $ — with a distribution-free guarantee of ≤10% wrong answers served at 95% confidence and a signed receipt every call." width="900">
 
 # ⚡ Firstpass
 
@@ -246,7 +246,7 @@ Multi-tenant deployments add per-tenant auth (Argon2id), rate limits, gate-healt
 
 ## Status
 
-**v0.2.0 — pre-GA, shipped in the open.** Honest about the line between shipped and researched.
+**v0.2.1 — pre-GA, shipped in the open.** Honest about the line between shipped and researched.
 
 | ✅ Shipped & verified | 🔬 Next / research |
 |---|---|
