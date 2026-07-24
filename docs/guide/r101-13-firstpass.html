@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Where Firstpass fits — How Agents Talk to Models — Firstpass docs</title>
+<meta name="description" content="How Agents Talk to Models lesson 13 of 13: Where Firstpass fits. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=4">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<a class="sidebar-back" href="index.html">&larr; All docs</a>
+<span class="course-title">How Agents Talk to Models</span>
+<a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
+<div class="grp lnav"><p class="grp-t">The core path</p>
+<a href="r101-01-one-request.html" class="done"><span class="num">01</span>One request, one response</a>
+<a href="r101-02-token-meter.html" class="done"><span class="num">02</span>The token meter</a>
+<a href="r101-03-multi-turn.html" class="done"><span class="num">03</span>Statelessness &amp; multi-turn</a>
+<a href="r101-04-tools.html" class="done"><span class="num">04</span>Tool calls</a>
+<a href="r101-05-caching.html" class="done"><span class="num">05</span>Prompt caching</a>
+<a href="r101-06-client-shapes.html" class="done"><span class="num">06</span>Three client shapes</a>
+<a href="r101-07-claude-code-session.html" class="done"><span class="num">07</span>A Claude Code session</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Beyond the core path</p>
+<a href="r101-08-streaming.html" class="done"><span class="num">08</span>Streaming</a>
+<a href="r101-09-structured-outputs.html" class="done"><span class="num">09</span>Structured outputs &amp; JSON</a>
+<a href="r101-10-images.html" class="done"><span class="num">10</span>Images &amp; multimodal</a>
+<a href="r101-11-mcp.html" class="done"><span class="num">11</span>MCP, in depth</a>
+<a href="r101-12-errors.html" class="done"><span class="num">12</span>Errors, rate limits &amp; retries</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Where Firstpass fits</p>
+<a href="r101-13-firstpass.html" aria-current="page"><span class="num">13</span>Where Firstpass fits</a>
+</div>
+</nav></aside><main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Where Firstpass fits</p>
+<div class="lesson-progress">
+  <div class="lp-meta"><span class="lp-group">Part B · Where Firstpass fits</span><span class="lp-count">Lesson 13 of 13</span></div>
+  <div class="lp-bar"><span style="width:100.0%"></span></div>
+</div>
+<h1>Where Firstpass fits</h1>
+<h2 id="bridge">The same wire seat, a different number<a class="anchor" href="r101-13-firstpass.html" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Firstpass sits in the <b>same wire seat</b> as the provider — same dialects, same request, byte-identical unless configured otherwise. It changes only <b>which model answers</b>: every call opens on the cheapest rung, its real output is <b>proved against a gate</b>, and only calls that fail escalate one rung. Cheap-and-proven for the easy majority, strong only where earned — the bill drops, the wire contract doesn't move.</div>
+<p>Everything in Part A happens whether or not Firstpass exists — it's just how agents and models work. Firstpass sits in the <strong>same wire seat</strong>: you point your agent's base URL at it instead of the provider, and it speaks the identical dialects (<code>/v1/messages</code>, <code>/v1/chat/completions</code>). Nothing about your request changes. What changes is what happens to each call <em>behind</em> that seat — and it maps one-to-one onto the modules you just read.</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 280" role="img" aria-labelledby="brdgT">
+<title id="brdgT">Without Firstpass, every call in the agent loop goes straight to the strong model and pays the top price. With Firstpass in the same wire seat, each call opens on the cheapest model, its real output is proved against a gate, and only calls that fail the gate escalate to a stronger model. Most calls are served cheap and proven, so the bill drops while the wire contract stays identical.</title>
+<defs><marker id="bgA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="bgP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker></defs>
+<!-- before -->
+<text x="40" y="30" class="ink-mut" font-size="11" font-weight="640">BEFORE — every call to the strong model</text>
+<rect x="40" y="46" width="120" height="44" rx="10" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="100" y="72" text-anchor="middle" class="ink m" font-size="11">agent call</text>
+<rect x="230" y="46" width="150" height="44" rx="10" class="n-fill fail-s glow-f" stroke-width="1.5"/>
+<text x="305" y="66" text-anchor="middle" class="fail m" font-size="11" font-weight="640">strong model</text>
+<text x="305" y="82" text-anchor="middle" class="ink-mut" font-size="9.5">top price · every time</text>
+<line x1="160" y1="68" x2="228" y2="68" class="n-stroke" stroke-width="1.5" marker-end="url(#bgA)"/>
+<text x="410" y="72" class="fail m" font-size="12" font-weight="700">$$$</text>
+<!-- after -->
+<text x="40" y="140" class="ink-mut" font-size="11" font-weight="640">AFTER — Firstpass in the same seat</text>
+<rect x="40" y="156" width="120" height="44" rx="10" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="100" y="182" text-anchor="middle" class="ink m" font-size="11">agent call</text>
+<rect x="230" y="156" width="140" height="44" rx="10" class="n-fill accent-s glow" stroke-width="1.6"/>
+<text x="300" y="176" text-anchor="middle" class="ink m" font-size="11" font-weight="640">cheapest rung</text>
+<text x="300" y="192" text-anchor="middle" class="accent-ink" font-size="9.5">first pass</text>
+<rect x="430" y="156" width="120" height="44" rx="10" class="n-fill accent-s glow" stroke-width="1.6"/>
+<text x="490" y="182" text-anchor="middle" class="ink m" font-size="11" font-weight="700">PROVE</text>
+<rect x="620" y="128" width="150" height="42" rx="10" class="n-fill pass-s glow-p" stroke-width="1.5"/>
+<text x="695" y="154" text-anchor="middle" class="pass m" font-size="10.5" font-weight="640">pass → serve cheap</text>
+<rect x="620" y="186" width="150" height="42" rx="10" class="n-fill warn-s glow-w" stroke-width="1.5"/>
+<text x="695" y="212" text-anchor="middle" class="warn m" font-size="10.5" font-weight="640">fail → escalate +1</text>
+<line x1="160" y1="178" x2="228" y2="178" class="n-stroke" stroke-width="1.5" marker-end="url(#bgA)"/>
+<line x1="370" y1="178" x2="428" y2="178" class="n-stroke" stroke-width="1.5" marker-end="url(#bgA)"/>
+<path d="M550 172 C588 160 600 150 618 148" fill="none" class="pass-s" stroke-width="1.5" marker-end="url(#bgP)"/>
+<path d="M550 184 C588 196 600 204 618 206" fill="none" class="warn-s" stroke-width="1.5" marker-end="url(#bgA)"/>
+<text x="820" y="152" class="pass m" font-size="12" font-weight="700">$</text>
+<text x="820" y="212" class="ink-mut" font-size="11">$$ · only when needed</text>
+<!-- pulses -->
+<line x1="160" y1="178" x2="228" y2="178" class="flow s" stroke-width="2"/>
+<line x1="370" y1="178" x2="428" y2="178" class="flow s d2" stroke-width="2"/>
+<path d="M550 172 C588 160 600 150 618 148" class="flow p s d3" stroke-width="2"/>
+</svg>
+  <figcaption>Same request in, same dialect out. Firstpass changes only which model actually answers — cheapest-first, proven against a real gate, escalating only on failure. The full mechanism is <a href="how-it-works.html">How it works</a>; the payloads and receipts for every case are in <a href="request-flow.html">Every scenario, end to end</a>.</figcaption>
+</div>
+<p class="subh">One gated call, over time</p>
+<p>Here is what happens behind the seat for a <em>single</em> call that turns out to be hard — the cheap rung tries first, fails its gate, and only then does the strong rung get involved. This is the Module-4 loop's inner mechanic, on a time axis:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 450" role="img" aria-labelledby="seqGateT">
+<title id="seqGateT">A sequence diagram of one gated call over time, with four lifelines: the client, Firstpass, the cheap model, and the strong model. Top to bottom: the client sends a request to Firstpass. Firstpass forwards it to the cheap model as a first pass. The cheap model returns a draft. Firstpass runs the gate to prove the draft and it fails. Firstpass escalates one rung to the strong model — the only call that pays the strong tier. The strong model returns its output. Firstpass runs the gate again and it passes. Firstpass serves the proven output back to the client with a receipt. The cheap attempt and the gate are the only overhead; the strong tier is paid once, only because it was proven necessary.</title>
+<defs><marker id="sq3A" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="sq3P" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+<marker id="sq3W" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker></defs>
+<text x="40" y="26" class="ink" font-size="13" font-weight="640">One hard call — cheap first, proven, strong only when the gate says so</text>
+<rect x="68" y="44" width="124" height="32" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="130" y="65" text-anchor="middle" class="ink" font-size="11" font-weight="680">client</text>
+<rect x="338" y="44" width="124" height="32" rx="9" class="n-fill accent-s glow" stroke-width="1.5"/>
+<text x="400" y="65" text-anchor="middle" class="ink" font-size="11" font-weight="680">Firstpass</text>
+<rect x="618" y="44" width="124" height="32" rx="9" class="n-fill pass-s glow-p" stroke-width="1.5"/>
+<text x="680" y="65" text-anchor="middle" class="ink" font-size="11" font-weight="680">cheap rung</text>
+<rect x="838" y="44" width="124" height="32" rx="9" class="n-fill warn-s glow-w" stroke-width="1.5"/>
+<text x="900" y="65" text-anchor="middle" class="ink" font-size="11" font-weight="680">strong rung</text>
+<line x1="130" y1="76" x2="130" y2="418" class="grid" stroke-width="1.3"/>
+<line x1="400" y1="76" x2="400" y2="418" class="grid" stroke-width="1.3"/>
+<line x1="680" y1="76" x2="680" y2="418" class="grid" stroke-width="1.3"/>
+<line x1="900" y1="76" x2="900" y2="418" class="grid" stroke-width="1.3"/>
+<line x1="130" y1="106" x2="394" y2="106" class="n-stroke" stroke-width="1.6" marker-end="url(#sq3A)"/>
+<text x="262" y="98" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">① request (unchanged)</text>
+<line x1="400" y1="140" x2="674" y2="140" class="pass-s" stroke-width="1.6" marker-end="url(#sq3P)"/>
+<text x="537" y="132" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">② first pass · cheapest rung</text>
+<rect x="674" y="140" width="12" height="40" rx="2" class="pass"/>
+<line x1="680" y1="184" x2="406" y2="184" class="pass-s" stroke-width="1.6" marker-end="url(#sq3P)"/>
+<text x="543" y="176" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">③ draft output</text>
+<text x="770" y="162" class="pass m" font-size="9.5" font-weight="600">$ cheap</text>
+<path d="M400 208 C452 208 452 234 400 234" fill="none" class="warn-s" stroke-width="1.7" marker-end="url(#sq3W)"/>
+<text x="462" y="225" class="warn m" font-size="10.5" font-weight="640">④ PROVE → fail</text>
+<line x1="400" y1="266" x2="894" y2="266" class="warn-s" stroke-width="1.8" marker-end="url(#sq3W)"/>
+<text x="640" y="258" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑤ escalate +1 rung — the only strong-tier call</text>
+<rect x="894" y="266" width="12" height="40" rx="2" class="warn"/>
+<line x1="900" y1="310" x2="406" y2="310" class="n-stroke" stroke-width="1.6" marker-end="url(#sq3A)"/>
+<text x="650" y="302" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑥ strong output</text>
+<text x="812" y="288" class="warn m" font-size="9.5" font-weight="600">$$ once</text>
+<path d="M400 334 C452 334 452 360 400 360" fill="none" class="pass-s" stroke-width="1.7" marker-end="url(#sq3P)"/>
+<text x="462" y="351" class="pass m" font-size="10.5" font-weight="640">⑦ PROVE → pass</text>
+<line x1="400" y1="392" x2="136" y2="392" class="pass-s" stroke-width="1.8" marker-end="url(#sq3P)"/>
+<text x="268" y="384" text-anchor="middle" class="pass m" font-size="10.5" font-weight="640">⑧ served: proven output + receipt</text>
+<line x1="400" y1="140" x2="674" y2="140" class="flow p s d2" stroke-width="2"/>
+<line x1="680" y1="184" x2="406" y2="184" class="flow p s d3" stroke-width="2"/>
+<line x1="400" y1="266" x2="894" y2="266" class="flow w s d4" stroke-width="2"/>
+<line x1="400" y1="392" x2="136" y2="392" class="flow p s d5" stroke-width="2"/>
+</svg>
+  <figcaption>The cheap attempt (②③) and the gate (④⑦) are the only overhead Firstpass adds; the strong tier (⑤⑥) is paid <em>once</em>, and only because the gate proved it necessary. On the easy majority of calls, the gate passes at step ④ and the strong rung is never touched at all — the call is served cheap and proven, and step ⑧ still leaves a receipt.</figcaption>
+</div>
+<p class="subh">On the wire: the request you send, the receipt you get</p>
+<p>Concretely, for one call of our <code>/orders</code> task. The request is <strong>byte-identical</strong> to a provider call — you changed one thing, the base URL:</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># the ONLY change: base URL points at Firstpass, not the provider</span>
+curl https://firstpass.internal/v1/messages \   <span class="tk-c"># was api.anthropic.com</span>
+  -H 'content-type: application/json' -H 'x-api-key: $KEY' \
+  -d '{ "model": "claude-sonnet-5", "max_tokens": 1024,
+        "tools": [ ... ], "messages": [ ... same body, unchanged ... ] }'</code></pre></div>
+<p>You get back a normal completion — the same shape the provider returns. Separately, Firstpass writes a <strong>receipt</strong> (a hash-chained <code>Trace</code>) recording what actually happened: the cheap rung was tried, its gate passed, and it served — no escalation, and the savings versus an always-strong baseline:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
+  &quot;trace_id&quot;: &quot;tr_7b31…&quot;, &quot;mode&quot;: &quot;enforce&quot;,
+  &quot;request&quot;: { &quot;api&quot;: &quot;anthropic.messages&quot;,
+              &quot;features&quot;: { &quot;tool_count&quot;: 3, &quot;has_images&quot;: false } },
+  &quot;attempts&quot;: [
+    { &quot;rung&quot;: 0, &quot;model&quot;: &quot;anthropic/claude-haiku-4-5&quot;,
+      &quot;in_tokens&quot;: 5120, &quot;out_tokens&quot;: 210, &quot;cost_usd&quot;: 0.0062,
+      &quot;gates&quot;: [{ &quot;name&quot;: &quot;pytest&quot;, &quot;verdict&quot;: &quot;pass&quot; }],
+      &quot;verdict&quot;: &quot;serve&quot; }
+  ],
+  &quot;final&quot;: {
+    &quot;served_rung&quot;: 0, &quot;served_from&quot;: &quot;anthropic/claude-haiku-4-5&quot;,
+    &quot;total_cost_usd&quot;: 0.0062, &quot;escalations&quot;: 0,
+    &quot;counterfactual_baseline_usd&quot;: 0.0185,   <span class="tk-c">// same call, always on sonnet</span>
+    &quot;savings_usd&quot;: 0.0123                     <span class="tk-c">// ← proven, not guessed</span>
+  },
+  &quot;prev_hash&quot;: &quot;sha256:9c1a…&quot;
+}</code></pre></div>
+<div class="note info"><span class="nt">Under the hood</span> Every number in that receipt is measured on the real call, not modeled: the tokens are what the provider reported, the <code>pytest</code> verdict is the actual gate result, and <code>savings_usd</code> is this call's cost against an always-strong baseline. The full anatomy — the hash chain, every field — is <a href="receipts.html">Receipts &amp; audit</a>. <em>(One honest limit: the baseline prices cached input at the full rate, so on heavily-cached traffic the stated savings can run slightly high.)</em></div>
+
+<h2 id="correlate">Module by module: what Firstpass does, and what it doesn't<a class="anchor" href="r101-13-firstpass.html" aria-label="Link to this section">#</a></h2>
+<p>Each fundamental from Part A creates a cost. Here is the honest mapping of what Firstpass does about it — and, where there's a limit, exactly what it is. No over-claims:</p>
+<div class="tblwrap"><table>
+<thead><tr><th>Fundamental (Part A)</th><th>The cost it creates</th><th>What Firstpass does</th></tr></thead>
+<tbody>
+<tr><td><b>Model tier</b> (M2)</td><td>The strong model costs 15–75× the cheap one, paid even on easy calls.</td><td>Opens every call on the <strong>cheapest</strong> rung and escalates only when a gate proves it necessary. This is the core lever. → <a href="request-flow.html#simple">simple</a> / <a href="request-flow.html#complex">complex</a></td></tr>
+<tr><td><b>Output tokens</b> (M2)</td><td>Output is ~5× input; strong-model output is the priciest thing you buy.</td><td>Serves the <strong>cheap rung's</strong> output whenever it passes the gate, so most output tokens are billed at the cheap rate.</td></tr>
+<tr><td><b>Multi-turn</b> (M3)</td><td>The whole transcript is re-read every turn; input cost compounds.</td><td>Re-proves <strong>each turn independently</strong>, cheapest-first — so a long session doesn't pin every turn to a strong model. Caps total spend with a per-session budget. <em>It does not summarize history — that stays the client's job.</em></td></tr>
+<tr><td><b>Tool loops</b> (M4)</td><td>One task = many calls, each re-billing transcript + tools.</td><td>Routes and proves <strong>every call</strong> in the loop on its own. Tool presence is a routing/fidelity signal (kept verbatim), <em>not</em> something Firstpass verifies or re-prices.</td></tr>
+<tr><td><b>MCP</b> (M5)</td><td>More connected tools = fatter <code>tools</code> array on every call.</td><td>Forwards the tools array <strong>byte-for-byte</strong>; it's MCP-agnostic on the data plane. <em>(Firstpass's own <code>firstpass mcp</code> is a separate audit surface — it exposes your receipts to an agent, not the routed traffic.)</em></td></tr>
+<tr><td><b>Prompt cache</b> (M6)</td><td>Repeated prefix re-read at full price unless cached.</td><td>Forwards your <code>cache_control</code> <strong>untouched</strong>, so provider caching keeps working. <em>Honest limit: its own savings math reads only input/output totals — cache-read tokens are counted at full input price in the counterfactual baseline, a known modeling gap.</em></td></tr>
+<tr><td><b>Cost is invisible</b> (all)</td><td>You rarely see per-call cost until the monthly bill.</td><td>Writes a hash-chained <strong>receipt</strong> per call: cost, the rung served, and the savings vs an always-strong baseline. → <a href="receipts.html">Receipts</a></td></tr>
+</tbody>
+</table></div>
+
+<h2 id="together">The same bugfix, end to end<a class="anchor" href="r101-13-firstpass.html" aria-label="Link to this section">#</a></h2>
+<p>Tie it together with the tool loop's four-call bugfix. Run vanilla, all four calls hit the strong model — the Part A baseline. Run through Firstpass, each call opens cheap and only the one that fails its <code>pytest</code> gate escalates. Same task, same wire, different number:</p>
+<div class="statcols">
+  <div class="statcol next"><span class="st-tag">vanilla · Part A</span>
+    <ul>
+      <li><b>Every call → strong model.</b> The safe reflex, applied to all four calls.</li>
+      <li><b>No proof.</b> A wrong patch ships unless your own harness catches it later.</li>
+      <li><b>≈ $0.063</b> for the task — the always-strong baseline (illustrative).</li>
+      <li><b>Cost is invisible</b> until it aggregates on the bill.</li>
+    </ul>
+  </div>
+  <div class="statcol shipped"><span class="st-tag">with Firstpass · Part B</span>
+    <ul>
+      <li><b>Cheapest rung first,</b> each call proved against the real test suite.</li>
+      <li><b>Only the failing call escalates</b> one rung — proof of need, not a guess.</li>
+      <li><b>≈ $0.0128</b> served vs the $0.063 baseline — <b>≈ $0.05 saved</b> on this task (illustrative).</li>
+      <li><b>Every call leaves a receipt</b> — cost, rung, gate verdict, savings.</li>
+    </ul>
+  </div>
+</div>
+<div class="note"><span class="nt">Where the measured numbers live</span> The dollar figures above are illustrative teaching numbers — your savings depend entirely on your models and workload. What <em>is</em> measured: on a live run of 974 real coding tasks scored by their unit tests, 82% of cheap-rung outputs cleared the serve gate at a 7.7% served-failure rate, under the 10% target at 95% confidence. The full run is in <a href="benchmarks.html#live">Benchmarks</a>; the guarantee behind it is <a href="guarantee.html">The guarantee</a>.</div>
+
+<h2 id="next">Where to go next<a class="anchor" href="r101-13-firstpass.html" aria-label="Link to this section">#</a></h2>
+<div class="cards g3">
+  <a class="card" href="how-it-works.html"><div class="step-n">next</div><h3>How it works →</h3><p>The gate and the ladder that make cheapest-first safe — the machinery under Part B, built from the ground up.</p></a>
+  <a class="card" href="request-flow.html"><div class="step-n">deep dive</div><h3>Every scenario, end to end →</h3><p>Simple, complex, exhausted, failover, observe, subagents, teams, multi-turn — each as a real request, response, and receipt.</p></a>
+  <a class="card" href="quickstart.html"><div class="step-n">hands-on</div><h3>Quickstart →</h3><p>Point your agent at Firstpass in observe mode — zero behavior change — and watch the receipts price your real traffic.</p></a>
+</div>
+<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-12-errors.html"><span class="dir">&larr; Previous</span><span class="t">Errors, rate limits &amp; retries</span></a><a class="next" href="../guide/how-it-works.html"><span class="dir">Next &rarr;</span><span class="t">How it works</span></a></nav>
+</main>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=4"></script>
+</body></html>

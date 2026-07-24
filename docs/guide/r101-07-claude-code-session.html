@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Claude Code session — How Agents Talk to Models — Firstpass docs</title>
+<meta name="description" content="How Agents Talk to Models lesson 7 of 13: A Claude Code session. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=4">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<a class="sidebar-back" href="index.html">&larr; All docs</a>
+<span class="course-title">How Agents Talk to Models</span>
+<a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
+<div class="grp lnav"><p class="grp-t">The core path</p>
+<a href="r101-01-one-request.html" class="done"><span class="num">01</span>One request, one response</a>
+<a href="r101-02-token-meter.html" class="done"><span class="num">02</span>The token meter</a>
+<a href="r101-03-multi-turn.html" class="done"><span class="num">03</span>Statelessness &amp; multi-turn</a>
+<a href="r101-04-tools.html" class="done"><span class="num">04</span>Tool calls</a>
+<a href="r101-05-caching.html" class="done"><span class="num">05</span>Prompt caching</a>
+<a href="r101-06-client-shapes.html" class="done"><span class="num">06</span>Three client shapes</a>
+<a href="r101-07-claude-code-session.html" aria-current="page"><span class="num">07</span>A Claude Code session</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Beyond the core path</p>
+<a href="r101-08-streaming.html"><span class="num">08</span>Streaming</a>
+<a href="r101-09-structured-outputs.html"><span class="num">09</span>Structured outputs &amp; JSON</a>
+<a href="r101-10-images.html"><span class="num">10</span>Images &amp; multimodal</a>
+<a href="r101-11-mcp.html"><span class="num">11</span>MCP, in depth</a>
+<a href="r101-12-errors.html"><span class="num">12</span>Errors, rate limits &amp; retries</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Where Firstpass fits</p>
+<a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
+</div>
+</nav></aside><main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / A Claude Code session</p>
+<div class="lesson-progress">
+  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Lesson 7 of 13</span></div>
+  <div class="lp-bar"><span style="width:53.8%"></span></div>
+</div>
+<h1>A Claude Code session</h1>
+<div class="tldr">A coding-agent session is every core-path module running at full tilt. At launch the harness assembles a <b>base context</b> — system prompt + your <code>CLAUDE.md</code> + every tool schema — and that base rides along as input on <b>every request</b>. One instruction (&ldquo;add a test&rdquo;) becomes a <b>loop of many requests</b>; subagents run their <b>own</b> transcripts and bills; and when the window fills the harness <b>compacts</b> older turns into a summary. It's the most expensive shape precisely because every earlier module compounds inside it.</div>
+<p>When you run <code>claude</code> in a terminal, it feels like a conversation. Underneath it's the exact machinery of the core path, just more of it. Nothing here is Firstpass — this is how any capable coding agent spends. Walking one session end to end makes every earlier module concrete.</p>
+
+<p class="subh">What's loaded before you type anything</p>
+<p>The moment a session starts, the harness builds a <strong>base context</strong> it will send on every request for the rest of the session:</p>
+<ul>
+  <li><strong>The system prompt</strong> — the harness's own instructions: how to use tools, safety rules, output conventions. Several thousand tokens, fixed for the session.</li>
+  <li><strong>Project memory</strong> — your <code>CLAUDE.md</code> / <code>AGENTS.md</code>, loaded verbatim so the agent knows your conventions.</li>
+  <li><strong>Tool schemas</strong> — the name + JSON schema of every tool the agent can call (Read, Edit, Bash, Grep, plus any MCP tools). This is the <code>tools</code> array from <a href="r101-04-tools.html">Tool calls</a> plus any <a href="r101-11-mcp.html">MCP</a> tools, together, on the wire.</li>
+</ul>
+<p>Add it up and the base context is often <em>several thousand input tokens before your first word</em> — and by multi-turn's rule, it is re-sent and re-read on <strong>every</strong> request in the session. That's exactly the stable prefix caching exists to cache, which is why a coding agent is the textbook case for prompt caching.</p>
+
+<p class="subh">One instruction becomes many requests</p>
+<p>You type one line — &ldquo;add a null-check test for <code>handle()</code>.&rdquo; That is <em>not</em> one model call. It kicks off the the tool loop loop: the agent reads files, writes a test, runs it, reads the failure, fixes it — each step a separate request, each carrying the base context <em>plus</em> a transcript that grew since the last step. A single instruction routinely spends five, ten, twenty model calls before it reports back:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 500" role="img" aria-labelledby="seqSessT">
+<title id="seqSessT">A sequence diagram of one Claude Code instruction over time, with three lifelines: you at the terminal, the model, and the local tools. A band across the top shows that at session launch a base context is assembled once — system prompt plus CLAUDE.md plus tool schemas. Then: you type an instruction; the terminal sends request one, which is the base context plus the instruction, billed as input; the model replies with a tool_use, billed as output; the terminal runs the tool locally, unbilled; the tool returns a result; the terminal sends request two, which resends the entire base context again plus the transcript and the result, billed as input; the model replies with an edit tool_use and, after several more such trips, a final answer, billed as output. Two callouts at the bottom note that when the window fills the harness compacts older turns into a summary, and that a spawned subagent runs its own separate transcript and bill and returns only a summary.</title>
+<defs><marker id="sq2A" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="sq2P" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker></defs>
+<text x="40" y="26" class="ink" font-size="13" font-weight="640">One instruction → a loop of requests, each re-sending the whole base context</text>
+<rect x="40" y="40" width="920" height="44" rx="11" class="n-fill accent-s glow" stroke-width="1.5"/>
+<text x="500" y="60" text-anchor="middle" class="ink m" font-size="11" font-weight="640">session launch · base context assembled once</text>
+<text x="500" y="76" text-anchor="middle" class="accent-ink m" font-size="10" font-weight="600">system prompt + CLAUDE.md + tool schemas — re-sent on every request below</text>
+<rect x="80" y="98" width="130" height="32" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="145" y="119" text-anchor="middle" class="ink" font-size="11" font-weight="680">you · terminal</text>
+<rect x="440" y="98" width="130" height="32" rx="9" class="n-fill accent-s glow" stroke-width="1.5"/>
+<text x="505" y="119" text-anchor="middle" class="ink" font-size="11" font-weight="680">model</text>
+<rect x="785" y="98" width="130" height="32" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="850" y="119" text-anchor="middle" class="ink" font-size="11" font-weight="680">local tools</text>
+<line x1="145" y1="130" x2="145" y2="398" class="grid" stroke-width="1.3"/>
+<line x1="505" y1="130" x2="505" y2="398" class="grid" stroke-width="1.3"/>
+<line x1="850" y1="130" x2="850" y2="398" class="grid" stroke-width="1.3"/>
+<text x="152" y="152" class="ink-mut m" font-size="10">you type: &quot;add a null-check test for handle()&quot;</text>
+<line x1="145" y1="176" x2="499" y2="176" class="n-stroke" stroke-width="2.2" marker-end="url(#sq2A)"/>
+<text x="322" y="168" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">① request 1 · base ctx + instruction</text>
+<text x="600" y="180" class="warn m" font-size="10" font-weight="600">$ input · base ctx billed</text>
+<rect x="499" y="176" width="12" height="42" rx="2" class="accent"/>
+<line x1="505" y1="222" x2="151" y2="222" class="pass-s" stroke-width="1.6" marker-end="url(#sq2P)"/>
+<text x="328" y="214" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">② tool_use · Read(orders.py)</text>
+<text x="600" y="226" class="pass m" font-size="10" font-weight="600">$ output</text>
+<line x1="145" y1="258" x2="844" y2="258" class="n-stroke" stroke-width="1.5" marker-end="url(#sq2A)"/>
+<text x="497" y="250" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">③ run tool locally · ④ result back</text>
+<line x1="850" y1="290" x2="151" y2="290" class="n-stroke" stroke-width="1.5" marker-end="url(#sq2A)"/>
+<text x="720" y="282" text-anchor="middle" class="ink-mut" font-size="9.5">unbilled — no model call</text>
+<line x1="145" y1="326" x2="499" y2="326" class="n-stroke" stroke-width="2.6" marker-end="url(#sq2A)"/>
+<text x="322" y="318" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑤ request 2 · base ctx RESENT + transcript + result</text>
+<text x="600" y="330" class="warn m" font-size="10" font-weight="600">$ input · base ctx again</text>
+<rect x="499" y="326" width="12" height="42" rx="2" class="accent"/>
+<line x1="505" y1="372" x2="151" y2="372" class="pass-s" stroke-width="1.6" marker-end="url(#sq2P)"/>
+<text x="322" y="364" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑥ Edit · then pytest · … · final answer</text>
+<text x="600" y="376" class="pass m" font-size="10" font-weight="600">$ output · ×N more trips</text>
+<rect x="40" y="414" width="450" height="70" rx="11" class="n-fill warn-s glow-w" stroke-width="1.4"/>
+<text x="60" y="438" class="ink m" font-size="10.5" font-weight="640">window fills → compaction</text>
+<text x="60" y="456" class="ink-mut m" font-size="9.5">older turns are summarized to free room;</text>
+<text x="60" y="470" class="ink-mut m" font-size="9.5">the loop continues on less history, not more</text>
+<rect x="510" y="414" width="450" height="70" rx="11" class="n-fill accent-s glow" stroke-width="1.4"/>
+<text x="530" y="438" class="ink m" font-size="10.5" font-weight="640">a subagent spawns</text>
+<text x="530" y="456" class="ink-mut m" font-size="9.5">its OWN base context + transcript + bill;</text>
+<text x="530" y="470" class="accent-ink m" font-size="9.5" font-weight="600">returns just a summary to this session</text>
+<line x1="145" y1="176" x2="499" y2="176" class="flow s" stroke-width="2.2"/>
+<line x1="505" y1="222" x2="151" y2="222" class="flow p s d2" stroke-width="2.2"/>
+<line x1="145" y1="326" x2="499" y2="326" class="flow s d3" stroke-width="2.6"/>
+<line x1="505" y1="372" x2="151" y2="372" class="flow p s d4" stroke-width="2.2"/>
+</svg>
+  <figcaption>One typed instruction, many billed requests — and every request re-sends the whole base context (system prompt + <code>CLAUDE.md</code> + tools). This is multi-turn's compounding and the tool loop's call count stacked on top of a fat fixed prefix, which is why coding-agent sessions dominate a bill and why caching (caching) matters most here.</figcaption>
+</div>
+
+<p class="subh">Subagents spend on their own tab</p>
+<p>When the agent delegates — &ldquo;search the codebase for every caller of <code>parse()</code>&rdquo; — it can spawn a <strong>subagent</strong>. That subagent gets its <em>own</em> base context and its <em>own</em> transcript, runs its own tool loop, and returns only a compact result to the main session. This is deliberate: it keeps the main thread's context lean (the subagent's twenty file-reads never pollute your window). But make no mistake — those tokens are <em>billed</em>. A session that spawns three subagents is running four independent Module-4 loops, four bills, that happen to roll up into one task.</p>
+
+<p class="subh">When the window fills: compaction</p>
+<p>Every model has a context ceiling. As a long session nears it, the harness <strong>compacts</strong> — summarizes older turns into a digest and continues, so the request stops growing without losing the thread. Two costs follow:</p>
+<ul>
+  <li>Compaction is itself a model call — summarizing isn't free.</li>
+  <li>It <em>rewrites the prefix</em>, so the prompt cache from before the event is invalidated — the next request pays fresh reads.</li>
+</ul>
+<p>Net: long sessions cost less than linear growth suggests (the transcript is capped), but they aren't free at the seams.</p>
+
+<p class="subh">So what does a session cost?</p>
+<p>Put the pieces together for a realistic half-hour of pair-programming — a handful of instructions, each fanning into a tool loop, over a fat base context:</p>
+<div class="chips">
+  <div class="chip"><div class="cn">~5k</div><div class="cl">base-context input tokens re-sent every request (illustrative)</div></div>
+  <div class="chip"><div class="cn">50–200</div><div class="cl">model calls across a busy 30-min session</div></div>
+  <div class="chip good"><div class="cn">≈90%</div><div class="cl">of input is the repeated prefix — the caching target</div></div>
+  <div class="chip"><div class="cn">tier</div><div class="cl">the one lever that scales the whole thing up or down</div></div>
+</div>
+<div class="note"><span class="nt">Key idea</span> A coding-agent session is where all seven earlier modules land at once: a fat fixed prefix (M1/M4/M5), re-read every request (M3), across a high call count (M4), on whatever tier you picked (M2), with caching as the main relief valve (M6). The single biggest knob is still <em>which tier answers each call</em> — and in a session of 50–200 calls, the vast majority are easy (read a file, apply a small edit) while a few are hard (design the fix). Paying the strong tier on all of them is the reflex Part B targets.</div>
+<div class="note info"><span class="nt">Under the hood</span> This is why &ldquo;my Claude Code bill is higher than my chatbot bill&rdquo; is expected, not a bug. A chatbot turn is one call over a short prompt. A coding-agent instruction is <em>dozens</em> of calls, each over a multi-thousand-token base context plus a growing transcript. The per-token price is identical; the token <em>count</em> is one to two orders of magnitude larger. Everything Firstpass does in Part B is aimed at the tier those tokens are billed at.</div>
+<div class="recap">A Claude Code session runs the core path at scale: a fat base context re-sent every request, one instruction fanning into many calls, subagents billing separately, and compaction capping the growth — the most expensive shape, and the one with the most to gain from cheaper tiers.</div>
+
+<p>The seven modules above are the main road — the path our one task actually walked. These five are the turns a real agent takes off it: streaming responses, machine-readable output, images, MCP servers, and the failures that happen when you make hundreds of calls. Each is a dedicated module; take them in any order.</p>
+<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-06-client-shapes.html"><span class="dir">&larr; Previous</span><span class="t">Three client shapes</span></a><a class="next" href="r101-08-streaming.html"><span class="dir">Next &rarr;</span><span class="t">Streaming</span></a></nav>
+</main>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=4"></script>
+</body></html>

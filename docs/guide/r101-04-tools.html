@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool calls — How Agents Talk to Models — Firstpass docs</title>
+<meta name="description" content="How Agents Talk to Models lesson 4 of 13: Tool calls. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=4">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<a class="sidebar-back" href="index.html">&larr; All docs</a>
+<span class="course-title">How Agents Talk to Models</span>
+<a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
+<div class="grp lnav"><p class="grp-t">The core path</p>
+<a href="r101-01-one-request.html" class="done"><span class="num">01</span>One request, one response</a>
+<a href="r101-02-token-meter.html" class="done"><span class="num">02</span>The token meter</a>
+<a href="r101-03-multi-turn.html" class="done"><span class="num">03</span>Statelessness &amp; multi-turn</a>
+<a href="r101-04-tools.html" aria-current="page"><span class="num">04</span>Tool calls</a>
+<a href="r101-05-caching.html"><span class="num">05</span>Prompt caching</a>
+<a href="r101-06-client-shapes.html"><span class="num">06</span>Three client shapes</a>
+<a href="r101-07-claude-code-session.html"><span class="num">07</span>A Claude Code session</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Beyond the core path</p>
+<a href="r101-08-streaming.html"><span class="num">08</span>Streaming</a>
+<a href="r101-09-structured-outputs.html"><span class="num">09</span>Structured outputs &amp; JSON</a>
+<a href="r101-10-images.html"><span class="num">10</span>Images &amp; multimodal</a>
+<a href="r101-11-mcp.html"><span class="num">11</span>MCP, in depth</a>
+<a href="r101-12-errors.html"><span class="num">12</span>Errors, rate limits &amp; retries</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Where Firstpass fits</p>
+<a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
+</div>
+</nav></aside><main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Tool calls</p>
+<div class="lesson-progress">
+  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Lesson 4 of 13</span></div>
+  <div class="lp-bar"><span style="width:30.8%"></span></div>
+</div>
+<h1>Tool calls</h1>
+<div class="tldr">A tool-using agent runs a <b>loop</b>: send <code>tools</code> → model replies with a <code>tool_use</code> → <b>your code</b> runs it → you send a <code>tool_result</code> in a <b>new</b> request → repeat until the model answers. Each trip is a <b>separate billed call</b>, and every call re-reads the growing transcript <em>and</em> the whole tools list. One &ldquo;fix the bug&rdquo; becomes four to a dozen calls.</div>
+<p>An agent that can read files, run tests, or hit an API does it through <strong>tool calls</strong>, and this is where call counts explode. You send the model a list of <code>tools</code> (name + JSON schema) in the request. Instead of a final answer, the model can reply with a <code>tool_use</code> block: &ldquo;call <code>Read</code> with <code>path=orders.py</code>.&rdquo; <strong>Your code</strong> — not the model — runs the tool, then you send the result back as a <code>tool_result</code> in a <em>new</em> request. The model reads it and continues. That's the agent loop:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="loopT">
+<title id="loopT">The agent loop. A request goes to the model with a list of tools. The model replies with a tool_use block naming a tool and arguments. The client runs the tool and sends the output back as a tool_result in a new request that also resends the whole growing transcript. The model reads it and either calls another tool or returns a final answer. Each pass around the loop is a separate billed model call.</title>
+<defs><marker id="lpA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="lpC" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/></marker></defs>
+<text x="40" y="30" class="ink" font-size="13" font-weight="640">Every trip around the loop is another billed model call</text>
+<!-- model -->
+<rect x="60" y="110" width="170" height="80" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="145" y="146" text-anchor="middle" class="ink" font-size="13" font-weight="700">the model</text>
+<text x="145" y="166" text-anchor="middle" class="ink-mut m" font-size="10">reads tools + transcript</text>
+<!-- tool_use -->
+<rect x="330" y="60" width="200" height="64" rx="11" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="430" y="86" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">reply: tool_use</text>
+<text x="430" y="104" text-anchor="middle" class="ink-mut m" font-size="10">Read( path="orders.py" )</text>
+<!-- your code -->
+<rect x="620" y="60" width="200" height="64" rx="11" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="720" y="86" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">your code runs it</text>
+<text x="720" y="104" text-anchor="middle" class="ink-mut m" font-size="10">reads the file from disk</text>
+<!-- tool_result -->
+<rect x="620" y="176" width="200" height="64" rx="11" class="n-fill accent-s" stroke-width="1.5"/>
+<text x="720" y="202" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">new request: tool_result</text>
+<text x="720" y="220" text-anchor="middle" class="accent-ink m" font-size="10" font-weight="600">+ whole transcript again</text>
+<!-- final -->
+<rect x="330" y="176" width="200" height="64" rx="11" class="n-fill pass-s glow-p" stroke-width="1.5"/>
+<text x="430" y="202" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">…or final answer</text>
+<text x="430" y="220" text-anchor="middle" class="pass m" font-size="10" font-weight="600">when no tool is needed</text>
+<!-- connectors -->
+<line x1="230" y1="140" x2="328" y2="98" class="n-stroke" stroke-width="1.5" marker-end="url(#lpA)"/>
+<line x1="530" y1="92" x2="618" y2="92" class="n-stroke" stroke-width="1.5" marker-end="url(#lpA)"/>
+<line x1="720" y1="124" x2="720" y2="174" class="accent-s" stroke-width="1.5" marker-end="url(#lpC)"/>
+<path d="M620 208 C420 208 300 200 232 168" fill="none" class="accent-s" stroke-width="1.6" marker-end="url(#lpC)"/>
+<text x="470" y="160" class="accent-ink" font-size="10" font-weight="600">loop back — another call</text>
+<line x1="230" y1="162" x2="328" y2="200" class="n-stroke" stroke-width="1.4" marker-end="url(#lpA)" opacity="0.5"/>
+<!-- pulses -->
+<line x1="230" y1="140" x2="328" y2="98" class="flow s" stroke-width="2"/>
+<line x1="530" y1="92" x2="618" y2="92" class="flow s d2" stroke-width="2"/>
+<line x1="720" y1="124" x2="720" y2="174" class="flow s d3" stroke-width="2"/>
+<path d="M620 208 C420 208 300 200 232 168" class="flow s d4" stroke-width="2"/>
+</svg>
+  <figcaption>The model never runs a tool itself — it asks, your code executes, you resend the result. So one &ldquo;fix the bug&rdquo; task becomes four, six, a dozen model calls, and every one of them re-reads the whole transcript <em>and</em> the tools list.</figcaption>
+</div>
+<p class="subh">The four payloads, in order</p>
+<p>Abstractions hide this, so here it is on the wire — one bugfix, request and response, four real bodies. Watch three things: the model <em>never</em> answers in ②, it asks; request ③ is a brand-new call that <strong>echoes the assistant's own <code>tool_use</code> back</strong> and appends your <code>tool_result</code>; and the <code>tools</code> array rides along on every request, billed as input each time.</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// ① REQUEST — tools declared, the task as a user message</span>
+{
+  "model": "claude-sonnet-5",
+  "max_tokens": 1024,
+  "tools": [
+    { "name": "Read", "description": "Read a file",
+      "input_schema": { "type": "object",
+        "properties": { "path": { "type": "string" } }, "required": ["path"] } },
+    { "name": "Edit", "description": "Replace text in a file", "input_schema": { "...": "..." } }
+  ],
+  "messages": [
+    { "role": "user", "content": "Make POST /orders reject a missing total, with a test." }
+  ]
+}
+
+<span class="tk-c">// ② RESPONSE — not an answer. stop_reason: tool_use → the model wants you to run a tool</span>
+{
+  "stop_reason": "tool_use",
+  "content": [
+    { "type": "text", "text": "Let me read the file first." },
+    { "type": "tool_use", "id": "toolu_01A",
+      "name": "Read", "input": { "path": "orders.py" } }
+  ],
+  "usage": { "input_tokens": 480, "output_tokens": 38 }
+}
+
+<span class="tk-c">// ③ REQUEST — a NEW call. Turn 1 kept verbatim, the assistant's tool_use echoed</span>
+<span class="tk-c">//    back, then YOUR tool_result appended. The tools array is re-sent, re-billed.</span>
+{
+  "model": "claude-sonnet-5",
+  "tools": [ "...the same two tools, sent again..." ],
+  "messages": [
+    { "role": "user",      "content": "Make POST /orders reject a missing total, with a test." },
+    { "role": "assistant", "content": [
+      { "type": "tool_use", "id": "toolu_01A",
+        "name": "Read", "input": { "path": "orders.py" } } ] },
+    { "role": "user",      "content": [
+      { "type": "tool_result", "tool_use_id": "toolu_01A",
+        "content": "def create_order(req): total = req.body['total']  # no presence check ...60 lines..." } ] }
+  ]
+}
+
+<span class="tk-c">// ④ RESPONSE — the model read the file and emits the fix as ANOTHER tool_use</span>
+{
+  "stop_reason": "tool_use",
+  "content": [
+    { "type": "tool_use", "id": "toolu_02B", "name": "Edit",
+      "input": { "path": "orders.py", "old": "total = req.body['total']", "new": "if 'total' not in req.body: abort(400)" } }
+  ],
+  "usage": { "input_tokens": 690, "output_tokens": 52 }   <span class="tk-c">// ← input grew: transcript is longer now</span>
+}</code></pre></div>
+<p>The loop runs once more past ④ — you apply the <code>Edit</code>, run <code>pytest</code>, and send the pass/fail back as one more <code>tool_result</code>. Only then does the model return a plain-text answer with <code>stop_reason: end_turn</code>. That's <strong>four model calls</strong> for one &ldquo;fix the bug,&rdquo; each re-reading the tools array and a transcript that was longer than the last.</p>
+<p class="subh">The same loop on a time axis</p>
+<p>The loop diagram shows <em>who talks to whom</em>. This sequence view shows <em>when</em>, and marks exactly which arrows cost money — the two model round-trips are billed, the local tool run between them is not:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 470" role="img" aria-labelledby="seqToolT">
+<title id="seqToolT">A sequence diagram of one tool-using task over time, with three lifelines: the client, the model, and the tool. Top to bottom: step one, the client sends a request carrying the tools list and the task to the model — billed as input. Step two, the model replies with a tool_use block — billed as output. Step three, the client runs the tool locally — no model call, not billed. Step four, the tool returns its output to the client. Step five, the client sends a new request carrying the tool_result plus the whole grown transcript — billed as input, and larger than step one. Step six, the model returns the final answer — billed as output. Only arrows that touch the model are billed, and the transcript grows every round trip.</title>
+<defs><marker id="sq1A" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="sq1P" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker></defs>
+<text x="40" y="28" class="ink" font-size="13" font-weight="640">One task, over time — every arrow that touches the model is a billed call</text>
+<rect x="90" y="46" width="120" height="34" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="150" y="68" text-anchor="middle" class="ink" font-size="11.5" font-weight="680">client</text>
+<rect x="460" y="46" width="120" height="34" rx="9" class="n-fill accent-s glow" stroke-width="1.5"/>
+<text x="520" y="68" text-anchor="middle" class="ink" font-size="11.5" font-weight="680">model</text>
+<rect x="800" y="46" width="120" height="34" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="860" y="68" text-anchor="middle" class="ink" font-size="11" font-weight="680">tool · your code</text>
+<line x1="150" y1="80" x2="150" y2="438" class="grid" stroke-width="1.3"/>
+<line x1="520" y1="80" x2="520" y2="438" class="grid" stroke-width="1.3"/>
+<line x1="860" y1="80" x2="860" y2="438" class="grid" stroke-width="1.3"/>
+<line x1="150" y1="120" x2="514" y2="120" class="n-stroke" stroke-width="1.6" marker-end="url(#sq1A)"/>
+<text x="332" y="112" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">① request · tools + task</text>
+<text x="620" y="124" class="accent-ink m" font-size="10" font-weight="600">$ input</text>
+<rect x="514" y="120" width="12" height="46" rx="2" class="accent"/>
+<line x1="520" y1="170" x2="156" y2="170" class="pass-s" stroke-width="1.6" marker-end="url(#sq1P)"/>
+<text x="338" y="162" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">② tool_use · Read(orders.py)</text>
+<text x="620" y="174" class="pass m" font-size="10" font-weight="600">$ output</text>
+<line x1="150" y1="220" x2="854" y2="220" class="n-stroke" stroke-width="1.5" marker-end="url(#sq1A)"/>
+<text x="505" y="212" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">③ run Read locally</text>
+<line x1="860" y1="262" x2="156" y2="262" class="n-stroke" stroke-width="1.5" marker-end="url(#sq1A)"/>
+<text x="505" y="254" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">④ file contents back</text>
+<text x="700" y="284" text-anchor="middle" class="ink-mut" font-size="9.5">③④ never touch the model — no tokens billed</text>
+<line x1="150" y1="322" x2="514" y2="322" class="n-stroke" stroke-width="2.4" marker-end="url(#sq1A)"/>
+<text x="332" y="314" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑤ new request · tool_result + whole transcript</text>
+<text x="620" y="326" class="warn m" font-size="10" font-weight="600">$ input — bigger</text>
+<rect x="514" y="322" width="12" height="46" rx="2" class="accent"/>
+<line x1="520" y1="372" x2="156" y2="372" class="pass-s" stroke-width="1.6" marker-end="url(#sq1P)"/>
+<text x="338" y="364" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑥ final answer · or next tool_use</text>
+<text x="620" y="376" class="pass m" font-size="10" font-weight="600">$ output</text>
+<text x="150" y="410" class="ink-mut" font-size="10">transcript at ① — the task alone</text>
+<text x="150" y="428" class="warn" font-size="10" font-weight="600">transcript at ⑤ — task + tool_use + result, and it keeps growing every trip</text>
+<line x1="150" y1="120" x2="514" y2="120" class="flow s" stroke-width="2.2"/>
+<line x1="520" y1="170" x2="156" y2="170" class="flow p s d2" stroke-width="2.2"/>
+<line x1="150" y1="322" x2="514" y2="322" class="flow s d3" stroke-width="2.6"/>
+<line x1="520" y1="372" x2="156" y2="372" class="flow p s d4" stroke-width="2.2"/>
+</svg>
+  <figcaption>The same loop on a time axis: two billed model round-trips (①② and ⑤⑥) with an unbilled local tool run (③④) between them. Step ⑤ is drawn fatter than ① on purpose — the transcript grew. A real bugfix stacks several of these before the final answer, which is why one task costs like four.</figcaption>
+</div>
+<p>Two costs hide in this loop. The obvious one: a single task is now <em>many</em> calls. The quiet one: the <code>tools</code> array is part of the input on <em>every</em> call — a fat toolbelt taxes each round-trip. A four-call bugfix where every call re-reads a ~2k-token transcript and a 3-tool schema, run entirely on the strong model, lands around the baseline the routing pages use:</p>
+<div class="chips">
+  <div class="chip"><div class="cn">4–12</div><div class="cl">model calls in one &ldquo;fix the bug&rdquo; task</div></div>
+  <div class="chip"><div class="cn">×N</div><div class="cl">the tools list billed as input every call</div></div>
+  <div class="chip"><div class="cn">$0.063<span class="u"></span></div><div class="cl">4-call bugfix, all on the strong model (illustrative)</div></div>
+</div>
+<div class="note"><span class="nt">Key idea</span> The loop is where the meter and multi-turn <em>compound</em>. Every tool round-trip is a full billed call (the token meter) that re-reads a transcript which is longer than the last (multi-turn) plus the entire tools list. Call count × growing input is the multiplier that turns a one-cent question into a real bill — and the calls in a loop are wildly uneven in difficulty, which is the whole opening for Part B.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Reading <code>stop_reason: tool_use</code> as an error or a finished answer. It's neither — it's the model handing control back to <em>you</em> to run the named tool and call again with the result. If your client stops there, the agent simply halts mid-task; if it forgets to echo the assistant's <code>tool_use</code> block into the next request, the provider rejects the <code>tool_result</code> as unmatched.</div>
+<div class="recap">A tool-using task is a loop of billed round-trips — model asks, your code runs the tool, you resend the result — so one task costs like many, each re-reading a bigger transcript and the full tools list.</div>
+<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-03-multi-turn.html"><span class="dir">&larr; Previous</span><span class="t">Statelessness &amp; multi-turn</span></a><a class="next" href="r101-05-caching.html"><span class="dir">Next &rarr;</span><span class="t">Prompt caching</span></a></nav>
+</main>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=4"></script>
+</body></html>

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Structured outputs & JSON — How Agents Talk to Models — Firstpass docs</title>
+<meta name="description" content="How Agents Talk to Models lesson 9 of 13: Structured outputs & JSON. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=4">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<a class="sidebar-back" href="index.html">&larr; All docs</a>
+<span class="course-title">How Agents Talk to Models</span>
+<a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
+<div class="grp lnav"><p class="grp-t">The core path</p>
+<a href="r101-01-one-request.html" class="done"><span class="num">01</span>One request, one response</a>
+<a href="r101-02-token-meter.html" class="done"><span class="num">02</span>The token meter</a>
+<a href="r101-03-multi-turn.html" class="done"><span class="num">03</span>Statelessness &amp; multi-turn</a>
+<a href="r101-04-tools.html" class="done"><span class="num">04</span>Tool calls</a>
+<a href="r101-05-caching.html" class="done"><span class="num">05</span>Prompt caching</a>
+<a href="r101-06-client-shapes.html" class="done"><span class="num">06</span>Three client shapes</a>
+<a href="r101-07-claude-code-session.html" class="done"><span class="num">07</span>A Claude Code session</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Beyond the core path</p>
+<a href="r101-08-streaming.html" class="done"><span class="num">08</span>Streaming</a>
+<a href="r101-09-structured-outputs.html" aria-current="page"><span class="num">09</span>Structured outputs &amp; JSON</a>
+<a href="r101-10-images.html"><span class="num">10</span>Images &amp; multimodal</a>
+<a href="r101-11-mcp.html"><span class="num">11</span>MCP, in depth</a>
+<a href="r101-12-errors.html"><span class="num">12</span>Errors, rate limits &amp; retries</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Where Firstpass fits</p>
+<a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
+</div>
+</nav></aside><main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Structured outputs & JSON</p>
+<div class="lesson-progress">
+  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Lesson 9 of 13</span></div>
+  <div class="lp-bar"><span style="width:69.2%"></span></div>
+</div>
+<h1>Structured outputs &amp; JSON</h1>
+<div class="tldr">Asking the model to &ldquo;return JSON&rdquo; in the prompt is fragile — you get prose, markdown fences, or truncated objects. Two reliable paths: <b>tool-as-schema</b> (define a single tool whose <code>input_schema</code> is your target shape, force the model to fill it via <code>tool_use</code>) and <b>provider structured/JSON mode</b> (OpenAI&rsquo;s <code>response_format</code>). Either way, the data arrives schema-validated in a predictable field. Token billing is unchanged — same rates, shaped output.</div>
+
+<p>When an agent needs machine-readable output &mdash; a patch plan, a routing decision, a list of findings &mdash; parsing freeform model text is the wrong tool. Two failure modes are common: the model wraps the JSON in a prose sentence or a markdown code fence and the parser breaks; or <code>max_tokens</code> cuts the output mid-object and you receive invalid JSON. Both are avoidable by using the API&rsquo;s structured-output surface instead of prompt engineering.</p>
+
+<p class="subh">Tool-as-schema — the reliable cross-provider approach</p>
+
+<p>Define a single tool whose <code>input_schema</code> is the exact JSON shape you want. Set <code>tool_choice</code> to force the model to call only that tool. The response arrives as a <code>tool_use</code> block — the structured data sits in <code>content[0].input</code>, already validated against the schema, with no freetext prose mixed in. Works on Anthropic and OpenAI.</p>
+
+<p>Here the coding agent plans the <code>POST /orders</code> patch as a typed object before writing a single line:</p>
+
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// ① REQUEST — one tool whose input_schema IS the target shape</span>
+{
+  &quot;model&quot;: &quot;claude-haiku-4-5&quot;,
+  &quot;max_tokens&quot;: 512,
+  &quot;tool_choice&quot;: { &quot;type&quot;: &quot;tool&quot;, &quot;name&quot;: &quot;emit_patch_plan&quot; },
+  &quot;tools&quot;: [{
+    &quot;name&quot;: &quot;emit_patch_plan&quot;,
+    &quot;description&quot;: &quot;Output the patch plan as structured data.&quot;,
+    &quot;input_schema&quot;: {
+      &quot;type&quot;: &quot;object&quot;,
+      &quot;properties&quot;: {
+        &quot;file&quot;:      { &quot;type&quot;: &quot;string&quot; },
+        &quot;old&quot;:       { &quot;type&quot;: &quot;string&quot; },
+        &quot;new&quot;:       { &quot;type&quot;: &quot;string&quot; },
+        &quot;test_name&quot;: { &quot;type&quot;: &quot;string&quot; }
+      },
+      &quot;required&quot;: [&quot;file&quot;, &quot;old&quot;, &quot;new&quot;, &quot;test_name&quot;]
+    }
+  }],
+  &quot;messages&quot;: [{
+    &quot;role&quot;: &quot;user&quot;,
+    &quot;content&quot;: &quot;Plan the fix for POST /orders: reject requests missing ‘total’.&quot;
+  }]
+}
+
+<span class="tk-c">// ② RESPONSE — structured data in content[0].input, stop_reason: tool_use</span>
+{
+  &quot;stop_reason&quot;: &quot;tool_use&quot;,
+  &quot;content&quot;: [{
+    &quot;type&quot;: &quot;tool_use&quot;,
+    &quot;id&quot;:   &quot;toolu_03C&quot;,
+    &quot;name&quot;: &quot;emit_patch_plan&quot;,
+    &quot;input&quot;: {
+      &quot;file&quot;:      &quot;orders.py&quot;,
+      &quot;old&quot;:       &quot;body = await request.json()&quot;,
+      &quot;new&quot;:       &quot;body = await request.json()\n    if ‘total’ not in body:\n        raise HTTPException(422, ‘total required’)&quot;,
+      &quot;test_name&quot;: &quot;test_rejects_missing_total&quot;
+    }
+  }],
+  &quot;usage&quot;: { &quot;input_tokens&quot;: 312, &quot;output_tokens&quot;: 71 }
+}</code></pre></div>
+
+<p>Read <code>response.content[0].input</code> directly as your parsed object. You are using the tool mechanism as a schema, not driving a loop &mdash; there is no <code>tool_result</code> to send back.</p>
+
+<p class="subh">OpenAI structured / JSON mode</p>
+
+<p>OpenAI&rsquo;s <code>POST /v1/chat/completions</code> has a <code>response_format</code> field with two variants. <code>json_object</code> guarantees syntactically valid JSON but doesn&rsquo;t enforce a shape. <code>json_schema</code> with <code>strict: true</code> enforces a full JSON Schema at generation time &mdash; no invalid shapes reach you. Anthropic&rsquo;s <code>POST /v1/messages</code> has no <code>response_format</code> field; use the tool-as-schema approach above.</p>
+
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// OpenAI — strict JSON Schema enforcement at generation time</span>
+{
+  &quot;model&quot;: &quot;gpt-4o&quot;,
+  &quot;response_format&quot;: {
+    &quot;type&quot;: &quot;json_schema&quot;,
+    &quot;json_schema&quot;: {
+      &quot;name&quot;:   &quot;patch_plan&quot;,
+      &quot;strict&quot;: true,
+      &quot;schema&quot;: {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: {
+          &quot;file&quot;:      { &quot;type&quot;: &quot;string&quot; },
+          &quot;old&quot;:       { &quot;type&quot;: &quot;string&quot; },
+          &quot;new&quot;:       { &quot;type&quot;: &quot;string&quot; },
+          &quot;test_name&quot;: { &quot;type&quot;: &quot;string&quot; }
+        },
+        &quot;required&quot;: [&quot;file&quot;, &quot;old&quot;, &quot;new&quot;, &quot;test_name&quot;],
+        &quot;additionalProperties&quot;: false  <span class="tk-c">// required when strict: true</span>
+      }
+    }
+  },
+  &quot;messages&quot;: [{ &quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Plan the fix for POST /orders …&quot; }]
+}
+<span class="tk-c">// response: choices[0].message.content is a JSON string; JSON.parse() it once</span>
+<span class="tk-c">// finish_reason: "stop" on success, "length" on truncation (see below)</span></code></pre></div>
+
+<div class="note warn"><span class="nt">Common mistake</span> Parsing the output without first checking <code>stop_reason</code> (Anthropic) or <code>finish_reason</code> (OpenAI). If the model runs out of tokens mid-JSON &mdash; <code>stop_reason: &quot;max_tokens&quot;</code> / <code>finish_reason: &quot;length&quot;</code> &mdash; the output is a truncated fragment that throws on parse. The fix is to check the stop reason <em>before</em> parsing and either retry with a higher <code>max_tokens</code> or surface the error cleanly. The response anatomy is covered in <a href="r101-01-one-request.html">Module 1</a>.</div>
+
+<div class="note"><span class="nt">Key idea</span> Structured output is a constraint on <em>how</em> the model writes output tokens &mdash; it is not a different kind of call or a different billing unit. The same per-Mtok input and output rates apply. The schema definition inside <code>input_schema</code> or <code>json_schema</code> is part of the request and is billed as input tokens, the same as any tool definition in Module 4.</div>
+
+<div class="note info"><span class="nt">Under the hood</span> With <code>tool_choice: {type: &quot;tool&quot;, name: &quot;…&quot;}</code> Anthropic guarantees the model calls exactly that tool and nothing else &mdash; no leading prose, no alternative tool. Without <code>tool_choice</code>, the model might emit a text block first or pick a different tool. For structured-output use, always pin <code>tool_choice</code>.</div>
+
+<div class="recap">Structured output works by using the API&rsquo;s own schema surface &mdash; a single forced tool on Anthropic, <code>response_format: json_schema</code> on OpenAI &mdash; so the data arrives validated in a known field. Always check <code>stop_reason</code> before parsing: a <code>max_tokens</code> cut produces a truncated fragment, not valid JSON.</div>
+<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-08-streaming.html"><span class="dir">&larr; Previous</span><span class="t">Streaming</span></a><a class="next" href="r101-10-images.html"><span class="dir">Next &rarr;</span><span class="t">Images &amp; multimodal</span></a></nav>
+</main>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=4"></script>
+</body></html>

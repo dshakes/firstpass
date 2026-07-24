@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>How Agents Talk to Models — Firstpass docs</title>
-<meta name="description" content="A from-first-principles course: how AI agents talk to models over ordinary HTTP, what every call costs, and where Firstpass changes the bill. Thirteen short, visual lessons following one real coding task.">
+<title>The token meter — How Agents Talk to Models — Firstpass docs</title>
+<meta name="description" content="How Agents Talk to Models lesson 2 of 13: The token meter. Part of the from-first-principles guide to how agents talk to models and what it costs.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -30,10 +30,10 @@
 <aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
-<a href="requests-101.html" aria-current="page" style="margin-bottom:14px">Course overview</a>
+<a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
 <div class="grp lnav"><p class="grp-t">The core path</p>
-<a href="r101-01-one-request.html"><span class="num">01</span>One request, one response</a>
-<a href="r101-02-token-meter.html"><span class="num">02</span>The token meter</a>
+<a href="r101-01-one-request.html" class="done"><span class="num">01</span>One request, one response</a>
+<a href="r101-02-token-meter.html" aria-current="page"><span class="num">02</span>The token meter</a>
 <a href="r101-03-multi-turn.html"><span class="num">03</span>Statelessness &amp; multi-turn</a>
 <a href="r101-04-tools.html"><span class="num">04</span>Tool calls</a>
 <a href="r101-05-caching.html"><span class="num">05</span>Prompt caching</a>
@@ -52,46 +52,39 @@
 </div>
 </nav></aside><main class="content" id="main">
 <button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
-<p class="crumb"><a href="index.html">Docs</a> / How Agents Talk to Models</p>
-<h1>How Agents Talk to Models</h1>
-<p class="page-sub">An agent doesn't &ldquo;use an AI.&rdquo; It makes a stream of ordinary HTTP calls, each one stateless and metered by the token. This short course builds the whole picture from first principles — following <strong>one real task</strong>, a coding agent fixing an endpoint — from its very first request out to a full tool-using, cached, multi-turn session, then streaming, structured output, images, MCP, and errors. No prior Firstpass knowledge needed; the last lesson shows where it changes the bill.</p>
-<div class="tldr">Thirteen short, <b>visual-first</b> lessons. Each is one idea — a diagram or a real payload, then a few lines — with a progress bar and next/back. Follow them in order for the full arc, or jump to the one you need.</div>
-<div class="note"><span class="nt">The task we'll follow</span> One job a developer hands a coding agent: <em>&ldquo;Make <code>POST /orders</code> reject a request with no <code>total</code> field, and add a test.&rdquo;</em> You'll watch the <em>actual HTTP requests</em> it produces — one call becomes a conversation, then a tool loop, then a whole session — and see the bill build on a single thread.</div>
-<div class="chips" style="margin-top:24px">
-  <div class="chip good"><div class="cn">13</div><div class="cl">short, visual lessons</div></div>
-  <div class="chip"><div class="cn">1</div><div class="cl">real task, followed the whole way</div></div>
-  <div class="chip"><div class="cn">~20m</div><div class="cl">start to finish</div></div>
-  <div class="chip good"><div class="cn">5×</div><div class="cl">what output costs vs input</div></div>
+<p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / The token meter</p>
+<div class="lesson-progress">
+  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Lesson 2 of 13</span></div>
+  <div class="lp-bar"><span style="width:15.4%"></span></div>
 </div>
-<p style="margin-top:26px"><a class="btn primary" href="r101-01-one-request.html">Start · Lesson 1 &rarr;</a></p>
-
-<p class="eyebrow" style="margin-top:40px">Part A · The core path</p>
-<p>The main road — the path our one task actually walks, from a single request to a full session.</p>
-<div class="cards g2">
-<a class="card" href="r101-01-one-request.html"><div class="step-n">lesson</div><h3>One request, one response &rarr;</h3><p>A model call is one stateless POST — meet <code>usage</code>, the meter.</p></a>
-<a class="card" href="r101-02-token-meter.html"><div class="step-n">lesson</div><h3>The token meter &rarr;</h3><p>Why output costs ~5× input, and the strong tier 15–75× the cheap one.</p></a>
-<a class="card" href="r101-03-multi-turn.html"><div class="step-n">lesson</div><h3>Statelessness &amp; multi-turn &rarr;</h3><p>The client resends the whole chat every turn; input cost compounds.</p></a>
-<a class="card" href="r101-04-tools.html"><div class="step-n">lesson</div><h3>Tool calls &rarr;</h3><p>One task becomes many billed round-trips through a loop.</p></a>
-<a class="card" href="r101-05-caching.html"><div class="step-n">lesson</div><h3>Prompt caching &rarr;</h3><p>Re-price the repeated prefix from full rate to ~0.1×.</p></a>
-<a class="card" href="r101-06-client-shapes.html"><div class="step-n">lesson</div><h3>Three client shapes &rarr;</h3><p>Interactive, headless, SDK — who drives the loop, and where the bill goes.</p></a>
-<a class="card" href="r101-07-claude-code-session.html"><div class="step-n">lesson</div><h3>A Claude Code session &rarr;</h3><p>Every earlier lesson at once, over one real session.</p></a>
+<h1>The token meter</h1>
+<div class="tldr">You pay <b>per token</b>, quoted per-million (per&nbsp;Mtok), at two rates: input (read) and output (written, ~5× dearer). Two ratios run the whole page — <b>output ≈ 5× input</b>, and the <b>strong tier costs 15–75× the cheap tier</b>. Every cost lever below is one of three numbers getting bigger: tier, input tokens, output tokens.</div>
+<p>Every provider prices by the token, quoted <strong>per million tokens (per&nbsp;Mtok)</strong>, with two rates: one for input (tokens the model reads) and a higher one for output (tokens it writes). The bill for one call is just:</p>
+<div class="codeblock"><div class="cb-head"><span>text</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>cost = input_tokens/1e6 × input_rate  +  output_tokens/1e6 × output_rate</code></pre></div>
+<p>Two facts fall out of this and drive every optimization in the rest of the page. <strong>First, output is the expensive half</strong> — roughly 5× the input rate across the frontier lineups. <strong>Second, the model tier matters enormously</strong>: the strongest models cost 15–75× the cheapest. Here is Firstpass's built-in default price table (a calibration knob you override in config — real prices move, so treat these as illustrative defaults):</p>
+<div class="tblwrap"><table>
+<thead><tr><th>Model</th><th>Input · $/Mtok</th><th>Output · $/Mtok</th><th>Tier</th></tr></thead>
+<tbody>
+<tr><td><code>anthropic/claude-haiku-4-5</code></td><td>1.00</td><td>5.00</td><td>cheap</td></tr>
+<tr><td><code>anthropic/claude-sonnet-5</code></td><td>3.00</td><td>15.00</td><td>mid</td></tr>
+<tr><td><code>anthropic/claude-opus-4-8</code></td><td>15.00</td><td>75.00</td><td>strong</td></tr>
+<tr><td><code>openai/gpt-4.1-mini</code></td><td>0.40</td><td>1.60</td><td>cheap</td></tr>
+<tr><td><code>openai/gpt-5.5</code></td><td>5.00</td><td>15.00</td><td>strong</td></tr>
+<tr><td><code>google/gemini-3.1-flash</code></td><td>0.35</td><td>1.05</td><td>cheap</td></tr>
+<tr><td><code>google/gemini-3.1-pro</code></td><td>3.50</td><td>10.50</td><td>mid</td></tr>
+</tbody>
+</table></div>
+<p>Put numbers on it. That first <code>/orders</code> question — 32 in, 14 out — costs almost nothing on <em>any</em> model. But the <em>ratio</em> between tiers is the whole game: send it to the strong model instead of the cheap one and you pay ~15× more for a one-line answer you'd have gotten either way.</p>
+<div class="chips">
+  <div class="chip good"><div class="cn">$0.0001<span class="u"></span></div><div class="cl">the <code>/orders</code> question on haiku (32 in · 14 out)</div></div>
+  <div class="chip"><div class="cn">$0.0015<span class="u"></span></div><div class="cl">same question on opus — ~15× more, same answer</div></div>
+  <div class="chip"><div class="cn">$0.0102<span class="u"></span></div><div class="cl">a 200-in / 2 000-out reply on haiku</div></div>
+  <div class="chip"><div class="cn">98%<span class="u"></span></div><div class="cl">of that reply's cost is the output half</div></div>
 </div>
-
-<p class="eyebrow" style="margin-top:36px">Part A2 · Beyond the core path</p>
-<p>The turns a real agent takes off the happy path — each a dedicated lesson, take them in any order.</p>
-<div class="cards g2">
-<a class="card" href="r101-08-streaming.html"><div class="step-n">lesson</div><h3>Streaming &rarr;</h3><p>The same answer, token by token — delivery changes, cost doesn't.</p></a>
-<a class="card" href="r101-09-structured-outputs.html"><div class="step-n">lesson</div><h3>Structured outputs &amp; JSON &rarr;</h3><p>Machine-readable output, reliably — schemas and the truncation trap.</p></a>
-<a class="card" href="r101-10-images.html"><div class="step-n">lesson</div><h3>Images &amp; multimodal &rarr;</h3><p>Image blocks bill as input tokens, by resolution.</p></a>
-<a class="card" href="r101-11-mcp.html"><div class="step-n">lesson</div><h3>MCP, in depth &rarr;</h3><p>Transports, the three primitives, and the cost of more tools.</p></a>
-<a class="card" href="r101-12-errors.html"><div class="step-n">lesson</div><h3>Errors, rate limits &amp; retries &rarr;</h3><p>429 / 5xx, backoff, idempotency — and failed-but-billed calls.</p></a>
-</div>
-
-<p class="eyebrow" style="margin-top:36px">Part B · Where Firstpass fits</p>
-<div class="cards g2">
-<a class="card" href="r101-13-firstpass.html"><div class="step-n">lesson</div><h3>Where Firstpass fits &rarr;</h3><p>The same task, re-priced — cheapest-first, proven, with a receipt.</p></a>
-</div>
-<nav class="pager" aria-label="Pagination"><a class="prev" href="quickstart.html"><span class="dir">&larr; Previous</span><span class="t">Quickstart</span></a><a class="next" href="r101-01-one-request.html"><span class="dir">Next &rarr;</span><span class="t">Lesson 1 · One request</span></a></nav>
+<div class="note"><span class="nt">The lesson that carries the whole page</span> A model call's cost is set by three numbers you can influence: <strong>which tier</strong> you send it to, <strong>how many input tokens</strong> you make it re-read, and <strong>how many output tokens</strong> it writes. Every module below is one of those three quietly getting bigger — and every Firstpass move in Part B is one of them getting smaller.</div>
+<div class="note warn"><span class="nt">Common mistake</span> &ldquo;Send everything to the best model, it's only fractions of a cent.&rdquo; True for <em>one</em> call — that opus answer above is $0.0005. But an agent makes hundreds of calls, each re-reading a growing transcript (multi-turn), and the easy calls vastly outnumber the hard ones. Paying the 15–75× tier premium on every one of them is how a fractions-of-a-cent call becomes a four-figure monthly bill. The premium is only worth it on the calls that actually need it.</div>
+<div class="recap">Cost = tier × (input tokens + ~5× output tokens); the strong tier is 15–75× the cheap one, so <b>which model answers</b> is the biggest single lever.</div>
+<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-01-one-request.html"><span class="dir">&larr; Previous</span><span class="t">One request, one response</span></a><a class="next" href="r101-03-multi-turn.html"><span class="dir">Next &rarr;</span><span class="t">Statelessness &amp; multi-turn</span></a></nav>
 </main>
 </div>
 <footer class="foot"><div class="wrap">
