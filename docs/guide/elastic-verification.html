@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Elastic verification — Firstpass docs</title>
-<meta name="description" content="The near-term research direction: verify proportional to doubt with a cheap probe under a conformal guarantee. The validation study, the corrected signal, and the honest go/no-go.">
+<meta name="description" content="Verify proportional to doubt with a cheap probe under a conformal guarantee. The serving path is implemented and off by default; the validation study, the corrected signal, and how to turn it on safely.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -55,9 +55,9 @@
 <button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
 <p class="crumb"><a href="index.html">Docs</a> / Elastic verification</p>
 <h1>Elastic verification</h1>
-<p class="page-sub">The near-term research direction: verify <em>proportional to doubt</em>. Run a cheap probe, and only pay for expensive verification where the probe is uncertain — with a conformal guarantee over the verify/skip decision itself.</p>
+<p class="page-sub">Verify <em>proportional to doubt</em>: run a cheap probe, and only pay for expensive verification where the probe is uncertain — with a conformal guarantee over the verify/skip decision itself. The serving path is implemented and off by default; you turn it on with a calibrated threshold.</p>
 
-<div class="note warn"><span class="nt">Status: research, validating</span> This is a validated research direction, <strong>not a shipped default</strong>. The go/no-go study below came back GO with a corrected signal, and Phase 1 (shadow measurement) is landing. Nothing here changes what Firstpass serves today.</div>
+<div class="note warn"><span class="nt">Status: implemented, default-off</span> The serving path is <strong>in the code, config-gated, and off by default</strong> — supply a calibrated <span class="mono">λ</span> under <span class="mono">escalation.elastic</span> to enable it; until you do, Firstpass serves exactly as it does today. The go/no-go study below came back GO with a corrected signal. Uniform verification remains the default — elastic verification earns <em>default</em> status only after it replicates on your distribution.</div>
 
 <h2 id="idea">The idea<a class="anchor" href="#idea" aria-label="Link to this section">#</a></h2>
 <p>Today every served output pays for the gate. But most outputs are obviously fine or obviously broken — uniform verification spends the same effort on both. Elastic verification asks a cheaper question first: <strong>how much doubt is there?</strong> A cheap probe sorts traffic into "clearly serve," "clearly escalate," and "genuinely uncertain," and only the uncertain slice pays for the full gate. The verify/skip decision itself is placed under a conformal guarantee, so skipping stays safe by construction.</p>
@@ -176,8 +176,8 @@
 <p>The study is honest about what did <em>not</em> work. The pre-registered continuous metric — the AUC of self-consistency <strong>entropy</strong> against oracle-failure — came back at <strong>0.431</strong>, below the 0.5 no-signal line. Entropy discards <em>direction</em>: it measures how spread the samples are, not whether they agree on the <em>right</em> answer. Five samples that all fail look as "confident" as five that all pass.</p>
 <div class="note"><span class="nt">The correction</span> The verdict is GO — but justified by the pass-count regime signal, not the entropy AUC. Firstpass ships the signal that validated, and says so plainly. A metric that failed its pre-registration is reported as failed.</div>
 
-<h2 id="phase1">What is landing<a class="anchor" href="#phase1" aria-label="Link to this section">#</a></h2>
-<p>Phase 1 is <strong>shadow measurement</strong>: compute the probe signal on live traffic and record it on the receipt, without acting on it. That collects the evidence to confirm the regimes hold on your distribution before any skip logic touches what you serve. It is the safe first move — measure, then decide.</p>
+<h2 id="phase1">Turning it on safely<a class="anchor" href="#phase1" aria-label="Link to this section">#</a></h2>
+<p>The serving path is merged and <strong>config-gated, default-off</strong>: set <span class="mono">escalation.elastic</span> with a calibrated <span class="mono">λ</span> and the expensive gates to skip, and elastic verification takes effect; leave it unset and behavior is byte-identical to today. The recommended first move is <strong>shadow measurement</strong> — compute the probe signal on live traffic and record it on the receipt <em>without acting on it</em> — so you confirm the three regimes hold on your own distribution before any skip logic touches what you serve. Measure, then enable.</p>
 
 <h2 id="caveats">Caveats<a class="anchor" href="#caveats" aria-label="Link to this section">#</a></h2>
 <ul>
@@ -188,7 +188,7 @@
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="api.html"><span class="dir">← Previous</span><span class="t">API & MCP</span></a><a class="next" href="benchmarks.html"><span class="dir">Next →</span><span class="t">Benchmarks</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#idea" class="">The idea</a><a href="#study" class="">The validation study</a><a href="#regimes" class="">The three regimes</a><a href="#entropy" class="">Why entropy failed</a><a href="#phase1" class="">What is landing</a><a href="#caveats" class="">Caveats</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#idea" class="">The idea</a><a href="#study" class="">The validation study</a><a href="#regimes" class="">The three regimes</a><a href="#entropy" class="">Why entropy failed</a><a href="#phase1" class="">Turning it on safely</a><a href="#caveats" class="">Caveats</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">
