@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Streaming — How Agents Talk to Models — Firstpass docs</title>
-<meta name="description" content="How Agents Talk to Models lesson 8 of 13: Streaming. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="description" content="How Agents Talk to Models module 8 of 13: Streaming. Part of the from-first-principles guide to how agents talk to models and what it costs.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -27,7 +27,7 @@
 </header>
 <div class="scrim"></div>
 <div class="docs">
-<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
 <a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
@@ -51,14 +51,53 @@
 <a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
 </div>
 </nav></aside><main class="content" id="main">
-<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<button class="btn sidebar-toggle" aria-label="Open modules" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Modules</button>
 <p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Streaming</p>
 <div class="lesson-progress">
-  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Lesson 8 of 13</span></div>
+  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Module 8 of 13</span></div>
   <div class="lp-bar"><span style="width:61.5%"></span></div>
 </div>
 <h1>Streaming</h1>
 <div class="tldr">Add <code>"stream": true</code> to any request and the answer arrives token by token as <b>Server-Sent Events</b> instead of one big JSON blob at the end. Cost is <b>identical</b> — same tokens, same price — streaming changes <em>delivery</em>, not the bill. The gain is perceived latency: your UI can start rendering before the model finishes writing. The catch: anything that must inspect the whole output first — a JSON parser, a verification gate — still has to buffer the stream to completion.</div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 260" role="img" aria-labelledby="stT">
+<title id="stT">Two horizontal timelines for the same response. Top row non-streaming: one long amber wait bar spanning the full generation time, then the complete response arrives at the end. Bottom row streaming: a short accent bar marking time-to-first-token where the user sees the first text, then tokens stream steadily to the same endpoint. Both rows end at identical wall-clock time, illustrating that streaming changes when you see tokens, not cost or total duration.</title>
+<defs>
+<marker id="stW" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
+<marker id="stP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+</defs>
+<!-- heading -->
+<text x="500" y="26" text-anchor="middle" class="ink" font-size="13" font-weight="640">Same response · same tokens · same cost — only delivery differs</text>
+<!-- row labels -->
+<text x="170" y="97" text-anchor="end" class="ink-mut m" font-size="11" dominant-baseline="middle">non-streaming</text>
+<text x="170" y="181" text-anchor="end" class="ink-mut m" font-size="11" dominant-baseline="middle">streaming</text>
+<!-- ── Row 1: non-streaming ── -->
+<rect x="178" y="81" width="682" height="32" rx="5" class="n-fill warn-s" stroke-width="1.4"/>
+<text x="519" y="97" text-anchor="middle" class="ink-mut m" font-size="10.5" dominant-baseline="middle">waiting… complete response held until generation finishes</text>
+<!-- response-arrives vertical marker -->
+<line x1="860" y1="73" x2="860" y2="117" stroke="var(--d-warn)" stroke-width="1.5"/>
+<text x="868" y="87" class="warn m" font-size="10" dominant-baseline="middle">response</text>
+<text x="868" y="103" class="warn m" font-size="10" dominant-baseline="middle">arrives</text>
+<!-- ── Row 2: streaming ── -->
+<!-- TTFT segment (accent glow) -->
+<rect x="178" y="165" width="110" height="32" rx="5" class="n-fill glow-p" stroke-width="1.4"/>
+<text x="233" y="181" text-anchor="middle" class="accent-ink m" font-size="10" dominant-baseline="middle">TTFT</text>
+<!-- streaming continuation segment -->
+<rect x="288" y="165" width="572" height="32" rx="5" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="574" y="181" text-anchor="middle" class="ink-mut m" font-size="10.5" dominant-baseline="middle">tokens streaming — render as they arrive</text>
+<!-- TTFT dashed vertical marker -->
+<line x1="288" y1="157" x2="288" y2="205" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4,3"/>
+<text x="288" y="220" text-anchor="middle" class="accent-ink m" font-size="10">user sees first text</text>
+<!-- stream-complete vertical marker -->
+<line x1="860" y1="157" x2="860" y2="205" stroke="var(--d-pass)" stroke-width="1.5"/>
+<text x="868" y="171" class="pass m" font-size="10" dominant-baseline="middle">stream</text>
+<text x="868" y="187" class="pass m" font-size="10" dominant-baseline="middle">complete</text>
+<!-- same-end dashed connector between rows -->
+<line x1="860" y1="119" x2="860" y2="155" stroke="var(--d-stroke)" stroke-width="1" stroke-dasharray="3,2"/>
+<!-- flow pulse on streaming row -->
+<line x1="288" y1="181" x2="860" y2="181" class="flow p s" stroke-width="2"/>
+</svg>
+  <figcaption>Streaming changes <em>when</em> you see tokens, not how many — cost is identical either way.</figcaption>
+</div>
 
 <p>The wire call changes by exactly one field. Point the same <code>POST</code> at the same endpoint, keep the same headers, add <code>"stream": true</code>:</p>
 
@@ -118,43 +157,6 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":
 event: message_stop
 data: {"type":"message_stop"}</code></pre></div>
 
-<figure>
-<svg viewBox="0 0 760 148" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ssT" style="max-width:760px;width:100%;display:block">
-<title id="ssT">Two horizontal timelines comparing non-streaming and streaming. Non-streaming: one long wait bar spanning the full generation time, then the complete response arrives at the end. Streaming: a short bar to time-to-first-token where the user sees the first text, then a longer bar as tokens stream in, with the stream completing at the same wall-clock point as non-streaming. Cost and total time are identical — streaming changes when the first byte appears, not when the last one does.</title>
-<defs>
-<marker id="ssA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
-</defs>
-
-<!-- row labels -->
-<text x="0" y="36" class="ink-mut m" font-size="11" dominant-baseline="middle">non-streaming</text>
-<text x="0" y="100" class="ink-mut m" font-size="11" dominant-baseline="middle">streaming</text>
-
-<!-- non-streaming: one long wait bar, response arrives at the end -->
-<rect x="168" y="20" width="516" height="32" rx="4" class="n-fill warn-s"/>
-<text x="426" y="36" text-anchor="middle" class="ink-mut m" font-size="10.5" dominant-baseline="middle">waiting for complete response…</text>
-<!-- response-arrives marker -->
-<line x1="684" y1="14" x2="684" y2="58" stroke="var(--d-warn)" stroke-width="1.5"/>
-<text x="692" y="28" class="warn m" font-size="10" dominant-baseline="middle">response</text>
-<text x="692" y="44" class="warn m" font-size="10" dominant-baseline="middle">arrives</text>
-
-<!-- streaming row -->
-<!-- TTFT segment -->
-<rect x="168" y="84" width="72" height="32" rx="4" class="n-fill glow-p"/>
-<text x="204" y="100" text-anchor="middle" class="accent-ink m" font-size="10" dominant-baseline="middle">TTFT</text>
-<!-- remaining stream segment -->
-<rect x="240" y="84" width="444" height="32" rx="4" class="n-fill"/>
-<text x="462" y="100" text-anchor="middle" class="ink-mut m" font-size="10.5" dominant-baseline="middle">tokens streaming — render as they arrive…</text>
-<!-- TTFT marker (dashed) -->
-<line x1="240" y1="78" x2="240" y2="122" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4,3"/>
-<text x="232" y="132" text-anchor="middle" class="accent-ink m" font-size="10">user sees</text>
-<text x="232" y="144" text-anchor="middle" class="accent-ink m" font-size="10">first text</text>
-<!-- stream-complete marker -->
-<line x1="684" y1="78" x2="684" y2="122" stroke="var(--d-pass)" stroke-width="1.5"/>
-<text x="692" y="92" class="ink m" font-size="10" dominant-baseline="middle">stream</text>
-<text x="692" y="108" class="ink m" font-size="10" dominant-baseline="middle">complete</text>
-</svg>
-<figcaption>Streaming and non-streaming finish at the same wall-clock point — total generation time is identical. What changes is the <em>first</em> byte: streaming surfaces it at TTFT while non-streaming blocks until every token is written. Cost is the same either way.</figcaption>
-</figure>
 
 <div class="note"><span class="nt">Key idea</span> The <code>usage</code> object is split across two events in a stream. <code>message_start</code> reports <code>input_tokens</code> immediately — the model read your whole prompt before writing a word, so input is known at the start. <code>message_delta</code> reports <code>output_tokens</code> at the end, once the model finishes. The bill is the same as if you hadn't streamed: those token counts, those prices.</div>
 
@@ -163,7 +165,7 @@ data: {"type":"message_stop"}</code></pre></div>
 <div class="note info"><span class="nt">Under the hood</span> Firstpass sits between your agent and the provider and forwards <code>stream: true</code> transparently — but it must buffer the full stream before the gate can run. Once the gate passes, Firstpass re-emits the buffered content as SSE to your client, so your agent still sees a stream. The practical effect: time-to-first-token is slightly higher through Firstpass (gate latency on top of generation), but the wire contract your agent code observes is identical. See <a href="how-it-works.html">how it works</a> for the full flow.</div>
 
 <div class="recap">Streaming changes <em>when</em> tokens arrive, not how many — cost is identical, time-to-first-token drops, but anything that reasons about the output still needs the complete stream first.</div>
-<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-07-claude-code-session.html"><span class="dir">&larr; Previous</span><span class="t">A Claude Code session</span></a><a class="next" href="r101-09-structured-outputs.html"><span class="dir">Next &rarr;</span><span class="t">Structured outputs &amp; JSON</span></a></nav>
+<nav class="pager" aria-label="Module navigation"><a class="prev" href="r101-07-claude-code-session.html"><span class="dir">&larr; Previous</span><span class="t">A Claude Code session</span></a><a class="next" href="r101-09-structured-outputs.html"><span class="dir">Next &rarr;</span><span class="t">Structured outputs &amp; JSON</span></a></nav>
 </main>
 </div>
 <footer class="foot"><div class="wrap">

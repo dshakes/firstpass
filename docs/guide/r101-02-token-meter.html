@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The token meter — How Agents Talk to Models — Firstpass docs</title>
-<meta name="description" content="How Agents Talk to Models lesson 2 of 13: The token meter. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="description" content="How Agents Talk to Models module 2 of 13: The token meter. Part of the from-first-principles guide to how agents talk to models and what it costs.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -27,7 +27,7 @@
 </header>
 <div class="scrim"></div>
 <div class="docs">
-<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
 <a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
@@ -51,14 +51,55 @@
 <a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
 </div>
 </nav></aside><main class="content" id="main">
-<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<button class="btn sidebar-toggle" aria-label="Open modules" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Modules</button>
 <p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / The token meter</p>
 <div class="lesson-progress">
-  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Lesson 2 of 13</span></div>
+  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Module 2 of 13</span></div>
   <div class="lp-bar"><span style="width:15.4%"></span></div>
 </div>
 <h1>The token meter</h1>
 <div class="tldr">You pay <b>per token</b>, quoted per-million (per&nbsp;Mtok), at two rates: input (read) and output (written, ~5× dearer). Two ratios run the whole page — <b>output ≈ 5× input</b>, and the <b>strong tier costs 15–75× the cheap tier</b>. Every cost lever below is one of three numbers getting bigger: tier, input tokens, output tokens.</div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 238" role="img" aria-labelledby="tmCost">
+<title id="tmCost">Two cost levers shown side by side. Left: proportional horizontal bars for INPUT ($1/Mtok, 60 units wide) and OUTPUT ($5/Mtok, 300 units wide) showing that output tokens cost roughly 5 times more. Right: a three-rung tier ladder with bars proportional to input rate — cheap tier (Haiku, $1) at 18 units, mid tier (Sonnet, $3) at 54 units, strong tier (Opus, $15) at 270 units.</title>
+<!-- divider -->
+<line x1="500" y1="46" x2="500" y2="222" class="grid" stroke-width="1"/>
+<!-- ── LEFT: rate asymmetry ──────────────────────── -->
+<text x="245" y="30" text-anchor="middle" class="ink" font-size="13" font-weight="700">Rate asymmetry</text>
+<text x="245" y="48" text-anchor="middle" class="ink-mut" font-size="10.5">output tokens cost ~5× input tokens (same model, same call)</text>
+<!-- INPUT bar -->
+<text x="152" y="80" text-anchor="end" class="ink m" font-size="11" font-weight="600">INPUT</text>
+<rect x="160" y="64" width="60" height="24" rx="4" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="228" y="80" class="ink-mut m" font-size="11">$1 / Mtok</text>
+<!-- 5× ratio callout in gap between bars -->
+<text x="240" y="107" text-anchor="middle" class="warn m" font-size="13" font-weight="800">5×</text>
+<!-- OUTPUT bar -->
+<text x="152" y="134" text-anchor="end" class="ink m" font-size="11" font-weight="600">OUTPUT</text>
+<rect x="160" y="118" width="300" height="24" rx="4" class="warn"/>
+<text x="168" y="134" font-size="11" font-weight="700" fill="var(--text-inv)" class="m">$5 / Mtok</text>
+<line x1="160" y1="130" x2="460" y2="130" class="flow w" stroke-width="2.2"/>
+<!-- note -->
+<text x="245" y="176" text-anchor="middle" class="ink-mut" font-size="10.5">output writes pile up fast — the dominant cost on long replies</text>
+<!-- ── RIGHT: tier ladder ─────────────────────────── -->
+<text x="745" y="30" text-anchor="middle" class="ink" font-size="13" font-weight="700">Tier ladder</text>
+<text x="745" y="48" text-anchor="middle" class="ink-mut" font-size="10.5">input rate $/Mtok — bar width proportional to cost vs cheap tier</text>
+<!-- cheap rung -->
+<text x="637" y="80" text-anchor="end" class="ink m" font-size="11" font-weight="600">cheap</text>
+<rect x="645" y="64" width="18" height="24" rx="4" class="pass"/>
+<text x="670" y="80" class="pass m" font-size="11" font-weight="700">Haiku · $1 · 1×</text>
+<!-- mid rung -->
+<text x="637" y="134" text-anchor="end" class="ink m" font-size="11" font-weight="600">mid</text>
+<rect x="645" y="118" width="54" height="24" rx="4" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="706" y="134" class="ink-mut m" font-size="11">Sonnet · $3 · 3×</text>
+<!-- strong rung -->
+<text x="637" y="188" text-anchor="end" class="ink m" font-size="11" font-weight="600">strong</text>
+<rect x="645" y="172" width="270" height="24" rx="4" class="warn"/>
+<text x="653" y="188" font-size="11" font-weight="700" fill="var(--text-inv)" class="m">Opus · $15 · 15×</text>
+<line x1="645" y1="184" x2="915" y2="184" class="flow w d3" stroke-width="2.2"/>
+<!-- note -->
+<text x="745" y="222" text-anchor="middle" class="ink-mut" font-size="10">Output rates: Haiku $5 · Sonnet $15 · Opus $75 / Mtok (each 5× its input rate)</text>
+</svg>
+  <figcaption>Two levers set your bill: output tokens cost ~5× input tokens, and the strong tier costs up to 15× the cheap tier — model choice is the biggest single knob.</figcaption>
+</div>
 <p>Every provider prices by the token, quoted <strong>per million tokens (per&nbsp;Mtok)</strong>, with two rates: one for input (tokens the model reads) and a higher one for output (tokens it writes). The bill for one call is just:</p>
 <div class="codeblock"><div class="cb-head"><span>text</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>cost = input_tokens/1e6 × input_rate  +  output_tokens/1e6 × output_rate</code></pre></div>
 <p>Two facts fall out of this and drive every optimization in the rest of the page. <strong>First, output is the expensive half</strong> — roughly 5× the input rate across the frontier lineups. <strong>Second, the model tier matters enormously</strong>: the strongest models cost 15–75× the cheapest. Here is Firstpass's built-in default price table (a calibration knob you override in config — real prices move, so treat these as illustrative defaults):</p>
@@ -81,10 +122,10 @@
   <div class="chip"><div class="cn">$0.0102<span class="u"></span></div><div class="cl">a 200-in / 2 000-out reply on haiku</div></div>
   <div class="chip"><div class="cn">98%<span class="u"></span></div><div class="cl">of that reply's cost is the output half</div></div>
 </div>
-<div class="note"><span class="nt">The lesson that carries the whole page</span> A model call's cost is set by three numbers you can influence: <strong>which tier</strong> you send it to, <strong>how many input tokens</strong> you make it re-read, and <strong>how many output tokens</strong> it writes. Every module below is one of those three quietly getting bigger — and every Firstpass move in Part B is one of them getting smaller.</div>
+<div class="note"><span class="nt">The module that carries the whole page</span> A model call's cost is set by three numbers you can influence: <strong>which tier</strong> you send it to, <strong>how many input tokens</strong> you make it re-read, and <strong>how many output tokens</strong> it writes. Every module below is one of those three quietly getting bigger — and every Firstpass move in Part B is one of them getting smaller.</div>
 <div class="note warn"><span class="nt">Common mistake</span> &ldquo;Send everything to the best model, it's only fractions of a cent.&rdquo; True for <em>one</em> call — that opus answer above is $0.0005. But an agent makes hundreds of calls, each re-reading a growing transcript (multi-turn), and the easy calls vastly outnumber the hard ones. Paying the 15–75× tier premium on every one of them is how a fractions-of-a-cent call becomes a four-figure monthly bill. The premium is only worth it on the calls that actually need it.</div>
 <div class="recap">Cost = tier × (input tokens + ~5× output tokens); the strong tier is 15–75× the cheap one, so <b>which model answers</b> is the biggest single lever.</div>
-<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-01-one-request.html"><span class="dir">&larr; Previous</span><span class="t">One request, one response</span></a><a class="next" href="r101-03-multi-turn.html"><span class="dir">Next &rarr;</span><span class="t">Statelessness &amp; multi-turn</span></a></nav>
+<nav class="pager" aria-label="Module navigation"><a class="prev" href="r101-01-one-request.html"><span class="dir">&larr; Previous</span><span class="t">One request, one response</span></a><a class="next" href="r101-03-multi-turn.html"><span class="dir">Next &rarr;</span><span class="t">Statelessness &amp; multi-turn</span></a></nav>
 </main>
 </div>
 <footer class="foot"><div class="wrap">

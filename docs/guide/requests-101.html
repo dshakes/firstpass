@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>How Agents Talk to Models — Firstpass docs</title>
-<meta name="description" content="A from-first-principles course: how AI agents talk to models over ordinary HTTP, what every call costs, and where Firstpass changes the bill. Thirteen short, visual lessons following one real coding task.">
+<meta name="description" content="A from-first-principles course: how AI agents talk to models over ordinary HTTP, what every call costs, and where Firstpass changes the bill. Thirteen short, visual modules following one real coding task.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -27,7 +27,7 @@
 </header>
 <div class="scrim"></div>
 <div class="docs">
-<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
 <a href="requests-101.html" aria-current="page" style="margin-bottom:14px">Course overview</a>
@@ -51,47 +51,47 @@
 <a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
 </div>
 </nav></aside><main class="content" id="main">
-<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<button class="btn sidebar-toggle" aria-label="Open modules" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Modules</button>
 <p class="crumb"><a href="index.html">Docs</a> / How Agents Talk to Models</p>
 <h1>How Agents Talk to Models</h1>
-<p class="page-sub">An agent doesn't &ldquo;use an AI.&rdquo; It makes a stream of ordinary HTTP calls, each one stateless and metered by the token. This short course builds the whole picture from first principles — following <strong>one real task</strong>, a coding agent fixing an endpoint — from its very first request out to a full tool-using, cached, multi-turn session, then streaming, structured output, images, MCP, and errors. No prior Firstpass knowledge needed; the last lesson shows where it changes the bill.</p>
-<div class="tldr">Thirteen short, <b>visual-first</b> lessons. Each is one idea — a diagram or a real payload, then a few lines — with a progress bar and next/back. Follow them in order for the full arc, or jump to the one you need.</div>
+<p class="page-sub">An agent doesn't &ldquo;use an AI.&rdquo; It makes a stream of ordinary HTTP calls, each one stateless and metered by the token. This short course builds the whole picture from first principles — following <strong>one real task</strong>, a coding agent fixing an endpoint — from its very first request out to a full tool-using, cached, multi-turn session, then streaming, structured output, images, MCP, and errors. No prior Firstpass knowledge needed; the last module shows where it changes the bill.</p>
+<div class="tldr">Thirteen short, <b>visual-first</b> modules. Each is one idea — a diagram or a real payload, then a few lines — with a progress bar and next/back. Follow them in order for the full arc, or jump to the one you need.</div>
 <div class="note"><span class="nt">The task we'll follow</span> One job a developer hands a coding agent: <em>&ldquo;Make <code>POST /orders</code> reject a request with no <code>total</code> field, and add a test.&rdquo;</em> You'll watch the <em>actual HTTP requests</em> it produces — one call becomes a conversation, then a tool loop, then a whole session — and see the bill build on a single thread.</div>
 <div class="chips" style="margin-top:24px">
-  <div class="chip good"><div class="cn">13</div><div class="cl">short, visual lessons</div></div>
+  <div class="chip good"><div class="cn">13</div><div class="cl">short, visual modules</div></div>
   <div class="chip"><div class="cn">1</div><div class="cl">real task, followed the whole way</div></div>
   <div class="chip"><div class="cn">~20m</div><div class="cl">start to finish</div></div>
   <div class="chip good"><div class="cn">5×</div><div class="cl">what output costs vs input</div></div>
 </div>
-<p style="margin-top:26px"><a class="btn primary" href="r101-01-one-request.html">Start · Lesson 1 &rarr;</a></p>
+<p style="margin-top:26px"><a class="btn primary" href="r101-01-one-request.html">Start · Module 1 &rarr;</a></p>
 
 <p class="eyebrow" style="margin-top:40px">Part A · The core path</p>
 <p>The main road — the path our one task actually walks, from a single request to a full session.</p>
 <div class="cards g2">
-<a class="card" href="r101-01-one-request.html"><div class="step-n">lesson</div><h3>One request, one response &rarr;</h3><p>A model call is one stateless POST — meet <code>usage</code>, the meter.</p></a>
-<a class="card" href="r101-02-token-meter.html"><div class="step-n">lesson</div><h3>The token meter &rarr;</h3><p>Why output costs ~5× input, and the strong tier 15–75× the cheap one.</p></a>
-<a class="card" href="r101-03-multi-turn.html"><div class="step-n">lesson</div><h3>Statelessness &amp; multi-turn &rarr;</h3><p>The client resends the whole chat every turn; input cost compounds.</p></a>
-<a class="card" href="r101-04-tools.html"><div class="step-n">lesson</div><h3>Tool calls &rarr;</h3><p>One task becomes many billed round-trips through a loop.</p></a>
-<a class="card" href="r101-05-caching.html"><div class="step-n">lesson</div><h3>Prompt caching &rarr;</h3><p>Re-price the repeated prefix from full rate to ~0.1×.</p></a>
-<a class="card" href="r101-06-client-shapes.html"><div class="step-n">lesson</div><h3>Three client shapes &rarr;</h3><p>Interactive, headless, SDK — who drives the loop, and where the bill goes.</p></a>
-<a class="card" href="r101-07-claude-code-session.html"><div class="step-n">lesson</div><h3>A Claude Code session &rarr;</h3><p>Every earlier lesson at once, over one real session.</p></a>
+<a class="card" href="r101-01-one-request.html"><div class="step-n">module</div><h3>One request, one response &rarr;</h3><p>A model call is one stateless POST — meet <code>usage</code>, the meter.</p></a>
+<a class="card" href="r101-02-token-meter.html"><div class="step-n">module</div><h3>The token meter &rarr;</h3><p>Why output costs ~5× input, and the strong tier 15–75× the cheap one.</p></a>
+<a class="card" href="r101-03-multi-turn.html"><div class="step-n">module</div><h3>Statelessness &amp; multi-turn &rarr;</h3><p>The client resends the whole chat every turn; input cost compounds.</p></a>
+<a class="card" href="r101-04-tools.html"><div class="step-n">module</div><h3>Tool calls &rarr;</h3><p>One task becomes many billed round-trips through a loop.</p></a>
+<a class="card" href="r101-05-caching.html"><div class="step-n">module</div><h3>Prompt caching &rarr;</h3><p>Re-price the repeated prefix from full rate to ~0.1×.</p></a>
+<a class="card" href="r101-06-client-shapes.html"><div class="step-n">module</div><h3>Three client shapes &rarr;</h3><p>Interactive, headless, SDK — who drives the loop, and where the bill goes.</p></a>
+<a class="card" href="r101-07-claude-code-session.html"><div class="step-n">module</div><h3>A Claude Code session &rarr;</h3><p>Every earlier module at once, over one real session.</p></a>
 </div>
 
 <p class="eyebrow" style="margin-top:36px">Part A2 · Beyond the core path</p>
-<p>The turns a real agent takes off the happy path — each a dedicated lesson, take them in any order.</p>
+<p>The turns a real agent takes off the happy path — each a dedicated module, take them in any order.</p>
 <div class="cards g2">
-<a class="card" href="r101-08-streaming.html"><div class="step-n">lesson</div><h3>Streaming &rarr;</h3><p>The same answer, token by token — delivery changes, cost doesn't.</p></a>
-<a class="card" href="r101-09-structured-outputs.html"><div class="step-n">lesson</div><h3>Structured outputs &amp; JSON &rarr;</h3><p>Machine-readable output, reliably — schemas and the truncation trap.</p></a>
-<a class="card" href="r101-10-images.html"><div class="step-n">lesson</div><h3>Images &amp; multimodal &rarr;</h3><p>Image blocks bill as input tokens, by resolution.</p></a>
-<a class="card" href="r101-11-mcp.html"><div class="step-n">lesson</div><h3>MCP, in depth &rarr;</h3><p>Transports, the three primitives, and the cost of more tools.</p></a>
-<a class="card" href="r101-12-errors.html"><div class="step-n">lesson</div><h3>Errors, rate limits &amp; retries &rarr;</h3><p>429 / 5xx, backoff, idempotency — and failed-but-billed calls.</p></a>
+<a class="card" href="r101-08-streaming.html"><div class="step-n">module</div><h3>Streaming &rarr;</h3><p>The same answer, token by token — delivery changes, cost doesn't.</p></a>
+<a class="card" href="r101-09-structured-outputs.html"><div class="step-n">module</div><h3>Structured outputs &amp; JSON &rarr;</h3><p>Machine-readable output, reliably — schemas and the truncation trap.</p></a>
+<a class="card" href="r101-10-images.html"><div class="step-n">module</div><h3>Images &amp; multimodal &rarr;</h3><p>Image blocks bill as input tokens, by resolution.</p></a>
+<a class="card" href="r101-11-mcp.html"><div class="step-n">module</div><h3>MCP, in depth &rarr;</h3><p>Transports, the three primitives, and the cost of more tools.</p></a>
+<a class="card" href="r101-12-errors.html"><div class="step-n">module</div><h3>Errors, rate limits &amp; retries &rarr;</h3><p>429 / 5xx, backoff, idempotency — and failed-but-billed calls.</p></a>
 </div>
 
 <p class="eyebrow" style="margin-top:36px">Part B · Where Firstpass fits</p>
 <div class="cards g2">
-<a class="card" href="r101-13-firstpass.html"><div class="step-n">lesson</div><h3>Where Firstpass fits &rarr;</h3><p>The same task, re-priced — cheapest-first, proven, with a receipt.</p></a>
+<a class="card" href="r101-13-firstpass.html"><div class="step-n">module</div><h3>Where Firstpass fits &rarr;</h3><p>The same task, re-priced — cheapest-first, proven, with a receipt.</p></a>
 </div>
-<nav class="pager" aria-label="Pagination"><a class="prev" href="quickstart.html"><span class="dir">&larr; Previous</span><span class="t">Quickstart</span></a><a class="next" href="r101-01-one-request.html"><span class="dir">Next &rarr;</span><span class="t">Lesson 1 · One request</span></a></nav>
+<nav class="pager" aria-label="Pagination"><a class="prev" href="quickstart.html"><span class="dir">&larr; Previous</span><span class="t">Quickstart</span></a><a class="next" href="r101-01-one-request.html"><span class="dir">Next &rarr;</span><span class="t">Module 1 · One request</span></a></nav>
 </main>
 </div>
 <footer class="foot"><div class="wrap">
