@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Structured outputs & JSON — How Agents Talk to Models — Firstpass docs</title>
-<meta name="description" content="How Agents Talk to Models lesson 9 of 13: Structured outputs & JSON. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="description" content="How Agents Talk to Models module 9 of 13: Structured outputs & JSON. Part of the from-first-principles guide to how agents talk to models and what it costs.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -27,7 +27,7 @@
 </header>
 <div class="scrim"></div>
 <div class="docs">
-<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
 <a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
@@ -51,14 +51,86 @@
 <a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
 </div>
 </nav></aside><main class="content" id="main">
-<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<button class="btn sidebar-toggle" aria-label="Open modules" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Modules</button>
 <p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Structured outputs & JSON</p>
 <div class="lesson-progress">
-  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Lesson 9 of 13</span></div>
+  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Module 9 of 13</span></div>
   <div class="lp-bar"><span style="width:69.2%"></span></div>
 </div>
 <h1>Structured outputs &amp; JSON</h1>
 <div class="tldr">Asking the model to &ldquo;return JSON&rdquo; in the prompt is fragile — you get prose, markdown fences, or truncated objects. Two reliable paths: <b>tool-as-schema</b> (define a single tool whose <code>input_schema</code> is your target shape, force the model to fill it via <code>tool_use</code>) and <b>provider structured/JSON mode</b> (OpenAI&rsquo;s <code>response_format</code>). Either way, the data arrives schema-validated in a predictable field. Token billing is unchanged — same rates, shaped output.</div>
+
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 285" role="img" aria-labelledby="soTitle">
+<title id="soTitle">Two paths to JSON output. Top path (fragile): a freeform prompt asks the model to return JSON, but the model may wrap output in prose or a code fence, or max_tokens cuts the object mid-field, so JSON.parse throws a SyntaxError. Bottom path (reliable): tool-as-schema with forced tool_choice or provider JSON mode constrains the model to the declared shape, so the response arrives validated and JSON.parse succeeds.</title>
+<defs>
+  <marker id="soA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="soW" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
+  <marker id="soF" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-fail)"/></marker>
+  <marker id="soP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+</defs>
+<!-- page label -->
+<text x="500" y="22" text-anchor="middle" class="ink-mut" font-size="11.5">Two paths to JSON output — ask nicely (fragile) vs. enforce via the API (reliable)</text>
+<!-- ── TOP ROW: FRAGILE ── -->
+<text x="20" y="46" class="warn" font-size="10.5" font-weight="700">FRAGILE</text>
+<!-- A1: freeform prompt -->
+<rect x="20" y="52" width="210" height="82" rx="10" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="125" y="73" text-anchor="middle" class="ink" font-size="11" font-weight="640">prompt (freeform)</text>
+<line x1="36" y1="81" x2="214" y2="81" class="grid" stroke-width="1"/>
+<text x="125" y="97" text-anchor="middle" class="ink-mut m" font-size="9.5">&quot;Please return JSON</text>
+<text x="125" y="111" text-anchor="middle" class="ink-mut m" font-size="9.5"> for the patch plan.&quot;</text>
+<text x="125" y="125" text-anchor="middle" class="warn" font-size="9">no schema enforced</text>
+<!-- arrow A1 → B1 -->
+<line x1="230" y1="93" x2="283" y2="93" class="warn-s" stroke-width="1.5" marker-end="url(#soW)"/>
+<line x1="230" y1="93" x2="283" y2="93" class="flow w s d2" stroke-width="2.2"/>
+<!-- B1: unconstrained model output -->
+<rect x="287" y="52" width="278" height="82" rx="10" class="n-fill warn-s glow-w" stroke-width="1.6"/>
+<text x="426" y="73" text-anchor="middle" class="ink" font-size="11" font-weight="640">model output (unconstrained)</text>
+<line x1="303" y1="81" x2="549" y2="81" class="grid" stroke-width="1"/>
+<text x="426" y="97" text-anchor="middle" class="warn m" font-size="9.5">&quot;Sure! Here&rsquo;s the JSON:</text>
+<text x="426" y="111" text-anchor="middle" class="warn m" font-size="9.5"> ```json&#x0a;{&quot;file&quot;:&quot;orders…</text>
+<text x="426" y="125" text-anchor="middle" class="warn m" font-size="9">prose wrap · code fence · mid-object cut</text>
+<!-- arrow B1 → C1 -->
+<line x1="565" y1="93" x2="622" y2="93" class="fail-s" stroke-width="1.5" marker-end="url(#soF)"/>
+<line x1="565" y1="93" x2="622" y2="93" class="flow f s d3" stroke-width="2.2"/>
+<!-- C1: parse fail -->
+<rect x="626" y="52" width="242" height="82" rx="10" class="n-fill fail-s glow-f" stroke-width="1.6"/>
+<text x="747" y="73" text-anchor="middle" class="ink" font-size="11" font-weight="640">JSON.parse()</text>
+<line x1="642" y1="81" x2="852" y2="81" class="grid" stroke-width="1"/>
+<text x="747" y="105" text-anchor="middle" class="fail" font-size="24" font-weight="800">&#x2717;</text>
+<text x="747" y="124" text-anchor="middle" class="fail m" font-size="9.5">SyntaxError: unexpected token</text>
+<!-- ── DIVIDER ── -->
+<line x1="10" y1="150" x2="990" y2="150" class="grid" stroke-width="1" stroke-dasharray="5 4"/>
+<!-- ── BOTTOM ROW: RELIABLE ── -->
+<text x="20" y="174" class="pass" font-size="10.5" font-weight="700">RELIABLE</text>
+<!-- A2: tool-as-schema / JSON mode -->
+<rect x="20" y="180" width="210" height="82" rx="10" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="125" y="201" text-anchor="middle" class="ink" font-size="11" font-weight="640">tool-as-schema / JSON mode</text>
+<line x1="36" y1="209" x2="214" y2="209" class="grid" stroke-width="1"/>
+<text x="125" y="226" text-anchor="middle" class="accent-ink m" font-size="9.5">tool_choice: &quot;emit_plan&quot;</text>
+<text x="125" y="241" text-anchor="middle" class="accent-ink m" font-size="9.5">input_schema: {…}</text>
+<text x="125" y="254" text-anchor="middle" class="ink-mut" font-size="9">shape declared in request</text>
+<!-- arrow A2 → B2 -->
+<line x1="230" y1="221" x2="283" y2="221" class="n-stroke" stroke-width="1.5" marker-end="url(#soP)"/>
+<line x1="230" y1="221" x2="283" y2="221" class="flow s d2" stroke-width="2.2"/>
+<!-- B2: constrained model output -->
+<rect x="287" y="180" width="278" height="82" rx="10" class="n-fill pass-s glow-p" stroke-width="1.6"/>
+<text x="426" y="201" text-anchor="middle" class="ink" font-size="11" font-weight="640">model output (constrained)</text>
+<line x1="303" y1="209" x2="549" y2="209" class="grid" stroke-width="1"/>
+<text x="426" y="226" text-anchor="middle" class="pass m" font-size="9.5">content[0].input: {</text>
+<text x="426" y="241" text-anchor="middle" class="pass m" font-size="9.5">  &quot;file&quot;: &quot;orders.py&quot;, …</text>
+<text x="426" y="254" text-anchor="middle" class="pass m" font-size="9">schema-validated · no wrapping</text>
+<!-- arrow B2 → C2 -->
+<line x1="565" y1="221" x2="622" y2="221" class="pass-s" stroke-width="1.5" marker-end="url(#soP)"/>
+<line x1="565" y1="221" x2="622" y2="221" class="flow p s d3" stroke-width="2.2"/>
+<!-- C2: parse pass -->
+<rect x="626" y="180" width="242" height="82" rx="10" class="n-fill pass-s glow-p" stroke-width="1.6"/>
+<text x="747" y="201" text-anchor="middle" class="ink" font-size="11" font-weight="640">JSON.parse()</text>
+<line x1="642" y1="209" x2="852" y2="209" class="grid" stroke-width="1"/>
+<text x="747" y="230" text-anchor="middle" class="pass" font-size="24" font-weight="800">&#x2713;</text>
+<text x="747" y="252" text-anchor="middle" class="pass m" font-size="9.5">valid object, ready to use</text>
+</svg>
+  <figcaption>Tool-as-schema or JSON mode enforces shape at generation time — no prose wrapping, no code fences, and a truncation is signaled by <code>stop_reason</code> rather than a silent parse failure.</figcaption>
+</div>
 
 <p>When an agent needs machine-readable output &mdash; a patch plan, a routing decision, a list of findings &mdash; parsing freeform model text is the wrong tool. Two failure modes are common: the model wraps the JSON in a prose sentence or a markdown code fence and the parser breaks; or <code>max_tokens</code> cuts the output mid-object and you receive invalid JSON. Both are avoidable by using the API&rsquo;s structured-output surface instead of prompt engineering.</p>
 
@@ -149,7 +221,7 @@
 <div class="note info"><span class="nt">Under the hood</span> With <code>tool_choice: {type: &quot;tool&quot;, name: &quot;…&quot;}</code> Anthropic guarantees the model calls exactly that tool and nothing else &mdash; no leading prose, no alternative tool. Without <code>tool_choice</code>, the model might emit a text block first or pick a different tool. For structured-output use, always pin <code>tool_choice</code>.</div>
 
 <div class="recap">Structured output works by using the API&rsquo;s own schema surface &mdash; a single forced tool on Anthropic, <code>response_format: json_schema</code> on OpenAI &mdash; so the data arrives validated in a known field. Always check <code>stop_reason</code> before parsing: a <code>max_tokens</code> cut produces a truncated fragment, not valid JSON.</div>
-<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-08-streaming.html"><span class="dir">&larr; Previous</span><span class="t">Streaming</span></a><a class="next" href="r101-10-images.html"><span class="dir">Next &rarr;</span><span class="t">Images &amp; multimodal</span></a></nav>
+<nav class="pager" aria-label="Module navigation"><a class="prev" href="r101-08-streaming.html"><span class="dir">&larr; Previous</span><span class="t">Streaming</span></a><a class="next" href="r101-10-images.html"><span class="dir">Next &rarr;</span><span class="t">Images &amp; multimodal</span></a></nav>
 </main>
 </div>
 <footer class="foot"><div class="wrap">

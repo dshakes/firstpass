@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Three client shapes — How Agents Talk to Models — Firstpass docs</title>
-<meta name="description" content="How Agents Talk to Models lesson 6 of 13: Three client shapes. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="description" content="How Agents Talk to Models module 6 of 13: Three client shapes. Part of the from-first-principles guide to how agents talk to models and what it costs.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -27,7 +27,7 @@
 </header>
 <div class="scrim"></div>
 <div class="docs">
-<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
 <a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
@@ -51,14 +51,61 @@
 <a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
 </div>
 </nav></aside><main class="content" id="main">
-<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<button class="btn sidebar-toggle" aria-label="Open modules" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Modules</button>
 <p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Three client shapes</p>
 <div class="lesson-progress">
-  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Lesson 6 of 13</span></div>
+  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Module 6 of 13</span></div>
   <div class="lp-bar"><span style="width:46.2%"></span></div>
 </div>
 <h1>Three client shapes</h1>
 <div class="tldr">The same wire powers three very different agents. A <b>coding agent</b> (Claude Code) — long multi-turn sessions, heavy tools; cost is transcript × call count. A <b>headless agent</b> — CI/cron, short loop run over many items; cost is volume × per-run. An <b>SDK app</b> — you own the loop, so you control all three levers directly. What changes isn't the wire, it's <b>who drives the loop and what dominates the bill</b>.</div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="shT">
+<title id="shT">Three client shapes on the same wire: Interactive coding agent (loop driven by human plus tool, cost = growing transcript × tool-call count), Headless CI/cron agent (loop driven by script or scheduler, cost = per-run × volume), and SDK app (loop driven by you, cost = your choices on all three levers).</title>
+<!-- header -->
+<text x="500" y="28" text-anchor="middle" class="ink" font-size="12.5" font-weight="640">Same wire underneath — three different cost shapes.</text>
+<!-- col 1: Interactive -->
+<rect x="28" y="48" width="288" height="212" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="44" y="74" class="accent-ink m" font-size="10" font-weight="700" letter-spacing=".5">INTERACTIVE</text>
+<text x="172" y="104" text-anchor="middle" class="ink" font-size="15" font-weight="700">Coding agent</text>
+<text x="172" y="122" text-anchor="middle" class="ink-mut m" font-size="10">(e.g. Claude Code)</text>
+<line x1="44" y1="134" x2="300" y2="134" class="grid" stroke-width="1"/>
+<text x="44" y="154" class="ink-mut" font-size="10">Drives loop</text>
+<text x="44" y="172" class="ink m" font-size="11" font-weight="600">human + tool</text>
+<text x="44" y="196" class="ink-mut" font-size="10">Cost driver</text>
+<text x="44" y="216" class="accent-ink m" font-size="11.5" font-weight="700">transcript × tool calls</text>
+<text x="44" y="235" class="ink-mut m" font-size="10">grows on every round-trip</text>
+<!-- col 2: Headless -->
+<rect x="356" y="48" width="288" height="212" rx="12" class="n-fill n-stroke" stroke-width="1.7"/>
+<text x="372" y="74" class="ink-mut m" font-size="10" font-weight="700" letter-spacing=".5">HEADLESS</text>
+<text x="500" y="104" text-anchor="middle" class="ink" font-size="15" font-weight="700">CI / cron</text>
+<text x="500" y="122" text-anchor="middle" class="ink-mut m" font-size="10">(pipeline, scheduler)</text>
+<line x1="372" y1="134" x2="628" y2="134" class="grid" stroke-width="1"/>
+<text x="372" y="154" class="ink-mut" font-size="10">Drives loop</text>
+<text x="372" y="172" class="ink m" font-size="11" font-weight="600">script / scheduler</text>
+<text x="372" y="196" class="ink-mut" font-size="10">Cost driver</text>
+<text x="372" y="216" class="ink m" font-size="11.5" font-weight="700">per-run × volume</text>
+<text x="372" y="235" class="ink-mut m" font-size="10">small run, paid thousands of times</text>
+<!-- col 3: SDK -->
+<rect x="684" y="48" width="288" height="212" rx="12" class="n-fill pass-s glow-p" stroke-width="1.7"/>
+<text x="700" y="74" class="pass m" font-size="10" font-weight="700" letter-spacing=".5">SDK APP</text>
+<text x="828" y="104" text-anchor="middle" class="ink" font-size="15" font-weight="700">Your SDK app</text>
+<text x="828" y="122" text-anchor="middle" class="ink-mut m" font-size="10">(you own the loop)</text>
+<line x1="700" y1="134" x2="956" y2="134" class="grid" stroke-width="1"/>
+<text x="700" y="154" class="ink-mut" font-size="10">Drives loop</text>
+<text x="700" y="172" class="pass m" font-size="11" font-weight="700">you</text>
+<text x="700" y="196" class="ink-mut" font-size="10">Cost driver</text>
+<text x="700" y="216" class="pass m" font-size="11.5" font-weight="700">your choices · all 3 levers</text>
+<text x="700" y="235" class="ink-mut m" font-size="10">most tuning headroom, most rope</text>
+<!-- shared wire -->
+<line x1="172" y1="260" x2="172" y2="278" class="n-stroke" stroke-width="1.2"/>
+<line x1="500" y1="260" x2="500" y2="278" class="n-stroke" stroke-width="1.2"/>
+<line x1="828" y1="260" x2="828" y2="278" class="n-stroke" stroke-width="1.2"/>
+<line x1="28" y1="278" x2="972" y2="278" class="n-stroke" stroke-width="1.4"/>
+<text x="500" y="295" text-anchor="middle" class="ink-mut m" font-size="10">POST /v1/messages — stateless · tokens · tools · cache</text>
+<line x1="28" y1="278" x2="972" y2="278" class="flow s" stroke-width="2"/>
+</svg>
+  <figcaption>Same HTTP wire, three cost shapes: coding agents pay for long tool-heavy transcripts, headless agents pay per-run × volume, SDK apps pay for whatever you choose to send.</figcaption>
+</div>
 <p>The same wire — stateless calls, tokens, tools, cache — powers very different agents. What changes is <em>who drives the loop</em> and <em>what dominates the bill</em>:</p>
 <div class="cards g3">
   <div class="card"><div class="step-n">interactive</div><h3>Coding agent</h3><p>A human-in-the-loop tool like Claude Code. Long multi-turn sessions, heavy tool use, subagents. Cost is dominated by <strong>the growing transcript × the tool-call count</strong>: re-read across dozens of round-trips. Prime candidate for caching.</p></div>
@@ -88,7 +135,7 @@ done
 </div>
 <div class="note"><span class="nt">One safe reflex, one big bill</span> Across all three shapes, the tempting default is &ldquo;send every call to the strongest model, to be safe.&rdquo; That's the single choice that makes an afternoon of agent work bill like a research run — and in the headless case, multiplies straight into the volume: the top tier on 200 runs a day, most of which were easy. That reflex is exactly what Part B is about.</div>
 <div class="recap">Same wire, three cost shapes: coding agents pay for long tool-heavy transcripts, headless agents pay <b>per-run × volume</b>, SDK apps pay for whatever you choose to send.</div>
-<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-05-caching.html"><span class="dir">&larr; Previous</span><span class="t">Prompt caching</span></a><a class="next" href="r101-07-claude-code-session.html"><span class="dir">Next &rarr;</span><span class="t">A Claude Code session</span></a></nav>
+<nav class="pager" aria-label="Module navigation"><a class="prev" href="r101-05-caching.html"><span class="dir">&larr; Previous</span><span class="t">Prompt caching</span></a><a class="next" href="r101-07-claude-code-session.html"><span class="dir">Next &rarr;</span><span class="t">A Claude Code session</span></a></nav>
 </main>
 </div>
 <footer class="foot"><div class="wrap">

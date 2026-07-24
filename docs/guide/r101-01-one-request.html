@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>One request, one response — How Agents Talk to Models — Firstpass docs</title>
-<meta name="description" content="How Agents Talk to Models lesson 1 of 13: One request, one response. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="description" content="How Agents Talk to Models module 1 of 13: One request, one response. Part of the from-first-principles guide to how agents talk to models and what it costs.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -27,7 +27,7 @@
 </header>
 <div class="scrim"></div>
 <div class="docs">
-<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
 <a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
@@ -51,10 +51,10 @@
 <a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
 </div>
 </nav></aside><main class="content" id="main">
-<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<button class="btn sidebar-toggle" aria-label="Open modules" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Modules</button>
 <p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / One request, one response</p>
 <div class="lesson-progress">
-  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Lesson 1 of 13</span></div>
+  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Module 1 of 13</span></div>
   <div class="lp-bar"><span style="width:7.7%"></span></div>
 </div>
 <h1>One request, one response</h1>
@@ -123,7 +123,7 @@ curl https://api.anthropic.com/v1/messages \
 <div class="note"><span class="nt">Key idea</span> The <code>usage</code> object is the only cost signal you get, and the provider hands it to you on every response. <code>input_tokens</code> is everything the model read — your system prompt, tools, the whole message history, this turn's text — and <code>output_tokens</code> is only what it just wrote. If you log one thing per call, log <code>usage</code>.</div>
 <div class="note info"><span class="nt">Under the hood</span> Tokens aren't words. A tokenizer splits text into sub-word pieces — <code>&quot;orders.py&quot;</code> might be three tokens, a curly brace one, a run of whitespace one. Rough rule of thumb for English prose and code: <b>~4 characters per token</b>, or ~0.75 tokens per word. Punctuation-dense code trends higher. You never count them by hand — <code>usage</code> is ground truth — but the 4-chars mental model tells you why a 300-line file lands around 3–4k input tokens.</div>
 <div class="recap">A model call is a stateless <code>POST</code>; the reply's <b>usage</b> field reports input vs output tokens, and the model forgets everything the instant it answers.</div>
-<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="requests-101.html"><span class="dir">&larr; Overview</span><span class="t">How Agents Talk to Models</span></a><a class="next" href="r101-02-token-meter.html"><span class="dir">Next &rarr;</span><span class="t">The token meter</span></a></nav>
+<nav class="pager" aria-label="Module navigation"><a class="prev" href="requests-101.html"><span class="dir">&larr; Overview</span><span class="t">How Agents Talk to Models</span></a><a class="next" href="r101-02-token-meter.html"><span class="dir">Next &rarr;</span><span class="t">The token meter</span></a></nav>
 </main>
 </div>
 <footer class="foot"><div class="wrap">

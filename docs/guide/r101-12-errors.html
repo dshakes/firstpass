@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Errors, rate limits & retries — How Agents Talk to Models — Firstpass docs</title>
-<meta name="description" content="How Agents Talk to Models lesson 12 of 13: Errors, rate limits & retries. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="description" content="How Agents Talk to Models module 12 of 13: Errors, rate limits & retries. Part of the from-first-principles guide to how agents talk to models and what it costs.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -27,7 +27,7 @@
 </header>
 <div class="scrim"></div>
 <div class="docs">
-<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
 <a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
@@ -51,14 +51,80 @@
 <a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
 </div>
 </nav></aside><main class="content" id="main">
-<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<button class="btn sidebar-toggle" aria-label="Open modules" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Modules</button>
 <p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Errors, rate limits & retries</p>
 <div class="lesson-progress">
-  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Lesson 12 of 13</span></div>
+  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Module 12 of 13</span></div>
   <div class="lp-bar"><span style="width:92.3%"></span></div>
 </div>
 <h1>Errors, rate limits &amp; retries</h1>
 <div class="tldr">Real traffic fails. <b>429</b> rate-limit and <b>529</b> overloaded are transient — back off and retry, respecting the <code>retry-after</code> header. <b>5xx</b> server faults are also retryable with a cap. <b>413</b> request-too-large is not — shrink the payload. The quiet trap: <b>a call can bill output tokens even when it fails</b>; the model may have started writing before the error was signalled. In a hundred-call agent run, a naive retry loop pays for those partial outputs twice.</div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 228" role="img" aria-labelledby="erT">
+<title id="erT">Retry flow: a request returns a 429 rate-limit error; the client waits using exponential backoff with jitter (2 s, then 4 s, then 8 s, capped at 60 s) and retries. A 529 overloaded or 5xx server error follows the same path.</title>
+<defs>
+  <marker id="erA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="erP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+  <marker id="erW" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
+</defs>
+<text x="30" y="28" class="ink" font-size="13" font-weight="640">Back off, then retry — the delay grows with each attempt.</text>
+<!-- POST attempt 1 -->
+<rect x="20" y="56" width="130" height="64" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="85" y="82" text-anchor="middle" class="ink m" font-size="11" font-weight="640">POST /v1/messages</text>
+<text x="85" y="102" text-anchor="middle" class="ink-mut" font-size="10">attempt 1</text>
+<!-- arrow to 429 -->
+<line x1="150" y1="88" x2="184" y2="88" class="n-stroke" stroke-width="1.6" marker-end="url(#erW)"/>
+<!-- 429 box -->
+<rect x="186" y="56" width="118" height="64" rx="10" class="warn glow-w" stroke-width="1.6"/>
+<text x="245" y="82" text-anchor="middle" font-size="14" font-weight="700" fill="var(--text-inv)">429</text>
+<text x="245" y="102" text-anchor="middle" font-size="10" fill="var(--text-inv)">rate limited</text>
+<!-- wait block -->
+<rect x="324" y="67" width="88" height="42" rx="8" class="n-fill warn-s" stroke-width="1.4"/>
+<text x="368" y="83" text-anchor="middle" class="warn m" font-size="11" font-weight="640">&#x21BB; wait 2 s</text>
+<text x="368" y="101" text-anchor="middle" class="ink-mut m" font-size="9">+ jitter</text>
+<!-- arrow to retry -->
+<line x1="412" y1="88" x2="446" y2="88" class="n-stroke" stroke-width="1.6" marker-end="url(#erA)"/>
+<!-- POST attempt 2 -->
+<rect x="448" y="56" width="130" height="64" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="513" y="82" text-anchor="middle" class="ink m" font-size="11" font-weight="640">POST /v1/messages</text>
+<text x="513" y="102" text-anchor="middle" class="ink-mut" font-size="10">attempt 2</text>
+<!-- arrow to 200 OK -->
+<line x1="578" y1="88" x2="612" y2="88" class="pass-s" stroke-width="1.6" marker-end="url(#erP)"/>
+<!-- 200 OK box -->
+<rect x="614" y="56" width="140" height="64" rx="10" class="pass glow-p" stroke-width="1.6"/>
+<text x="684" y="82" text-anchor="middle" font-size="14" font-weight="700" fill="var(--text-inv)">200 OK</text>
+<text x="684" y="102" text-anchor="middle" font-size="10" fill="var(--text-inv)">completion JSON</text>
+<!-- side note: 5xx / 529 -->
+<text x="778" y="74" class="ink-mut" font-size="10.5">Also retryable:</text>
+<text x="778" y="90" class="ink-mut m" font-size="10.5">5xx server error</text>
+<text x="778" y="106" class="ink-mut m" font-size="10.5">529 overloaded</text>
+<text x="778" y="120" class="ink-mut" font-size="9.5">(same backoff path)</text>
+<!-- flow pulses -->
+<line x1="150" y1="88" x2="184" y2="88" class="flow w" stroke-width="2.2"/>
+<line x1="412" y1="88" x2="446" y2="88" class="flow s d2" stroke-width="2.2"/>
+<line x1="578" y1="88" x2="612" y2="88" class="flow p d3" stroke-width="2.2"/>
+<!-- divider -->
+<line x1="20" y1="144" x2="980" y2="144" class="grid" stroke-width="1"/>
+<!-- backoff scale label -->
+<text x="20" y="164" class="ink" font-size="12" font-weight="640">Backoff doubles each attempt — cap at 60 s</text>
+<!-- 2 s block: 46 px wide (base unit) -->
+<rect x="20" y="176" width="46" height="32" rx="6" class="n-fill warn-s" stroke-width="1.4"/>
+<text x="43" y="197" text-anchor="middle" class="warn m" font-size="11" font-weight="640">2 s</text>
+<!-- 4 s block: 92 px wide (2x) -->
+<rect x="78" y="176" width="92" height="32" rx="6" class="n-fill warn-s" stroke-width="1.4"/>
+<text x="124" y="197" text-anchor="middle" class="warn m" font-size="11" font-weight="640">4 s</text>
+<!-- 8 s block: 160 px wide (visual ~4x) -->
+<rect x="182" y="176" width="160" height="32" rx="6" class="n-fill warn-s" stroke-width="1.4"/>
+<text x="262" y="197" text-anchor="middle" class="warn m" font-size="11" font-weight="640">8 s</text>
+<!-- ellipsis and cap -->
+<text x="354" y="197" class="ink-mut" font-size="11">&#x2192; &#x2026;</text>
+<rect x="388" y="176" width="120" height="32" rx="6" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="448" y="197" text-anchor="middle" class="ink m" font-size="11" font-weight="640">&#x2264; 60 s cap</text>
+<!-- formula annotation -->
+<text x="528" y="191" class="ink-mut m" font-size="10">min(2^attempt, 60) + uniform(0, wait &#xD7; 0.25)</text>
+<text x="528" y="207" class="ink-mut" font-size="10">retry-after header value takes priority if present</text>
+</svg>
+  <figcaption>On 429 / 529 / 5xx: wait exponential-backoff time (plus jitter) before retrying — never hammer a rate-limited endpoint.</figcaption>
+</div>
 
 <p>Take the running example: the coding agent makes six calls to handle the &ldquo;add a <code>total</code> guard and a test&rdquo; task. On call&nbsp;4 — edit <code>orders.py</code>, run the test suite — the provider returns a 429. The tool loop is mid-flight. Crashing here leaves a half-applied change; hammering the endpoint without a delay digs the hole deeper.</p>
 
@@ -117,7 +183,7 @@ def call_with_backoff(payload, max_attempts=4):
 <div class="note info"><span class="nt">Under the hood</span> A failover on a 529 is not an escalation in Firstpass&rsquo;s sense. The cheap model never got to answer, so there is no quality comparison to make. The router finds another healthy rung at the same tier (or the next tier if no same-tier rung is healthy) and replays the request. The serving attempt that errored is recorded in the receipt but does not count as a rung escalation in the gate logic.</div>
 
 <div class="recap">Retry 429 / 529 / 5xx with exponential backoff and a <code>retry-after</code>-aware cap; never retry 413 or 4xx client errors. Failed calls can still bill output tokens — log <code>usage</code> on every response including errors. Track <code>tool_use.id</code> to avoid double-executing tools on retry.</div>
-<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-11-mcp.html"><span class="dir">&larr; Previous</span><span class="t">MCP, in depth</span></a><a class="next" href="r101-13-firstpass.html"><span class="dir">Next &rarr;</span><span class="t">Where Firstpass fits</span></a></nav>
+<nav class="pager" aria-label="Module navigation"><a class="prev" href="r101-11-mcp.html"><span class="dir">&larr; Previous</span><span class="t">MCP, in depth</span></a><a class="next" href="r101-13-firstpass.html"><span class="dir">Next &rarr;</span><span class="t">Where Firstpass fits</span></a></nav>
 </main>
 </div>
 <footer class="foot"><div class="wrap">

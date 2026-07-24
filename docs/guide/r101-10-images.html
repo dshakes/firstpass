@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Images & multimodal — How Agents Talk to Models — Firstpass docs</title>
-<meta name="description" content="How Agents Talk to Models lesson 10 of 13: Images & multimodal. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="description" content="How Agents Talk to Models module 10 of 13: Images & multimodal. Part of the from-first-principles guide to how agents talk to models and what it costs.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -27,7 +27,7 @@
 </header>
 <div class="scrim"></div>
 <div class="docs">
-<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
 <a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
@@ -51,14 +51,52 @@
 <a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
 </div>
 </nav></aside><main class="content" id="main">
-<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<button class="btn sidebar-toggle" aria-label="Open modules" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Modules</button>
 <p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Images & multimodal</p>
 <div class="lesson-progress">
-  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Lesson 10 of 13</span></div>
+  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Module 10 of 13</span></div>
   <div class="lp-bar"><span style="width:76.9%"></span></div>
 </div>
 <h1>Images &amp; multimodal</h1>
 <div class="tldr">A message's <code>content</code> can be an array mixing <b>text blocks</b> and <b>image blocks</b>. Images — base64 or URL — are billed as <b>input tokens</b>, scaled by resolution: a typical screenshot adds ~1,500–3,200 tokens, as much as a page of text. The cost model (rate per Mtok) doesn't change; only the input-token count does.</div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 250" role="img" aria-labelledby="imT">
+<title id="imT">An image content block is split by the provider into tiles based on its resolution, and every tile is billed as input tokens — so a larger or higher-resolution image costs more input tokens. A typical screenshot lands around 1,500 tokens, roughly a page of text. The per-token rate is unchanged; only the token count grows.</title>
+<defs><marker id="imA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="imP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker></defs>
+<text x="40" y="30" class="ink" font-size="13" font-weight="640">An image is tiled by resolution — every tile is billed as input tokens</text>
+<!-- source image -->
+<text x="132" y="66" text-anchor="middle" class="ink-mut m" font-size="10">screenshot · 1080×800</text>
+<rect x="44" y="78" width="176" height="120" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
+<circle cx="86" cy="112" r="12" class="warn"/>
+<path d="M60 176 L104 122 L138 158 L168 128 L206 176 Z" class="accent" opacity="0.55"/>
+<text x="132" y="216" text-anchor="middle" class="ink-mut" font-size="9.5">the image you send</text>
+<!-- tiled -->
+<line x1="228" y1="138" x2="300" y2="138" class="n-stroke" stroke-width="1.6" marker-end="url(#imA)"/>
+<text x="264" y="128" text-anchor="middle" class="ink-mut" font-size="9.5">tiled</text>
+<text x="452" y="66" text-anchor="middle" class="ink-mut m" font-size="10">split into fixed-size tiles</text>
+<rect x="316" y="82" width="62" height="34" rx="4" class="n-fill n-stroke" stroke-width="1.3"/>
+<rect x="386" y="82" width="62" height="34" rx="4" class="n-fill accent-s" stroke-width="1.3"/>
+<rect x="456" y="82" width="62" height="34" rx="4" class="n-fill n-stroke" stroke-width="1.3"/>
+<rect x="526" y="82" width="62" height="34" rx="4" class="n-fill n-stroke" stroke-width="1.3"/>
+<rect x="316" y="122" width="62" height="34" rx="4" class="n-fill n-stroke" stroke-width="1.3"/>
+<rect x="386" y="122" width="62" height="34" rx="4" class="n-fill n-stroke" stroke-width="1.3"/>
+<rect x="456" y="122" width="62" height="34" rx="4" class="n-fill accent-s" stroke-width="1.3"/>
+<rect x="526" y="122" width="62" height="34" rx="4" class="n-fill n-stroke" stroke-width="1.3"/>
+<rect x="316" y="162" width="62" height="34" rx="4" class="n-fill n-stroke" stroke-width="1.3"/>
+<rect x="386" y="162" width="62" height="34" rx="4" class="n-fill n-stroke" stroke-width="1.3"/>
+<rect x="456" y="162" width="62" height="34" rx="4" class="n-fill n-stroke" stroke-width="1.3"/>
+<rect x="526" y="162" width="62" height="34" rx="4" class="n-fill n-stroke" stroke-width="1.3"/>
+<text x="452" y="216" text-anchor="middle" class="ink-mut" font-size="9.5">more pixels → more tiles</text>
+<!-- to tokens -->
+<line x1="600" y1="138" x2="672" y2="138" class="accent-s" stroke-width="1.7" marker-end="url(#imP)"/>
+<rect x="690" y="90" width="270" height="96" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="825" y="126" text-anchor="middle" class="ink" font-size="16" font-weight="700">&#8776; 1,500 tokens</text>
+<text x="825" y="150" text-anchor="middle" class="accent-ink m" font-size="10.5" font-weight="600">billed as INPUT</text>
+<text x="825" y="170" text-anchor="middle" class="ink-mut" font-size="9.5">as much as a page of text</text>
+<line x1="600" y1="138" x2="672" y2="138" class="flow p s" stroke-width="2.2"/>
+</svg>
+  <figcaption>An image isn't a flat fee — the provider tiles it by resolution and bills each tile as input tokens, so a bigger screenshot costs more. The rate per token is unchanged; the token <em>count</em> jumps, which is why a vision-heavy agent's bill climbs.</figcaption>
+</div>
 
 <p>Every <code>content</code> value so far has been a plain string. The API also accepts an array of typed blocks, which is how you mix text and images in one turn. In our running example, the agent might be handed a screenshot of the failing CI run rather than raw terminal text — the PNG goes directly into the request alongside the user's question:</p>
 
@@ -89,7 +127,7 @@
 <div class="note warn"><span class="nt">Common mistake</span> Sending images doesn't change the <em>rate</em> you're charged per token — it changes how many input tokens you consume. An agent that routinely attaches screenshots pays the same per-Mtok price but reads a much larger input on every call. Proxies like Firstpass treat <code>has_images</code> as a routing signal for exactly this reason: a vision-capable cheap model that can handle the image skips the expensive escalation.</div>
 
 <div class="recap">Images land in <code>content</code> as typed blocks with a <code>source</code> (base64 or URL); they're billed as <b>input tokens</b> proportional to resolution — the rate stays flat, the count jumps, and <code>has_images</code> is a real routing signal.</div>
-<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-09-structured-outputs.html"><span class="dir">&larr; Previous</span><span class="t">Structured outputs &amp; JSON</span></a><a class="next" href="r101-11-mcp.html"><span class="dir">Next &rarr;</span><span class="t">MCP, in depth</span></a></nav>
+<nav class="pager" aria-label="Module navigation"><a class="prev" href="r101-09-structured-outputs.html"><span class="dir">&larr; Previous</span><span class="t">Structured outputs &amp; JSON</span></a><a class="next" href="r101-11-mcp.html"><span class="dir">Next &rarr;</span><span class="t">MCP, in depth</span></a></nav>
 </main>
 </div>
 <footer class="foot"><div class="wrap">

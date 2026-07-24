@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MCP, in depth — How Agents Talk to Models — Firstpass docs</title>
-<meta name="description" content="How Agents Talk to Models lesson 11 of 13: MCP, in depth. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="description" content="How Agents Talk to Models module 11 of 13: MCP, in depth. Part of the from-first-principles guide to how agents talk to models and what it costs.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
@@ -27,7 +27,7 @@
 </header>
 <div class="scrim"></div>
 <div class="docs">
-<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
 <a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
@@ -51,10 +51,10 @@
 <a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
 </div>
 </nav></aside><main class="content" id="main">
-<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<button class="btn sidebar-toggle" aria-label="Open modules" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Modules</button>
 <p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / MCP, in depth</p>
 <div class="lesson-progress">
-  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Lesson 11 of 13</span></div>
+  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Module 11 of 13</span></div>
   <div class="lp-bar"><span style="width:84.6%"></span></div>
 </div>
 <h1>MCP, in depth</h1>
@@ -178,7 +178,7 @@
 <div class="note info"><span class="nt">Under the hood — two things called MCP</span> There are two unrelated uses of the name and it's worth separating them clearly. <b>Data-plane MCP</b> is what this module describes: external tool servers the agent folds into requests. Firstpass is completely transparent to it — the <code>tools</code> array is forwarded byte-for-byte and Firstpass never reads or rewrites MCP content on the routed path. <b>Firstpass's own <code>firstpass mcp</code></b> is a separate, unrelated thing entirely: a <em>stdio</em> self-audit server that exposes your deployment's trace store to an agent so it can inspect routing decisions. Its nine tools are <code>list_traces</code>, <code>get_trace</code>, <code>get_savings</code>, <code>get_evals</code>, <code>explain_route</code>, <code>verify_receipts</code>, <code>submit_feedback</code>, <code>rehearse_policy</code>, and <code>list_modes</code>. It sits beside the router and reads the audit log — it is not on the routed traffic path. Same acronym, opposite side of the wire.</div>
 
 <div class="recap">MCP is the agent's protocol, not the model's. Its three primitives — tools, resources, prompts — land in the model request as ordinary entries in <code>tools[]</code> and injected context in <code>messages[]</code>. Tool schemas cost input tokens on every call; keep connected servers to the minimum the task requires.</div>
-<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-10-images.html"><span class="dir">&larr; Previous</span><span class="t">Images &amp; multimodal</span></a><a class="next" href="r101-12-errors.html"><span class="dir">Next &rarr;</span><span class="t">Errors, rate limits &amp; retries</span></a></nav>
+<nav class="pager" aria-label="Module navigation"><a class="prev" href="r101-10-images.html"><span class="dir">&larr; Previous</span><span class="t">Images &amp; multimodal</span></a><a class="next" href="r101-12-errors.html"><span class="dir">Next &rarr;</span><span class="t">Errors, rate limits &amp; retries</span></a></nav>
 </main>
 </div>
 <footer class="foot"><div class="wrap">
