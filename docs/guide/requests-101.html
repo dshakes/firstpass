@@ -65,6 +65,46 @@
 </div>
 <p style="margin-top:26px"><a class="btn primary" href="r101-01-one-request.html">Start · Module 1 &rarr;</a></p>
 
+<p class="eyebrow" style="margin-top:40px">The story, in one picture</p>
+<p>The core path is one arc: a single call is nearly free, but conversation compounds it, tools multiply it, and caching bends it back down — and a full session is the sum of all of it. Each module below adds (or removes) one layer of this bill.</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="arcT">
+<title id="arcT">The cost story of the core path as a single rising-then-dipping curve. A single request is nearly free. Adding multi-turn conversation raises the cost because the transcript is resent every turn. Adding tool calls raises it sharply because one task becomes many billed round-trips. Prompt caching then bends the curve back down by re-pricing the repeated prefix. A full Claude Code session is the sum of all these layers. Each core-path module adds or removes one layer of this bill.</title>
+<defs><marker id="arA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
+<text x="40" y="28" class="ink" font-size="13" font-weight="640">How the bill builds across the core path &mdash; and what bends it back down</text>
+<line x1="70" y1="256" x2="944" y2="256" class="n-stroke" stroke-width="1.3"/>
+<text x="58" y="120" text-anchor="end" class="ink-mut" font-size="9.5" transform="rotate(-90 58 120)">cost of one task</text>
+<!-- area under the curve -->
+<path d="M120 256 L120 232 L330 186 L540 110 L730 160 L910 146 L910 256 Z" fill="var(--accent-soft)" opacity="0.7"/>
+<!-- rising segments -->
+<path d="M120 232 L330 186 L540 110" fill="none" class="accent-s" stroke-width="2.6"/>
+<!-- caching dip (relief) -->
+<path d="M540 110 L730 160" fill="none" class="pass-s" stroke-width="2.8"/>
+<!-- to session -->
+<path d="M730 160 L910 146" fill="none" class="accent-s" stroke-width="2.6"/>
+<!-- points -->
+<circle cx="120" cy="232" r="5" class="pass"/>
+<circle cx="330" cy="186" r="5" class="accent"/>
+<circle cx="540" cy="110" r="5.5" class="warn"/>
+<circle cx="730" cy="160" r="5.5" class="pass"/>
+<circle cx="910" cy="146" r="5.5" class="accent"/>
+<!-- effect labels (above) -->
+<text x="120" y="222" text-anchor="middle" class="pass m" font-size="9.5" font-weight="600">nearly free</text>
+<text x="330" y="176" text-anchor="middle" class="accent-ink m" font-size="9.5" font-weight="600">compounds</text>
+<text x="540" y="100" text-anchor="middle" class="warn m" font-size="9.5" font-weight="600">&times; many calls</text>
+<text x="730" y="150" text-anchor="middle" class="pass m" font-size="9.5" font-weight="600">&minus;90% input</text>
+<text x="910" y="136" text-anchor="middle" class="accent-ink m" font-size="9.5" font-weight="600">the sum</text>
+<!-- module labels (below axis) -->
+<text x="120" y="274" text-anchor="middle" class="ink-mut" font-size="10">one call</text>
+<text x="330" y="274" text-anchor="middle" class="ink-mut" font-size="10">+ multi-turn</text>
+<text x="540" y="274" text-anchor="middle" class="ink-mut" font-size="10">+ tools</text>
+<text x="730" y="274" text-anchor="middle" class="ink-mut" font-size="10">+ caching</text>
+<text x="910" y="274" text-anchor="middle" class="ink-mut" font-size="10">a session</text>
+<!-- pulse along the curve -->
+<path d="M120 232 L330 186 L540 110 L730 160 L910 146" class="flow s l" stroke-width="3"/>
+</svg>
+  <figcaption>The whole core path in one line: cost climbs with conversation and tools, caching bends it down, and a full session is the sum. The modules below walk each layer — request, meter, multi-turn, tools, caching, shapes, session.</figcaption>
+</div>
+
 <p class="eyebrow" style="margin-top:40px">Part A · The core path</p>
 <p>The main road — the path our one task actually walks, from a single request to a full session.</p>
 <div class="cards g2">
