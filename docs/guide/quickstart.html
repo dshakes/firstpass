@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quickstart — Firstpass docs</title>
+<meta name="description" content="Get Firstpass running and watch it prove one decision — in about a minute, with no API keys. Then point your own agent at it in observe mode, and enforce when you're ready.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=2">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.0</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html"><span class="num">01</span>Overview</a>
+<a href="quickstart.html" aria-current="page"><span class="num">02</span>Quickstart</a>
+<a href="how-it-works.html"><span class="num">03</span>How it works</a>
+<a href="request-flow.html"><span class="num">04</span>Routing, end to end</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html"><span class="num">05</span>Gates</a>
+<a href="routing.html"><span class="num">06</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">07</span>The guarantee</a>
+<a href="receipts.html"><span class="num">08</span>Receipts &amp; audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">09</span>Providers</a>
+<a href="configuration.html"><span class="num">10</span>Configuration</a>
+<a href="cli.html"><span class="num">11</span>CLI reference</a>
+<a href="api.html"><span class="num">12</span>API &amp; MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research &amp; data</p>
+<a href="elastic-verification.html"><span class="num">13</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">14</span>Benchmarks</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / Quickstart</p>
+<h1>Quickstart</h1>
+<p class="page-sub">The fastest way to understand Firstpass is to watch it prove one decision. In about a minute, with no API keys, you'll run a real routing loop — cheap model first, gate the output, escalate on failure — and read the tamper-evident receipt it seals. Then you'll point your own agent at it, safely.</p>
+
+<div class="chips">
+  <div class="chip good"><div class="cn">~60<span class="u">s</span></div><div class="cl">to your first receipt</div></div>
+  <div class="chip"><div class="cn">0</div><div class="cl">API keys for the demo</div></div>
+  <div class="chip"><div class="cn">1</div><div class="cl">env var to leave, ever</div></div>
+</div>
+
+<h2 id="demo">1 · See it prove one decision<a class="anchor" href="#demo" aria-label="Link to this section">#</a></h2>
+<p>The demo needs no keys and talks to no provider. It stands up a mock upstream, drives one request through the full loop — open the cheap rung, gate the output, escalate one rung when the gate fails, serve the passing answer — and prints the receipt to your terminal. All you need is <code>git</code> and a Rust toolchain (<a href="https://rustup.rs" rel="noopener">rustup.rs</a>).</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>git clone https://github.com/dshakes/firstpass &amp;&amp; cd firstpass
+cargo run -p firstpass-proxy --example demo</code></pre></div>
+<p>You don't have to install anything or read the config first. The point is to see the shape of a decision before you learn the parts — everything after this is that same loop, made real.</p>
+
+<h2 id="receipt">2 · Read the receipt<a class="anchor" href="#receipt" aria-label="Link to this section">#</a></h2>
+<p>The demo prints a receipt like the one below. It is the whole decision, in one record: which rungs were tried, how each gate voted, what it cost against the always-expensive counterfactual, and the hash link that makes the log tamper-evident. This artifact — not a prediction, not a log line — is what Firstpass produces for <em>every</em> request.</p>
+<div class="codeblock"><div class="cb-head"><span>json · one receipt</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
+  "seq": 1,
+  "mode": "balanced",
+  "attempts": [
+    { "rung": 0, "model": "mock/cheap",  "gate": "json-valid", "verdict": "fail" },
+    { "rung": 1, "model": "mock/strong", "gate": "json-valid", "verdict": "pass", "served": true }
+  ],
+  "served_rung": 1,
+  "cost_usd": 0.0004,
+  "counterfactual_usd": 0.0011,
+  "prev_hash": "genesis",
+  "hash": "b9c4…b1a7"
+}</code></pre></div>
+<p>Read it top to bottom and you've read the product: rung&nbsp;0 answered, the gate rejected it, so Firstpass escalated to rung&nbsp;1, which passed and was served. <code>seq&nbsp;1</code> and <code>prev_hash&nbsp;"genesis"</code> mark this as the first link in the chain; the next receipt will carry this <code>hash</code> as its <code>prev_hash</code>, and so on — which is what lets <a href="cli.html#audit"><code>firstpass verify</code></a> re-derive the entire history from scratch and catch any edit. <a href="receipts.html">Receipts &amp; audit</a> takes the record apart field by field.</p>
+
+<h2 id="what-happened">3 · What just happened<a class="anchor" href="#what-happened" aria-label="Link to this section">#</a></h2>
+<p>That one decision is the whole system in miniature — the <a href="index.html#moves">four moves from the Overview</a>, now watched running. Firstpass does exactly these four things, in order, on every request:</p>
+<div class="defs">
+  <div class="row"><div class="k">Route</div><div class="v">Open the cheapest rung in your ladder. No classifier guesses from the prompt — the cheap model simply takes the first pass. <a href="routing.html">Routing &amp; escalation →</a></div></div>
+  <div class="row"><div class="k">Prove</div><div class="v">Gate the <em>real</em> output. In the demo that's <code>json-valid</code>; in production it's your schema, your test suite, an LLM judge, or self-consistency. <a href="gates.html">Gates →</a></div></div>
+  <div class="row"><div class="k">Escalate</div><div class="v">One rung up on gate failure — budget-capped, with cross-provider failover on transport or 5xx errors. The strong model is spent only when the cheap one provably isn't enough. <a href="routing.html#escalation">How escalation is bounded →</a></div></div>
+  <div class="row"><div class="k">Learn</div><div class="v">Outcomes feed back through <code>/v1/feedback</code> and move the serve threshold, so the served-failure rate stays bounded even as traffic drifts. <a href="guarantee.html">The guarantee →</a></div></div>
+</div>
+<p><a href="how-it-works.html">How it works</a> follows a single request through all four in detail, and <a href="request-flow.html">Routing, end to end</a> traces a real one hop by hop.</p>
+
+<h2 id="your-agent">4 · Point your own agent at it<a class="anchor" href="#your-agent" aria-label="Link to this section">#</a></h2>
+<p>Now do it for real. Install the proxy — one line; the <a href="cli.html#install">CLI reference</a> lists every channel (pip, Homebrew, Docker, Cargo):</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh</code></pre></div>
+<p>Then let Firstpass wire itself in. <code>onboard</code> detects your provider config, starts the proxy, points your agent's base URL at it, and checks itself — <code>--apply</code> writes the changes, and bare <code>onboard</code> is a dry run that shows you exactly what it would do first:</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass onboard          # dry run — shows every change
+firstpass onboard --apply  # wire it in
+firstpass doctor           # confirm config, keys, connectivity</code></pre></div>
+<div class="note"><span class="nt">Safe by default</span> Fresh installs start in <strong>observe</strong> mode: every request is forwarded to your provider <em>unchanged</em> and a receipt is written off the hot path. Zero behavior change — you get the audit trail and the savings estimate before you let Firstpass route a single request. When the shadow numbers convince you, switch to <strong>enforce</strong> and it starts serving from the cheap rung. <a href="how-it-works.html#modes">Observe vs enforce →</a></div>
+<p>Enforce mode is driven by a small TOML ladder — which models to try, in order, and which gates must pass. This is the minimal one; <a href="configuration.html">Configuration</a> covers matching, budgets, and per-route gates:</p>
+<div class="codeblock"><div class="cb-head"><span>toml · firstpass.toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[route]]
+match  = {}                 # everything — first match wins, top to bottom
+mode   = "enforce"
+ladder = ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
+gates  = ["json-valid", "cargo-test"]</code></pre></div>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass up</code></pre></div>
+<p>Your keys stay yours — Firstpass is bring-your-own-key, adds no markup, and redacts keys from every log and receipt. And leaving is always one line, by design:</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass offboard   # or just: unset ANTHROPIC_BASE_URL</code></pre></div>
+
+<h2 id="next">Where to go next<a class="anchor" href="#next" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><a href="how-it-works.html">How it works</a> — the full request flow, observe vs enforce, and the anatomy of one decision.</li>
+  <li><a href="gates.html">Gates</a> — the five kinds of proof, and how to bring your own definition of "good."</li>
+  <li><a href="guarantee.html">The guarantee</a> — how the served-failure bound is computed, with the real data behind it.</li>
+  <li><a href="configuration.html">Configuration</a> and the <a href="cli.html">CLI reference</a> — every knob and every subcommand.</li>
+</ul>
+
+<nav class="pager" aria-label="Pagination"><a class="prev" href="index.html"><span class="dir">← Previous</span><span class="t">Overview</span></a><a class="next" href="how-it-works.html"><span class="dir">Next →</span><span class="t">How it works</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#demo" class="">See it prove one decision</a><a href="#receipt" class="">Read the receipt</a><a href="#what-happened" class="">What just happened</a><a href="#your-agent" class="">Point your own agent at it</a><a href="#next" class="">Where to go next</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=2"></script>
+</body></html>
