@@ -72,6 +72,18 @@ curl https://api.anthropic.com/v1/messages \
     "messages": [{"role": "user", "content": "Does POST /orders reject a request with no total field?"}]
   }'</code></pre></div>
 <p>That is the developer's first move on our running task — just <em>asking</em>, before any agent touches the code. Two fields beyond <code>messages</code> are worth naming now. <code>max_tokens</code> is the hard ceiling on the <em>output</em> — the model will be cut off there (more on that below). The optional <code>system</code> field is the <strong>system prompt</strong>: standing instructions, separate from the conversation, that ride along as input on every call. It's the first thing loaded and the last thing that changes — which (jump to <a href="r101-05-caching.html">caching</a>) makes it prime cache material.</p>
+<p class="subh">Same wire, different front doors</p>
+<p>The <code>curl</code> above hits Anthropic directly, but the <em>body</em> — model, messages, tools — is identical wherever Claude runs. Only the front door changes:</p>
+<div class="tblwrap"><table>
+<thead><tr><th>Access</th><th>Endpoint &amp; auth</th><th>Where the model id goes</th></tr></thead>
+<tbody>
+<tr><td>Anthropic API</td><td><code>api.anthropic.com</code> · <code>x-api-key</code></td><td>in the body (<code>"model"</code>)</td></tr>
+<tr><td>Amazon Bedrock</td><td><code>bedrock-runtime.&lt;region&gt;…</code> · AWS SigV4 (IAM)</td><td>in the URL path; body carries <code>anthropic_version: "bedrock-2023-05-31"</code></td></tr>
+<tr><td>Google Vertex</td><td>Vertex AI endpoint · Google OAuth</td><td>in the URL path; body carries <code>anthropic_version: "vertex-2023-10-16"</code></td></tr>
+</tbody>
+</table></div>
+<div class="note info"><span class="nt">Under the hood</span> Everything in this course — tokens, multi-turn resend, tool loops, caching, streaming, retries — is identical across all three; only the endpoint, auth, and where the model id sits differ. Firstpass treats Anthropic, Bedrock, and Vertex as one <em>Anthropic-dialect</em> family: it forwards your body verbatim and swaps only the model, so routing Bedrock- or Vertex-hosted Claude works the same as calling Anthropic direct.</div>
+
 <p>The response is one JSON object. The part that matters for cost is <code>usage</code> — the model reports how many tokens it <em>read</em> (input) and how many it <em>wrote</em> (output):</p>
 <div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
   &quot;id&quot;: &quot;msg_01F3k…&quot;,
@@ -81,8 +93,20 @@ curl https://api.anthropic.com/v1/messages \
   &quot;stop_reason&quot;: &quot;end_turn&quot;,
   &quot;usage&quot;: { &quot;input_tokens&quot;: 32, &quot;output_tokens&quot;: 14 }   <span class="tk-c">// ← the meter</span>
 }</code></pre></div>
+<p class="subh">Reading the response</p>
+<p>Four parts matter. <code>id</code> and <code>model</code> echo the call. <code>content</code> is an <strong>array of blocks</strong> — a <code>text</code> block here, but it can be a <code>tool_use</code> block (<a href="r101-04-tools.html">tools</a>), or several blocks at once. <code>stop_reason</code> says why it ended (below). And <code>usage</code> is the meter — <code>input_tokens</code> and <code>output_tokens</code>, plus <code>cache_creation_input_tokens</code> and <code>cache_read_input_tokens</code> once <a href="r101-05-caching.html">caching</a> is on. If you log one field per call, log <code>usage</code>.</p>
 <p class="subh">When the model stops: <code>stop_reason</code></p>
-<p>Every response says <em>why</em> it ended. <code>end_turn</code> — the model finished naturally (above). <code>tool_use</code> — it wants you to run a tool and call again (<a href="r101-04-tools.html">the tool loop</a>). <code>max_tokens</code> — it hit your output ceiling and was <strong>cut off mid-sentence</strong>. That last one is the quiet failure mode: a truncated reply still <em>looks</em> like a reply, and you were billed for every token it wrote before the cut. It bites hardest with structured output — half a JSON object doesn't parse (<a href="r101-09-structured-outputs.html">structured outputs</a>).</p>
+<p>Every response says <em>why</em> it ended — and a truncated reply still <em>looks</em> like a reply, so always check it before trusting the body:</p>
+<div class="tblwrap"><table>
+<thead><tr><th><code>stop_reason</code></th><th>Means</th><th>You do</th></tr></thead>
+<tbody>
+<tr><td><code>end_turn</code></td><td>finished naturally</td><td>use the answer</td></tr>
+<tr><td><code>tool_use</code></td><td>wants a tool run first</td><td>run it, call again with the <a href="r101-04-tools.html">result</a></td></tr>
+<tr><td><code>max_tokens</code></td><td>hit your output ceiling — <b>cut off mid-sentence</b></td><td>don't trust the body; raise <code>max_tokens</code> and retry</td></tr>
+<tr><td><code>stop_sequence</code></td><td>hit a stop string you set</td><td>use the answer up to it</td></tr>
+</tbody>
+</table></div>
+<p>The <code>max_tokens</code> row is the quiet failure mode — you were billed for every token written before the cut, and it bites hardest with structured output, where half a JSON object doesn't parse (<a href="r101-09-structured-outputs.html">structured outputs</a>).</p>
 <div class="note warn"><span class="nt">Common mistake</span> Treating <code>max_tokens</code> as &ldquo;how long an answer I want&rdquo; and setting it low to save money. It's a <em>guillotine</em>, not a hint — the model doesn't aim to finish under it, it just stops when it hits it. Set it comfortably above the longest valid answer and always check <code>stop_reason == "max_tokens"</code> before trusting the body.</div>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 260" role="img" aria-labelledby="wrOneReq">
 <title id="wrOneReq">A single HTTP POST carrying a model name and a messages array reaches the model, which is stateless and keeps no memory; it returns one JSON response whose usage field reports 32 input tokens read and 14 output tokens written.</title>
