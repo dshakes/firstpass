@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=4">
+<link rel="stylesheet" href="../assets/docs.css?v=5">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -26,7 +26,7 @@
 <div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
 </header>
 <div class="scrim"></div>
-<div class="docs">
+<div class="docs docs-course">
 <aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
@@ -72,56 +72,72 @@
 
 <p class="subh">One instruction becomes many requests</p>
 <p>You type one line — &ldquo;add a null-check test for <code>handle()</code>.&rdquo; That is <em>not</em> one model call. It kicks off the the tool loop loop: the agent reads files, writes a test, runs it, reads the failure, fixes it — each step a separate request, each carrying the base context <em>plus</em> a transcript that grew since the last step. A single instruction routinely spends five, ten, twenty model calls before it reports back:</p>
-<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 500" role="img" aria-labelledby="seqSessT">
-<title id="seqSessT">A sequence diagram of one Claude Code instruction over time, with three lifelines: you at the terminal, the model, and the local tools. A band across the top shows that at session launch a base context is assembled once — system prompt plus CLAUDE.md plus tool schemas. Then: you type an instruction; the terminal sends request one, which is the base context plus the instruction, billed as input; the model replies with a tool_use, billed as output; the terminal runs the tool locally, unbilled; the tool returns a result; the terminal sends request two, which resends the entire base context again plus the transcript and the result, billed as input; the model replies with an edit tool_use and, after several more such trips, a final answer, billed as output. Two callouts at the bottom note that when the window fills the harness compacts older turns into a summary, and that a spawned subagent runs its own separate transcript and bill and returns only a summary.</title>
-<defs><marker id="sq2A" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
-<marker id="sq2P" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker></defs>
-<text x="40" y="26" class="ink" font-size="13" font-weight="640">One instruction → a loop of requests, each re-sending the whole base context</text>
-<rect x="40" y="40" width="920" height="44" rx="11" class="n-fill accent-s glow" stroke-width="1.5"/>
-<text x="500" y="60" text-anchor="middle" class="ink m" font-size="11" font-weight="640">session launch · base context assembled once</text>
-<text x="500" y="76" text-anchor="middle" class="accent-ink m" font-size="10" font-weight="600">system prompt + CLAUDE.md + tool schemas — re-sent on every request below</text>
-<rect x="80" y="98" width="130" height="32" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
-<text x="145" y="119" text-anchor="middle" class="ink" font-size="11" font-weight="680">you · terminal</text>
-<rect x="440" y="98" width="130" height="32" rx="9" class="n-fill accent-s glow" stroke-width="1.5"/>
-<text x="505" y="119" text-anchor="middle" class="ink" font-size="11" font-weight="680">model</text>
-<rect x="785" y="98" width="130" height="32" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
-<text x="850" y="119" text-anchor="middle" class="ink" font-size="11" font-weight="680">local tools</text>
-<line x1="145" y1="130" x2="145" y2="398" class="grid" stroke-width="1.3"/>
-<line x1="505" y1="130" x2="505" y2="398" class="grid" stroke-width="1.3"/>
-<line x1="850" y1="130" x2="850" y2="398" class="grid" stroke-width="1.3"/>
-<text x="152" y="152" class="ink-mut m" font-size="10">you type: &quot;add a null-check test for handle()&quot;</text>
-<line x1="145" y1="176" x2="499" y2="176" class="n-stroke" stroke-width="2.2" marker-end="url(#sq2A)"/>
-<text x="322" y="168" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">① request 1 · base ctx + instruction</text>
-<text x="600" y="180" class="warn m" font-size="10" font-weight="600">$ input · base ctx billed</text>
-<rect x="499" y="176" width="12" height="42" rx="2" class="accent"/>
-<line x1="505" y1="222" x2="151" y2="222" class="pass-s" stroke-width="1.6" marker-end="url(#sq2P)"/>
-<text x="328" y="214" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">② tool_use · Read(orders.py)</text>
-<text x="600" y="226" class="pass m" font-size="10" font-weight="600">$ output</text>
-<line x1="145" y1="258" x2="844" y2="258" class="n-stroke" stroke-width="1.5" marker-end="url(#sq2A)"/>
-<text x="497" y="250" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">③ run tool locally · ④ result back</text>
-<line x1="850" y1="290" x2="151" y2="290" class="n-stroke" stroke-width="1.5" marker-end="url(#sq2A)"/>
-<text x="720" y="282" text-anchor="middle" class="ink-mut" font-size="9.5">unbilled — no model call</text>
-<line x1="145" y1="326" x2="499" y2="326" class="n-stroke" stroke-width="2.6" marker-end="url(#sq2A)"/>
-<text x="322" y="318" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑤ request 2 · base ctx RESENT + transcript + result</text>
-<text x="600" y="330" class="warn m" font-size="10" font-weight="600">$ input · base ctx again</text>
-<rect x="499" y="326" width="12" height="42" rx="2" class="accent"/>
-<line x1="505" y1="372" x2="151" y2="372" class="pass-s" stroke-width="1.6" marker-end="url(#sq2P)"/>
-<text x="322" y="364" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑥ Edit · then pytest · … · final answer</text>
-<text x="600" y="376" class="pass m" font-size="10" font-weight="600">$ output · ×N more trips</text>
-<rect x="40" y="414" width="450" height="70" rx="11" class="n-fill warn-s glow-w" stroke-width="1.4"/>
-<text x="60" y="438" class="ink m" font-size="10.5" font-weight="640">window fills → compaction</text>
-<text x="60" y="456" class="ink-mut m" font-size="9.5">older turns are summarized to free room;</text>
-<text x="60" y="470" class="ink-mut m" font-size="9.5">the loop continues on less history, not more</text>
-<rect x="510" y="414" width="450" height="70" rx="11" class="n-fill accent-s glow" stroke-width="1.4"/>
-<text x="530" y="438" class="ink m" font-size="10.5" font-weight="640">a subagent spawns</text>
-<text x="530" y="456" class="ink-mut m" font-size="9.5">its OWN base context + transcript + bill;</text>
-<text x="530" y="470" class="accent-ink m" font-size="9.5" font-weight="600">returns just a summary to this session</text>
-<line x1="145" y1="176" x2="499" y2="176" class="flow s" stroke-width="2.2"/>
-<line x1="505" y1="222" x2="151" y2="222" class="flow p s d2" stroke-width="2.2"/>
-<line x1="145" y1="326" x2="499" y2="326" class="flow s d3" stroke-width="2.6"/>
-<line x1="505" y1="372" x2="151" y2="372" class="flow p s d4" stroke-width="2.2"/>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 510" role="img" aria-labelledby="seSessionT">
+<title id="seSessionT">A sequence diagram showing one Claude Code instruction becoming a loop of many model requests. At session launch a base context is assembled once from the system prompt, CLAUDE.md, and tool schemas — several thousand tokens before your first word. You type one instruction. The agent sends request 1 (base context plus instruction, billed as input); the model replies with a tool_use block (billed as output); the agent runs the tool locally (no model call, unbilled); the tool returns its result. The agent then sends request 2, which resends the entire base context again plus the growing transcript and the tool result — billed as input, and already larger than request 1. After several more such round trips the model returns a final answer. Two callouts note that when the context window fills the harness compacts older turns, and that a spawned subagent runs its own separate base context, transcript, and bill, returning only a compact summary to this session.</title>
+<defs>
+<marker id="seA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="seP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+</defs>
+<!-- headline -->
+<text x="40" y="26" class="ink" font-size="13" font-weight="640">One instruction → many requests · base context re-sent in full every time</text>
+<!-- base context band -->
+<rect x="40" y="38" width="920" height="52" rx="10" class="n-fill accent-s glow" stroke-width="1.5"/>
+<text x="500" y="58" text-anchor="middle" class="ink m" font-size="11" font-weight="640">session launch — base context assembled once</text>
+<text x="500" y="76" text-anchor="middle" class="accent-ink m" font-size="10" font-weight="600">system prompt · CLAUDE.md · tool schemas → several thousand tokens before your first word</text>
+<!-- lifeline labels -->
+<rect x="74" y="106" width="134" height="32" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="141" y="127" text-anchor="middle" class="ink" font-size="11" font-weight="680">you · terminal</text>
+<rect x="448" y="106" width="116" height="32" rx="9" class="n-fill accent-s glow" stroke-width="1.5"/>
+<text x="506" y="127" text-anchor="middle" class="ink" font-size="11" font-weight="680">model</text>
+<rect x="800" y="106" width="134" height="32" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="867" y="127" text-anchor="middle" class="ink" font-size="11" font-weight="680">local tools</text>
+<!-- lifelines -->
+<line x1="141" y1="138" x2="141" y2="406" class="grid" stroke-width="1.3"/>
+<line x1="506" y1="138" x2="506" y2="406" class="grid" stroke-width="1.3"/>
+<line x1="867" y1="138" x2="867" y2="406" class="grid" stroke-width="1.3"/>
+<!-- you type -->
+<text x="148" y="158" class="ink-mut m" font-size="10">you type: "add a null-check test for handle()"</text>
+<!-- ① request 1: you → model (thin — only the instruction added on top of base ctx) -->
+<line x1="141" y1="180" x2="500" y2="180" class="n-stroke" stroke-width="2" marker-end="url(#seA)"/>
+<text x="320" y="172" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">① request 1 · base ctx + instruction</text>
+<text x="614" y="184" class="warn m" font-size="9.5" font-weight="600">$ input · base ctx billed</text>
+<rect x="500" y="180" width="12" height="40" rx="2" class="accent"/>
+<!-- ② tool_use: model → you -->
+<line x1="506" y1="224" x2="147" y2="224" class="pass-s" stroke-width="1.6" marker-end="url(#seP)"/>
+<text x="323" y="216" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">② tool_use · Read(orders.py)</text>
+<text x="614" y="228" class="pass m" font-size="9.5" font-weight="600">$ output</text>
+<!-- ③ run locally: you → tools -->
+<line x1="141" y1="264" x2="861" y2="264" class="n-stroke" stroke-width="1.4" marker-end="url(#seA)"/>
+<text x="504" y="256" text-anchor="middle" class="ink m" font-size="10" font-weight="600">③ run Read locally</text>
+<!-- ④ result: tools → you -->
+<line x1="867" y1="294" x2="147" y2="294" class="n-stroke" stroke-width="1.4" marker-end="url(#seA)"/>
+<text x="504" y="286" text-anchor="middle" class="ink m" font-size="10" font-weight="600">④ file contents returned</text>
+<text x="504" y="310" text-anchor="middle" class="ink-mut" font-size="9">③ – ④ never touch the model · unbilled</text>
+<!-- ⑤ request 2: you → model (fatter — transcript has grown with ①②③④) -->
+<line x1="141" y1="338" x2="500" y2="338" class="n-stroke" stroke-width="3.2" marker-end="url(#seA)"/>
+<text x="320" y="329" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑤ request 2 · base ctx RESENT + transcript + result</text>
+<text x="614" y="343" class="warn m" font-size="9.5" font-weight="600">$ input · bigger than ①</text>
+<rect x="500" y="338" width="12" height="40" rx="2" class="accent"/>
+<!-- ⑥ final answer / more trips: model → you -->
+<line x1="506" y1="382" x2="147" y2="382" class="pass-s" stroke-width="1.6" marker-end="url(#seP)"/>
+<text x="320" y="374" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">⑥ Edit · pytest · … · final answer</text>
+<text x="614" y="386" class="pass m" font-size="9.5" font-weight="600">$ output · ×N more trips</text>
+<!-- bottom callouts -->
+<rect x="40" y="422" width="452" height="72" rx="10" class="n-fill warn-s glow-w" stroke-width="1.4"/>
+<text x="62" y="446" class="ink m" font-size="10.5" font-weight="640">window fills → compaction</text>
+<text x="62" y="464" class="ink-mut m" font-size="9.5">older turns summarized to free room;</text>
+<text x="62" y="480" class="ink-mut m" font-size="9.5">loop continues · prompt-cache prefix invalidated</text>
+<rect x="508" y="422" width="452" height="72" rx="10" class="n-fill accent-s glow" stroke-width="1.4"/>
+<text x="530" y="446" class="ink m" font-size="10.5" font-weight="640">spawned subagent</text>
+<text x="530" y="464" class="ink-mut m" font-size="9.5">its OWN base context + transcript + bill;</text>
+<text x="530" y="480" class="accent-ink m" font-size="9.5" font-weight="600">returns just a compact summary to this session</text>
+<!-- flow animations -->
+<line x1="141" y1="180" x2="500" y2="180" class="flow s" stroke-width="2"/>
+<line x1="506" y1="224" x2="147" y2="224" class="flow p s d2" stroke-width="2"/>
+<line x1="141" y1="338" x2="500" y2="338" class="flow s d3" stroke-width="3.2"/>
+<line x1="506" y1="382" x2="147" y2="382" class="flow p s d4" stroke-width="2"/>
 </svg>
-  <figcaption>One typed instruction, many billed requests — and every request re-sends the whole base context (system prompt + <code>CLAUDE.md</code> + tools). This is multi-turn's compounding and the tool loop's call count stacked on top of a fat fixed prefix, which is why coding-agent sessions dominate a bill and why caching (caching) matters most here.</figcaption>
+  <figcaption>One typed instruction, many billed requests — every request re-sends the whole base context (system prompt + <code>CLAUDE.md</code> + tools). Steps ③–④ run locally with no model call. The fatter arrow at ⑤ reflects the larger input after the transcript grows. This stacks multi-turn compounding on top of a fat fixed prefix — which is why caching matters most in a coding session.</figcaption>
 </div>
 
 <p class="subh">Subagents spend on their own tab</p>
@@ -161,5 +177,5 @@
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=4"></script>
+<script src="../assets/docs.js?v=5"></script>
 </body></html>

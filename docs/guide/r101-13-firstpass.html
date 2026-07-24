@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=4">
+<link rel="stylesheet" href="../assets/docs.css?v=5">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -26,7 +26,7 @@
 <div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
 </header>
 <div class="scrim"></div>
-<div class="docs">
+<div class="docs docs-course">
 <aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
@@ -61,44 +61,81 @@
 <h2 id="bridge">The same wire seat, a different number<a class="anchor" href="r101-13-firstpass.html" aria-label="Link to this section">#</a></h2>
 <div class="tldr">Firstpass sits in the <b>same wire seat</b> as the provider — same dialects, same request, byte-identical unless configured otherwise. It changes only <b>which model answers</b>: every call opens on the cheapest rung, its real output is <b>proved against a gate</b>, and only calls that fail escalate one rung. Cheap-and-proven for the easy majority, strong only where earned — the bill drops, the wire contract doesn't move.</div>
 <p>Everything in Part A happens whether or not Firstpass exists — it's just how agents and models work. Firstpass sits in the <strong>same wire seat</strong>: you point your agent's base URL at it instead of the provider, and it speaks the identical dialects (<code>/v1/messages</code>, <code>/v1/chat/completions</code>). Nothing about your request changes. What changes is what happens to each call <em>behind</em> that seat — and it maps one-to-one onto the modules you just read.</p>
-<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 280" role="img" aria-labelledby="brdgT">
-<title id="brdgT">Without Firstpass, every call in the agent loop goes straight to the strong model and pays the top price. With Firstpass in the same wire seat, each call opens on the cheapest model, its real output is proved against a gate, and only calls that fail the gate escalate to a stronger model. Most calls are served cheap and proven, so the bill drops while the wire contract stays identical.</title>
-<defs><marker id="bgA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
-<marker id="bgP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker></defs>
-<!-- before -->
-<text x="40" y="30" class="ink-mut" font-size="11" font-weight="640">BEFORE — every call to the strong model</text>
-<rect x="40" y="46" width="120" height="44" rx="10" class="n-fill n-stroke" stroke-width="1.4"/>
-<text x="100" y="72" text-anchor="middle" class="ink m" font-size="11">agent call</text>
-<rect x="230" y="46" width="150" height="44" rx="10" class="n-fill fail-s glow-f" stroke-width="1.5"/>
-<text x="305" y="66" text-anchor="middle" class="fail m" font-size="11" font-weight="640">strong model</text>
-<text x="305" y="82" text-anchor="middle" class="ink-mut" font-size="9.5">top price · every time</text>
-<line x1="160" y1="68" x2="228" y2="68" class="n-stroke" stroke-width="1.5" marker-end="url(#bgA)"/>
-<text x="410" y="72" class="fail m" font-size="12" font-weight="700">$$$</text>
-<!-- after -->
-<text x="40" y="140" class="ink-mut" font-size="11" font-weight="640">AFTER — Firstpass in the same seat</text>
-<rect x="40" y="156" width="120" height="44" rx="10" class="n-fill n-stroke" stroke-width="1.4"/>
-<text x="100" y="182" text-anchor="middle" class="ink m" font-size="11">agent call</text>
-<rect x="230" y="156" width="140" height="44" rx="10" class="n-fill accent-s glow" stroke-width="1.6"/>
-<text x="300" y="176" text-anchor="middle" class="ink m" font-size="11" font-weight="640">cheapest rung</text>
-<text x="300" y="192" text-anchor="middle" class="accent-ink" font-size="9.5">first pass</text>
-<rect x="430" y="156" width="120" height="44" rx="10" class="n-fill accent-s glow" stroke-width="1.6"/>
-<text x="490" y="182" text-anchor="middle" class="ink m" font-size="11" font-weight="700">PROVE</text>
-<rect x="620" y="128" width="150" height="42" rx="10" class="n-fill pass-s glow-p" stroke-width="1.5"/>
-<text x="695" y="154" text-anchor="middle" class="pass m" font-size="10.5" font-weight="640">pass → serve cheap</text>
-<rect x="620" y="186" width="150" height="42" rx="10" class="n-fill warn-s glow-w" stroke-width="1.5"/>
-<text x="695" y="212" text-anchor="middle" class="warn m" font-size="10.5" font-weight="640">fail → escalate +1</text>
-<line x1="160" y1="178" x2="228" y2="178" class="n-stroke" stroke-width="1.5" marker-end="url(#bgA)"/>
-<line x1="370" y1="178" x2="428" y2="178" class="n-stroke" stroke-width="1.5" marker-end="url(#bgA)"/>
-<path d="M550 172 C588 160 600 150 618 148" fill="none" class="pass-s" stroke-width="1.5" marker-end="url(#bgP)"/>
-<path d="M550 184 C588 196 600 204 618 206" fill="none" class="warn-s" stroke-width="1.5" marker-end="url(#bgA)"/>
-<text x="820" y="152" class="pass m" font-size="12" font-weight="700">$</text>
-<text x="820" y="212" class="ink-mut" font-size="11">$$ · only when needed</text>
-<!-- pulses -->
-<line x1="160" y1="178" x2="228" y2="178" class="flow s" stroke-width="2"/>
-<line x1="370" y1="178" x2="428" y2="178" class="flow s d2" stroke-width="2"/>
-<path d="M550 172 C588 160 600 150 618 148" class="flow p s d3" stroke-width="2"/>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 250" role="img" aria-labelledby="bgBridgeT">
+<title id="bgBridgeT">Before and after diagram showing how Firstpass changes which model answers agent calls. Before: every call routes directly to the strong model at top price every time — no gate, output unverified. After, with Firstpass in the same wire seat: each call opens on the cheapest rung, its real output is proved against a gate, and only calls that fail the gate escalate one rung. The easy majority is served cheap and proved at low cost; the strong tier is paid only when earned. The request in and response out are identical — only the bill changes.</title>
+<defs>
+  <marker id="bgBrA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="bgBrP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+  <marker id="bgBrW" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
+</defs>
+
+<!-- vertical divider -->
+<line x1="500" y1="18" x2="500" y2="232" class="grid" stroke-width="1"/>
+
+<!-- ── BEFORE (left half) ────────────────────────── -->
+<text x="30" y="22" class="ink-mut" font-size="11" font-weight="640">BEFORE — without Firstpass</text>
+
+<rect x="30" y="36" width="100" height="40" rx="8" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="80" y="60" text-anchor="middle" class="ink m" font-size="11">agent call</text>
+
+<line x1="130" y1="56" x2="214" y2="56" class="n-stroke" stroke-width="2" marker-end="url(#bgBrA)"/>
+<text x="172" y="50" text-anchor="middle" class="ink-mut" font-size="9.5">every call</text>
+
+<rect x="216" y="36" width="148" height="40" rx="8" class="n-fill fail-s glow-f" stroke-width="1.5"/>
+<text x="290" y="55" text-anchor="middle" class="fail m" font-size="11" font-weight="700">strong model</text>
+<text x="290" y="69" text-anchor="middle" class="ink-mut" font-size="9.5">top price · $15/Mtok</text>
+
+<text x="378" y="62" class="fail m" font-size="17" font-weight="800">$$$</text>
+
+<line x1="30" y1="102" x2="475" y2="102" class="grid" stroke-width="0.7" stroke-dasharray="4 3"/>
+<text x="252" y="119" text-anchor="middle" class="ink-mut" font-size="10">no gate · output unverified · strong-tier price on every call</text>
+
+<!-- ── AFTER (right half) ─────────────────────────── -->
+<text x="520" y="22" class="ink-mut" font-size="11" font-weight="640">AFTER — Firstpass in the same wire seat</text>
+
+<rect x="520" y="36" width="90" height="40" rx="8" class="n-fill n-stroke" stroke-width="1.4"/>
+<text x="565" y="60" text-anchor="middle" class="ink m" font-size="11">agent call</text>
+
+<line x1="610" y1="56" x2="641" y2="56" class="n-stroke" stroke-width="1.5" marker-end="url(#bgBrA)"/>
+
+<rect x="643" y="36" width="105" height="40" rx="8" class="n-fill pass-s glow-p" stroke-width="1.5"/>
+<text x="696" y="54" text-anchor="middle" class="ink m" font-size="11" font-weight="640">cheap rung</text>
+<text x="696" y="68" text-anchor="middle" class="pass m" font-size="9.5">first pass</text>
+
+<line x1="748" y1="56" x2="779" y2="56" class="n-stroke" stroke-width="1.5" marker-end="url(#bgBrA)"/>
+
+<!-- PROVE gate — accent solid fill -->
+<rect x="781" y="36" width="72" height="40" rx="8" class="accent"/>
+<text x="817" y="60" text-anchor="middle" fill="var(--text-inv)" class="m" font-size="11" font-weight="700">PROVE</text>
+
+<!-- pass: exits gate right → cheap & proved -->
+<line x1="853" y1="56" x2="870" y2="56" class="pass-s" stroke-width="1.6" marker-end="url(#bgBrP)"/>
+<text x="876" y="52" class="pass m" font-size="13" font-weight="800">$</text>
+<text x="889" y="52" class="pass m" font-size="10.5" font-weight="640"> cheap · proved</text>
+<text x="876" y="65" class="ink-mut" font-size="9.5">easy majority</text>
+
+<!-- flow pulse: pass path -->
+<line x1="853" y1="56" x2="870" y2="56" class="flow p s d3" stroke-width="2"/>
+
+<!-- fail: exits gate bottom → escalates to strong rung -->
+<path d="M817 76 C820 96 820 112 817 124" fill="none" class="warn-s" stroke-width="1.6" marker-end="url(#bgBrW)"/>
+<text x="826" y="104" class="warn m" font-size="9.5" font-weight="640">fail · escalate +1</text>
+
+<rect x="756" y="126" width="148" height="40" rx="8" class="n-fill warn-s glow-w" stroke-width="1.5"/>
+<text x="830" y="145" text-anchor="middle" class="warn m" font-size="11" font-weight="640">strong rung</text>
+<text x="830" y="159" text-anchor="middle" class="ink-mut" font-size="9.5">escalated · only when earned</text>
+
+<text x="912" y="150" class="warn m" font-size="15" font-weight="800">$$</text>
+
+<!-- bottom note -->
+<line x1="520" y1="184" x2="980" y2="184" class="grid" stroke-width="0.7" stroke-dasharray="4 3"/>
+<text x="750" y="201" text-anchor="middle" class="ink-mut" font-size="10">same request in · same dialect out · wire contract unchanged · bill drops</text>
+
+<!-- flow pulses: main AFTER path -->
+<line x1="610" y1="56" x2="641" y2="56" class="flow p s" stroke-width="2"/>
+<line x1="748" y1="56" x2="779" y2="56" class="flow p s d2" stroke-width="2"/>
 </svg>
-  <figcaption>Same request in, same dialect out. Firstpass changes only which model actually answers — cheapest-first, proven against a real gate, escalating only on failure. The full mechanism is <a href="how-it-works.html">How it works</a>; the payloads and receipts for every case are in <a href="request-flow.html">Every scenario, end to end</a>.</figcaption>
+  <figcaption>Same request in, same dialect out. Firstpass changes only which model actually answers — cheapest-first, proved against a real gate, escalating only on failure. The full mechanism is <a href="how-it-works.html">How it works</a>; the payloads and receipts for every case are in <a href="request-flow.html">Every scenario, end to end</a>.</figcaption>
 </div>
 <p class="subh">One gated call, over time</p>
 <p>Here is what happens behind the seat for a <em>single</em> call that turns out to be hard — the cheap rung tries first, fails its gate, and only then does the strong rung get involved. This is the Module-4 loop's inner mechanic, on a time axis:</p>
@@ -231,5 +268,5 @@ curl https://firstpass.internal/v1/messages \   <span class="tk-c"># was api.ant
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=4"></script>
+<script src="../assets/docs.js?v=5"></script>
 </body></html>

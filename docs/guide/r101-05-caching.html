@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=4">
+<link rel="stylesheet" href="../assets/docs.css?v=5">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -26,7 +26,7 @@
 <div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
 </header>
 <div class="scrim"></div>
-<div class="docs">
+<div class="docs docs-course">
 <aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
@@ -71,34 +71,46 @@
   "cache_creation_input_tokens": 0,       <span class="tk-c">// nonzero only on the write</span>
   "output_tokens": 420
 }</code></pre></div>
-<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="cacheT">
-<title id="cacheT">Two cost curves across ten turns. Without caching, the input cost per turn climbs steadily as the transcript grows. With prompt caching, the stable prefix is read at roughly one tenth the price after the first turn, so the with-cache curve stays low and nearly flat while only the small fresh portion of each turn is billed at full price. Caching cancels most of the multi-turn compounding.</title>
-<defs><marker id="caA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
-<text x="40" y="30" class="ink" font-size="13" font-weight="640">Input cost per turn — caching flattens the climb</text>
-<line x1="70" y1="248" x2="720" y2="248" class="n-stroke" stroke-width="1.3"/>
-<line x1="70" y1="70" x2="70" y2="248" class="n-stroke" stroke-width="1.3"/>
-<text x="56" y="74" text-anchor="end" class="ink-mut" font-size="9.5">$</text>
-<text x="395" y="272" text-anchor="middle" class="ink-mut" font-size="9.5">turns 1 → 10</text>
-<!-- without cache: rising line -->
-<path d="M84 236 L154 224 L224 210 L294 194 L364 176 L434 158 L504 138 L574 118 L644 98 L706 84" fill="none" class="fail-s" stroke-width="2.4"/>
-<circle cx="706" cy="84" r="4" class="fail"/>
-<text x="600" y="72" class="fail m" font-size="11" font-weight="640">no cache</text>
-<!-- with cache: write spike then flat-low -->
-<path d="M84 214 L154 234 L224 232 L294 231 L364 230 L434 229 L504 228 L574 227 L644 226 L706 225" fill="none" class="pass-s" stroke-width="2.4"/>
-<circle cx="84" cy="214" r="4" class="warn"/>
-<circle cx="706" cy="225" r="4" class="pass"/>
-<text x="96" y="204" class="warn m" font-size="9.5" font-weight="600">write (once)</text>
-<text x="588" y="244" class="pass m" font-size="11" font-weight="640">with cache · ~0.1× reads</text>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 280" role="img" aria-labelledby="caCostChart">
+<title id="caCostChart">Two input-cost curves across ten conversation turns. Without caching, the per-turn cost climbs steadily as the growing transcript is re-read at full price. With prompt caching, turn one pays a small write overhead at 1.25× the input rate; every later turn reads the stable prefix at roughly 0.1× — so the with-cache curve stays low and nearly flat while the no-cache curve keeps climbing, creating roughly 90% savings on the re-read portion.</title>
+<defs>
+  <marker id="caArr" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="var(--d-stroke)"/></marker>
+</defs>
+<!-- chart heading -->
+<text x="390" y="28" text-anchor="middle" class="ink" font-size="13" font-weight="700">Input cost per turn — caching flattens the multi-turn climb</text>
+<!-- axes -->
+<line x1="80" y1="240" x2="714" y2="240" class="n-stroke" stroke-width="1.3"/>
+<line x1="80" y1="54" x2="80" y2="244" class="n-stroke" stroke-width="1.3"/>
+<text x="66" y="60" text-anchor="end" class="ink-mut" font-size="9.5">$</text>
+<text x="390" y="260" text-anchor="middle" class="ink-mut" font-size="9.5">turns  1 → 10</text>
+<!-- no cache: rising line (cost climbs as transcript grows) -->
+<path d="M93 228 L160 211 L227 194 L294 177 L361 160 L428 143 L495 126 L562 109 L629 92 L696 75"
+      fill="none" class="fail-s" stroke-width="2.4"/>
+<circle cx="696" cy="75" r="4" class="fail"/>
+<text x="608" y="62" class="fail m" font-size="11" font-weight="700">no cache</text>
+<text x="608" y="76" class="ink-mut m" font-size="9.5">re-read grows each turn</text>
+<!-- with cache: write spike on turn 1 then low and flat (reads at 0.1×) -->
+<path d="M93 218 L160 234 L227 233 L294 232 L361 231 L428 230 L495 230 L562 229 L629 229 L696 228"
+      fill="none" class="pass-s" stroke-width="2.4"/>
+<circle cx="93" cy="218" r="5" class="warn"/>
+<text x="102" y="208" class="warn m" font-size="9.5" font-weight="600">write (1.25×, once)</text>
+<circle cx="696" cy="228" r="4" class="pass"/>
+<text x="600" y="246" class="pass m" font-size="11" font-weight="700">with cache · reads ≈ 0.1×</text>
+<!-- gap annotation at turn 10 -->
+<line x1="703" y1="79" x2="703" y2="224" class="ink-mut" stroke-width="1.1" stroke-dasharray="3 3" marker-end="url(#caArr)"/>
+<text x="716" y="155" class="ink-mut m" font-size="10">≈ 90%</text>
+<text x="716" y="169" class="ink-mut m" font-size="10">saved</text>
 <!-- callout -->
-<rect x="760" y="92" width="212" height="150" rx="12" class="n-fill pass-s glow-p" stroke-width="1.5"/>
-<text x="776" y="118" class="ink m" font-size="11.5" font-weight="640">same 10-turn session</text>
-<text x="776" y="142" class="ink-mut m" font-size="10.5">history re-read ≈ 82k tok</text>
-<text x="776" y="162" class="fail m" font-size="10.5" font-weight="600">no cache ≈ $0.25 input</text>
-<text x="776" y="184" class="pass m" font-size="11" font-weight="640">cached ≈ $0.03 input</text>
-<text x="776" y="204" class="ink-mut m" font-size="10">≈ 90% off the re-read half</text>
-<text x="776" y="228" class="ink-mut m" font-size="9.5">illustrative · Anthropic-style ratios</text>
-<!-- pulse -->
-<path d="M84 214 L154 234 L224 232 L294 231 L364 230 L434 229 L504 228 L574 227 L644 226 L706 225" class="flow p l" stroke-width="2.6"/>
+<rect x="754" y="58" width="224" height="168" rx="12" class="n-fill pass-s glow-p" stroke-width="1.5"/>
+<text x="866" y="84" text-anchor="middle" class="ink m" font-size="11.5" font-weight="700">same 10-turn session</text>
+<text x="770" y="106" class="ink-mut m" font-size="10.5">history re-read ≈ 82 k tok</text>
+<text x="770" y="128" class="fail m" font-size="10.5" font-weight="600">no cache ≈ $0.25 input</text>
+<text x="770" y="152" class="pass m" font-size="11" font-weight="700">cached ≈ $0.03 input</text>
+<text x="770" y="174" class="ink-mut m" font-size="10">≈ 90% off the re-read half</text>
+<text x="770" y="214" class="ink-mut m" font-size="9.5">illustrative · Anthropic-style ratios</text>
+<!-- flow pulse on with-cache line -->
+<path d="M93 218 L160 234 L227 233 L294 232 L361 231 L428 230 L495 230 L562 229 L629 229 L696 228"
+      class="flow p l" stroke-width="2.6"/>
 </svg>
   <figcaption>Caching attacks exactly the cost multi-turn creates: the repeated prefix. It doesn't reduce output tokens or call count — but on a long, tool-heavy session it can take most of the input bill off the table. Whether it helps depends on how stable your prefix is.</figcaption>
 </div>
@@ -117,5 +129,5 @@
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=4"></script>
+<script src="../assets/docs.js?v=5"></script>
 </body></html>
