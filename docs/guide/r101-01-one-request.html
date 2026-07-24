@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One request, one response — How Agents Talk to Models — Firstpass docs</title>
+<meta name="description" content="How Agents Talk to Models lesson 1 of 13: One request, one response. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=4">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<a class="sidebar-back" href="index.html">&larr; All docs</a>
+<span class="course-title">How Agents Talk to Models</span>
+<a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
+<div class="grp lnav"><p class="grp-t">The core path</p>
+<a href="r101-01-one-request.html" aria-current="page"><span class="num">01</span>One request, one response</a>
+<a href="r101-02-token-meter.html"><span class="num">02</span>The token meter</a>
+<a href="r101-03-multi-turn.html"><span class="num">03</span>Statelessness &amp; multi-turn</a>
+<a href="r101-04-tools.html"><span class="num">04</span>Tool calls</a>
+<a href="r101-05-caching.html"><span class="num">05</span>Prompt caching</a>
+<a href="r101-06-client-shapes.html"><span class="num">06</span>Three client shapes</a>
+<a href="r101-07-claude-code-session.html"><span class="num">07</span>A Claude Code session</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Beyond the core path</p>
+<a href="r101-08-streaming.html"><span class="num">08</span>Streaming</a>
+<a href="r101-09-structured-outputs.html"><span class="num">09</span>Structured outputs &amp; JSON</a>
+<a href="r101-10-images.html"><span class="num">10</span>Images &amp; multimodal</a>
+<a href="r101-11-mcp.html"><span class="num">11</span>MCP, in depth</a>
+<a href="r101-12-errors.html"><span class="num">12</span>Errors, rate limits &amp; retries</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Where Firstpass fits</p>
+<a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
+</div>
+</nav></aside><main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / One request, one response</p>
+<div class="lesson-progress">
+  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Lesson 1 of 13</span></div>
+  <div class="lp-bar"><span style="width:7.7%"></span></div>
+</div>
+<h1>One request, one response</h1>
+<div class="tldr">One model call is a single HTTP <code>POST</code> carrying a <b>model name</b> and a <b>messages</b> array. The reply is one JSON object whose <code>usage</code> field is the meter: <b>input_tokens</b> read, <b>output_tokens</b> written. The model keeps <b>no memory</b> of the call — that one fact drives every cost in this page.</div>
+<p class="subh">The wire, in full</p>
+<p>A language model is a <strong>stateless function</strong>: text in, text out, no memory of the last call. You talk to it over HTTP. The two dialects you'll meet are Anthropic's <code>POST /v1/messages</code> and OpenAI's <code>POST /v1/chat/completions</code> — same idea, different field names. Here is the whole thing, provider-direct, nothing clever:</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># a single call, straight to the provider</span>
+curl https://api.anthropic.com/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: $KEY' -H 'anthropic-version: 2023-06-01' \
+  -d '{
+    "model": "claude-haiku-4-5",
+    "max_tokens": 256,
+    "system": "You are a terse senior engineer. Answer in one line.",
+    "messages": [{"role": "user", "content": "Does POST /orders reject a request with no total field?"}]
+  }'</code></pre></div>
+<p>That is the developer's first move on our running task — just <em>asking</em>, before any agent touches the code. Two fields beyond <code>messages</code> are worth naming now. <code>max_tokens</code> is the hard ceiling on the <em>output</em> — the model will be cut off there (more on that below). The optional <code>system</code> field is the <strong>system prompt</strong>: standing instructions, separate from the conversation, that ride along as input on every call. It's the first thing loaded and the last thing that changes — which (jump to <a href="r101-05-caching.html">caching</a>) makes it prime cache material.</p>
+<p>The response is one JSON object. The part that matters for cost is <code>usage</code> — the model reports how many tokens it <em>read</em> (input) and how many it <em>wrote</em> (output):</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
+  &quot;id&quot;: &quot;msg_01F3k…&quot;,
+  &quot;role&quot;: &quot;assistant&quot;,
+  &quot;model&quot;: &quot;claude-haiku-4-5&quot;,
+  &quot;content&quot;: [{ &quot;type&quot;: &quot;text&quot;, &quot;text&quot;: &quot;No — it reads req.body.total without a presence check.&quot; }],
+  &quot;stop_reason&quot;: &quot;end_turn&quot;,
+  &quot;usage&quot;: { &quot;input_tokens&quot;: 32, &quot;output_tokens&quot;: 14 }   <span class="tk-c">// ← the meter</span>
+}</code></pre></div>
+<p class="subh">When the model stops: <code>stop_reason</code></p>
+<p>Every response says <em>why</em> it ended. <code>end_turn</code> — the model finished naturally (above). <code>tool_use</code> — it wants you to run a tool and call again (<a href="r101-04-tools.html">the tool loop</a>). <code>max_tokens</code> — it hit your output ceiling and was <strong>cut off mid-sentence</strong>. That last one is the quiet failure mode: a truncated reply still <em>looks</em> like a reply, and you were billed for every token it wrote before the cut. It bites hardest with structured output — half a JSON object doesn't parse (<a href="r101-09-structured-outputs.html">structured outputs</a>).</p>
+<div class="note warn"><span class="nt">Common mistake</span> Treating <code>max_tokens</code> as &ldquo;how long an answer I want&rdquo; and setting it low to save money. It's a <em>guillotine</em>, not a hint — the model doesn't aim to finish under it, it just stops when it hits it. Set it comfortably above the longest valid answer and always check <code>stop_reason == "max_tokens"</code> before trusting the body.</div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 250" role="img" aria-labelledby="wireT">
+<title id="wireT">A request is a single HTTP POST carrying a model name and a messages array. The provider runs the model, which reads the input tokens and writes the output tokens, and returns one JSON response whose usage field reports input_tokens and output_tokens. The model keeps no memory of the call.</title>
+<defs><marker id="wrA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+<marker id="wrP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker></defs>
+<text x="40" y="30" class="ink" font-size="13" font-weight="640">Text in → model → text out. No memory kept.</text>
+<!-- request -->
+<rect x="34" y="76" width="230" height="104" rx="12" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="50" y="100" class="ink m" font-size="11" font-weight="640">POST /v1/messages</text>
+<line x1="50" y1="110" x2="248" y2="110" class="grid" stroke-width="1"/>
+<text x="50" y="130" class="ink-mut m" font-size="10.5">"model": "claude-haiku-4-5"</text>
+<text x="50" y="150" class="ink-mut m" font-size="10.5">"messages": [ user: "Does /orders…" ]</text>
+<text x="50" y="170" class="accent-ink m" font-size="10.5" font-weight="600">input · 32 tokens read</text>
+<!-- model -->
+<rect x="392" y="86" width="150" height="84" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="467" y="122" text-anchor="middle" class="ink" font-size="13" font-weight="700">the model</text>
+<text x="467" y="142" text-anchor="middle" class="ink-mut m" font-size="10">stateless function</text>
+<!-- response -->
+<rect x="670" y="76" width="296" height="104" rx="12" class="n-fill pass-s glow-p" stroke-width="1.6"/>
+<text x="686" y="100" class="ink m" font-size="11" font-weight="640">200 · completion JSON</text>
+<line x1="686" y1="110" x2="950" y2="110" class="grid" stroke-width="1"/>
+<text x="686" y="130" class="ink-mut m" font-size="10.5">content: [{ text: "No — no check." }]</text>
+<text x="686" y="150" class="pass m" font-size="10.5" font-weight="600">output · 14 tokens written</text>
+<text x="686" y="170" class="ink-mut m" font-size="10.5">usage: { input 32, output 14 }</text>
+<!-- connectors -->
+<line x1="264" y1="128" x2="390" y2="128" class="n-stroke" stroke-width="1.6" marker-end="url(#wrA)"/>
+<line x1="542" y1="128" x2="668" y2="128" class="pass-s" stroke-width="1.6" marker-end="url(#wrP)"/>
+<text x="300" y="118" class="ink-mut" font-size="10">read</text>
+<text x="580" y="118" class="pass m" font-size="10" font-weight="600">write</text>
+<!-- memory note -->
+<text x="467" y="206" text-anchor="middle" class="ink-mut" font-size="10.5">the model remembers nothing after it answers — that fact drives everything below</text>
+<!-- pulses -->
+<line x1="264" y1="128" x2="390" y2="128" class="flow s" stroke-width="2.2"/>
+<line x1="542" y1="128" x2="668" y2="128" class="flow p s d2" stroke-width="2.2"/>
+</svg>
+  <figcaption>One request, one response, metered two ways: tokens read (input) and tokens written (output). The model forgets the call the instant it returns — multi-turn is about the bill that fact creates.</figcaption>
+</div>
+<div class="note"><span class="nt">Key idea</span> The <code>usage</code> object is the only cost signal you get, and the provider hands it to you on every response. <code>input_tokens</code> is everything the model read — your system prompt, tools, the whole message history, this turn's text — and <code>output_tokens</code> is only what it just wrote. If you log one thing per call, log <code>usage</code>.</div>
+<div class="note info"><span class="nt">Under the hood</span> Tokens aren't words. A tokenizer splits text into sub-word pieces — <code>&quot;orders.py&quot;</code> might be three tokens, a curly brace one, a run of whitespace one. Rough rule of thumb for English prose and code: <b>~4 characters per token</b>, or ~0.75 tokens per word. Punctuation-dense code trends higher. You never count them by hand — <code>usage</code> is ground truth — but the 4-chars mental model tells you why a 300-line file lands around 3–4k input tokens.</div>
+<div class="recap">A model call is a stateless <code>POST</code>; the reply's <b>usage</b> field reports input vs output tokens, and the model forgets everything the instant it answers.</div>
+<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="requests-101.html"><span class="dir">&larr; Overview</span><span class="t">How Agents Talk to Models</span></a><a class="next" href="r101-02-token-meter.html"><span class="dir">Next &rarr;</span><span class="t">The token meter</span></a></nav>
+</main>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=4"></script>
+</body></html>

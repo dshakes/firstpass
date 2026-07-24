@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prompt caching — How Agents Talk to Models — Firstpass docs</title>
+<meta name="description" content="How Agents Talk to Models lesson 5 of 13: Prompt caching. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=4">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<a class="sidebar-back" href="index.html">&larr; All docs</a>
+<span class="course-title">How Agents Talk to Models</span>
+<a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
+<div class="grp lnav"><p class="grp-t">The core path</p>
+<a href="r101-01-one-request.html" class="done"><span class="num">01</span>One request, one response</a>
+<a href="r101-02-token-meter.html" class="done"><span class="num">02</span>The token meter</a>
+<a href="r101-03-multi-turn.html" class="done"><span class="num">03</span>Statelessness &amp; multi-turn</a>
+<a href="r101-04-tools.html" class="done"><span class="num">04</span>Tool calls</a>
+<a href="r101-05-caching.html" aria-current="page"><span class="num">05</span>Prompt caching</a>
+<a href="r101-06-client-shapes.html"><span class="num">06</span>Three client shapes</a>
+<a href="r101-07-claude-code-session.html"><span class="num">07</span>A Claude Code session</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Beyond the core path</p>
+<a href="r101-08-streaming.html"><span class="num">08</span>Streaming</a>
+<a href="r101-09-structured-outputs.html"><span class="num">09</span>Structured outputs &amp; JSON</a>
+<a href="r101-10-images.html"><span class="num">10</span>Images &amp; multimodal</a>
+<a href="r101-11-mcp.html"><span class="num">11</span>MCP, in depth</a>
+<a href="r101-12-errors.html"><span class="num">12</span>Errors, rate limits &amp; retries</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Where Firstpass fits</p>
+<a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
+</div>
+</nav></aside><main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Prompt caching</p>
+<div class="lesson-progress">
+  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Lesson 5 of 13</span></div>
+  <div class="lp-bar"><span style="width:38.5%"></span></div>
+</div>
+<h1>Prompt caching</h1>
+<div class="tldr">Caching attacks the one cost history, tools, and MCP all create: the <b>repeated prefix</b>. Mark a stable prefix with <code>cache_control</code>; the first call pays a one-time <b>write</b> (~1.25× input), every later reuse pays a <b>read</b> (~0.1× input) instead of full price. It cuts input, not output or call count — but on a long, tool-heavy session it takes most of the input bill off the table. It only helps if your prefix is actually stable.</div>
+<p>history, tools, and MCP all inflate <em>input</em> tokens — the same long prefix (system prompt, tools, early history) re-read on every call. Prompt caching is the provider's fix. You mark a stable prefix with <code>cache_control</code>; the first call pays a one-time <strong>cache write</strong> (~1.25× the input rate) to store it, and every later call that reuses that prefix pays a <strong>cache read</strong> (~0.1× the input rate) instead of the full price. The response's <code>usage</code> splits the input into fresh vs cached so you can see it working:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// request: mark the stable prefix cacheable (system + tools + old turns)</span>
+"system": [ { "type": "text", "text": "You are…",
+             "cache_control": { "type": "ephemeral" } } ]
+
+<span class="tk-c">// response usage on a later turn — most input is now a cheap cache read</span>
+"usage": {
+  "input_tokens": 210,                    <span class="tk-c">// fresh tokens, full price</span>
+  "cache_read_input_tokens": 24000,       <span class="tk-c">// reused prefix, ~0.1× price</span>
+  "cache_creation_input_tokens": 0,       <span class="tk-c">// nonzero only on the write</span>
+  "output_tokens": 420
+}</code></pre></div>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="cacheT">
+<title id="cacheT">Two cost curves across ten turns. Without caching, the input cost per turn climbs steadily as the transcript grows. With prompt caching, the stable prefix is read at roughly one tenth the price after the first turn, so the with-cache curve stays low and nearly flat while only the small fresh portion of each turn is billed at full price. Caching cancels most of the multi-turn compounding.</title>
+<defs><marker id="caA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
+<text x="40" y="30" class="ink" font-size="13" font-weight="640">Input cost per turn — caching flattens the climb</text>
+<line x1="70" y1="248" x2="720" y2="248" class="n-stroke" stroke-width="1.3"/>
+<line x1="70" y1="70" x2="70" y2="248" class="n-stroke" stroke-width="1.3"/>
+<text x="56" y="74" text-anchor="end" class="ink-mut" font-size="9.5">$</text>
+<text x="395" y="272" text-anchor="middle" class="ink-mut" font-size="9.5">turns 1 → 10</text>
+<!-- without cache: rising line -->
+<path d="M84 236 L154 224 L224 210 L294 194 L364 176 L434 158 L504 138 L574 118 L644 98 L706 84" fill="none" class="fail-s" stroke-width="2.4"/>
+<circle cx="706" cy="84" r="4" class="fail"/>
+<text x="600" y="72" class="fail m" font-size="11" font-weight="640">no cache</text>
+<!-- with cache: write spike then flat-low -->
+<path d="M84 214 L154 234 L224 232 L294 231 L364 230 L434 229 L504 228 L574 227 L644 226 L706 225" fill="none" class="pass-s" stroke-width="2.4"/>
+<circle cx="84" cy="214" r="4" class="warn"/>
+<circle cx="706" cy="225" r="4" class="pass"/>
+<text x="96" y="204" class="warn m" font-size="9.5" font-weight="600">write (once)</text>
+<text x="588" y="244" class="pass m" font-size="11" font-weight="640">with cache · ~0.1× reads</text>
+<!-- callout -->
+<rect x="760" y="92" width="212" height="150" rx="12" class="n-fill pass-s glow-p" stroke-width="1.5"/>
+<text x="776" y="118" class="ink m" font-size="11.5" font-weight="640">same 10-turn session</text>
+<text x="776" y="142" class="ink-mut m" font-size="10.5">history re-read ≈ 82k tok</text>
+<text x="776" y="162" class="fail m" font-size="10.5" font-weight="600">no cache ≈ $0.25 input</text>
+<text x="776" y="184" class="pass m" font-size="11" font-weight="640">cached ≈ $0.03 input</text>
+<text x="776" y="204" class="ink-mut m" font-size="10">≈ 90% off the re-read half</text>
+<text x="776" y="228" class="ink-mut m" font-size="9.5">illustrative · Anthropic-style ratios</text>
+<!-- pulse -->
+<path d="M84 214 L154 234 L224 232 L294 231 L364 230 L434 229 L504 228 L574 227 L644 226 L706 225" class="flow p l" stroke-width="2.6"/>
+</svg>
+  <figcaption>Caching attacks exactly the cost multi-turn creates: the repeated prefix. It doesn't reduce output tokens or call count — but on a long, tool-heavy session it can take most of the input bill off the table. Whether it helps depends on how stable your prefix is.</figcaption>
+</div>
+<div class="note warn"><span class="nt">Common mistake</span> Assuming caching &ldquo;just works&rdquo; once you set <code>cache_control</code>. The cache keys on an <em>exact prefix match</em> and entries are short-lived (minutes). Change one byte early in the prompt — a rotating timestamp in the system prompt, a reordered tools array, a per-request id — and every downstream token becomes a fresh full-price read again. Caching rewards a <em>stable</em> prefix; a prompt that mutates near the top quietly pays full price while looking cached.</div>
+<div class="recap">Prompt caching re-prices the repeated prefix from full rate to ~0.1×, flattening multi-turn's climb — but only for the bytes that stay byte-identical across calls.</div>
+<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-04-tools.html"><span class="dir">&larr; Previous</span><span class="t">Tool calls</span></a><a class="next" href="r101-06-client-shapes.html"><span class="dir">Next &rarr;</span><span class="t">Three client shapes</span></a></nav>
+</main>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=4"></script>
+</body></html>

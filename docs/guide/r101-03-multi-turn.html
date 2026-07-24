@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Statelessness & multi-turn — How Agents Talk to Models — Firstpass docs</title>
+<meta name="description" content="How Agents Talk to Models lesson 3 of 13: Statelessness & multi-turn. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=4">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<a class="sidebar-back" href="index.html">&larr; All docs</a>
+<span class="course-title">How Agents Talk to Models</span>
+<a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
+<div class="grp lnav"><p class="grp-t">The core path</p>
+<a href="r101-01-one-request.html" class="done"><span class="num">01</span>One request, one response</a>
+<a href="r101-02-token-meter.html" class="done"><span class="num">02</span>The token meter</a>
+<a href="r101-03-multi-turn.html" aria-current="page"><span class="num">03</span>Statelessness &amp; multi-turn</a>
+<a href="r101-04-tools.html"><span class="num">04</span>Tool calls</a>
+<a href="r101-05-caching.html"><span class="num">05</span>Prompt caching</a>
+<a href="r101-06-client-shapes.html"><span class="num">06</span>Three client shapes</a>
+<a href="r101-07-claude-code-session.html"><span class="num">07</span>A Claude Code session</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Beyond the core path</p>
+<a href="r101-08-streaming.html"><span class="num">08</span>Streaming</a>
+<a href="r101-09-structured-outputs.html"><span class="num">09</span>Structured outputs &amp; JSON</a>
+<a href="r101-10-images.html"><span class="num">10</span>Images &amp; multimodal</a>
+<a href="r101-11-mcp.html"><span class="num">11</span>MCP, in depth</a>
+<a href="r101-12-errors.html"><span class="num">12</span>Errors, rate limits &amp; retries</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Where Firstpass fits</p>
+<a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
+</div>
+</nav></aside><main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Statelessness & multi-turn</p>
+<div class="lesson-progress">
+  <div class="lp-meta"><span class="lp-group">Part A · The core path</span><span class="lp-count">Lesson 3 of 13</span></div>
+  <div class="lp-bar"><span style="width:23.1%"></span></div>
+</div>
+<h1>Statelessness &amp; multi-turn</h1>
+<div class="tldr">The model is stateless, so a chat &ldquo;remembers&rdquo; only because the client <b>resends the entire conversation every turn</b>. Turn N re-reads all of turns 1…N−1 as input. Summed over a session, input cost grows with the <b>square</b> of the turn count — the real reason long agent sessions bill far more than their answers suggest.</div>
+<p>Here's the twist that surprises people. The model is stateless — it remembers nothing between calls. So how does a chat &ldquo;remember&rdquo; what you said three turns ago? <strong>The client resends the entire conversation every single turn.</strong> Turn 2's request is turn 1's request with the last exchange appended. Turn 12 carries all of turns 1–11 in its body. Continuity lives in the bytes you resend, not in the model.</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// TURN 1 — one message in the body</span>
+"messages": [ { "role": "user", "content": "Does POST /orders reject a missing total?" } ]
+
+<span class="tk-c">// TURN 2 — turn 1 kept verbatim, the reply + your follow-up appended.</span>
+<span class="tk-c">// The model re-reads ALL of it as input, and you pay for it again.</span>
+"messages": [
+  { "role": "user",      "content": "Does POST /orders reject a missing total?" },
+  { "role": "assistant", "content": "No — it reads req.body.total unchecked." },
+  { "role": "user",      "content": "Now add the guard and a test." }
+]</code></pre></div>
+<p>Because the transcript only grows, the <strong>input</strong> tokens on turn N are roughly N times a single turn's worth. Summed across a conversation, input cost grows with the <em>square</em> of the turn count — the classic reason a long agent session bills far more than its individual answers would suggest.</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 320" role="img" aria-labelledby="growT">
+<title id="growT">A ten-turn conversation. Each turn resends the whole transcript so far as input, so the input tokens per turn climb roughly linearly from turn one to turn ten. The bars grow left to right. Because every turn re-pays for all prior turns, the total input cost of the conversation grows with the square of the turn count.</title>
+<defs><marker id="grA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
+<text x="40" y="30" class="ink" font-size="13" font-weight="640">Input tokens per turn — the transcript rides along and only grows</text>
+<text x="40" y="50" class="ink-mut" font-size="11">each turn re-reads every earlier turn · cost per turn climbs with the conversation</text>
+<line x1="60" y1="268" x2="748" y2="268" class="n-stroke" stroke-width="1.3"/>
+<line x1="60" y1="92" x2="60" y2="268" class="n-stroke" stroke-width="1.3"/>
+<text x="46" y="96" text-anchor="end" class="ink-mut" font-size="9.5">tok</text>
+<!-- bars: 10 turns, climbing -->
+<g>
+<rect x="76" y="252" width="46" height="16" rx="3" class="pass"/>
+<rect x="144" y="238" width="46" height="30" rx="3" class="pass"/>
+<rect x="212" y="222" width="46" height="46" rx="3" class="accent"/>
+<rect x="280" y="206" width="46" height="62" rx="3" class="accent"/>
+<rect x="348" y="188" width="46" height="80" rx="3" class="accent"/>
+<rect x="416" y="170" width="46" height="98" rx="3" class="warn"/>
+<rect x="484" y="152" width="46" height="116" rx="3" class="warn"/>
+<rect x="552" y="134" width="46" height="134" rx="3" class="warn"/>
+<rect x="620" y="116" width="46" height="152" rx="3" class="fail"/>
+<rect x="688" y="98" width="46" height="170" rx="3" class="fail"/>
+</g>
+<text x="99" y="284" text-anchor="middle" class="ink-mut" font-size="9">t1</text>
+<text x="371" y="284" text-anchor="middle" class="ink-mut" font-size="9">t5</text>
+<text x="711" y="284" text-anchor="middle" class="ink-mut" font-size="9">t10</text>
+<!-- callout -->
+<rect x="784" y="112" width="188" height="140" rx="12" class="n-fill warn-s glow-w" stroke-width="1.5"/>
+<text x="800" y="138" class="ink m" font-size="11.5" font-weight="640">10-turn coding session</text>
+<text x="800" y="162" class="ink-mut m" font-size="10.5">~1.5k tokens added / turn</text>
+<text x="800" y="182" class="ink-mut m" font-size="10.5">history re-read ≈ 82k tok</text>
+<text x="800" y="206" class="warn m" font-size="11" font-weight="640">≈ $0.25 just to re-read</text>
+<text x="800" y="224" class="ink-mut m" font-size="10">the past, on sonnet input</text>
+<text x="800" y="244" class="ink-mut m" font-size="9.5">illustrative — your tokens vary</text>
+<!-- pulse -->
+<line x1="76" y1="260" x2="734" y2="260" class="flow w l" stroke-width="2"/>
+</svg>
+  <figcaption>Statelessness is why context works and why it costs: the client resends the whole thread each turn, so input tokens — and the bill — climb with every message. Nothing here is Firstpass; this is just how chat with a stateless model works.</figcaption>
+</div>
+<div class="note info"><span class="nt">Under the hood</span> The client isn't obliged to resend <em>everything</em> — it resends whatever it wants the model to still &ldquo;know.&rdquo; That's a client decision, not a model feature. Trim the array and the model genuinely forgets: drop the early turns and it can't reference them. Every &ldquo;memory&rdquo; strategy — full replay, sliding window, summarize-and-truncate — is just a different rule for <em>which bytes to resend</em>. Keep this in your pocket for Part B: shrinking the resent history is the client's job, not the router's.</div>
+<div class="recap">Continuity is an illusion the client pays for: it resends the whole transcript each turn, so input — and the bill — grows quadratically over a long session.</div>
+<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-02-token-meter.html"><span class="dir">&larr; Previous</span><span class="t">The token meter</span></a><a class="next" href="r101-04-tools.html"><span class="dir">Next &rarr;</span><span class="t">Tool calls</span></a></nav>
+</main>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=4"></script>
+</body></html>

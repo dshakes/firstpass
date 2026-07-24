@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP, in depth — How Agents Talk to Models — Firstpass docs</title>
+<meta name="description" content="How Agents Talk to Models lesson 11 of 13: MCP, in depth. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=4">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<a class="sidebar-back" href="index.html">&larr; All docs</a>
+<span class="course-title">How Agents Talk to Models</span>
+<a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
+<div class="grp lnav"><p class="grp-t">The core path</p>
+<a href="r101-01-one-request.html" class="done"><span class="num">01</span>One request, one response</a>
+<a href="r101-02-token-meter.html" class="done"><span class="num">02</span>The token meter</a>
+<a href="r101-03-multi-turn.html" class="done"><span class="num">03</span>Statelessness &amp; multi-turn</a>
+<a href="r101-04-tools.html" class="done"><span class="num">04</span>Tool calls</a>
+<a href="r101-05-caching.html" class="done"><span class="num">05</span>Prompt caching</a>
+<a href="r101-06-client-shapes.html" class="done"><span class="num">06</span>Three client shapes</a>
+<a href="r101-07-claude-code-session.html" class="done"><span class="num">07</span>A Claude Code session</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Beyond the core path</p>
+<a href="r101-08-streaming.html" class="done"><span class="num">08</span>Streaming</a>
+<a href="r101-09-structured-outputs.html" class="done"><span class="num">09</span>Structured outputs &amp; JSON</a>
+<a href="r101-10-images.html" class="done"><span class="num">10</span>Images &amp; multimodal</a>
+<a href="r101-11-mcp.html" aria-current="page"><span class="num">11</span>MCP, in depth</a>
+<a href="r101-12-errors.html"><span class="num">12</span>Errors, rate limits &amp; retries</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Where Firstpass fits</p>
+<a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
+</div>
+</nav></aside><main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / MCP, in depth</p>
+<div class="lesson-progress">
+  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Lesson 11 of 13</span></div>
+  <div class="lp-bar"><span style="width:84.6%"></span></div>
+</div>
+<h1>MCP, in depth</h1>
+<div class="tldr">MCP is a protocol your <b>agent</b> speaks to external <b>tool servers</b> — it lives entirely above the model API. The model never speaks MCP. By the time a request reaches the model, MCP has already done its job: <b>tools</b> became entries in the <code>tools</code> array; <b>resources</b> became injected context in <code>messages</code>; <b>prompts</b> became expanded templates. The cost consequence is precise: every connected server's tool schemas ride the <code>tools</code> array as <b>input tokens on every single call</b> — whether those tools are used on that call or not.</div>
+
+<p>The Model Context Protocol gets talked about as if the model &ldquo;understands&rdquo; MCP or &ldquo;speaks&rdquo; it directly. It doesn't. MCP is a JSON-RPC&nbsp;2.0 protocol between your <em>agent</em> — acting as an MCP client — and external <strong>tool servers</strong>. It's a standard way for the agent to discover what a server exposes and invoke it. Everything MCP does happens before the model call. By the time any of it reaches the model, it's ordinary HTTP: a <code>tools</code> array and a <code>messages</code> array, nothing special about them.</p>
+
+<p class="subh">Transports</p>
+<p>Two transport modes — the agent's concern, never in the model request:</p>
+<ul>
+  <li><strong>stdio</strong> — the server runs as a local subprocess; JSON-RPC over stdin/stdout. Zero network overhead; right for local tools (a filesystem server, a local DB).</li>
+  <li><strong>Streamable HTTP</strong> — a remote process over HTTP with SSE push; right for hosted services (a GitHub integration, a managed Postgres).</li>
+</ul>
+<p>Either way, the agent calls <code>tools/list</code> at startup, discovers the schemas, and caches them for the session.</p>
+
+<p class="subh">Primitives</p>
+<p>An MCP server can expose three kinds of things, and each lands somewhere different in the model request:</p>
+<ul>
+  <li><strong>Tools</strong> are callable functions — <code>query</code>, <code>list_prs</code>, <code>create_file</code>. The agent folds their JSON&nbsp;schemas into the <code>tools</code> array of every subsequent model request. To the model, a postgres MCP tool and a native <code>Read</code> tool are identical: both are entries in the same array.</li>
+  <li><strong>Resources</strong> are data the server can serve on demand — table rows, documents, code files. The agent fetches them explicitly and <em>injects the content into <code>messages</code></em>, typically as a user-turn or <code>tool_result</code>. Resource content never enters the <code>tools</code> array; it becomes ordinary conversation context.</li>
+  <li><strong>Prompts</strong> are server-provided templates — system prompt snippets, few-shot examples, task scaffolding. The agent retrieves them and <em>expands them into <code>messages</code></em> before the call. The model reads prose and turns, not a &ldquo;prompt&rdquo; primitive.</li>
+</ul>
+<p>The key asymmetry: tool schemas are re-sent on <em>every</em> call for the whole session; resources and prompt templates only appear when the agent explicitly fetches them and injects the result.</p>
+
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 252" role="img" aria-labelledby="mcpDpT">
+<title id="mcpDpT">MCP sits above the model API. On the left are two MCP servers: a postgres server connected over stdio that exposes tools (query, schema) and resources (table_doc), and a github server connected over streamable HTTP that exposes tools (list_prs, create_pr) and prompts (pr_template). Arrows lead from both servers to the agent in the center, labeled MCP client. The agent discovers tools, fetches resources, and expands prompts, then builds a single POST to the model API. A dashed vertical separator marks the boundary where MCP ends and the HTTP API begins. On the right is the model request: a tools array containing all four MCP tool schemas (highlighted) alongside native tools, and a messages array where resource content and expanded prompts are injected. A note marks the tools array as billed as input tokens on every call.</title>
+<defs>
+  <marker id="mcpDpA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="mcpDpAc" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/></marker>
+</defs>
+<text x="40" y="26" class="ink" font-size="13" font-weight="640">MCP is above the model API — three server primitives, two slots in the request</text>
+
+<!-- MCP server: postgres (stdio) -->
+<rect x="20" y="42" width="192" height="85" rx="8" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="116" y="63" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">MCP server: postgres</text>
+<text x="116" y="79" text-anchor="middle" class="ink-mut m" font-size="9.5">stdio transport</text>
+<text x="116" y="95" text-anchor="middle" class="ink-mut" font-size="9.5">tools: query, schema</text>
+<text x="116" y="111" text-anchor="middle" class="ink-mut" font-size="9.5">resources: table_doc</text>
+
+<!-- MCP server: github (streamable HTTP) -->
+<rect x="20" y="148" width="192" height="85" rx="8" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="116" y="169" text-anchor="middle" class="ink m" font-size="10.5" font-weight="600">MCP server: github</text>
+<text x="116" y="185" text-anchor="middle" class="ink-mut m" font-size="9.5">streamable HTTP</text>
+<text x="116" y="201" text-anchor="middle" class="ink-mut" font-size="9.5">tools: list_prs, create_pr</text>
+<text x="116" y="217" text-anchor="middle" class="ink-mut" font-size="9.5">prompts: pr_template</text>
+
+<!-- Arrows: servers → agent -->
+<line x1="212" y1="84" x2="278" y2="112" class="n-stroke" stroke-width="1.4" marker-end="url(#mcpDpA)"/>
+<line x1="212" y1="190" x2="278" y2="160" class="n-stroke" stroke-width="1.4" marker-end="url(#mcpDpA)"/>
+
+<!-- Agent box -->
+<rect x="278" y="57" width="166" height="158" rx="10" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="361" y="81" text-anchor="middle" class="ink m" font-size="10.5" font-weight="700">Agent (MCP client)</text>
+<text x="361" y="101" text-anchor="middle" class="ink-mut" font-size="9.5">discovers tools</text>
+<text x="361" y="117" text-anchor="middle" class="ink-mut" font-size="9.5">fetches resources</text>
+<text x="361" y="133" text-anchor="middle" class="ink-mut" font-size="9.5">expands prompts</text>
+<line x1="300" y1="146" x2="422" y2="146" class="n-stroke" stroke-width="0.8" opacity="0.4"/>
+<text x="361" y="163" text-anchor="middle" class="ink-mut m" font-size="9.5">↓ build HTTP call</text>
+<text x="361" y="179" text-anchor="middle" class="ink-mut" font-size="9">(no MCP on the wire)</text>
+<text x="361" y="200" text-anchor="middle" class="ink-mut" font-size="9">POST /v1/messages</text>
+
+<!-- Separator: MCP ↔ API boundary -->
+<line x1="502" y1="42" x2="502" y2="238" class="n-stroke" stroke-width="1" stroke-dasharray="5,4" opacity="0.6"/>
+<text x="497" y="57" text-anchor="end" class="ink-mut" font-size="9">MCP ends</text>
+
+<!-- Arrow: agent → model request -->
+<line x1="444" y1="136" x2="508" y2="136" class="accent-s" stroke-width="1.7" marker-end="url(#mcpDpAc)"/>
+
+<!-- Model request box -->
+<rect x="508" y="42" width="470" height="196" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="526" y="64" class="ink m" font-size="11" font-weight="640">POST /v1/messages  (nothing MCP here)</text>
+
+<text x="526" y="84" class="ink-mut m" font-size="10">"tools": [</text>
+<text x="538" y="100" class="ink-mut m" font-size="9.5">{ "name": "Read",      ... },  { "name": "Edit",   ... },</text>
+<text x="538" y="116" class="accent-ink m" font-size="10" font-weight="600">{ "name": "query",     ... },  { "name": "schema", ... },   ← postgres</text>
+<text x="538" y="132" class="accent-ink m" font-size="10" font-weight="600">{ "name": "list_prs",  ... },  { "name": "create_pr", ... } ← github</text>
+<text x="526" y="150" class="ink-mut m" font-size="9.5">],  ← all tool schemas billed as input tokens on every call</text>
+
+<line x1="526" y1="161" x2="962" y2="161" class="n-stroke" stroke-width="0.8" opacity="0.3"/>
+
+<text x="526" y="178" class="ink-mut m" font-size="10">"messages": [</text>
+<text x="538" y="194" class="ink-mut" font-size="9.5">history, task, + resource content + expanded prompts (injected by agent)</text>
+<text x="526" y="210" class="ink-mut m" font-size="10">]  ← resources &amp; prompts live here, not in tools</text>
+<text x="526" y="228" class="ink-mut" font-size="9">resources and prompts cost tokens only when fetched; tool schemas cost every call</text>
+
+<!-- Animated flow overlays -->
+<line x1="212" y1="84" x2="278" y2="112" class="flow s" stroke-width="1.8"/>
+<line x1="212" y1="190" x2="278" y2="160" class="flow s d3" stroke-width="1.8"/>
+<line x1="444" y1="136" x2="508" y2="136" class="flow s d2" stroke-width="2.2"/>
+</svg>
+  <figcaption>Three server primitives, two slots in the model request. Tool schemas enter <code>tools[]</code> and are re-sent on every call; resource content and expanded prompts are injected into <code>messages[]</code> only when the agent explicitly fetches them.</figcaption>
+</div>
+
+<p class="subh">Cost</p>
+<p>Every MCP server's tool schemas enter the <code>tools</code> array and are billed as input tokens on every call for the whole session — whether the model uses those tools on that call or not. For the six-call fix-a-bug task from the tool-loops module, adding two MCP servers looks like this:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// POST /v1/messages — native tools + MCP schemas in one tools array, every call</span>
+{
+  "model": "claude-sonnet-5",
+  "tools": [
+    <span class="tk-c">// native agent tools (always present)</span>
+    { "name": "Read",      "description": "Read a file",          "input_schema": { ... } },
+    { "name": "Edit",      "description": "Apply edits to a file","input_schema": { ... } },
+    <span class="tk-c">// postgres MCP server — ~300 tokens of schema, re-billed on all 6 calls</span>
+    { "name": "query",     "description": "Run a SQL query",      "input_schema": { ... } },
+    { "name": "schema",    "description": "List tables + columns","input_schema": { ... } },
+    <span class="tk-c">// github MCP server — ~260 tokens of schema, re-billed on all 6 calls</span>
+    { "name": "list_prs",  "description": "List pull requests",   "input_schema": { ... } },
+    { "name": "create_pr", "description": "Open a pull request",  "input_schema": { ... } }
+  ],
+  <span class="tk-c">// fetched resources are injected into messages, not tools</span>
+  "messages": [{ "role": "user", "content": "Fix the handler bug and open a PR." }]
+}
+<span class="tk-c">// MCP overhead: ~560 extra input tokens × 6 calls = ~3 400 extra tokens for the task</span>
+<span class="tk-c">// On a strong-tier model at $15/Mtok input: ~$0.05 of MCP overhead per task</span></code></pre></div>
+<p>That overhead is constant — it doesn't grow with the transcript the way multi-turn history does. But it starts on call&nbsp;one, never shrinks during the session, and multiplies with both call count and tier price. Ten servers with detailed input schemas can add thousands of tokens to every call. The pattern is also invisible unless you log <code>usage.input_tokens</code> per call and notice it creeping up from session to session.</p>
+
+<div class="note"><span class="nt">Key idea</span> MCP tool schemas are input tokens that ride the request on every call <em>whether or not those tools are actually used</em>. Connect only the servers a given task needs. Disconnect them when the task is done. Fewer connected servers means a smaller <code>tools</code> array and lower input cost on every call for the rest of the session.</div>
+
+<div class="note warn"><span class="nt">Common mistake</span> Assuming resources are &ldquo;free&rdquo; because they're not in the <code>tools</code> array. They aren't. A fetched resource is injected into <code>messages</code> and re-read on every subsequent call as part of the conversation history — exactly like Module&nbsp;3's multi-turn compounding. A large document fetched early in the session can dominate the input bill by the tenth call, with no tool schemas to blame.</div>
+
+<div class="note info"><span class="nt">Under the hood — two things called MCP</span> There are two unrelated uses of the name and it's worth separating them clearly. <b>Data-plane MCP</b> is what this module describes: external tool servers the agent folds into requests. Firstpass is completely transparent to it — the <code>tools</code> array is forwarded byte-for-byte and Firstpass never reads or rewrites MCP content on the routed path. <b>Firstpass's own <code>firstpass mcp</code></b> is a separate, unrelated thing entirely: a <em>stdio</em> self-audit server that exposes your deployment's trace store to an agent so it can inspect routing decisions. Its nine tools are <code>list_traces</code>, <code>get_trace</code>, <code>get_savings</code>, <code>get_evals</code>, <code>explain_route</code>, <code>verify_receipts</code>, <code>submit_feedback</code>, <code>rehearse_policy</code>, and <code>list_modes</code>. It sits beside the router and reads the audit log — it is not on the routed traffic path. Same acronym, opposite side of the wire.</div>
+
+<div class="recap">MCP is the agent's protocol, not the model's. Its three primitives — tools, resources, prompts — land in the model request as ordinary entries in <code>tools[]</code> and injected context in <code>messages[]</code>. Tool schemas cost input tokens on every call; keep connected servers to the minimum the task requires.</div>
+<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-10-images.html"><span class="dir">&larr; Previous</span><span class="t">Images &amp; multimodal</span></a><a class="next" href="r101-12-errors.html"><span class="dir">Next &rarr;</span><span class="t">Errors, rate limits &amp; retries</span></a></nav>
+</main>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=4"></script>
+</body></html>

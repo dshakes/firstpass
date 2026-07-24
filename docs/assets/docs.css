@@ -541,3 +541,23 @@ h1.title{font-size:clamp(40px,6vw,72px);font-weight:680;letter-spacing:-.04em;li
 .defs .v code{background:var(--surface-3);border:1px solid var(--border);border-radius:4px;padding:.08em .34em;font-size:12.5px}
 
 hr.rule{border:0;border-top:1px solid var(--border);margin:40px 0}
+
+
+/* ── Requests 101 tutorial: lesson pages, progress, course nav ───────────── */
+.course-title{display:block;font-weight:680;font-size:14px;color:var(--text);margin:0 0 2px}
+.sidebar-back{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--text-3);margin-bottom:16px}
+.sidebar-back:hover{color:var(--accent-strong)}
+.lesson-progress{margin:0 0 26px}
+.lp-meta{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+.lp-group{font:600 10.5px/1.4 var(--mono);letter-spacing:.05em;text-transform:uppercase;color:var(--accent-strong)}
+.lp-count{font:600 12px/1 var(--mono);color:var(--text-3)}
+.lp-bar{height:5px;border-radius:3px;background:var(--surface-2);overflow:hidden;border:1px solid var(--border-2)}
+.lp-bar span{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--accent-strong));transition:width .5s cubic-bezier(.2,.7,.2,1)}
+@media (prefers-reduced-motion:reduce){.lp-bar span{transition:none}}
+.lesson-lead{font-size:17px;line-height:1.55;color:var(--text-2);margin:0 0 22px}
+.lesson-lead b{color:var(--text);font-weight:620}
+/* lesson nav list in the sidebar */
+.sidebar .lnav a{display:flex;gap:9px;align-items:baseline}
+.sidebar .lnav a .num{flex:none}
+.sidebar .lnav a.done .num{color:var(--accent-strong)}
+.sidebar .lnav a.done::after{content:"✓";margin-left:auto;color:var(--accent-strong);font-size:11px}

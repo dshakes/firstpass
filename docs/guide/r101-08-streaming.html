@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streaming — How Agents Talk to Models — Firstpass docs</title>
+<meta name="description" content="How Agents Talk to Models lesson 8 of 13: Streaming. Part of the from-first-principles guide to how agents talk to models and what it costs.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=4">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="How Agents Talk to Models lessons"><nav>
+<a class="sidebar-back" href="index.html">&larr; All docs</a>
+<span class="course-title">How Agents Talk to Models</span>
+<a href="requests-101.html" style="font-size:13px;color:var(--text-3);margin-bottom:14px">Course overview</a>
+<div class="grp lnav"><p class="grp-t">The core path</p>
+<a href="r101-01-one-request.html" class="done"><span class="num">01</span>One request, one response</a>
+<a href="r101-02-token-meter.html" class="done"><span class="num">02</span>The token meter</a>
+<a href="r101-03-multi-turn.html" class="done"><span class="num">03</span>Statelessness &amp; multi-turn</a>
+<a href="r101-04-tools.html" class="done"><span class="num">04</span>Tool calls</a>
+<a href="r101-05-caching.html" class="done"><span class="num">05</span>Prompt caching</a>
+<a href="r101-06-client-shapes.html" class="done"><span class="num">06</span>Three client shapes</a>
+<a href="r101-07-claude-code-session.html" class="done"><span class="num">07</span>A Claude Code session</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Beyond the core path</p>
+<a href="r101-08-streaming.html" aria-current="page"><span class="num">08</span>Streaming</a>
+<a href="r101-09-structured-outputs.html"><span class="num">09</span>Structured outputs &amp; JSON</a>
+<a href="r101-10-images.html"><span class="num">10</span>Images &amp; multimodal</a>
+<a href="r101-11-mcp.html"><span class="num">11</span>MCP, in depth</a>
+<a href="r101-12-errors.html"><span class="num">12</span>Errors, rate limits &amp; retries</a>
+</div>
+<div class="grp lnav"><p class="grp-t">Where Firstpass fits</p>
+<a href="r101-13-firstpass.html"><span class="num">13</span>Where Firstpass fits</a>
+</div>
+</nav></aside><main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open lessons" aria-expanded="false" type="button" style="margin-bottom:18px">&#9776; Lessons</button>
+<p class="crumb"><a href="index.html">Docs</a> / <a href="requests-101.html">How Agents Talk to Models</a> / Streaming</p>
+<div class="lesson-progress">
+  <div class="lp-meta"><span class="lp-group">Part A2 · Beyond the core path</span><span class="lp-count">Lesson 8 of 13</span></div>
+  <div class="lp-bar"><span style="width:61.5%"></span></div>
+</div>
+<h1>Streaming</h1>
+<div class="tldr">Add <code>"stream": true</code> to any request and the answer arrives token by token as <b>Server-Sent Events</b> instead of one big JSON blob at the end. Cost is <b>identical</b> — same tokens, same price — streaming changes <em>delivery</em>, not the bill. The gain is perceived latency: your UI can start rendering before the model finishes writing. The catch: anything that must inspect the whole output first — a JSON parser, a verification gate — still has to buffer the stream to completion.</div>
+
+<p>The wire call changes by exactly one field. Point the same <code>POST</code> at the same endpoint, keep the same headers, add <code>"stream": true</code>:</p>
+
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># same endpoint, same headers — one extra field</span>
+curl https://api.anthropic.com/v1/messages \
+  -H 'content-type: application/json' \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{
+    "model": "claude-haiku-4-5-20251001",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [{"role": "user", "content": "Scan orders.py for validation gaps."}]
+  }'</code></pre></div>
+
+<p>The connection stays open and events arrive in a fixed sequence, each a pair of lines (<code>event: &lt;type&gt;</code> then <code>data: &lt;json&gt;</code>). Four matter most:</p>
+<ul>
+  <li><code>message_start</code> — opens; the input-token count is already known.</li>
+  <li><code>content_block_delta</code> — a few tokens per event; this is where you render.</li>
+  <li><code>message_delta</code> — closes with the final output-token count and <code>stop_reason</code>.</li>
+  <li><code>message_stop</code> — the stream is done.</li>
+</ul>
+
+<div class="codeblock"><div class="cb-head"><span>sse</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># ① message_start — input_tokens known immediately; output_tokens not yet final</span>
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_01XA9g...","role":"assistant",
+      "model":"claude-haiku-4-5-20251001","stop_reason":null,
+      "usage":{"input_tokens":842,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: ping
+data: {"type":"ping"}
+
+<span class="tk-c"># ② content_block_delta — one or a few tokens per event; render as they arrive</span>
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"'ll scan"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" orders.py"}}
+
+<span class="tk-c">  ... more content_block_delta events ...</span>
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+<span class="tk-c"># ③ message_delta — final usage: output_tokens now settled; stop_reason set</span>
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},
+      "usage":{"output_tokens":312}}
+
+<span class="tk-c"># ④ message_stop — stream closed; safe to release the connection</span>
+event: message_stop
+data: {"type":"message_stop"}</code></pre></div>
+
+<figure>
+<svg viewBox="0 0 760 148" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ssT" style="max-width:760px;width:100%;display:block">
+<title id="ssT">Two horizontal timelines comparing non-streaming and streaming. Non-streaming: one long wait bar spanning the full generation time, then the complete response arrives at the end. Streaming: a short bar to time-to-first-token where the user sees the first text, then a longer bar as tokens stream in, with the stream completing at the same wall-clock point as non-streaming. Cost and total time are identical — streaming changes when the first byte appears, not when the last one does.</title>
+<defs>
+<marker id="ssA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+</defs>
+
+<!-- row labels -->
+<text x="0" y="36" class="ink-mut m" font-size="11" dominant-baseline="middle">non-streaming</text>
+<text x="0" y="100" class="ink-mut m" font-size="11" dominant-baseline="middle">streaming</text>
+
+<!-- non-streaming: one long wait bar, response arrives at the end -->
+<rect x="168" y="20" width="516" height="32" rx="4" class="n-fill warn-s"/>
+<text x="426" y="36" text-anchor="middle" class="ink-mut m" font-size="10.5" dominant-baseline="middle">waiting for complete response…</text>
+<!-- response-arrives marker -->
+<line x1="684" y1="14" x2="684" y2="58" stroke="var(--d-warn)" stroke-width="1.5"/>
+<text x="692" y="28" class="warn m" font-size="10" dominant-baseline="middle">response</text>
+<text x="692" y="44" class="warn m" font-size="10" dominant-baseline="middle">arrives</text>
+
+<!-- streaming row -->
+<!-- TTFT segment -->
+<rect x="168" y="84" width="72" height="32" rx="4" class="n-fill glow-p"/>
+<text x="204" y="100" text-anchor="middle" class="accent-ink m" font-size="10" dominant-baseline="middle">TTFT</text>
+<!-- remaining stream segment -->
+<rect x="240" y="84" width="444" height="32" rx="4" class="n-fill"/>
+<text x="462" y="100" text-anchor="middle" class="ink-mut m" font-size="10.5" dominant-baseline="middle">tokens streaming — render as they arrive…</text>
+<!-- TTFT marker (dashed) -->
+<line x1="240" y1="78" x2="240" y2="122" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4,3"/>
+<text x="232" y="132" text-anchor="middle" class="accent-ink m" font-size="10">user sees</text>
+<text x="232" y="144" text-anchor="middle" class="accent-ink m" font-size="10">first text</text>
+<!-- stream-complete marker -->
+<line x1="684" y1="78" x2="684" y2="122" stroke="var(--d-pass)" stroke-width="1.5"/>
+<text x="692" y="92" class="ink m" font-size="10" dominant-baseline="middle">stream</text>
+<text x="692" y="108" class="ink m" font-size="10" dominant-baseline="middle">complete</text>
+</svg>
+<figcaption>Streaming and non-streaming finish at the same wall-clock point — total generation time is identical. What changes is the <em>first</em> byte: streaming surfaces it at TTFT while non-streaming blocks until every token is written. Cost is the same either way.</figcaption>
+</figure>
+
+<div class="note"><span class="nt">Key idea</span> The <code>usage</code> object is split across two events in a stream. <code>message_start</code> reports <code>input_tokens</code> immediately — the model read your whole prompt before writing a word, so input is known at the start. <code>message_delta</code> reports <code>output_tokens</code> at the end, once the model finishes. The bill is the same as if you hadn't streamed: those token counts, those prices.</div>
+
+<div class="note warn"><span class="nt">Common mistake</span> Trying to parse or verify partial stream output. A JSON parser fails on a half-written object. A semantic gate can't rule on an answer the model hasn't finished. If your code needs the complete text — to validate, to parse structured output, to decide on tool calls — you must accumulate every <code>content_block_delta</code> and wait for <code>message_stop</code> before acting. Rendering can happen token by token; <em>reasoning</em> about the output cannot.</div>
+
+<div class="note info"><span class="nt">Under the hood</span> Firstpass sits between your agent and the provider and forwards <code>stream: true</code> transparently — but it must buffer the full stream before the gate can run. Once the gate passes, Firstpass re-emits the buffered content as SSE to your client, so your agent still sees a stream. The practical effect: time-to-first-token is slightly higher through Firstpass (gate latency on top of generation), but the wire contract your agent code observes is identical. See <a href="how-it-works.html">how it works</a> for the full flow.</div>
+
+<div class="recap">Streaming changes <em>when</em> tokens arrive, not how many — cost is identical, time-to-first-token drops, but anything that reasons about the output still needs the complete stream first.</div>
+<nav class="pager" aria-label="Lesson navigation"><a class="prev" href="r101-07-claude-code-session.html"><span class="dir">&larr; Previous</span><span class="t">A Claude Code session</span></a><a class="next" href="r101-09-structured-outputs.html"><span class="dir">Next &rarr;</span><span class="t">Structured outputs &amp; JSON</span></a></nav>
+</main>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=4"></script>
+</body></html>
