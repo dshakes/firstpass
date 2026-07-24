@@ -55,65 +55,96 @@
 <button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
 <p class="crumb"><a href="index.html">Docs</a> / Routing, end to end</p>
 <h1>Routing, end to end</h1>
-<p class="page-sub">Point your agent at Firstpass and every model call runs through one engine that serves the cheapest model which can <em>prove</em> its answer. A one-shot question, a fifty-step loop, a subagent, a whole team running in parallel — all of it is the same thing: an independent HTTP request, routed and proven on its own. This page follows one real request from the terminal to the served bytes — the actual request, response, and receipt — then scales it up to every hard case.</p>
+<p class="page-sub">An agent doesn't make one model call — it makes hundreds, and the safe reflex of sending every one to the strongest model is why an afternoon of agent work bills like a research run. Firstpass runs the <em>cheapest</em> model first, proves its output against a real check, and escalates only when the proof fails. You pay for strength exactly when strength is needed — and every decision leaves a receipt that says why.</p>
 
-<div class="note info"><span class="nt">Read this after "How it works"</span> That page explains the gate and the ladder — the machinery. This page is the guided tour: what a <em>request</em> is, how your prompts become requests, and how the same four steps carry you from a trivial question to a dynamic multi-agent workflow.</div>
-
-<h2 id="one-idea">The one idea<a class="anchor" href="#one-idea" aria-label="Link to this section">#</a></h2>
-<p>Firstpass is an HTTP proxy. Your agent — Claude Code, the Agent SDK, or anything that speaks the Anthropic or OpenAI wire format — points its base URL at Firstpass instead of the provider. From that seat, Firstpass sees exactly one kind of thing: a <strong>completion request</strong>, a single <code>POST</code> with a body of messages and tools. That is the entire surface, and it is what makes the model tractable: there is no session object to reason about, no turn counter, no agent graph. There's the next request, and the router earns the right answer for it.</p>
-<p>Everything on this page follows from that seat. The agent loop, subagents, and multi-agent workflows are all built by the client out of many independent requests. Firstpass routes each on its own merits — which is why one small engine handles the trivial and the enormous with no special cases.</p>
-<div class="note"><span class="nt">The key point</span> A terminal prompt is <strong>not</strong> a request. It's the start of an agent loop that emits <em>many</em> requests. Firstpass routes requests, not prompts — so scale is just volume, never a new mechanism.</div>
-
-<h2 id="unit">The unit of routing is one request<a class="anchor" href="#unit" aria-label="Link to this section">#</a></h2>
-<p>When you type a prompt and hit enter, the agent begins a loop: think, call a tool, read the result, think again, maybe spawn a subagent, and eventually answer. <strong>Each "think" is a separate model call — a separate <code>POST</code> to Firstpass.</strong> A single prompt routinely produces five, ten, or fifty requests. Each arrives independently, is routed independently, and is proven independently.</p>
-<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="fanT">
-<title id="fanT">One terminal prompt starts an agent loop that emits many independent HTTP requests — reasoning steps, tool-result reads, and subagent calls — each a separate POST to Firstpass, routed on its own.</title>
+<h2 id="why">Why routing, and why proof<a class="anchor" href="#why" aria-label="Link to this section">#</a></h2>
+<p>Point your agent — Claude Code, the Agent SDK, anything speaking the Anthropic or OpenAI wire format — at Firstpass instead of the provider, and it sees exactly one kind of thing: a <strong>completion request</strong>, a single <code>POST</code> of messages and tools. An agent loop emits these by the hundred — every reasoning step, every tool-result read, every subagent is its own request, and the whole growing transcript rides along on each. Bill all of it to a frontier model &ldquo;to be safe&rdquo; and the cost compounds three ways at once: many calls per prompt, a transcript that only grows, and the top model spent on the easy calls too.</p>
+<p>The two obvious fixes both break. Send everything to a cheap model and <em>hope</em>, and you ship wrong answers you won't catch until production. <strong>Predict</strong> which prompt needs which model, and you're guessing from the question — before you've seen the answer — and you learn you guessed wrong the expensive way. Firstpass does neither. It runs the cheapest rung first, <strong>proves the actual output</strong> against your gate — a test, a schema, a judge — and serves it only if the proof holds. If it doesn't, it escalates one rung and proves again. That is the whole product, in one picture:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 400" role="img" aria-labelledby="heroT">
+<title id="heroT">One request opens on the cheapest rung; its real output is proved against a gate. When the gate passes — measured at 82 percent of requests on a live coding run — the cheap answer is served and no strong model is ever called. When it fails, the cascade escalates one rung and proves again, serving only a proven answer. The routing decision is proof of the output, never a prediction from the prompt.</title>
 <defs>
-  <marker id="fanA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
-  <marker id="fanP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/></marker>
+  <marker id="hrA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="hrP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+  <marker id="hrW" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
 </defs>
-<line x1="40" y1="270" x2="960" y2="270" class="grid" stroke-width="1.2"/>
-<text x="40" y="34" class="ink" font-size="13" font-weight="640">One prompt → many requests → one router</text>
-<!-- prompt -->
-<rect x="40" y="118" width="150" height="70" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
-<text x="115" y="147" text-anchor="middle" class="ink" font-size="13.5" font-weight="640">Terminal</text>
-<text x="115" y="166" text-anchor="middle" class="ink-mut m" font-size="10.5">one prompt</text>
-<!-- loop calls -->
-<g>
-  <rect x="300" y="50" width="200" height="42" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
-  <text x="316" y="76" class="ink m" font-size="11.5">reason · POST /v1/messages</text>
-  <rect x="300" y="104" width="200" height="42" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
-  <text x="316" y="130" class="ink m" font-size="11.5">read tool result · POST</text>
-  <rect x="300" y="158" width="200" height="42" rx="9" class="n-fill n-stroke" stroke-width="1.4"/>
-  <text x="316" y="184" class="ink m" font-size="11.5">reason again · POST</text>
-  <rect x="300" y="212" width="200" height="42" rx="9" class="n-fill accent-s" stroke-width="1.4"/>
-  <text x="316" y="238" class="ink m" font-size="11.5">subagent call · POST</text>
-</g>
-<!-- router -->
-<rect x="640" y="116" width="156" height="74" rx="13" class="n-fill accent-s glow" stroke-width="1.8"/>
-<text x="718" y="146" text-anchor="middle" class="ink" font-size="14" font-weight="700">Firstpass</text>
-<text x="718" y="166" text-anchor="middle" class="ink-mut m" font-size="10.5">routes each POST</text>
-<!-- connectors: prompt -> calls -->
-<line x1="190" y1="150" x2="296" y2="71" class="n-stroke" stroke-width="1.4" marker-end="url(#fanA)"/>
-<line x1="190" y1="150" x2="296" y2="125" class="n-stroke" stroke-width="1.4" marker-end="url(#fanA)"/>
-<line x1="190" y1="150" x2="296" y2="179" class="n-stroke" stroke-width="1.4" marker-end="url(#fanA)"/>
-<line x1="190" y1="150" x2="296" y2="233" class="accent-s" stroke-width="1.4" marker-end="url(#fanP)"/>
-<!-- connectors: calls -> router -->
-<line x1="500" y1="71" x2="638" y2="138" class="n-stroke" stroke-width="1.4" marker-end="url(#fanA)"/>
-<line x1="500" y1="125" x2="638" y2="150" class="n-stroke" stroke-width="1.4" marker-end="url(#fanA)"/>
-<line x1="500" y1="179" x2="638" y2="162" class="n-stroke" stroke-width="1.4" marker-end="url(#fanA)"/>
-<line x1="500" y1="233" x2="638" y2="174" class="accent-s" stroke-width="1.4" marker-end="url(#fanP)"/>
+<text x="40" y="34" class="ink" font-size="14" font-weight="700">Cheapest first · prove the real output · escalate only on failure</text>
+<text x="40" y="55" class="ink-mut" font-size="11.5">the routing decision is proof of the answer, never a guess from the prompt</text>
+<!-- one request -->
+<rect x="30" y="182" width="126" height="60" rx="12" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="93" y="208" text-anchor="middle" class="ink m" font-size="12" font-weight="640">one request</text>
+<text x="93" y="226" text-anchor="middle" class="ink-mut m" font-size="10">a single POST</text>
+<!-- cheapest rung -->
+<rect x="196" y="182" width="150" height="60" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="271" y="206" text-anchor="middle" class="ink m" font-size="12" font-weight="640">cheapest rung</text>
+<text x="271" y="224" text-anchor="middle" class="accent-ink m" font-size="10" font-weight="600">takes the first pass</text>
+<!-- GATE pivot -->
+<rect x="404" y="164" width="168" height="96" rx="14" class="n-fill accent-s glow" stroke-width="2.4"/>
+<text x="488" y="196" text-anchor="middle" class="ink" font-size="15" font-weight="800">PROVE</text>
+<text x="488" y="216" text-anchor="middle" class="ink-mut m" font-size="10.5">test · schema · judge</text>
+<text x="488" y="234" text-anchor="middle" class="ink-mut m" font-size="10">on the real output</text>
+<!-- PASS path -->
+<text x="612" y="120" class="pass m" font-size="12.5" font-weight="700">82% · gate passes</text>
+<rect x="700" y="130" width="268" height="72" rx="13" class="n-fill pass-s glow-p" stroke-width="1.8"/>
+<text x="834" y="160" text-anchor="middle" class="ink" font-size="13" font-weight="700">serve — cheap &amp; proven</text>
+<text x="834" y="181" text-anchor="middle" class="pass m" font-size="10.5" font-weight="600">the common case · no strong-model bill</text>
+<!-- FAIL path -->
+<text x="612" y="302" class="warn m" font-size="12.5" font-weight="700">18% · gate fails</text>
+<rect x="700" y="288" width="150" height="62" rx="12" class="n-fill warn-s glow-w" stroke-width="1.6"/>
+<text x="775" y="314" text-anchor="middle" class="warn m" font-size="11.5" font-weight="640">escalate +1 rung</text>
+<text x="775" y="332" text-anchor="middle" class="ink-mut m" font-size="9.5">budget-capped</text>
+<rect x="866" y="288" width="108" height="62" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="920" y="314" text-anchor="middle" class="ink m" font-size="11" font-weight="640">strong rung</text>
+<text x="920" y="332" text-anchor="middle" class="accent-ink m" font-size="10" font-weight="600">serve proven</text>
+<!-- connectors -->
+<line x1="156" y1="212" x2="194" y2="212" class="n-stroke" stroke-width="1.6" marker-end="url(#hrA)"/>
+<line x1="346" y1="212" x2="402" y2="212" class="n-stroke" stroke-width="1.6" marker-end="url(#hrA)"/>
+<path d="M572 190 C636 170 662 166 698 166" fill="none" class="pass-s" stroke-width="2.1" marker-end="url(#hrP)"/>
+<path d="M572 232 C636 254 662 318 698 318" fill="none" class="warn-s" stroke-width="1.9" marker-end="url(#hrW)"/>
+<line x1="850" y1="319" x2="864" y2="319" class="accent-s" stroke-width="1.7" marker-end="url(#hrA)"/>
 <!-- pulses -->
-<line x1="190" y1="150" x2="296" y2="71" class="flow s" stroke-width="2"/>
-<line x1="190" y1="150" x2="296" y2="179" class="flow s d3" stroke-width="2"/>
-<line x1="190" y1="150" x2="296" y2="233" class="flow p s d5" stroke-width="2"/>
-<line x1="500" y1="125" x2="638" y2="150" class="flow s d2" stroke-width="2"/>
-<line x1="500" y1="233" x2="638" y2="174" class="flow p s d4" stroke-width="2"/>
+<line x1="156" y1="212" x2="194" y2="212" class="flow s" stroke-width="2.4"/>
+<line x1="346" y1="212" x2="402" y2="212" class="flow s d2" stroke-width="2.4"/>
+<path d="M572 190 C636 170 662 166 698 166" class="flow p s d3" stroke-width="2.6"/>
+<path d="M572 232 C636 254 662 318 698 318" class="flow w s d4" stroke-width="2.2"/>
 </svg>
-  <figcaption>A prompt fans out into independent requests. Firstpass has no idea they share a prompt unless you tag them (see <a href="#multiturn">sessions</a>) — and for routing, it doesn't need to.</figcaption>
+  <figcaption>The gate is the pivot: it proves the cheap model's actual output before anything ships. Pass — most of the time — and the strong model is never called. Fail, and the cascade escalates and proves again. Nothing is served unproven.</figcaption>
 </div>
+<p>Because the decision is <em>proof</em> and not a prompt-time guess, most requests never touch the expensive model — and the ones that do have earned it. That split isn't a hope; on a live run of <strong>974 real coding tasks</strong>, each gated by its real unit tests, it's measured:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 372" role="img" aria-labelledby="moneyT">
+<title id="moneyT">On a live run of 974 real MBPP coding tasks gated by real unit tests, 82 percent of requests were served from the cheapest rung with no escalation, and 18 percent escalated. Because 82 percent never invoke the strong model, the blended cost sits far below the always-strong baseline where every call pays top price. The realized served-failure rate was 7.7 percent, under the 10 percent target at 95 percent confidence.</title>
+<defs><marker id="mnA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
+<text x="40" y="34" class="ink" font-size="14" font-weight="700">Where the bill goes — 974 live coding tasks</text>
+<text x="40" y="55" class="ink-mut" font-size="11.5">real unit-test gates, live provider · measured, not modeled</text>
+<!-- LEFT: served split -->
+<text x="40" y="98" class="ink m" font-size="11.5" font-weight="640">Where each request is served</text>
+<rect x="40" y="112" width="386" height="52" rx="9" class="pass"/>
+<rect x="428" y="112" width="86" height="52" rx="9" class="warn"/>
+<text x="233" y="144" text-anchor="middle" fill="var(--text-inv)" font-size="13" font-weight="700">82% cheap tier</text>
+<text x="471" y="144" text-anchor="middle" fill="var(--text-inv)" font-size="10.5" font-weight="700">18%</text>
+<text x="40" y="188" class="pass m" font-size="10.5" font-weight="600">served on rung 0 — no escalation, no strong-model call</text>
+<text x="40" y="204" class="warn m" font-size="10.5" font-weight="600">escalated on proof of need</text>
+<text x="40" y="242" class="ink" font-size="15" font-weight="800">82% of requests never pay for the strong model.</text>
+<text x="40" y="264" class="ink-mut" font-size="11">The savings come from there — the expensive model only when proof demanded it.</text>
+<!-- RIGHT: cost bars -->
+<line x1="612" y1="300" x2="968" y2="300" class="n-stroke" stroke-width="1.3"/>
+<text x="612" y="98" class="ink m" font-size="11.5" font-weight="640">Cost vs always-strong</text>
+<rect x="636" y="116" width="82" height="184" rx="6" class="fail"/>
+<text x="677" y="318" text-anchor="middle" class="ink-mut" font-size="10">every call · top price</text>
+<rect x="788" y="250" width="82" height="50" rx="6" class="pass"/>
+<text x="829" y="242" text-anchor="middle" class="pass m" font-size="10.5" font-weight="700">Firstpass</text>
+<text x="829" y="318" text-anchor="middle" class="ink-mut" font-size="10">cheap-first, proven</text>
+<path d="M900 118 L900 294" fill="none" class="n-stroke" stroke-width="1.2" stroke-dasharray="3 3"/>
+<text x="910" y="200" class="ink-mut" font-size="10">strong paid</text>
+<text x="910" y="215" class="ink-mut" font-size="10">only on 18%</text>
+<text x="40" y="352" class="ink-mut" font-size="9.5">Bar heights illustrative (list prices drift); the 82 / 18 split and 7.7% served-fail are measured.</text>
+<!-- pulse -->
+<line x1="40" y1="138" x2="426" y2="138" class="flow p l" stroke-width="2"/>
+</svg>
+  <figcaption>Measured on 974 live MBPP tasks: 82% served from the cheap tier, 18% escalated, and a 7.7% served-failure rate — under the 10% target at 95% confidence. Full run in <a href="benchmarks.html#live">Benchmarks</a>; the served-failure math in <a href="guarantee.html">The guarantee</a>.</figcaption>
+</div>
+<div class="note"><span class="nt">New here? Read this after "How it works"</span> That page builds the gate and the ladder — the machinery under the picture above. This page is the guided tour: what a <em>request</em> is, how your prompts become hundreds of them, and how the same loop carries you from a one-shot question to a dynamic multi-agent workflow. The rest of the page is that loop, one request at a time.</div>
 
-<h3 id="request-shape">What a request looks like<a class="anchor" href="#request-shape" aria-label="Link to this section">#</a></h3>
+<h2 id="request-shape">What a request looks like<a class="anchor" href="#request-shape" aria-label="Link to this section">#</a></h2>
 <p>A request is a standard provider call. Firstpass accepts two wire dialects and matches whichever the client speaks:</p>
 <div class="tblwrap"><table>
 <thead><tr><th>Field</th><th>What it is</th></tr></thead>
@@ -203,19 +234,6 @@ x-firstpass-session: agent-run-4417     <span class="tk-c"># optional — budget
 </svg>
   <figcaption>The routing decision rides on the headers and a few structural signals — not the content. The prompt, history, and tools are forwarded whole to the rung that answers.</figcaption>
 </div>
-
-<h2 id="why-expensive">Why this gets expensive fast<a class="anchor" href="#why-expensive" aria-label="Link to this section">#</a></h2>
-<p>Before we follow a request through the engine, it helps to see the problem the engine exists to solve. Providers bill per token — every token you send <em>in</em> and every token the model writes <em>out</em>, at a price that climbs steeply with the model's strength. A frontier model can cost 15–30× a small one for the same tokens. On a single question that's a rounding error. Inside an agent it compounds three ways at once:</p>
-<div class="tblwrap"><table>
-<thead><tr><th>Multiplier</th><th>What it does to the bill</th></tr></thead>
-<tbody>
-<tr><td><strong>Many calls per prompt</strong></td><td>One prompt is not one call — it's a loop of 5, 10, 50 (<a href="#unit">as we saw</a>). Every reasoning step, every tool-result read, every subagent is its own billed request.</td></tr>
-<tr><td><strong>A transcript that only grows</strong></td><td>The model is stateless, so each turn resends the <em>whole</em> conversation so far — system prompt, every past message, every tool result. Turn 10's input is turns 1–9 stacked underneath the new one. The input bill climbs with every step, even when the new ask is tiny.</td></tr>
-<tr><td><strong>Top model on the easy calls too</strong></td><td>The reflex is to send every call to the strongest model "to be safe." But most calls in a loop are easy — read a file, apply a clean diff, format output — and pay frontier prices for a task a small model nails.</td></tr>
-</tbody>
-</table></div>
-<p>Multiply those together and you get the <strong>always-strong baseline</strong>: what the loop costs if every call goes to the top model. In the worked example later on this page, one code-edit request carries a fat ~2,000-token transcript and would cost <strong>$0.0630</strong> at that baseline. Across a fifty-step loop, that is where the bill goes.</p>
-<div class="note"><span class="nt">What Firstpass does about it</span> Try the cheapest model that could plausibly work, and only pay for a stronger one when a <em>real check</em> — a test, a compile, a schema validation — says the cheap answer wasn't good enough. That same request lands at <strong>$0.0128</strong>: the cheap rung was tried, a test caught that it fell short, and it escalated exactly once. You pay for strength only on the calls that actually need it. The rest of this page is how that decision is made, one request at a time.</div>
 
 <h2 id="lifecycle">The life of one request<a class="anchor" href="#lifecycle" aria-label="Link to this section">#</a></h2>
 <p>Every <code>POST</code> — no matter what produced it — travels the same four steps. No fast path for "simple" prompts, no special case for subagents. The uniformity is the point: it's what lets one engine stay correct across every case below.</p>
@@ -867,7 +885,7 @@ const client = new Anthropic({ baseURL: "http://localhost:8080" });
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="how-it-works.html"><span class="dir">← Previous</span><span class="t">How it works</span></a><a class="next" href="gates.html"><span class="dir">Next →</span><span class="t">Gates</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#one-idea" class="">The one idea</a><a href="#unit" class="">The unit of routing</a><a href="#why-expensive" class="">Why it gets expensive</a><a href="#lifecycle" class="">Life of one request</a><a href="#scenarios" class="">Every scenario</a><a href="#simple" class="">A simple question</a><a href="#complex" class="">A complex question</a><a href="#exhausted" class="">Nothing clears the gate</a><a href="#failover" class="">A provider is down</a><a href="#observe" class="">Observe mode</a><a href="#subagents" class="">Subagents</a><a href="#teams" class="">Teams &amp; workflows</a><a href="#multiturn" class="">Multi-turn &amp; context</a><a href="#modes" class="">Claude Code vs SDK</a><a href="#limits" class="">Configure vs automatic</a><a href="#tackle" class="">How we tackle it</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#why" class="">Why routing &amp; proof</a><a href="#request-shape" class="">What a request looks like</a><a href="#lifecycle" class="">Life of one request</a><a href="#scenarios" class="">Every scenario</a><a href="#simple" class="">A simple question</a><a href="#complex" class="">A complex question</a><a href="#exhausted" class="">Nothing clears the gate</a><a href="#failover" class="">A provider is down</a><a href="#observe" class="">Observe mode</a><a href="#subagents" class="">Subagents</a><a href="#teams" class="">Teams &amp; workflows</a><a href="#multiturn" class="">Multi-turn &amp; context</a><a href="#modes" class="">Claude Code vs SDK</a><a href="#limits" class="">Configure vs automatic</a><a href="#tackle" class="">How we tackle it</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">
