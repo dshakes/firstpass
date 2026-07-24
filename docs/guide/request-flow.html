@@ -109,25 +109,25 @@
 </svg>
   <figcaption>The gate is the pivot: it proves the cheap model's actual output before anything ships. Pass — most of the time — and the strong model is never called. Fail, and the cascade escalates and proves again. Nothing is served unproven.</figcaption>
 </div>
-<p>Because the decision is <em>proof</em> and not a prompt-time guess, most requests never touch the expensive model — and the ones that do have earned it. That split isn't a hope; on a live run of <strong>974 real coding tasks</strong>, each gated by its real unit tests, it's measured:</p>
+<p>Because the decision is <em>proof</em> and not a prompt-time guess, most of the cheap rung's answers turn out good enough to serve as-is — and the ones that don't escalate. That isn't a hope: on a live run of <strong>974 real coding tasks</strong>, each scored by its real unit tests, the cheap rung's pass rate is measured:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 372" role="img" aria-labelledby="moneyT">
-<title id="moneyT">On a live run of 974 real MBPP coding tasks gated by real unit tests, 82 percent of requests were served from the cheapest rung with no escalation, and 18 percent escalated. Because 82 percent never invoke the strong model, the blended cost sits far below the always-strong baseline where every call pays top price. The realized served-failure rate was 7.7 percent, under the 10 percent target at 95 percent confidence.</title>
+<title id="moneyT">On a live run of 974 real MBPP coding tasks, one model's outputs were scored by real unit-test gates: 82 percent cleared the conformal serve threshold and can be served on the cheap rung, while 18 percent fell below it and would escalate in a deployed cascade. The realized served-failure rate was 7.7 percent, under the 10 percent target at 95 percent confidence. Cost savings depend on your models and workload and are not measured here.</title>
 <defs><marker id="mnA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
-<text x="40" y="34" class="ink" font-size="14" font-weight="700">Where the bill goes — 974 live coding tasks</text>
-<text x="40" y="55" class="ink-mut" font-size="11.5">real unit-test gates, live provider · measured, not modeled</text>
+<text x="40" y="34" class="ink" font-size="14" font-weight="700">The cheap rung on 974 live coding tasks</text>
+<text x="40" y="55" class="ink-mut" font-size="11.5">single-model conformal run · real unit-test gates, live provider</text>
 <!-- LEFT: served split -->
-<text x="40" y="98" class="ink m" font-size="11.5" font-weight="640">Where each request is served</text>
+<text x="40" y="98" class="ink m" font-size="11.5" font-weight="640">Cheap-rung outputs, by the serve gate</text>
 <rect x="40" y="112" width="386" height="52" rx="9" class="pass"/>
 <rect x="428" y="112" width="86" height="52" rx="9" class="warn"/>
-<text x="233" y="144" text-anchor="middle" fill="var(--text-inv)" font-size="13" font-weight="700">82% cheap tier</text>
+<text x="233" y="144" text-anchor="middle" fill="var(--text-inv)" font-size="12.5" font-weight="700">82% cleared the serve gate</text>
 <text x="471" y="144" text-anchor="middle" fill="var(--text-inv)" font-size="10.5" font-weight="700">18%</text>
-<text x="40" y="188" class="pass m" font-size="10.5" font-weight="600">served on rung 0 — no escalation, no strong-model call</text>
-<text x="40" y="204" class="warn m" font-size="10.5" font-weight="600">escalated on proof of need</text>
-<text x="40" y="242" class="ink" font-size="15" font-weight="800">82% of requests never pay for the strong model.</text>
-<text x="40" y="264" class="ink-mut" font-size="11">The savings come from there — the expensive model only when proof demanded it.</text>
+<text x="40" y="188" class="pass m" font-size="10.5" font-weight="600">good enough to ship on the cheap rung — no escalation needed</text>
+<text x="40" y="204" class="warn m" font-size="10.5" font-weight="600">below the threshold — would escalate on proof of need</text>
+<text x="40" y="242" class="ink" font-size="15" font-weight="800">82% cleared the gate on the cheap rung.</text>
+<text x="40" y="264" class="ink-mut" font-size="11">That is the savings lever — those requests need no strong model. Your dollar figure is your workload's; measure it.</text>
 <!-- RIGHT: cost bars -->
 <line x1="612" y1="300" x2="968" y2="300" class="n-stroke" stroke-width="1.3"/>
-<text x="612" y="98" class="ink m" font-size="11.5" font-weight="640">Cost vs always-strong</text>
+<text x="612" y="98" class="ink m" font-size="11.5" font-weight="640">Cost shape (illustrative)</text>
 <rect x="636" y="116" width="82" height="184" rx="6" class="fail"/>
 <text x="677" y="318" text-anchor="middle" class="ink-mut" font-size="10">every call · top price</text>
 <rect x="788" y="250" width="82" height="50" rx="6" class="pass"/>
@@ -136,11 +136,11 @@
 <path d="M900 118 L900 294" fill="none" class="n-stroke" stroke-width="1.2" stroke-dasharray="3 3"/>
 <text x="910" y="200" class="ink-mut" font-size="10">strong paid</text>
 <text x="910" y="215" class="ink-mut" font-size="10">only on 18%</text>
-<text x="40" y="352" class="ink-mut" font-size="9.5">Bar heights illustrative (list prices drift); the 82 / 18 split and 7.7% served-fail are measured.</text>
+<text x="40" y="352" class="ink-mut" font-size="9.5">Measured: 82% serve fraction, 7.7% served-fail (single-model conformal). Cost bars illustrative — no dollar figure is measured; Firstpass measures your real savings.</text>
 <!-- pulse -->
 <line x1="40" y1="138" x2="426" y2="138" class="flow p l" stroke-width="2"/>
 </svg>
-  <figcaption>Measured on 974 live MBPP tasks: 82% served from the cheap tier, 18% escalated, and a 7.7% served-failure rate — under the 10% target at 95% confidence. Full run in <a href="benchmarks.html#live">Benchmarks</a>; the served-failure math in <a href="guarantee.html">The guarantee</a>.</figcaption>
+  <figcaption>Measured on 974 live MBPP tasks (single-model conformal): 82% of cheap-rung outputs cleared the serve gate and 7.7% served-failure, under the 10% bound at 95% confidence. In a deployed cascade the other 18% escalate; your cost savings depend on your models — measure them. Full run in <a href="benchmarks.html#live">Benchmarks</a>; the math in <a href="guarantee.html">The guarantee</a>.</figcaption>
 </div>
 <div class="note"><span class="nt">New here? Read this after "How it works"</span> That page builds the gate and the ladder — the machinery under the picture above. This page is the guided tour: what a <em>request</em> is, how your prompts become hundreds of them, and how the same loop carries you from a one-shot question to a dynamic multi-agent workflow. The rest of the page is that loop, one request at a time.</div>
 
