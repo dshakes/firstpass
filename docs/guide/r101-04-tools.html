@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=4">
+<link rel="stylesheet" href="../assets/docs.css?v=5">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -26,7 +26,7 @@
 <div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
 </header>
 <div class="scrim"></div>
-<div class="docs">
+<div class="docs docs-course">
 <aside class="sidebar" aria-label="How Agents Talk to Models modules"><nav>
 <a class="sidebar-back" href="index.html">&larr; All docs</a>
 <span class="course-title">How Agents Talk to Models</span>
@@ -60,43 +60,46 @@
 <h1>Tool calls</h1>
 <div class="tldr">A tool-using agent runs a <b>loop</b>: send <code>tools</code> → model replies with a <code>tool_use</code> → <b>your code</b> runs it → you send a <code>tool_result</code> in a <b>new</b> request → repeat until the model answers. Each trip is a <b>separate billed call</b>, and every call re-reads the growing transcript <em>and</em> the whole tools list. One &ldquo;fix the bug&rdquo; becomes four to a dozen calls.</div>
 <p>An agent that can read files, run tests, or hit an API does it through <strong>tool calls</strong>, and this is where call counts explode. You send the model a list of <code>tools</code> (name + JSON schema) in the request. Instead of a final answer, the model can reply with a <code>tool_use</code> block: &ldquo;call <code>Read</code> with <code>path=orders.py</code>.&rdquo; <strong>Your code</strong> — not the model — runs the tool, then you send the result back as a <code>tool_result</code> in a <em>new</em> request. The model reads it and continues. That's the agent loop:</p>
-<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="loopT">
-<title id="loopT">The agent loop. A request goes to the model with a list of tools. The model replies with a tool_use block naming a tool and arguments. The client runs the tool and sends the output back as a tool_result in a new request that also resends the whole growing transcript. The model reads it and either calls another tool or returns a final answer. Each pass around the loop is a separate billed model call.</title>
-<defs><marker id="lpA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
-<marker id="lpC" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/></marker></defs>
-<text x="40" y="30" class="ink" font-size="13" font-weight="640">Every trip around the loop is another billed model call</text>
-<!-- model -->
-<rect x="60" y="110" width="170" height="80" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
-<text x="145" y="146" text-anchor="middle" class="ink" font-size="13" font-weight="700">the model</text>
-<text x="145" y="166" text-anchor="middle" class="ink-mut m" font-size="10">reads tools + transcript</text>
-<!-- tool_use -->
-<rect x="330" y="60" width="200" height="64" rx="11" class="n-fill n-stroke" stroke-width="1.5"/>
-<text x="430" y="86" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">reply: tool_use</text>
-<text x="430" y="104" text-anchor="middle" class="ink-mut m" font-size="10">Read( path="orders.py" )</text>
-<!-- your code -->
-<rect x="620" y="60" width="200" height="64" rx="11" class="n-fill n-stroke" stroke-width="1.5"/>
-<text x="720" y="86" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">your code runs it</text>
-<text x="720" y="104" text-anchor="middle" class="ink-mut m" font-size="10">reads the file from disk</text>
-<!-- tool_result -->
-<rect x="620" y="176" width="200" height="64" rx="11" class="n-fill accent-s" stroke-width="1.5"/>
-<text x="720" y="202" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">new request: tool_result</text>
-<text x="720" y="220" text-anchor="middle" class="accent-ink m" font-size="10" font-weight="600">+ whole transcript again</text>
-<!-- final -->
-<rect x="330" y="176" width="200" height="64" rx="11" class="n-fill pass-s glow-p" stroke-width="1.5"/>
-<text x="430" y="202" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">…or final answer</text>
-<text x="430" y="220" text-anchor="middle" class="pass m" font-size="10" font-weight="600">when no tool is needed</text>
-<!-- connectors -->
-<line x1="230" y1="140" x2="328" y2="98" class="n-stroke" stroke-width="1.5" marker-end="url(#lpA)"/>
-<line x1="530" y1="92" x2="618" y2="92" class="n-stroke" stroke-width="1.5" marker-end="url(#lpA)"/>
-<line x1="720" y1="124" x2="720" y2="174" class="accent-s" stroke-width="1.5" marker-end="url(#lpC)"/>
-<path d="M620 208 C420 208 300 200 232 168" fill="none" class="accent-s" stroke-width="1.6" marker-end="url(#lpC)"/>
-<text x="470" y="160" class="accent-ink" font-size="10" font-weight="600">loop back — another call</text>
-<line x1="230" y1="162" x2="328" y2="200" class="n-stroke" stroke-width="1.4" marker-end="url(#lpA)" opacity="0.5"/>
-<!-- pulses -->
-<line x1="230" y1="140" x2="328" y2="98" class="flow s" stroke-width="2"/>
-<line x1="530" y1="92" x2="618" y2="92" class="flow s d2" stroke-width="2"/>
-<line x1="720" y1="124" x2="720" y2="174" class="flow s d3" stroke-width="2"/>
-<path d="M620 208 C420 208 300 200 232 168" class="flow s d4" stroke-width="2"/>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 268" role="img" aria-labelledby="lpLoopT">
+<title id="lpLoopT">The agent loop as a racetrack between two nodes. Left: the model, which reads the tools list and the growing transcript and is billed on every call. Right: your code, which runs the tool locally — not billed. Top track going right: the model replies with tool_use, asking your code to Read orders.py. Bottom track going left: your code sends a new request carrying the tool_result and the full transcript back to the model — this is a fresh billed call, and the transcript is larger than the last time. The loop repeats until the model returns a final answer instead of a tool_use.</title>
+<defs>
+  <marker id="lpStdArr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="lpAccArr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/></marker>
+  <marker id="lpPassArr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+</defs>
+<!-- header -->
+<text x="500" y="24" text-anchor="middle" class="ink" font-size="13" font-weight="640">Each trip around the loop is a separate billed model call</text>
+<!-- MODEL box -->
+<rect x="40" y="42" width="200" height="148" rx="13" class="n-fill accent-s glow" stroke-width="1.8"/>
+<text x="140" y="76" text-anchor="middle" class="ink" font-size="14" font-weight="800">the model</text>
+<text x="140" y="98" text-anchor="middle" class="ink-mut m" font-size="10.5">reads tools + transcript</text>
+<text x="140" y="118" text-anchor="middle" class="accent-ink m" font-size="11" font-weight="700">$ input billed</text>
+<text x="140" y="140" text-anchor="middle" class="ink-mut m" font-size="10">480 tok call 1 → 690 tok call 2</text>
+<text x="140" y="158" text-anchor="middle" class="ink-mut m" font-size="10">transcript grows each pass</text>
+<!-- YOUR CODE box -->
+<rect x="760" y="42" width="200" height="148" rx="13" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="860" y="76" text-anchor="middle" class="ink m" font-size="13" font-weight="700">your code</text>
+<text x="860" y="98" text-anchor="middle" class="ink-mut m" font-size="10.5">runs Read(orders.py)</text>
+<text x="860" y="118" text-anchor="middle" class="ink-mut m" font-size="10.5">reads file from disk</text>
+<text x="860" y="140" text-anchor="middle" class="pass m" font-size="11" font-weight="600">not billed</text>
+<text x="860" y="158" text-anchor="middle" class="ink-mut m" font-size="10">no model call here</text>
+<!-- TOP arrow: model right → code left (tool_use reply) -->
+<line x1="240" y1="76" x2="758" y2="76" class="n-stroke" stroke-width="1.6" marker-end="url(#lpStdArr)"/>
+<text x="499" y="64" text-anchor="middle" class="ink m" font-size="11" font-weight="640">model reply: tool_use · Read( path=&quot;orders.py&quot; )</text>
+<!-- flow pulse on top arrow -->
+<line x1="240" y1="76" x2="758" y2="76" class="flow s" stroke-width="2.2"/>
+<!-- BOTTOM arrow: code left → model right (new request — billed loop-back) -->
+<line x1="760" y1="158" x2="242" y2="158" class="accent-s" stroke-width="1.8" marker-end="url(#lpAccArr)"/>
+<text x="499" y="178" text-anchor="middle" class="accent-ink m" font-size="11" font-weight="640">new request · tool_result + full transcript · $ billed again</text>
+<!-- flow pulse on bottom arrow -->
+<line x1="760" y1="158" x2="242" y2="158" class="flow s d3" stroke-width="2.4"/>
+<!-- center gap label -->
+<text x="499" y="122" text-anchor="middle" class="ink-mut" font-size="10">↕ loop continues until the model stops calling tools</text>
+<!-- FINAL ANSWER exit — arrow down from model box, then final answer node -->
+<line x1="140" y1="190" x2="140" y2="218" class="n-stroke" stroke-width="1.4" marker-end="url(#lpPassArr)" opacity="0.7"/>
+<rect x="40" y="220" width="200" height="40" rx="10" class="n-fill pass-s glow-p" stroke-width="1.4"/>
+<text x="140" y="238" text-anchor="middle" class="ink m" font-size="11" font-weight="640">or: final answer (end_turn)</text>
+<text x="140" y="253" text-anchor="middle" class="pass m" font-size="10">when the model has no more tool calls</text>
 </svg>
   <figcaption>The model never runs a tool itself — it asks, your code executes, you resend the result. So one &ldquo;fix the bug&rdquo; task becomes four, six, a dozen model calls, and every one of them re-reads the whole transcript <em>and</em> the tools list.</figcaption>
 </div>
@@ -220,5 +223,5 @@
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=4"></script>
+<script src="../assets/docs.js?v=5"></script>
 </body></html>
