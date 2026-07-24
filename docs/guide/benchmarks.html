@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -58,11 +58,16 @@
 <h1>Benchmarks</h1>
 <p class="page-sub">Every number Firstpass publishes regenerates from a committed command. This page is the index of those artifacts, the provenance rules that keep them honest, and the exact commands to reproduce them on your own account.</p>
 
+<div class="tldr">On <b>974 real coding tasks</b> with real unit-test gates, Firstpass served <b>82% of requests from the cheap rung</b> at a <b>7.7% served-failure rate</b> — below the pre-registered 10% target at 95% confidence. Every published number here traces to a committed, reproducible artifact; if the artifact isn't in <code>docs/benchmarks/</code>, the number is stale.</div>
+
 <h2 id="rule">The provenance rule<a class="anchor" href="#rule" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Every public number Firstpass cites must have a <b>committed artifact</b> — the harness's raw stdout, unedited. No artifact means the number is stale; the missing artifact is the bug to file, not the number to debate.</div>
 <div class="note"><span class="nt">The rule</span> If a number appears on this site and its artifact isn't committed under <code>docs/benchmarks/</code>, treat the number as stale and the missing artifact as the bug to file. Artifacts are the harness's stdout, unedited; the harness self-labels simulation vs live.</div>
 <p>This is deliberate discipline. A benchmark you can't rerun is marketing; a benchmark with a committed command and raw output is evidence.</p>
+<div class="recap">No committed artifact means <b>the number is stale</b> — open a bug, not a debate.</div>
 
 <h2 id="live">MBPP live bound<a class="anchor" href="#live" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The headline result: <b>82% of outputs cleared the gate on the cheap rung</b> at a <b>7.7% served-failure rate</b> across 974 real MBPP coding tasks — under the pre-registered 10% target at 95% confidence. The full artifact is <code>docs/benchmarks/mbpp-live-base.txt</code>.</div>
 <p>The headline guarantee artifact: <code>docs/benchmarks/mbpp-live-base.txt</code>. 974 real MBPP coding tasks, gated by real unit tests in a Docker sandbox, live against an Anthropic solver, with pre-registered <code>α=0.10, δ=0.05</code>.</p>
 <div class="chips">
   <div class="chip"><div class="cn">974</div><div class="cl">tasks</div></div>
@@ -107,10 +112,16 @@
   <text x="772" y="288" class="ink" font-size="20" font-weight="680">live</text>
 </g>
 </svg></div>
+<p class="subh">Reading the numbers</p>
 <p>The raw artifact also records the gate's real error: a 14.7% false-accept rate (P(full visible pass | incorrect)) and 0.0% false-reject. The conformal step is what turns that imperfect gate into a certified serve threshold. See <a href="guarantee.html">The guarantee</a> for the math.</p>
+<div class="note info"><span class="nt">Under the hood</span> <b>Served-failure</b> is not a system error — it means the gate cleared the cheap-rung output, Firstpass served it, and then the oracle (the unit test) found it incorrect. The gate is imperfect by design: with a 14.7% false-accept rate, some incorrect outputs slip through. The conformal step converts that imperfect gate into a certified bound — given the gate's calibrated error on held-out data, it guarantees the realized served-failure rate stays under 10% at 95% confidence. The 7.7% result demonstrates the bound holds in practice.</div>
+<div class="note"><span class="nt">Key idea</span> The <b>82% figure</b> is the efficiency number: four out of five requests never needed a strong-model call. The <b>7.7% served-failure rate</b> is the safety number: of the cheap-tier serves, how often does the unit test disagree? Both hold simultaneously — that is the point of the conformal bound.</div>
+<div class="recap">82% cheap-tier, 7.7% served-failure, 974 live tasks, real unit-test gates — one committed artifact, one command to reproduce.</div>
 
 <h2 id="probe">Probe study<a class="anchor" href="#probe" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The go/no-go for elastic verification: the <b>pass-count regime signal works</b> — 77% of traffic is decidable at ~99% safety with k=5 cheap probes. The entropy AUC signal does not (0.431, near chance). Verdict: <b>GO</b> on elastic verification, using pass-count only.</div>
 <p>The elastic-verification go/no-go: <code>docs/benchmarks/probe-study-mbpp.txt</code>. <code>k=5</code>, <code>n=150</code> MBPP tasks, cheap-model probe. Verdict: GO with a corrected signal — the entropy AUC failed (0.431), the pass-count regime signal succeeded (77% of traffic decidable at ~99% safety).</p>
+<p class="subh">Probe signal breakdown</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 360" role="img" aria-labelledby="rgT">
 <title id="rgT">Elastic verification probe study (k=5, n=150 MBPP): 0 of 5 visible passes covers 12% of traffic at 0% oracle-correct, so escalate now; 5 of 5 covers 65% at 99% oracle-correct, so serve without the expensive gate; 1 to 4 of 5 covers 23% and is mixed, so run the gate. 77% of traffic is decidable by the cheap probe alone at about 99% safety.</title>
 <line x1="90" y1="70" x2="90" y2="250" class="grid" stroke-width="1"/>
@@ -138,9 +149,12 @@
   <text x="770" y="316" text-anchor="middle" class="pass" font-size="12" font-weight="620">→ serve, skip gate</text>
 </g><text x="525" y="46" text-anchor="middle" class="ink" font-size="13" font-weight="640">77% of traffic decidable by the cheap probe alone, at ~99% safety (k=5, n=150)</text>
 </svg></div>
+<div class="note info"><span class="nt">Under the hood</span> Two signals were tested for elastic verification: <b>entropy</b> (how confident is the cheap model?) and <b>pass-count</b> (how many of k=5 cheap probes produce a passing output?). Entropy AUC was 0.431 — near chance, effectively useless as a routing signal. Pass-count succeeded: 5/5 passes correlate with 99% oracle-correct; 0/5 correlates with 0% oracle-correct. The mixed band (1–4 of 5) routes to the full gate. This is the signal the elastic verifier uses.</div>
 <p>Full analysis on the <a href="elastic-verification.html">Elastic verification</a> page.</p>
+<div class="recap">Pass-count wins, entropy loses — 77% of traffic is decidable by the cheap probe alone at ~99% safety.</div>
 
 <h2 id="artifacts">Artifact index<a class="anchor" href="#artifacts" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Four artifacts back the published numbers; <b>two are committed</b> today. If a row has no <span class="badge ok">committed</span> badge, it hasn't been run on a live key — treat it as a runnable template, not an evidence record.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Artifact</th><th>Backs</th><th>Command</th><th>Cost</th></tr></thead>
   <tbody>
@@ -150,8 +164,10 @@
     <tr><td><code>live-200.txt</code></td><td>200-task live cost/success table</td><td><code>--live</code></td><td>key, ~a few $</td></tr>
   </tbody>
 </table></div>
+<div class="recap">Two artifacts committed, two still unrun — <b>the badge is the evidence</b>.</div>
 
 <h2 id="repro">Reproduce<a class="anchor" href="#repro" aria-label="Link to this section">#</a></h2>
+<div class="tldr">One command per artifact. The <b>bound machinery reproduces exactly</b> — give it your own run's gate/oracle outcomes and it recomputes the same certified threshold. The raw pass/fail counts will differ (model updates, sampling); cross-run dollar comparisons are not meaningful.</div>
 <p>The MBPP dataset is not vendored (license + size); the command fetches the same public <code>mbpp.jsonl</code> the published runs used — 974 rows, with loader-rejected rows counted in the artifact.</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># the live served-failure bound</span>
 FIRSTPASS_CODING_DATASET=./mbpp.jsonl \
@@ -160,7 +176,11 @@ FIRSTPASS_CODING_DATASET=./mbpp.jsonl \
 <span class="tk-c"># the probe / elastic-verification study</span>
 FIRSTPASS_CODING_DATASET=./mbpp.jsonl FIRSTPASS_PROBE_K=5 \
   firstpass-bench --probe-study</code></pre></div>
+<p class="subh">What reproduces and what doesn't</p>
 <div class="note info"><span class="nt">What is reproducible</span> A re-run on your account will differ (model updates, sampling). The <strong>bound machinery</strong> is the reproducible part: the harness recomputes the conformal bound from your own run's gate/oracle outcomes with the same pre-registered <code>α/δ</code>. Cross-artifact dollar comparisons are not meaningful — prices drift — but each artifact is internally consistent.</div>
+<div class="note info"><span class="nt">Under the hood</span> The receipt's <code>counterfactual_baseline_usd</code> field is how Firstpass computes savings: what would this traffic have cost if every call went to the strong tier? Known modeling gap: <b>cache-read tokens in the counterfactual are priced at full input rate</b>, not the cheaper cache-read rate that providers charge when prompt caching is in play. This means reported savings may be slightly overstated on heavily cached traffic. The served-failure bound is unaffected — this only touches cost accounting.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Comparing dollar figures across artifact runs. Prices drift — a <code>counterfactual_baseline_usd</code> from one run and a <code>total_cost_usd</code> from another run months later aren't directly comparable. Compare <em>rates</em> (served-failure rate, escalation rate, cheap-tier fraction) across runs, not absolute dollar figures.</div>
+<div class="recap">The conformal bound is what reproduces — the raw numbers are yours; <b>the certified threshold is universal</b>.</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="elastic-verification.html"><span class="dir">← Previous</span><span class="t">Elastic verification</span></a><span></span></nav>
 </main>
@@ -176,5 +196,5 @@ FIRSTPASS_CODING_DATASET=./mbpp.jsonl FIRSTPASS_PROBE_K=5 \
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

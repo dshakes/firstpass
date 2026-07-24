@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -58,6 +58,8 @@
 <h1>Quickstart</h1>
 <p class="page-sub">The fastest way to understand Firstpass is to watch it prove one decision. In about a minute, with no API keys, you'll run a real routing loop — cheap model first, gate the output, escalate on failure — and read the tamper-evident receipt it seals. Then you'll point your own agent at it, safely.</p>
 
+<div class="tldr">Run <b>two commands with no API keys</b> to watch Firstpass prove one decision end to end. Then point your own agent at it in <b>observe mode</b> — requests forward <b>byte-identical</b> to your provider while Firstpass writes shadow receipts off the hot path. Flip to <b>enforce</b> when the numbers convince you.</div>
+
 <div class="chips">
   <div class="chip good"><div class="cn">~60<span class="u">s</span></div><div class="cl">to your first receipt</div></div>
   <div class="chip"><div class="cn">0</div><div class="cl">API keys for the demo</div></div>
@@ -65,12 +67,15 @@
 </div>
 
 <h2 id="demo">1 · See it prove one decision<a class="anchor" href="#demo" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Two commands, no keys, no config. The demo stands up a mock upstream and drives a request through the full loop — <b>cheap model first, gate the output, escalate on failure</b> — then prints the hash-sealed receipt. You're watching the whole product in miniature.</div>
 <p>The demo needs no keys and talks to no provider. It stands up a mock upstream, drives one request through the full loop — open the cheap rung, gate the output, escalate one rung when the gate fails, serve the passing answer — and prints the receipt to your terminal. All you need is <code>git</code> and a Rust toolchain (<a href="https://rustup.rs" rel="noopener">rustup.rs</a>).</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>git clone https://github.com/dshakes/firstpass &amp;&amp; cd firstpass
 cargo run -p firstpass-proxy --example demo</code></pre></div>
 <p>You don't have to install anything or read the config first. The point is to see the shape of a decision before you learn the parts — everything after this is that same loop, made real.</p>
+<div class="recap">Clone and run — no keys, no config; the demo drives the <b>full routing loop</b> and prints the tamper-evident receipt in about 60 seconds.</div>
 
 <h2 id="receipt">2 · Read the receipt<a class="anchor" href="#receipt" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The receipt is Firstpass's proof artifact — a <b>hash-chained record</b> of every rung tried, each gate verdict, cost, and counterfactual. Not a log line: the complete, auditable account of one decision. Read it top to bottom and you've read the architecture.</div>
 <p>The demo prints a receipt like the one below. It is the whole decision, in one record: which rungs were tried, how each gate voted, what it cost against the always-expensive counterfactual, and the hash link that makes the log tamper-evident. This artifact — not a prediction, not a log line — is what Firstpass produces for <em>every</em> request.</p>
 <div class="codeblock"><div class="cb-head"><span>json · one receipt</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
   "seq": 1,
@@ -86,8 +91,10 @@ cargo run -p firstpass-proxy --example demo</code></pre></div>
   "hash": "b9c4…b1a7"
 }</code></pre></div>
 <p>Read it top to bottom and you've read the product: rung&nbsp;0 answered, the gate rejected it, so Firstpass escalated to rung&nbsp;1, which passed and was served. <code>seq&nbsp;1</code> and <code>prev_hash&nbsp;"genesis"</code> mark this as the first link in the chain; the next receipt will carry this <code>hash</code> as its <code>prev_hash</code>, and so on — which is what lets <a href="cli.html#audit"><code>firstpass verify</code></a> re-derive the entire history from scratch and catch any edit. <a href="receipts.html">Receipts &amp; audit</a> takes the record apart field by field.</p>
+<div class="recap">Every request produces one receipt: <b>attempts, verdicts, cost vs counterfactual</b>, and a hash link that lets <code>firstpass verify</code> re-derive the full chain from scratch and catch any edit.</div>
 
 <h2 id="what-happened">3 · What just happened<a class="anchor" href="#what-happened" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Four moves in order: <b>Route → Prove → Escalate → Learn</b>. The demo ran all four on one mock request. Every real request goes through the same loop — the pages linked below take each move apart.</div>
 <p>That one decision is the whole system in miniature — the <a href="index.html#moves">four moves from the Overview</a>, now watched running. Firstpass does exactly these four things, in order, on every request:</p>
 <div class="defs">
   <div class="row"><div class="k">Route</div><div class="v">Open the cheapest rung in your ladder. No classifier guesses from the prompt — the cheap model simply takes the first pass. <a href="routing.html">Routing &amp; escalation →</a></div></div>
@@ -96,15 +103,22 @@ cargo run -p firstpass-proxy --example demo</code></pre></div>
   <div class="row"><div class="k">Learn</div><div class="v">Outcomes feed back through <code>/v1/feedback</code> and move the serve threshold, so the served-failure rate stays bounded even as traffic drifts. <a href="guarantee.html">The guarantee →</a></div></div>
 </div>
 <p><a href="how-it-works.html">How it works</a> follows a single request through all four in detail, and <a href="request-flow.html">Routing, end to end</a> traces a real one hop by hop.</p>
+<div class="recap"><b>Route → Prove → Escalate → Learn</b>, every request, sealed in one tamper-evident receipt — that's the whole system.</div>
 
 <h2 id="your-agent">4 · Point your own agent at it<a class="anchor" href="#your-agent" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Install Firstpass, run <code>firstpass onboard</code> (dry-run first, then <code>--apply</code>), and start collecting receipts. <b>Fresh installs start in observe mode</b> — every request forwards byte-identical to your provider while Firstpass builds a shadow picture. Flip to enforce when you've seen enough.</div>
+<p class="subh">Install the proxy</p>
 <p>Now do it for real. Install the proxy — one line; the <a href="cli.html#install">CLI reference</a> lists every channel (pip, Homebrew, Docker, Cargo):</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/releases/latest/download/firstpass-proxy-installer.sh | sh</code></pre></div>
+<p class="subh">Wire your agent in</p>
 <p>Then let Firstpass wire itself in. <code>onboard</code> detects your provider config, starts the proxy, points your agent's base URL at it, and checks itself — <code>--apply</code> writes the changes, and bare <code>onboard</code> is a dry run that shows you exactly what it would do first:</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass onboard          # dry run — shows every change
 firstpass onboard --apply  # wire it in
 firstpass doctor           # confirm config, keys, connectivity</code></pre></div>
 <div class="note"><span class="nt">Safe by default</span> Fresh installs start in <strong>observe</strong> mode: every request is forwarded to your provider <em>unchanged</em> and a receipt is written off the hot path. Zero behavior change — you get the audit trail and the savings estimate before you let Firstpass route a single request. When the shadow numbers convince you, switch to <strong>enforce</strong> and it starts serving from the cheap rung. <a href="how-it-works.html#modes">Observe vs enforce →</a></div>
+<div class="note"><span class="nt">Key idea</span> Observe mode is a <b>byte-identical passthrough on the wire</b> — Firstpass forwards your request body verbatim, swapping nothing, and writes the receipt asynchronously. Your agent sees the same response it would have gotten from the provider directly. There is no behavior difference until you explicitly switch to enforce.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Jumping straight to <code>enforce</code> before reading the observe-mode receipts. Spend a session or two in observe first — the shadow data shows exactly how often the cheap rung would have cleared the gate on its own, so you know what to expect before any real traffic routes differently.</div>
+<p class="subh">Configure your ladder</p>
 <p>Enforce mode is driven by a small TOML ladder — which models to try, in order, and which gates must pass. This is the minimal one; <a href="configuration.html">Configuration</a> covers matching, budgets, and per-route gates:</p>
 <div class="codeblock"><div class="cb-head"><span>toml · firstpass.toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[route]]
 match  = {}                 # everything — first match wins, top to bottom
@@ -114,6 +128,7 @@ gates  = ["json-valid", "cargo-test"]</code></pre></div>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass up</code></pre></div>
 <p>Your keys stay yours — Firstpass is bring-your-own-key, adds no markup, and redacts keys from every log and receipt. And leaving is always one line, by design:</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass offboard   # or just: unset ANTHROPIC_BASE_URL</code></pre></div>
+<div class="recap">Install → onboard → <b>observe first</b> (byte-identical, receipts off the hot path) → enforce when ready. One env var to leave, ever.</div>
 
 <h2 id="next">Where to go next<a class="anchor" href="#next" aria-label="Link to this section">#</a></h2>
 <ul>
@@ -137,5 +152,5 @@ gates  = ["json-valid", "cargo-test"]</code></pre></div>
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

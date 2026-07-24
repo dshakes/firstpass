@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -58,7 +58,10 @@
 <h1>How it works</h1>
 <p class="page-sub">Firstpass is a proxy that sits in front of your provider calls. A request enters, moves through route → prove → escalate → serve, and its outcome feeds back to the router. Here is the full journey.</p>
 
+<div class="tldr">Firstpass intercepts your model calls and runs them through <b>four moves</b>: <b>Route</b> to the cheapest rung, <b>Prove</b> the real output against a gate, <b>Escalate</b> exactly one rung only on gate failure, and <b>Learn</b> from deferred outcomes. The gate is what makes cheapest-first <b>safe</b> — it reads the actual completion, not a pre-execution prediction, and only escalates on evidence. On a measured run of 974 real coding tasks, <b>82% of requests were served from the first rung</b> at a 7.7% served-failure rate. The remaining 18% escalated once; zero paid the strong tier as a default.</div>
+
 <h2 id="flow">The request flow<a class="anchor" href="#flow" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The cascade is five boxes in sequence: <b>Route → Gate → (Escalate → re-Gate) → Serve → Receipt + Feedback</b>. The green path — gate passes on the first rung — covers the majority of traffic. The red loop fires only on gate failure, climbs one rung, and re-gates. On exhaustion the cascade always terminates with a <b>real model answer</b>, never a router error.</div>
 <p>The client keeps its existing endpoint — <code>POST /v1/messages</code> or <code>POST /v1/chat/completions</code>. Firstpass intercepts, runs the cascade, and returns a normal response. The identical served bytes go back to the client; everything else is bookkeeping.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 420" role="img" aria-labelledby="flowT">
 <title id="flowT">Request flow: an agent calls the Firstpass proxy, which routes to the cheapest rung, gates the real output, escalates one rung or fails over on failure, serves the first pass, seals a hash-chained receipt, and feeds the outcome back to the serve threshold.</title>
@@ -143,44 +146,73 @@
 </svg>
   <figcaption>One request, end to end. The green path (gate passes on the first rung) covers the majority of traffic; the red loop is the escalation that only fires on proof of need.</figcaption>
 </div>
+<div class="note"><span class="nt">Key idea</span> The gate-first design is what makes cheapest-first safe. The cheap model is not selected because a classifier predicted it would pass — it is selected first, then its output is <em>proved</em>. No prediction commits before the output exists. Escalation fires on evidence of failure, not on suspicion.</div>
+<div class="recap">The cascade always terminates with a real served answer. The green (pass) path handles the majority of traffic; the red (escalate) path fires only on proved gate failure.</div>
 
 <h2 id="route">1 · Route<a class="anchor" href="#route" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Every request opens on the <b>cheapest rung</b> — the first entry in <code>rungs</code>. There is no per-prompt classifier deciding which model should answer before any output exists. The cheap model takes every first pass. An optional <b>learned start-rung bandit</b> can shift where the cascade <em>begins</em> for traffic classes it has seen escalate repeatedly, but it never changes what gets <em>served</em> — only the gate decides that.</div>
 <p>The request opens on the <strong>start rung</strong> — by default the cheapest model in the ladder. Rungs are ordered cheap-to-capable and named <code>provider/model</code>:</p>
+<p class="subh">The ladder</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[ladder]
 rungs = [
   &quot;anthropic/claude-haiku-4-5&quot;,   # rung 0 — start here
   &quot;openai/gpt-mini&quot;,              # rung 1
   &quot;anthropic/claude-sonnet-5&quot;,    # rung 2
 ]</code></pre></div>
+<p class="subh">No classifier — proof instead</p>
 <p>There is no per-prompt classifier deciding <em>which</em> model. The cheap model simply takes the first pass. An optional <a href="routing.html#startrung">learned start-rung bandit</a> can move the entry point for classes of traffic it has seen escalate — but that only sets where the cascade <em>begins</em>, never what it serves.</p>
+<div class="note info"><span class="nt">Under the hood</span> Firstpass forwards the entire request body verbatim, swapping only the <code>model</code> field. For routing decisions it reads: model name, tool count, image blocks, and request headers. It does not inspect, summarize, or rewrite the message history — and <code>tool_use</code>/<code>tool_result</code> blocks are forwarded byte-for-byte, not re-verified.</div>
+<div class="recap">The cheap rung opens every request. The gate — not a classifier — decides whether it stays there.</div>
 
 <h2 id="prove">2 · Prove<a class="anchor" href="#prove" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The gate reads the <b>real candidate output</b> — not a prompt-time prediction — and returns one of three verdicts: <b>pass</b>, <b>fail</b>, or <b>abstain</b>. A pass serves immediately and stops the cascade. Firstpass ships five gate kinds: inline checks, JSON-Schema, a bring-your-own subprocess, a native LLM judge, and self-consistency. On 974 real coding tasks scored by unit tests, <b>82% cleared the gate</b> at rung 0 — see <a href="benchmarks.html#live">Benchmarks</a>.</div>
+<p class="subh">What a gate sees that a classifier can't</p>
 <p>The candidate output is handed to the gate — the heart of the system. A gate reads the <strong>actual response</strong> and returns a verdict: pass, fail, or abstain. Firstpass ships five kinds (<a href="gates.html">full detail</a>): inline checks, JSON-Schema, a bring-your-own subprocess, a native LLM judge, and self-consistency.</p>
 <div class="note"><span class="nt">Why the real output matters</span> A predictive router commits before any output exists. A gate commits after — it can catch a malformed JSON, a failing test, or a hallucinated field that no prompt-time classifier could have seen.</div>
 <p>If the gate passes, the output is served immediately and the cascade stops. On 974 MBPP tasks, that first-rung pass happened for <strong>82%</strong> of requests.</p>
+<div class="note"><span class="nt">Key idea</span> Every gate kind operates on the already-returned completion. A <code>json-schema</code> gate can catch a hallucinated field. An inline check catches a missing key in microseconds. A <code>subprocess</code> gate can run <code>cargo test</code> or <code>pytest</code> on the actual output. These are things a prompt-time classifier decides blind — the gate has the answer in hand before it rules.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Assuming the gate itself costs as much as a model call. The gate runs on the completion that already returned — it does not need a separate model call unless you configure an LLM-judge gate. Inline, schema, and subprocess gates add fractions of a millisecond, not token spend. Only the <code>llm-judge</code> gate incurs a second model call, and its cost is reported separately in the receipt's <code>gate_cost_usd</code> field so you can see it clearly.</div>
+<div class="recap">The gate commits after the output exists, catches failures no classifier could have predicted, and stops the cascade the moment it passes.</div>
 
 <h2 id="escalate">3 · Escalate<a class="anchor" href="#escalate" aria-label="Link to this section">#</a></h2>
+<div class="tldr">On gate failure, Firstpass climbs <b>exactly one rung</b>, re-runs the call, and re-gates the new output. Escalation is bounded by <code>max_rungs</code>, per-request/session/day budgets, and a hard termination guarantee: on exhaustion, Firstpass serves the <b>best attempt</b> — a real model answer, never a router error in place of a completion.</div>
 <p>On gate failure, Firstpass climbs exactly one rung and re-runs the candidate + gate. Escalation is bounded:</p>
+<p class="subh">The four rules</p>
 <ul>
   <li><strong>One rung at a time</strong> — never a jump straight to the top (unless <code>max</code> mode asks for it).</li>
   <li><strong>Budget-capped</strong> — per-request, per-session, and per-day caps stop runaway spend; <code>max_rungs</code> caps the climb.</li>
   <li><strong>Cross-provider failover</strong> — a transport error or 5xx from a provider fails over to the next rung, which can be a different provider entirely.</li>
   <li><strong>Speculative</strong> (optional) — in the marginal gate-pass zone, prefetch the next rung in parallel so a likely escalation doesn't pay serial latency. Served bytes are byte-identical to the serial path.</li>
 </ul>
-<p>See <a href="routing.html">Routing &amp; escalation</a> for the ladder, the bandit, speculation, and budgets in full.</p>
+<p class="subh">Failover vs escalation</p>
+<p>See <a href="routing.html">Routing &amp; escalation</a> for the ladder, the bandit, speculation, and budgets in full. Failover (triggered by a 5xx or transport error) and escalation (triggered by gate failure) both advance one rung, but they are logged separately in the receipt so you can distinguish "provider down" from "output failed the gate."</p>
+<div class="note"><span class="nt">Key idea</span> Escalation is bounded by design — there is no path to an infinite loop. <code>max_rungs</code> caps the climb, budget caps stop runaway spend, and on exhaustion the <strong>served-failure guarantee</strong> kicks in: a real model answer goes back to the client, never an error message in place of a completion.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Treating escalation as the normal path and sizing the ladder accordingly (many strong-model rungs "just in case"). The cheap rung passes 82% of real coding traffic — escalation is the exception. A ladder heavy with strong-model rungs means paying the strong-tier price on traffic the cheap rung would have handled. Let the gate data from observe mode tell you how many rungs you actually need.</div>
+<div class="recap">One rung at a time, bounded by caps, with cross-provider failover — and always a real answer at the end, even if every rung is exhausted.</div>
 
 <h2 id="learn">4 · Learn<a class="anchor" href="#learn" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Deferred outcomes — a CI test passing hours later, a user accepting an answer, a reviewer flagging a problem — are posted to <code>POST /v1/feedback</code>. These drive <b>adaptive conformal calibration</b> (Gibbs–Candès), which nudges the serve threshold as your traffic distribution drifts over time. Two Prometheus gauges expose the live state of the loop.</div>
+<p class="subh">Deferred outcomes</p>
 <p>Serving is not the end. When the true outcome of a request becomes known later — a test passed in CI, a user accepted the answer, a reviewer flagged it — you report it to <code>POST /v1/feedback</code>. Those deferred outcomes drive <strong>adaptive conformal</strong> calibration (Gibbs–Candès), which nudges the serve threshold as your traffic drifts. Two Prometheus gauges expose the loop live: <code>firstpass_serve_threshold</code> and <code>firstpass_realized_served_failure</code>. See <a href="guarantee.html">The guarantee</a>.</p>
+<p class="subh">The calibration loop</p>
+<div class="note info"><span class="nt">Under the hood</span> Conformal calibration is a statistical guarantee, not a heuristic. The Gibbs–Candès method nudges the serve threshold so the realized served-failure rate tracks your configured target (default 10%) as traffic distribution shifts over time. There is no model to retrain — the threshold is a single scalar that adjusts in response to feedback. The two Prometheus gauges let you see the current threshold and the trailing realized rate in any monitoring dashboard.</div>
+<div class="recap">POST real-world outcomes to <code>/v1/feedback</code>; conformal calibration keeps the serve threshold honest as traffic drifts.</div>
 
 <h2 id="observe">Observe vs enforce<a class="anchor" href="#observe" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Set <code>FIRSTPASS_MODE=observe</code> to shadow the cascade without changing what's served. Every receipt records the full decision — rungs tried, gate verdicts, what <em>would</em> have been served — so you can validate before going live. Flip to <code>enforce</code> once the numbers convince you.</div>
 <p>Firstpass runs in one of two modes, set by <code>FIRSTPASS_MODE</code>:</p>
 <div class="defs">
   <div class="row"><div class="k">observe</div><div class="v">Shadow. Route and gate every request, record the full decision and what <em>would</em> have happened — but serve your original path unchanged. Zero behavior change; pure measurement. The safe way to start.</div></div>
   <div class="row"><div class="k">enforce</div><div class="v">Live. The cascade actually decides what is served. Structured enforce is the default-on production path.</div></div>
 </div>
+<p class="subh">Recommended rollout</p>
 <p>The recommended rollout is <code>observe</code> first — collect a few days of receipts, run <code>firstpass savings</code> and <code>firstpass evals</code> to see what the cascade would have done — then flip to <code>enforce</code> once the numbers convince you.</p>
+<div class="note"><span class="nt">Key idea</span> Observe mode is byte-identical to your existing provider path from the client's point of view — every response is your original provider's answer. The cascade runs in parallel and records receipts, but changes nothing. It is the no-risk way to see exactly what Firstpass would have done on real traffic before you commit to enforce.</div>
+<div class="recap">Start in observe, collect receipts, run <code>firstpass savings</code> and <code>firstpass evals</code>, then flip to enforce with data behind you.</div>
 
 <h2 id="anatomy">Anatomy of a decision<a class="anchor" href="#anatomy" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Every request produces one <b>hash-chained receipt</b> — a single JSON object capturing the rungs tried, each gate verdict, the mode, the cost, and a chain link that makes tampering detectable. The receipt is the ground truth for every routing decision Firstpass makes.</div>
+<p class="subh">What's in a receipt</p>
 <p>Every request produces one receipt capturing the whole decision — the rungs tried, each gate verdict, the mode in force, the cost, and the chain link. A trimmed example:</p>
 <div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
   &quot;seq&quot;: 4021,
@@ -201,7 +233,10 @@ rungs = [
   &quot;prev_hash&quot;: &quot;sha256:a91f…&quot;,
   &quot;hash&quot;: &quot;sha256:5c02…&quot;
 }</code></pre></div>
+<p class="subh">Inspecting after the fact</p>
 <p>Inspect any decision after the fact with <code>firstpass trace &lt;request_id&gt;</code> or <code>firstpass explain</code>. The receipt is the ground truth — see <a href="receipts.html">Receipts &amp; audit</a>.</p>
+<div class="note info"><span class="nt">Under the hood</span> The <code>prev_hash</code> field chains each receipt to the previous one using SHA-256. This makes the log tamper-evident: any deletion or modification of a past receipt breaks the chain. The receipt store is append-only by design, and <code>firstpass audit</code> walks the chain and reports the first broken link.</div>
+<div class="recap">The receipt is the ground truth for every decision — rungs tried, gate verdicts, cost, and hash chain link. <code>firstpass trace &lt;request_id&gt;</code> retrieves any decision by ID.</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="requests-101.html"><span class="dir">← Previous</span><span class="t">Requests 101</span></a><a class="next" href="request-flow.html"><span class="dir">Next →</span><span class="t">Routing, end to end</span></a></nav>
 </main>
@@ -217,5 +252,5 @@ rungs = [
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

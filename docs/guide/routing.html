@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -58,7 +58,11 @@
 <h1>Routing &amp; escalation</h1>
 <p class="page-sub">The ladder decides where a request can go; the gate decides whether it stays. This page covers the ladder, the learned start-rung bandit, speculative escalation, cross-provider failover, budget caps, and the modes that tune all of it.</p>
 
+<div class="tldr">Firstpass always opens on the <b>cheapest rung</b> and escalates <b>exactly one rung</b> per gate failure, bounded by per-request, per-session, and per-day budgets. The gate decides what ships; the ladder, bandit, and speculation knobs change where the cascade starts and how fast it runs — <b>never the correctness</b> of the served output.</div>
+
 <h2 id="ladder">The ladder<a class="anchor" href="#ladder" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The ladder is an ordered list of <code>provider/model</code> rungs, cheapest first. A request opens at the start rung and climbs <b>exactly one rung per gate failure</b>. No gate failure = no escalation. A budget or rung-cap hit = serve the best attempt on hand.</div>
+<p class="subh">The escalation rule</p>
 <p>A ladder is an ordered list of rungs, cheapest first. Each rung is <code>provider/model</code>. A request opens on the start rung and climbs one rung per gate failure until something passes or a cap is hit.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 260" role="img" aria-labelledby="ldT">
 <title id="ldT">The ladder: rungs ordered cheapest to most capable. A request opens on the start rung, and escalates one rung at a time only when the gate fails, stopping at the first rung whose output passes or when the budget or max_rungs cap is hit.</title>
@@ -86,6 +90,7 @@
 <text x="60" y="40" class="ink" font-size="13" font-weight="640">Cheapest first — climb only on proof of need</text>
 <defs><marker id="ld" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-fail)"/></marker></defs>
 </svg></div>
+<p class="subh">Configuring the ladder</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[ladder]
 rungs = [
   &quot;anthropic/claude-haiku-4-5&quot;,   # rung 0
@@ -133,9 +138,14 @@ max_rungs = 3                      # hard cap on the climb</code></pre></div>
 </svg>
   <figcaption>The gate on rung 0 fails, so the request climbs exactly one rung; rung 1 passes and is served. A mis-started rung only changes where the climb begins — the gate always decides what ships.</figcaption>
 </div>
+<div class="note"><span class="nt">Key idea</span> The gate is the arbiter of what ships; the ladder is just the order in which Firstpass tries rungs. An expensive rung fires only on <em>proof</em> of need — a gate failure on the cheaper rung. No gate failure = cheap rung served, regardless of how many rungs are configured above it.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Setting <code>max_rungs</code> too high "just in case." Every escalation costs real tokens on the higher rung. If the quality bar is set by the gate (it should be), a longer ladder only adds spend on requests that would have passed earlier — it does not improve quality above the gate's threshold.</div>
+<div class="recap">The ladder is cheapest-first; <b>the gate decides every climb</b> — no gate failure, no escalation, no extra cost.</div>
 
 <h2 id="startrung">Learned start-rung<a class="anchor" href="#startrung" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The bandit predicts the <b>best start rung</b> for a traffic class — but only changes the <em>entry point</em>. The gate still verifies every output that ships. A wrong prediction wastes one rung's compute; it never changes what is served.</div>
 <p>Always starting at rung 0 is wasteful when a class of traffic reliably escalates. An optional bandit learns a better <strong>start rung</strong> — where to <em>begin</em> the cascade. The gate still decides what to serve, so a mis-predicted start only changes the entry point, never correctness. This is the "predict-to-start, verify-to-serve" split.</p>
+<p class="subh">The two algorithms</p>
 <p>Two algorithms are available (ADR 0007). The default is <strong>UCB1</strong>, and the bandit is <strong>default-off</strong>.</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Algorithm</th><th>Character</th><th>When</th></tr></thead>
@@ -173,9 +183,14 @@ algo    = &quot;ucb1&quot;           # or &quot;thompson&quot;</code></pre></div
 </svg>
   <figcaption>Predict-to-start, verify-to-serve: the bandit only sets where the cascade begins. A mis-drawn start never changes correctness — the gate still proves every served output.</figcaption>
 </div>
+<div class="note"><span class="nt">Key idea</span> Predict-to-start, verify-to-serve: the bandit is a cost optimizer, not a correctness mechanism. A mis-drawn start rung only means the cascade begins one rung higher than optimal — the gate still catches every bad output before it ships.</div>
+<div class="note info"><span class="nt">Under the hood</span> UCB1 picks the arm with the highest upper-confidence bound — fully deterministic and replayable from the receipt. Thompson samples from a Beta posterior with drift discounting, producing per-arm propensities that off-policy evaluation (OPE) can consume directly. Both write the chosen rung to the receipt, so every routing decision is auditable.</div>
+<div class="recap">The bandit is <b>default-off</b>; when on, it predicts the start rung — the <b>gate still proves</b> what ships. A wrong prediction is an inefficiency, not an error.</div>
 
 <h2 id="speculation">Speculative escalation<a class="anchor" href="#speculation" aria-label="Link to this section">#</a></h2>
+<div class="tldr">When escalation is likely, speculation fires the <b>next rung in parallel</b> — so a probable gate failure pays no extra serial latency. The first rung to clear the gate is served; the rest are aborted. <b>Output is byte-identical</b> to the serial path. Latency changes; correctness never does.</div>
 <p>When an escalation is likely, waiting for the gate to fail before starting the next rung pays serial latency. Speculation prefetches <code>k</code> rungs ahead in parallel, serves the first that passes, and discards the rest. The served bytes are <strong>byte-identical</strong> to the serial path — speculation changes latency, never output.</p>
+<p class="subh">The speculation band</p>
 <p>To avoid speculating on requests that will obviously pass or obviously fail, a <code>speculation_band</code> fires the prefetch only in the marginal gate-pass zone:</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[speculation]
 enabled = true
@@ -219,9 +234,15 @@ speculation_band = [0.35, 0.65]   # only speculate when the pass-signal is margi
 </svg>
   <figcaption>In the marginal band, the next rung is prefetched in parallel so a likely escalation pays no serial latency. The first rung to clear the gate is served; the speculative rung is aborted. Latency changes; output never does.</figcaption>
 </div>
+<div class="note info"><span class="nt">Under the hood</span> SSE streaming is buffered to the gate boundary before the serve decision is made, then re-emitted as SSE once the winning rung is chosen. The served-failure guarantee holds under speculation: if every speculative rung fails or is aborted, Firstpass serves the best attempt on hand — never a router error in place of a completion.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Setting <code>speculation_band = [0, 1]</code> to always speculate. This fires parallel rungs on every request — including obvious cheap passes — burning higher-rung compute as wasted cost. The band is a guard: only speculate when the pass signal is genuinely marginal.</div>
+<div class="recap">Speculation trades higher-rung compute for lower latency on likely escalations — <b>output is byte-identical</b>, only the timing changes.</div>
 
 <h2 id="failover">Failover &amp; budgets<a class="anchor" href="#failover" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A transport error or provider 5xx triggers <b>automatic cross-provider failover</b> — the next rung fires exactly as it would on a gate failure. Budget caps bound spend at three levels (per request, per session, per day). Cap exhaustion serves the best attempt on hand, <b>never a router error</b>.</div>
 <p>Escalation doubles as resilience. A transport error or a 5xx from a provider triggers <strong>cross-provider failover</strong> — the next rung may be a different vendor, so one provider's outage degrades gracefully instead of failing the request.</p>
+<div class="note"><span class="nt">Key idea</span> Failover and escalation use the same mechanism at different triggers. Gate failure &rarr; climb one rung. Transport error or provider 5xx &rarr; climb one rung. The served-failure guarantee holds in both cases: Firstpass never returns a router error in place of a completion.</div>
+<p class="subh">Budget caps</p>
 <p>Spend is bounded at three levels, plus the rung cap:</p>
 <div class="defs">
   <div class="row"><div class="k">per_request</div><div class="v">Cap on total cost for a single request across all rungs and gates.</div></div>
@@ -233,9 +254,13 @@ speculation_band = [0.35, 0.65]   # only speculate when the pass-signal is margi
 per_request_usd = 0.05
 per_session_usd = 1.00
 per_day_usd     = 250.00</code></pre></div>
+<div class="note info"><span class="nt">Under the hood</span> Budget accounting runs in the receipt layer. Each attempt's cost — including gate cost — is summed against the applicable caps before the next rung fires. Gate cost counts against <code>per_request_usd</code> even when the rung's output is not served: verifying a bad answer still costs tokens.</div>
+<div class="recap">Escalation and failover are <b>the same climb</b>, triggered by different failures — gate or transport. Budget caps bound total spend at request, session, and day granularity.</div>
 
 <h2 id="modes">Modes<a class="anchor" href="#modes" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A mode is a <b>named preset</b> over the escalation knobs — one word that shifts the cost/quality/latency trade-off without editing config. The gate still validates every response regardless of the mode in force.</div>
 <p>A <strong>mode</strong> is a named preset over the escalation knobs — a single dial that shifts the cost/quality/latency balance without editing config. Set it per task, per turn, or per request.</p>
+<p class="subh">What each mode changes</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Mode</th><th>What it does</th></tr></thead>
   <tbody>
@@ -248,8 +273,12 @@ per_day_usd     = 250.00</code></pre></div>
   </tbody>
 </table></div>
 <p>Inspect the resolved presets with <code>firstpass modes</code>. The mode in force is recorded on every receipt.</p>
+<div class="note info"><span class="nt">Under the hood</span> <code>latency</code> enables speculation (<code>lookahead&nbsp;=&nbsp;1</code> in the marginal band). <code>quality</code> widens the cascade headroom by one rung. <code>max</code> starts at the top rung and skips cheaper options entirely. <code>observe</code> runs the gate and records the receipt but serves the original provider response byte-for-byte — a zero-risk shadow. The resolved knobs for any mode are visible in <code>firstpass modes</code>.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Using <code>max</code> mode as a blanket default. <code>max</code> starts at the strongest rung, paying the 15–75&times; tier premium on every request — including the easy ones a cheaper model would ace. <code>balanced</code> with a well-tuned gate handles the vast majority of traffic at a fraction of the cost; reserve <code>max</code> for the rare task that genuinely requires it.</div>
+<div class="recap">Modes are <b>one-word presets</b> over the escalation knobs — the gate still runs on every response; the mode only changes the starting point and headroom.</div>
 
 <h2 id="precedence">Mode precedence<a class="anchor" href="#precedence" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The most-specific source wins: a per-request <code>x-firstpass-mode</code> header beats everything. The built-in fallback is <b>balanced</b>. The mode in force is written to every receipt.</div>
 <p>When more than one source names a mode, the most specific wins:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 120" role="img" aria-label="Mode precedence: the x-firstpass-mode request header beats the per-route routing_mode, which beats the FIRSTPASS_MODE_PROFILE environment default, which beats the built-in balanced default.">
   <g font-size="12.5">
@@ -279,6 +308,7 @@ per_day_usd     = 250.00</code></pre></div>
 curl localhost:8080/v1/messages \
   -H &quot;x-firstpass-mode: quality&quot; \
   -d @request.json</code></pre></div>
+<div class="recap">Mode resolution is pure precedence: <b>header &rarr; per-route &rarr; env default &rarr; balanced</b>. The receipt always records which one won.</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="gates.html"><span class="dir">← Previous</span><span class="t">Gates</span></a><a class="next" href="guarantee.html"><span class="dir">Next →</span><span class="t">The guarantee</span></a></nav>
 </main>
@@ -294,5 +324,5 @@ curl localhost:8080/v1/messages \
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

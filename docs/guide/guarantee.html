@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -58,15 +58,38 @@
 <h1>The guarantee</h1>
 <p class="page-sub">Firstpass puts a distribution-free bound on how often a wrong answer is served. It is computed from a real run — not assumed — and tracked live as your traffic drifts. This is the headline claim, and this page shows exactly how it is earned.</p>
 
+<div class="tldr">Firstpass makes two distinct guarantees. The <b>delivery guarantee</b>: even under provider exhaustion or failure, Firstpass always serves a real model answer — never a router error in place of a completion. The <b>quality bound</b>: a distribution-free statistical upper bound on the <b>served-failure rate</b> (wrong answers served), configurable target defaulting to <b>≤10%</b> at 95% confidence. Measured on <a href="benchmarks.html">974 real coding tasks</a>, Firstpass hit <b>7.7% served-failure</b> with <b>82% served from the cheap tier</b> — both under the bound, on a live run with real unit-test gates.</div>
+
+<h2 id="delivery">The delivery guarantee<a class="anchor" href="#delivery" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Firstpass will always serve a <b>real model answer</b> — never a router error in place of a completion. Even if every rung exhausts or the provider fails, the best available model attempt is served. This is unconditional and always active; it is not config-gated.</div>
+<p class="subh">What this means, precisely</p>
+<p>Every request that enters the serving path exits with a model-generated completion. Firstpass does not substitute a router error — a 502, a fallback stub, a "provider unavailable" message — for an actual model answer. If a clean route succeeds, that completion is served. If every rung fails (provider timeouts, rate limits, escalation ceiling hit), the best real model attempt buffered during the request is served. The client always receives a model-generated token stream.</p>
+<p class="subh">Two guarantees, not one</p>
+<p>Holding these separately avoids a common source of confusion:</p>
+<div class="cards g2">
+  <div class="card"><div class="step-n">I</div><h3>Delivery guarantee</h3><p>A model answer always arrives. The router never replaces a completion with a router-generated error. Always active — not config-gated.</p></div>
+  <div class="card"><div class="step-n">II</div><h3>Quality bound</h3><p>A statistical upper bound on how often the served answer is wrong. Earned from calibration data, held live by adaptive conformal. Covered in the sections below.</p></div>
+</div>
+<div class="note"><span class="nt">Key idea</span> "Served-failure" in Firstpass means <em>a wrong model answer was served</em> — not that delivery failed. A served failure is a request where the model completed, the gate passed it, and the oracle later found it incorrect. The delivery guarantee and the quality bound are orthogonal: one says <em>something always arrives</em>, the other says <em>how often that something is correct</em>.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Reading the served-failure rate as a delivery failure rate. If the served-failure rate is 7.7%, that means 7.7% of served answers were wrong — not that 7.7% of requests failed to deliver. Every one of those requests still got a model completion; the model just happened to be incorrect on that task.</div>
+<div class="note info"><span class="nt">Under the hood</span> Exhaustion case: if every rung has been attempted and all failed, Firstpass serves the best real model attempt buffered during the request rather than propagating the provider error upstream. This is implemented in the serving path and is always active — not config-gated.</div>
+<div class="recap">Delivery is unconditional: Firstpass always returns a real model answer even under provider exhaustion — the served-failure rate measures <b>answer quality</b>, not delivery.</div>
+
 <h2 id="headline">The headline<a class="anchor" href="#headline" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The quality bound is a <b>distribution-free upper bound</b> on the served-failure rate — the fraction of served outputs that are actually wrong. You pick a target <code>α</code> and a confidence <code>1−δ</code>; Firstpass certifies whether the serve threshold holds the bound. Two methods are available: <b>split-conformal</b> (Hoeffding bound on served-failure rate, default) and <b>Learn-then-Test</b> (exact-binomial bound on the gate's false-accept rate). Both require no distributional assumptions.</div>
+<p class="subh">What is being bounded</p>
 <p>The guarantee is a bound on the <strong>served-failure rate</strong>: the fraction of served outputs that are actually wrong. Firstpass offers two ways to earn it, both distribution-free (no assumption about the shape of your data):</p>
 <ul>
   <li><strong>Split-conformal</strong> — a Hoeffding upper confidence bound on the served-failure rate.</li>
   <li><strong>Learn-then-Test / RCPS</strong> — fixed-sequence exact-binomial testing that reports the gate's false-accept rate at the chosen threshold (<code>firstpass calibrate --method ltt</code>).</li>
 </ul>
 <p>Either way, you pick a target failure rate <code>α</code> and a confidence <code>1−δ</code>, and Firstpass certifies whether the chosen serve threshold holds the bound.</p>
+<div class="note"><span class="nt">Key idea</span> The bound is <em>distribution-free</em>: it does not assume your inputs follow a Gaussian, Pareto, or any other shape. It is derived from the empirical outcomes of a real calibration run — which is why reproducing the benchmark with your own data is meaningful, not cosmetic.</div>
+<div class="recap">Firstpass certifies a distribution-free upper bound on served-failure rate — you supply the target and confidence, calibration supplies the threshold.</div>
 
 <h2 id="chart">The live result<a class="anchor" href="#chart" aria-label="Link to this section">#</a></h2>
+<div class="tldr">On <a href="benchmarks.html">974 real MBPP coding tasks</a>, gated by real unit tests, with pre-registered <code>α=0.10, δ=0.05</code>: realized served-failure was <b>7.7%</b> (under the 10% target at 95% confidence), calibrated risk was <b>5.5%</b>, and <b>82% of requests were served from the cheap tier</b> with no escalation.</div>
+<p class="subh">Reading the numbers</p>
 <p>The committed result — from <code>docs/benchmarks/mbpp-live-base.txt</code> — is 974 real MBPP coding tasks, gated by real unit tests, live against an Anthropic solver, with pre-registered <code>α=0.10, δ=0.05</code>:</p>
 <div class="chips">
   <div class="chip good"><div class="cn">≤10<span class="u">%</span></div><div class="cl">distribution-free target, 95% conf.</div></div>
@@ -114,18 +137,31 @@
 </div>
 <p>Read that as: on this run, serving every output that clears the threshold produced a wrong answer 7.7% of the time, and the machinery certifies the true rate is at or below 10% with 95% confidence — while the expensive tier was needed for fewer than one request in five.</p>
 <div class="note"><span class="nt">What the raw artifact also shows</span> The gate's false-accept rate — P(full visible pass | actually incorrect) — was 14.7%, and its false-reject rate was 0.0%. The conformal step turns that imperfect gate into a certified serve threshold rather than trusting the gate blindly.</div>
+<div class="note info"><span class="nt">Under the hood</span> The calibrated risk (5.5%) and the realized served-failure (7.7%) can differ because calibration uses a held-out slice, not the full run. Calibrated risk is what conformal guarantees the rate stays under; realized served-failure is what actually happened on the live run. Both sit under the 10% line, which is what the guarantee requires. The gap between them is slack the held-out calibration set purchased — a larger calibration set typically narrows it.</div>
+<div class="recap">On 974 real coding tasks: 7.7% served-failure (below the 10% bound at 95% confidence), 82% served cheap — <a href="benchmarks.html">full artifact at Benchmarks</a>.</div>
 
 <h2 id="conformal">Split-conformal<a class="anchor" href="#conformal" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Conformal calibration holds out a labeled slice, derives a gate score threshold such that serving above it keeps served-failure under <code>α</code>, and expresses uncertainty as a <b>Hoeffding upper confidence bound</b>. No distributional assumptions. Outputs: threshold, served fraction, calibrated risk, feasibility flag.</div>
+<p class="subh">How it works</p>
 <p>Split-conformal calibration holds out a labeled slice of outcomes and derives a threshold on the gate's score such that serving above it keeps the failure rate under <code>α</code>. The bound is a Hoeffding upper confidence bound, so it is valid for any data distribution — no Gaussian assumptions, no model of the errors. The reported figures are the threshold (0.500 here), the served fraction (82%), the calibrated risk (5.5%), and a feasibility flag.</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass calibrate --method conformal --alpha 0.10 --delta 0.05</code></pre></div>
+<div class="note"><span class="nt">Key idea</span> Conformal speaks in <em>served-failure rate</em> terms: the output is a certified bound on how often a served answer is wrong. The feasibility flag tells you whether the calibration data was large enough to certify the target <code>α</code> at the chosen confidence — if infeasible, collect more labeled outcomes before deploying the threshold.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Running calibration on the same data used to tune the gate. Conformal requires a <em>held-out</em> calibration set — using the training data conflates fitting with bounding, and the certified threshold will undercount the true failure rate. Hold out a fresh, labeled sample and run calibration on that alone.</div>
+<div class="recap">Conformal gives a Hoeffding-bounded served-failure guarantee from a held-out calibration slice — no distributional assumptions, just labeled outcomes and a feasibility check.</div>
 
 <h2 id="ltt">Learn-then-Test / RCPS<a class="anchor" href="#ltt" aria-label="Link to this section">#</a></h2>
+<div class="tldr">LTT frames threshold selection as <b>multiple hypothesis testing</b>: it walks candidate thresholds in a fixed sequence, applies an exact-binomial test at each, and stops at the first that provably controls risk. Where conformal bounds the served-failure rate, LTT bounds the <b>gate's false-accept rate</b> — the same property viewed through the gate rather than the served output.</div>
+<p class="subh">What LTT measures</p>
 <p>Learn-then-Test frames threshold selection as multiple hypothesis testing. It walks candidate thresholds in a fixed sequence, applying an exact-binomial test at each, and stops at the first that provably controls risk. Where conformal reports a served-failure bound, LTT reports the <strong>gate's false-accept rate</strong> at the chosen threshold — the same guarantee viewed through the gate.</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass calibrate --method ltt --alpha 0.10 --delta 0.05</code></pre></div>
 <div class="note info"><span class="nt">Which to use</span> Conformal is the default and speaks directly in served-failure terms. LTT is the choice when you want the exact-binomial guarantee expressed as the gate's false-accept rate, or when the fixed-sequence testing better matches your risk framing.</div>
+<div class="note"><span class="nt">Key idea</span> The two methods certify the same underlying property from two angles. Conformal says: "the served-failure rate is ≤ α." LTT says: "the gate's false-accept rate is ≤ α." On the benchmark run, the gate's false-accept rate was 14.7% — the conformal step converts that imperfect gate into a certified serve threshold by being conservative about what it serves.</div>
+<div class="recap">LTT certifies the gate's false-accept rate via exact-binomial testing — the same guarantee as conformal expressed through the gate rather than the served output.</div>
 
 <h2 id="adaptive">Adaptive conformal<a class="anchor" href="#adaptive" aria-label="Link to this section">#</a></h2>
-<p>A static threshold decays as your traffic drifts. Adaptive conformal (Gibbs–Candès) tracks the threshold <strong>live</strong>: each deferred outcome reported to <code>/v1/feedback</code> nudges the threshold up or down to keep the realized failure rate near the target. No recalibration run, no downtime — the bound follows the distribution.</p>
+<div class="tldr">A static threshold decays as your traffic drifts. Adaptive conformal (Gibbs–Candès) tracks the threshold <b>live</b>: each deferred outcome reported to <code>/v1/feedback</code> nudges the threshold to keep the realized failure rate near target. <b>No recalibration run, no downtime.</b></div>
+<p class="subh">Why drift matters</p>
+<p>A static threshold derived from calibration data drifts as your traffic changes — model updates, input distribution shifts, new task types. Adaptive conformal (Gibbs–Candès) tracks the threshold <strong>live</strong>: each deferred outcome reported to <code>/v1/feedback</code> nudges the threshold up or down to keep the realized failure rate near the target. No recalibration run, no downtime — the bound follows the distribution.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="loopT">
 <title id="loopT">The self-tuning loop: the router serves the first pass, the true outcome is reported to /v1/feedback, adaptive conformal nudges the serve threshold up or down to hold the target, and the next request serves against the updated threshold — a closed loop that tracks drift with no recalibration run.</title>
 <defs><marker id="lp" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker></defs>
@@ -156,24 +192,38 @@
 </svg>
   <figcaption>Each reported outcome moves the serve threshold to keep realized served-failure under target as traffic drifts — no recalibration run, no downtime.</figcaption>
 </div>
+<p class="subh">Closing the feedback loop</p>
+<p>Adaptive conformal requires you to close the loop: after a served answer's true outcome is known (a test run passes, a user confirms, an oracle grades it), post it to <code>POST /v1/feedback</code> with the trace ID. Firstpass matches the outcome to the gate score from that request and updates the threshold. The tighter and faster the feedback loop, the more responsive the threshold.</p>
+<div class="note info"><span class="nt">Under the hood</span> The Gibbs–Candès update is an online algorithm: it adjusts the threshold by a small step each time an outcome arrives, proportional to whether that outcome was a failure or a success. This keeps the time-averaged failure rate near <code>α</code> without reprocessing the full calibration holdout on each update.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Reporting outcomes selectively — only posting feedback when an answer was wrong, or only when it was right. Adaptive conformal requires <em>representative</em> feedback: cherry-picking which outcomes you report shifts the threshold in the direction of your bias. Report all outcomes, or at minimum a random sample.</div>
+<div class="recap">Adaptive conformal keeps the quality bound live as traffic drifts, consuming each <code>/v1/feedback</code> post to nudge the threshold — no batch recalibration needed.</div>
 
 <h2 id="gauges">The two gauges<a class="anchor" href="#gauges" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The guarantee is observable in Prometheus in real time: <code>firstpass_serve_threshold</code> tracks the live adaptive threshold, and <code>firstpass_realized_served_failure</code> is the measured failure rate from reported outcomes. Alert on the second approaching your target <code>α</code>.</div>
+<p class="subh">What to watch</p>
 <p>The loop is observable in Prometheus, so you can watch the guarantee hold in real time:</p>
 <div class="defs">
   <div class="row"><div class="k">firstpass_serve_threshold</div><div class="v">The current threshold the router serves above. Moves as adaptive conformal responds to feedback.</div></div>
   <div class="row"><div class="k">firstpass_realized_served_failure</div><div class="v">The measured served-failure rate from reported outcomes. This is what you alert on if it approaches your target.</div></div>
 </div>
+<div class="note"><span class="nt">Key idea</span> The threshold and the realized failure rate move together: if the threshold rises (more conservative), fewer requests serve cheap but fewer failures pass through; if it falls, more serve cheap but the failure rate edges up. A widening gap between the two metrics is a signal that feedback reporting has gone stale.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Alerting only when <code>firstpass_realized_served_failure</code> <em>crosses</em> your target rather than approaching it. By the time the realized rate crosses <code>α</code>, the threshold has been serving at risk for some window. Alert at 80–90% of your target to give the feedback loop time to respond.</div>
+<div class="recap">Two Prometheus gauges give real-time visibility: the adaptive threshold and the realized failure rate — watch both, alert before the rate hits target.</div>
 
 <h2 id="repro">Reproduce it<a class="anchor" href="#repro" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Every published number regenerates from a committed command. Run the same harness against the same 974-row <code>mbpp.jsonl</code> to recompute the conformal bound from your own live gate/oracle outcomes with the same pre-registered <code>α/δ</code>.</div>
+<p class="subh">What the harness does</p>
 <p>Every published number regenerates from a committed command. The bound machinery is the reproducible part — the harness recomputes the conformal bound from <em>your</em> run's gate/oracle outcomes with the same pre-registered <code>α/δ</code>.</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># fetch the same public mbpp.jsonl (974 rows), then:</span>
 FIRSTPASS_CODING_DATASET=./mbpp.jsonl \
   cargo run --release -p firstpass-bench -- --coding-live</code></pre></div>
 <p>Needs your provider key and Docker (for the sandboxed test gate); the run costs a few dollars. See <a href="benchmarks.html">Benchmarks</a> for the full artifact index and provenance rules.</p>
+<div class="note info"><span class="nt">Under the hood</span> The harness runs each of the 974 MBPP tasks through Firstpass (cheap tier first, gate checked, escalate on fail), records gate scores and oracle outcomes, then feeds them to the conformal calibration to derive the threshold and certified risk. The pre-registered <code>α=0.10, δ=0.05</code> are committed in the artifact — you can change them in your own run, but the published numbers will not match if you do.</div>
+<div class="recap">The published benchmark is fully reproducible: committed harness + committed data + same pre-registered parameters = same certified bound.</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="routing.html"><span class="dir">← Previous</span><span class="t">Routing & escalation</span></a><a class="next" href="receipts.html"><span class="dir">Next →</span><span class="t">Receipts & audit</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#headline" class="">The headline</a><a href="#chart" class="">The live result</a><a href="#conformal" class="">Split-conformal</a><a href="#ltt" class="">Learn-then-Test / RCPS</a><a href="#adaptive" class="">Adaptive conformal</a><a href="#gauges" class="">The two gauges</a><a href="#repro" class="">Reproduce it</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#delivery" class="">The delivery guarantee</a><a href="#headline" class="">The headline</a><a href="#chart" class="">The live result</a><a href="#conformal" class="">Split-conformal</a><a href="#ltt" class="">Learn-then-Test / RCPS</a><a href="#adaptive" class="">Adaptive conformal</a><a href="#gauges" class="">The two gauges</a><a href="#repro" class="">Reproduce it</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">
@@ -185,5 +235,5 @@ FIRSTPASS_CODING_DATASET=./mbpp.jsonl \
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>

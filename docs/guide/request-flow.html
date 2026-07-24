@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
-<link rel="stylesheet" href="../assets/docs.css?v=2">
+<link rel="stylesheet" href="../assets/docs.css?v=3">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
@@ -57,8 +57,10 @@
 <p class="crumb"><a href="index.html">Docs</a> / Routing, end to end</p>
 <h1>Routing, end to end</h1>
 <p class="page-sub">An agent doesn't make one model call — it makes hundreds, and the safe reflex of sending every one to the strongest model is why an afternoon of agent work bills like a research run. Firstpass runs the <em>cheapest</em> model first, proves its output against a real check, and escalates only when the proof fails. You pay for strength exactly when strength is needed — and every decision leaves a receipt that says why.</p>
+<div class="tldr">Every request Firstpass sees — a one-shot question, a tool-loop step, a subagent call, turn 17 of a long conversation — travels the same four steps: <b>extract features → match route → prove the output → write a receipt.</b> This page walks every outcome as a real payload, escalation diagram, and receipt. Scan the TL;DRs to see the shape; read the JSON to see the mechanics.</div>
 
 <h2 id="why">Why routing, and why proof<a class="anchor" href="#why" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Two broken fixes frame the problem: send everything cheap and ship wrong answers; predict which prompt needs strength and you're guessing before you've seen the answer. Firstpass does neither — it <b>runs cheap first, proves the real output</b> against a gate (a unit test, a JSON schema, a judge), and escalates one rung only when the proof fails. The gate verdict is the routing decision.</div>
 <p>Point your agent — Claude Code, the Agent SDK, anything speaking the Anthropic or OpenAI wire format — at Firstpass instead of the provider, and it sees exactly one kind of thing: a <strong>completion request</strong>, a single <code>POST</code> of messages and tools. An agent loop emits these by the hundred — every reasoning step, every tool-result read, every subagent is its own request, and the whole growing transcript rides along on each. Bill all of it to a frontier model &ldquo;to be safe&rdquo; and the cost compounds three ways at once: many calls per prompt, a transcript that only grows, and the top model spent on the easy calls too.</p>
 <p>The two obvious fixes both break. Send everything to a cheap model and <em>hope</em>, and you ship wrong answers you won't catch until production. <strong>Predict</strong> which prompt needs which model, and you're guessing from the question — before you've seen the answer — and you learn you guessed wrong the expensive way. Firstpass does neither. It runs the cheapest rung first, <strong>proves the actual output</strong> against your gate — a test, a schema, a judge — and serves it only if the proof holds. If it doesn't, it escalates one rung and proves again. That is the whole product, in one picture:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 400" role="img" aria-labelledby="heroT">
@@ -144,8 +146,10 @@
   <figcaption>Measured on 974 live MBPP tasks (single-model conformal): 82% of cheap-rung outputs cleared the serve gate and 7.7% served-failure, under the 10% bound at 95% confidence. In a deployed cascade the other 18% escalate; your cost savings depend on your models — measure them. Full run in <a href="benchmarks.html#live">Benchmarks</a>; the math in <a href="guarantee.html">The guarantee</a>.</figcaption>
 </div>
 <div class="note"><span class="nt">New here? Read this after "How it works"</span> That page builds the gate and the ladder — the machinery under the picture above. This page is the guided tour: what a <em>request</em> is, how your prompts become hundreds of them, and how the same loop carries you from a one-shot question to a dynamic multi-agent workflow. The rest of the page is that loop, one request at a time.</div>
+<div class="recap">Route by proof of output, not prediction from prompt — the gate decides, and 82% of the time on a live coding run the cheap rung's output clears it.</div>
 
 <h2 id="request-shape">What a request looks like<a class="anchor" href="#request-shape" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A request is a stock Anthropic (or OpenAI) API call — nothing Firstpass-specific on the wire. <b>The router reads exactly two optional headers and three structural body signals — tool count, image flag, a coarse prompt-size bucket — to choose a route.</b> It never reads your prompt text. Once a route matches, the full body is forwarded unchanged to whichever rung the route picks.</div>
 <p>A request is a standard provider call. Firstpass accepts two wire dialects and matches whichever the client speaks:</p>
 <div class="tblwrap"><table>
 <thead><tr><th>Field</th><th>What it is</th></tr></thead>
@@ -168,6 +172,7 @@
 </tbody>
 </table></div>
 <div class="note"><span class="nt">No headers still works</span> Send none and Firstpass still routes every call — it falls to the wildcard route (<code>match = {}</code>). Headers don't <em>enable</em> routing; they let you split traffic across ladders. No tags means one ladder for everything, which is a fine place to start.</div>
+<div class="note"><span class="nt">Key idea</span> Routing is content-blind by design. Firstpass routes on structure — tool count, image presence, prompt-size bucket — not on your prompt text. That makes the routing signal privacy-preserving and the route match fast: no tokenization, no embedding, no semantic classifier runs before the first rung opens.</div>
 
 <p>Here is a real one, exactly as Claude Code puts it on the wire when you ask it to fix a bug. Nothing about it is Firstpass-specific — it is a stock Anthropic call, plus two optional headers:</p>
 <div class="codeblock"><div class="cb-head"><span>http</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>POST /v1/messages
@@ -235,8 +240,10 @@ x-firstpass-session: agent-run-4417     <span class="tk-c"># optional — budget
 </svg>
   <figcaption>The routing decision rides on the headers and a few structural signals — not the content. The prompt, history, and tools are forwarded whole to the rung that answers.</figcaption>
 </div>
+<div class="recap">Route features come from structure, not text — Firstpass decides <b>where</b> a request goes without ever reading <b>what</b> it says.</div>
 
 <h2 id="lifecycle">The life of one request<a class="anchor" href="#lifecycle" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Every <code>POST</code> — one-shot question, tool-loop step, subagent call, turn 17 of a conversation — travels the same four steps: <b>extract features → match route → enforce or observe → serve and record.</b> No fast path, no special cases. Uniformity is what makes per-request proof safe to run on every call.</div>
 <p>Every <code>POST</code> — no matter what produced it — travels the same four steps. No fast path for "simple" prompts, no special case for subagents. The uniformity is the point: it's what lets one engine stay correct across every case below.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 320" role="img" aria-labelledby="lifeT">
 <title id="lifeT">One request flows through four steps: extract features from headers and body, match a route by those features, then either enforce (cascade cheapest-first with a gate on each rung, escalating on failure) or observe (forward the original request unchanged). Every decision is written to a receipt.</title>
@@ -295,8 +302,10 @@ x-firstpass-session: agent-run-4417     <span class="tk-c"># optional — budget
 <li><strong>Serve and record.</strong> The winning output is returned in the caller's own dialect. The full decision — every rung tried, every gate verdict, the cost — is written to a hash-chained <a href="receipts.html">receipt</a>.</li>
 </ol>
 <div class="note"><span class="nt">Where "which model answered" lives</span> The response you get back is a normal completion in your dialect — no vendor cruft bolted on. The rung, the gate verdicts, and the cost live in the <strong>receipt</strong>. The split is deliberate: the answer is the product, the proof is the receipt. You'll see both, for a real escalation, in <a href="#complex">the complex case</a>.</div>
+<div class="recap">Four deterministic steps, every time — the gate verdict and the provider response decide which of the five endings you land on.</div>
 
 <h2 id="scenarios">Every scenario, end to end<a class="anchor" href="#scenarios" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Four steps, five outcomes. <b>The `served_from` field on the receipt — `attempt`, `best_attempt`, `error` — is the machine-readable branch point</b> that tells your pipeline which ending it got. Scan the map here; read the next five sections for the real payloads.</div>
 <p>Those four steps produce exactly <strong>five outcomes</strong> — and every request Firstpass serves is one of them. Scan the map, then follow any row to its real request, response, and receipt. The <code>served_from</code> field on the receipt is how your pipeline tells the outcomes apart after the fact.</p>
 <div class="tblwrap"><table>
 <thead><tr><th>Scenario</th><th>What the router does</th><th>The receipt says</th></tr></thead>
@@ -309,8 +318,10 @@ x-firstpass-session: agent-run-4417     <span class="tk-c"># optional — budget
 </tbody>
 </table></div>
 <div class="note"><span class="nt">One engine, five endings</span> There is no branch in the code for "hard prompt" or "provider outage." The same extract → match → cascade → serve runs every time; the gate verdicts and the provider responses decide which of these five endings you land on. The next five sections are those endings, each a real request you can run.</div>
+<div class="recap">One loop, five outcomes. <b><code>served_from</code></b> on the receipt is the branch point for downstream code.</div>
 
 <h2 id="simple">A simple question<a class="anchor" href="#simple" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Rung 0 runs, the gate passes, done. <b>No escalation, no overhead beyond a single cheap model call.</b> The receipt has one attempt, <code>served_from: "attempt"</code>, <code>served_rung: 0</code>. This is the common case — 82% of outputs on a live coding run clear the gate at rung 0.</div>
 <p>Start with the easy case. You ask a one-shot question that needs no tools. The agent sends one request; Firstpass opens it on rung 0 (the cheapest model), the gate passes, and that output is served. One request, one rung, done. Here is the actual call:</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># "model":"auto" hands the choice to the matched route's ladder</span>
 curl localhost:8080/v1/messages \
@@ -331,8 +342,10 @@ curl localhost:8080/v1/messages \
   &quot;usage&quot;: { &quot;input_tokens&quot;: 14, &quot;output_tokens&quot;: 4 }
 }</code></pre></div>
 <p>The receipt for that request has a single attempt on rung 0 with <code>served_from: "attempt"</code> and <code>served_rung: 0</code>. No escalation, no waste. The whole cascade for an easy request <em>is</em> the cheapest model — the gate just confirmed it was good enough to ship. The interesting case is when it isn't.</p>
+<div class="recap"><code>served_from: "attempt"</code> · <code>served_rung: 0</code> — the cascade ran, the gate confirmed, the cheapest answer shipped.</div>
 
 <h2 id="complex">A complex question<a class="anchor" href="#complex" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A complex task is a loop of independent requests — each routed and proven from scratch. <b>When the cheap rung's output fails the gate, the cascade climbs exactly one rung.</b> An easy turn later in the same loop re-enters at rung 0; the router never pins difficulty to a conversation.</div>
 <p>Now a real task: "find the bug in this handler and fix it." The agent can't answer in one shot — it reads files, reasons, edits, re-reads, and concludes. That is a <strong>loop</strong>, and every iteration is its own request:</p>
 <ul>
 <li>Request 1 — reason about the task, decide to read <code>handler.rs</code>.</li>
@@ -340,6 +353,7 @@ curl localhost:8080/v1/messages \
 <li>Request 3 — propose an edit; a <code>cargo-test</code> gate runs against the result.</li>
 <li>Request 4 — with the test outcome in the messages, confirm the fix.</li>
 </ul>
+<p class="subh">Zoom in: request 3, where escalation happens</p>
 <p>Firstpass routes each one independently and proves each one independently. Zoom into request 3, where the edit is gated by the project's own test suite. The cheap rung takes the first pass, its patch fails <code>cargo test</code>, and the cascade climbs one rung — which passes. This is the whole product in one request:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 340" role="img" aria-labelledby="escT">
 <title id="escT">Request 3 escalates. Rung 0 (haiku, $0.0007) produces a patch that fails the cargo-test gate. The cascade climbs to rung 1 (sonnet, $0.0121), whose patch passes the gate and is served. Total cost $0.0128 versus a $0.0630 always-strong baseline — the receipt records every rung, verdict, and dollar.</title>
@@ -441,8 +455,10 @@ curl localhost:8080/v1/messages \
   &quot;hash&quot;: &quot;sha256:5c02d9…&quot;                    <span class="tk-c">// SHA-256 of this record — the next record's prev_hash</span>
 }</code></pre></div>
 <p>Read that receipt and the routing is fully explained: the cheap rung was tried ($0.0007), its output <em>failed a real test</em> (not a guess — <code>cargo-test</code> ran and returned <code>fail</code>), the cascade escalated exactly once, and the served answer cost $0.0128 against a $0.0630 always-strong baseline. Request 4 in the same loop might pass on rung 0, because "did the edit apply cleanly" is easy. The router never assumes that because turn 2 was hard, turn 4 will be — <strong>it re-earns the answer every time.</strong> No routing decision is ever carried forward, because none is kept.</p>
+<div class="recap"><code>served_from: "attempt"</code> · <code>served_rung: 1</code> — a real gate ran, one escalation bought correctness; the receipt counts every dollar.</div>
 
 <h2 id="exhausted">Nothing clears the gate<a class="anchor" href="#exhausted" aria-label="Link to this section">#</a></h2>
+<div class="tldr">When no rung clears the gate — or a budget cap stops the climb — Firstpass never returns nothing. <b>It serves the strongest attempt it saw, stamped <code>served_from: "best_attempt"</code></b> so downstream code can detect and branch on it. Prefer a hard error? Set <code>on_exhausted = "error"</code>.</div>
 <p>Sometimes the task is hard enough that <em>no</em> rung passes the gate — or a per-request budget cap stops the climb first. Firstpass never returns nothing, and never pretends. It serves the <strong>strongest attempt it saw</strong> and stamps the receipt <code>served_from: "best_attempt"</code> — a flag your pipeline can branch on. Here a strict <code>json-valid</code> gate rejects every rung, and a <code>$0.02</code> per-request cap halts the climb before the top model is ever tried:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 340" role="img" aria-labelledby="exhT">
 <title id="exhT">Rung 0 (haiku) fails the json-valid gate, the cascade climbs to rung 1 (sonnet) which also fails, and the per-request budget cap stops the climb before the top rung is tried. With no rung passing, the best attempt seen — rung 1 — is served and the receipt is stamped served_from best_attempt, unproven, so downstream code can detect it.</title>
@@ -540,8 +556,10 @@ curl localhost:8080/v1/messages \
   }
 }</code></pre></div>
 <div class="note"><span class="nt">The served-failure guarantee, stated precisely</span> You always get bytes back — the strongest answer the budget bought — and the receipt marks it <em>unproven</em> so you can retry, flag, or fall back. It is never a silent bad answer dressed up as a good one. Prefer a hard error over a best-effort serve? Set <code>on_exhausted = "error"</code> and an exhausted ladder returns a structured error with <code>served_from: "error"</code> instead of a body. Either way the outcome is explicit — see <a href="guarantee.html">the guarantee</a>.</div>
+<div class="recap"><code>served_from: "best_attempt"</code> — unproven, flagged, and still real bytes. Never a silent bad answer, never a router error in place of a completion.</div>
 
 <h2 id="failover">A provider is down<a class="anchor" href="#failover" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A provider <code>5xx</code> is an <b>abstain</b>, not a gate failure. The cascade tries the next rung — which can live on a completely different provider. <b>The client sees one ordinary response; only the receipt reveals the failover.</b> A hard <code>4xx</code> stops immediately — the request itself was wrong, and another provider can't fix that.</div>
 <p>Providers have bad minutes. When a rung returns a <code>5xx</code> or drops the connection, Firstpass treats it as an <strong>abstain</strong> on that rung — not a gate failure, not a served answer — and moves to the next rung, which can live on a <em>different provider</em> entirely. The client sees one ordinary response; only the receipt reveals the failover. The ladder here crosses providers on purpose:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 320" role="img" aria-labelledby="foT">
 <title id="foT">Rung 0 on Anthropic returns HTTP 503, so it is recorded as an abstain rather than a failure. The cascade fails over to rung 1 on OpenAI, which answers and passes its gate. The served response is re-rendered into the caller's Anthropic dialect, and the receipt shows the abstain, the provider switch, and served_from attempt on rung 1.</title>
@@ -629,8 +647,10 @@ curl localhost:8080/v1/messages \
   }
 }</code></pre></div>
 <div class="note"><span class="nt">A hard 4xx is not a failover</span> A <code>4xx</code> means the request itself was wrong — malformed body, bad auth — and a stronger model on another provider can't fix that. So the ladder stops immediately with <code>served_from: "error"</code> and a structured error to the caller. Failover is only for provider-side faults (<code>5xx</code>, transport), where the <em>same</em> request may well succeed elsewhere.</div>
+<div class="recap">Provider fault = <code>abstain</code> = try the next rung. Cross-provider failover is automatic when your ladder spans providers; the client never sees the switch.</div>
 
 <h2 id="observe">Observe mode: shadow, zero change<a class="anchor" href="#observe" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Observe forwards every request byte-for-byte to the model you asked for and returns the provider's own response — no change. <b>In the shadow, Firstpass runs the cascade and writes a receipt with the savings estimate</b> — real measurement, zero behavior change. It is the default mode on a fresh install, and the safe on-ramp before flipping to enforce.</div>
 <p>Before Firstpass changes a single response, run it in <strong>observe</strong> — the default on a fresh install. Every request is forwarded <em>byte-for-byte</em> to the exact model you asked for, and the response you get is precisely what the provider returns. Firstpass still scores the cascade <em>in the shadow</em> and writes a receipt, so you collect the savings estimate and the audit trail with <strong>zero behavior change</strong>. Set it per route, or per request with a header:</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="obT">
 <title id="obT">In observe mode the request is forwarded byte-for-byte to the model the client asked for and that provider's response is served unchanged — the top path. In parallel, in the shadow, Firstpass runs the cascade and gate for learning and writes a receipt marked mode observe, which carries the savings estimate. The served path never changes; only the receipt is produced.</title>
@@ -706,8 +726,10 @@ curl localhost:8080/v1/messages \
   }
 }</code></pre></div>
 <div class="note"><span class="nt">Observe → enforce, when the data convinces you</span> Read a week of shadow receipts, see the savings and the gate pass-rate on <em>your</em> real traffic, then flip the route to an enforce mode — one line per route. See <a href="how-it-works.html#observe">observe vs enforce</a> and <a href="configuration.html">Configuration</a>.</div>
+<div class="recap">Observe = zero risk, real measurement. Read the shadow receipts on your traffic; flip one config line to enforce when you're ready.</div>
 
 <h2 id="subagents">Subagents<a class="anchor" href="#subagents" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A subagent call is a tagged <code>POST</code> — structurally identical to any other request. <b>Set <code>x-firstpass-subagent</code> on the call, write a <code>[[route]]</code> block that matches it, and the subagent gets its own ladder with its own gate.</b> A `match` value can be a list, so many mechanical subagents share one route. Context never leaks between agents.</div>
 <p>When the main agent spawns a subagent, the subagent runs its <em>own</em> loop — and every call in that loop is, again, an independent <code>POST</code> to Firstpass. Nothing about a subagent call is structurally different from a main-loop call. So how does Firstpass route a planner subagent to a strong model and a mechanical one to a cheap model? <strong>You tag the request.</strong> The orchestrator sets <code>x-firstpass-subagent</code> on the subagent's calls, and a route matches on it:</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># the planner: enforce a tall ladder with a quality bias</span>
 [[route]]
@@ -776,13 +798,17 @@ mode  = "observe"</code></pre></div>
   <figcaption>The subagent's requested model does not decide what runs. The matched route's ladder does, and the gate decides where on that ladder it stops.</figcaption>
 </div>
 <div class="note"><span class="nt">A subagent has its own transcript</span> Context does not leak between agents. A subagent carries its <em>own</em> message history — its own system prompt, its own growing list of messages — separate from the main agent's. It accumulates turn-over-turn exactly like the main loop (<a href="#multiturn">shown below</a>), and every one of its calls is routed and proven on its own.</div>
+<div class="recap">Tag the call, write the route, get the ladder. A subagent is just a request with a name — the router treats it identically.</div>
 
 <h2 id="teams">Agent teams &amp; dynamic workflows<a class="anchor" href="#teams" aria-label="Link to this section">#</a></h2>
+<div class="tldr">An agent team is concurrent <code>POST</code>s. <b>There is no team object and no coordinator inside the router</b> — Firstpass matches each request to a route by its own features and routes it independently. The one team-level concept is the shared session budget: give every worker the same <code>x-firstpass-session</code> and they draw from one pool.</div>
 <p>A team of agents — or a dynamic workflow that fans out dozens of workers in parallel — looks, from Firstpass's seat, like nothing new: <strong>more concurrent requests.</strong> Ten agents running at once is ten streams of independent <code>POST</code>s. Each is matched on its own features (<code>agent</code>, <code>subagent</code>, plus <code>task_kind</code> and <code>language</code> if your client sets them) and routed to the ladder you configured for that kind of worker. There is no "team" object and no coordinator inside the router; concurrency is just volume.</p>
 <p>What ties a team together is not routing — it's <strong>budget</strong>. Give every request in a workflow the same <code>x-firstpass-session</code>, and the per-session cap (<code>per_session_usd</code>) governs the whole team's spend as one pool. That is the one place a multi-agent workload is treated as a unit, and it is a spend guardrail, not a routing input.</p>
 <div class="note"><span class="nt">Dynamic ≠ special</span> A workflow that decides <em>at runtime</em> to spawn a new worker doesn't need Firstpass to know that in advance. The new worker's first call is just another request; it matches a route the instant it arrives. Dynamism lives in the orchestrator; Firstpass only ever sees the next <code>POST</code>.</div>
+<div class="recap">Concurrency is just volume. Per-worker routes differentiate; a shared <code>x-firstpass-session</code> ties the team's spend to one budget cap.</div>
 
 <h2 id="multiturn">Multi-turn &amp; "previous context"<a class="anchor" href="#multiturn" aria-label="Link to this section">#</a></h2>
+<div class="tldr">The router keeps no memory between turns — <b>and that is the feature.</b> Context rides in the request body (the full history, resent every turn), so the model that answers turn 12 can be different from turn 1 and lose nothing. Every turn re-enters the cascade at the start rung and is proven from scratch.</div>
 <p>This is the question that trips people up, so here is the blunt version: <strong>the router does not remember your conversation, and that is the feature.</strong> Statelessness is what makes per-request proof safe to run on every call — a router that pinned "this conversation needs Opus" would be trading a correctness guarantee for a cost guess.</p>
 <p>Where does the context go, then? Into the request body. An LLM is stateless — every turn, the client (Claude Code, the SDK) resends the <em>entire</em> message history so the model can "remember." That history is part of the <code>POST</code> Firstpass forwards. So the context absolutely reaches the model — it just rides in the prompt, not in any router-side memory. You can watch it happen: turn&nbsp;2's body is turn&nbsp;1's body with the last exchange appended verbatim.</p>
 <div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c">// TURN 1 — the POST body carries a single message</span>
@@ -804,6 +830,7 @@ mode  = "observe"</code></pre></div>
       "content": "pub fn handle(req: Req) -> Resp { /* … */ }" }
   ] }
 ]</code></pre></div>
+<p class="subh">What actually carries across turns</p>
 <p>The body grew from one message to three, and it only ever grows — every future turn stacks on top of this one. Here is the payoff that surprises people: because the whole thread rides in the body, the rung that answers turn&nbsp;12 can be a <em>different</em> model than answered turn&nbsp;1 and lose nothing. Each call reads the transcript cold, so continuity lives in the bytes, not in any one model's memory. Turn&nbsp;12 re-enters the cascade at the same start rung as turn&nbsp;1 and is proven from scratch. Two things, and only two, thread across the calls of one conversation:</p>
 <div class="tblwrap"><table>
 <thead><tr><th>Thread</th><th>What it carries across turns</th></tr></thead>
@@ -812,6 +839,7 @@ mode  = "observe"</code></pre></div>
 <tr><td>Learned start-rung <span class="ink-mut">(optional)</span></td><td>An off-by-default bandit (ADR&nbsp;0007) can learn a smarter <em>entry</em> rung for a class of traffic — keyed by request features, <strong>not</strong> by conversation. It moves where the climb begins; the gate still decides what ships, so it can never change correctness.</td></tr>
 </tbody>
 </table></div>
+<div class="note warn"><span class="nt">Common mistake</span> Assuming that because turn 8 escalated to sonnet, turn 9 will start there too. It won't — every turn re-enters at rung 0 and is proven from scratch. An "easy" turn 9 answer from the cheap rung is exactly as cheap as it would have been in a brand-new conversation. The session budget is the one thing that connects turns; the routing logic treats each one as if no prior turns exist.</div>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 250" role="img" aria-labelledby="mtT">
 <title id="mtT">Each turn of a conversation re-enters the cascade independently at the start rung and is proven from scratch. The router keeps no memory between turns. The only line connecting the turns is the session budget, which caps their combined spend.</title>
 <defs><marker id="mtA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/></marker></defs>
@@ -847,8 +875,10 @@ mode  = "observe"</code></pre></div>
 </svg>
   <figcaption>Statelessness is the feature. A router that pinned "this conversation needs Opus" would trade a correctness guarantee for a cost guess — Firstpass re-proves every turn instead.</figcaption>
 </div>
+<div class="recap">Stateless router, stateful body — context rides in the bytes, not in any router-side memory; every turn is proven from scratch.</div>
 
 <h2 id="modes">Claude Code vs the Agent SDK<a class="anchor" href="#modes" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Both are HTTP clients that speak the Anthropic dialect. <b>Wire either to Firstpass with one env var or one constructor option</b> and every call — reasoning, tools, subagents — routes through the cascade. Everything on this page applies identically to either client.</div>
 <p>Both are just HTTP clients that speak the Anthropic dialect, so both wire up the same way: point the base URL at Firstpass. Everything on this page applies identically to either — the differences are only in how you set the base URL and headers.</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># Claude Code — send every call through Firstpass instead of the API</span>
 export ANTHROPIC_BASE_URL=http://localhost:8080
@@ -857,8 +887,10 @@ export ANTHROPIC_BASE_URL=http://localhost:8080
 const client = new Anthropic({ baseURL: "http://localhost:8080" });
 <span class="tk-c">// optional: tag calls so subagent-aware routes can fire</span>
 <span class="tk-c">// headers: { "x-firstpass-subagent": "architect" }</span></code></pre></div>
+<div class="recap">One base URL change, everything routes. Claude Code: <code>ANTHROPIC_BASE_URL</code>. Agent SDK: <code>baseURL</code> on the client constructor.</div>
 
 <h2 id="limits">What you configure, and what's automatic<a class="anchor" href="#limits" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Three things are automatic with zero config; three more require you to tag calls or flip a mode. <b>The automatic path is safe and correct — every call routes, proves, and receipts.</b> The optional parts add differentiation, spend controls, and enforcement when the shadow data convinces you.</div>
 <p>Everything above is capability out of one seat. Three facts about that seat are worth stating plainly — not as caveats, but as the dividing line between what Firstpass does for free and what you switch on:</p>
 <div class="tblwrap"><table>
 <thead><tr><th>Automatic — zero config</th><th>You switch on — by tagging or setting a mode</th></tr></thead>
@@ -869,8 +901,10 @@ const client = new Anthropic({ baseURL: "http://localhost:8080" });
 </tbody>
 </table></div>
 <div class="note"><span class="nt">The safe default when routing can't apply</span> If a request can't be routed faithfully — an unknown dialect quirk, a translation Firstpass won't risk — it falls back to <em>observe</em> and forwards the original untouched. The served-failure guarantee holds: you never get a worse answer than the provider would have given, only a proven-cheaper one when the gate allows.</div>
+<div class="recap">Zero config routes everything to one ladder in observe mode. Tags and mode switches add differentiation; <code>per_session_usd</code> caps total spend.</div>
 
 <h2 id="tackle">How Firstpass tackles all of it<a class="anchor" href="#tackle" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Every scenario — simple, complex, exhausted, failover, observe, subagents, teams, multi-turn — reduces to the same four steps. <b>Proof over prediction, one request at a time.</b></div>
 <p>Every scenario on this page reduces to the same handful of moves. There is not much to it:</p>
 <div class="tblwrap"><table>
 <thead><tr><th>You have…</th><th>Firstpass sees…</th><th>You steer it with…</th></tr></thead>
@@ -883,6 +917,7 @@ const client = new Anthropic({ baseURL: "http://localhost:8080" });
 </tbody>
 </table></div>
 <p>The design holds because it is not clever about state. It does not predict what your conversation will need. It <strong>proves</strong> each request against a gate and serves the cheapest output that clears it. Statelessness is what makes that safe to run on every call. Differentiation comes from the tags you send. The one thing carried across a conversation — the budget — is a guardrail, not a guess. That is the whole model: <em>proof over prediction</em>, one request at a time.</p>
+<div class="recap">Proof over prediction. One request, four steps, one receipt. Every scenario on this page is this loop.</div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="how-it-works.html"><span class="dir">← Previous</span><span class="t">How it works</span></a><a class="next" href="gates.html"><span class="dir">Next →</span><span class="t">Gates</span></a></nav>
 </main>
@@ -898,5 +933,5 @@ const client = new Anthropic({ baseURL: "http://localhost:8080" });
   </div>
   <div class="legal"><span>Firstpass v0.2.1 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
-<script src="../assets/docs.js?v=2"></script>
+<script src="../assets/docs.js?v=3"></script>
 </body></html>
