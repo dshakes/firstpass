@@ -277,6 +277,20 @@ x-firstpass-session: agent-run-4417     <span class="tk-c"># optional — budget
 </ol>
 <div class="note"><span class="nt">Where "which model answered" lives</span> The response you get back is a normal completion in your dialect — no vendor cruft bolted on. The rung, the gate verdicts, and the cost live in the <strong>receipt</strong>. The split is deliberate: the answer is the product, the proof is the receipt. You'll see both, for a real escalation, in <a href="#complex">the complex case</a>.</div>
 
+<h2 id="scenarios">Every scenario, end to end<a class="anchor" href="#scenarios" aria-label="Link to this section">#</a></h2>
+<p>Those four steps produce exactly <strong>five outcomes</strong> — and every request Firstpass serves is one of them. Scan the map, then follow any row to its real request, response, and receipt. The <code>served_from</code> field on the receipt is how your pipeline tells the outcomes apart after the fact.</p>
+<div class="tblwrap"><table>
+<thead><tr><th>Scenario</th><th>What the router does</th><th>The receipt says</th></tr></thead>
+<tbody>
+<tr><td><a href="#simple"><strong>Cheap model is right</strong></a></td><td>Rung 0 answers, the gate passes, it's served. No escalation, no waste.</td><td><code>served_from: "attempt"</code> · rung 0</td></tr>
+<tr><td><a href="#complex"><strong>Cheap model falls short</strong></a></td><td>Rung 0's output fails the gate; climb one rung; rung 1 passes and is served.</td><td><code>served_from: "attempt"</code> · rung 1</td></tr>
+<tr><td><a href="#exhausted"><strong>Nothing clears the gate</strong></a></td><td>Ladder or budget runs out with no pass; the best attempt is served, flagged unproven.</td><td><code>served_from: "best_attempt"</code></td></tr>
+<tr><td><a href="#failover"><strong>A provider is down</strong></a></td><td>A rung 5xxs → it abstains → fail over to the next rung, even on another provider.</td><td>an <code>abstain</code>, then <code>pass</code> on a new <code>provider</code></td></tr>
+<tr><td><a href="#observe"><strong>Observe mode</strong></a></td><td>Forwarded byte-for-byte to the model you asked for; the cascade runs only in the shadow.</td><td><code>mode: "observe"</code></td></tr>
+</tbody>
+</table></div>
+<div class="note"><span class="nt">One engine, five endings</span> There is no branch in the code for "hard prompt" or "provider outage." The same extract → match → cascade → serve runs every time; the gate verdicts and the provider responses decide which of these five endings you land on. The next five sections are those endings, each a real request you can run.</div>
+
 <h2 id="simple">A simple question<a class="anchor" href="#simple" aria-label="Link to this section">#</a></h2>
 <p>Start with the easy case. You ask a one-shot question that needs no tools. The agent sends one request; Firstpass opens it on rung 0 (the cheapest model), the gate passes, and that output is served. One request, one rung, done. Here is the actual call:</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># "model":"auto" hands the choice to the matched route's ladder</span>
@@ -408,6 +422,271 @@ curl localhost:8080/v1/messages \
   &quot;hash&quot;: &quot;sha256:5c02d9…&quot;                    <span class="tk-c">// SHA-256 of this record — the next record's prev_hash</span>
 }</code></pre></div>
 <p>Read that receipt and the routing is fully explained: the cheap rung was tried ($0.0007), its output <em>failed a real test</em> (not a guess — <code>cargo-test</code> ran and returned <code>fail</code>), the cascade escalated exactly once, and the served answer cost $0.0128 against a $0.0630 always-strong baseline. Request 4 in the same loop might pass on rung 0, because "did the edit apply cleanly" is easy. The router never assumes that because turn 2 was hard, turn 4 will be — <strong>it re-earns the answer every time.</strong> No routing decision is ever carried forward, because none is kept.</p>
+
+<h2 id="exhausted">Nothing clears the gate<a class="anchor" href="#exhausted" aria-label="Link to this section">#</a></h2>
+<p>Sometimes the task is hard enough that <em>no</em> rung passes the gate — or a per-request budget cap stops the climb first. Firstpass never returns nothing, and never pretends. It serves the <strong>strongest attempt it saw</strong> and stamps the receipt <code>served_from: "best_attempt"</code> — a flag your pipeline can branch on. Here a strict <code>json-valid</code> gate rejects every rung, and a <code>$0.02</code> per-request cap halts the climb before the top model is ever tried:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 340" role="img" aria-labelledby="exhT">
+<title id="exhT">Rung 0 (haiku) fails the json-valid gate, the cascade climbs to rung 1 (sonnet) which also fails, and the per-request budget cap stops the climb before the top rung is tried. With no rung passing, the best attempt seen — rung 1 — is served and the receipt is stamped served_from best_attempt, unproven, so downstream code can detect it.</title>
+<defs>
+  <marker id="exA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="exF" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-fail)"/></marker>
+  <marker id="exW" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
+</defs>
+<text x="40" y="30" class="ink" font-size="13" font-weight="640">Every rung fails → serve the best attempt, flagged unproven</text>
+<!-- rung 0 -->
+<rect x="24" y="72" width="182" height="72" rx="12" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="40" y="98" class="ink m" font-size="12.5" font-weight="640">rung 0 · haiku</text>
+<text x="40" y="118" class="ink-mut m" font-size="10">in 60 · out 900</text>
+<text x="40" y="134" class="ink-mut m" font-size="10.5" font-weight="600">$0.0012</text>
+<!-- gate 0 fail -->
+<rect x="222" y="78" width="128" height="60" rx="11" class="n-fill fail-s glow-f" stroke-width="1.6"/>
+<text x="286" y="102" text-anchor="middle" class="fail m" font-size="11.5" font-weight="640">json-valid</text>
+<text x="286" y="122" text-anchor="middle" class="fail m" font-size="11" font-weight="600">fail</text>
+<!-- rung 1 -->
+<rect x="366" y="72" width="182" height="72" rx="12" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="382" y="98" class="ink m" font-size="12.5" font-weight="640">rung 1 · sonnet</text>
+<text x="382" y="118" class="ink-mut m" font-size="10">in 60 · out 1100</text>
+<text x="382" y="134" class="ink-mut m" font-size="10.5" font-weight="600">$0.0185</text>
+<!-- gate 1 fail -->
+<rect x="564" y="78" width="128" height="60" rx="11" class="n-fill fail-s glow-f" stroke-width="1.6"/>
+<text x="628" y="102" text-anchor="middle" class="fail m" font-size="11.5" font-weight="640">json-valid</text>
+<text x="628" y="122" text-anchor="middle" class="fail m" font-size="11" font-weight="600">fail</text>
+<!-- budget wall -->
+<rect x="708" y="72" width="104" height="72" rx="12" class="n-fill warn-s glow-w" stroke-width="1.7"/>
+<text x="760" y="96" text-anchor="middle" class="warn m" font-size="11" font-weight="700">budget cap</text>
+<text x="760" y="114" text-anchor="middle" class="warn m" font-size="10" font-weight="600">$0.02 · stop</text>
+<text x="760" y="132" text-anchor="middle" class="ink-mut m" font-size="9">opus untried</text>
+<!-- serve best -->
+<rect x="828" y="72" width="148" height="72" rx="12" class="n-fill warn-s glow-w" stroke-width="1.7"/>
+<text x="902" y="96" text-anchor="middle" class="ink" font-size="12" font-weight="700">serve best</text>
+<text x="902" y="115" text-anchor="middle" class="warn m" font-size="10" font-weight="600">attempt · rung 1</text>
+<text x="902" y="132" text-anchor="middle" class="ink-mut m" font-size="9.5">unproven</text>
+<!-- connectors -->
+<line x1="206" y1="108" x2="220" y2="108" class="n-stroke" stroke-width="1.5" marker-end="url(#exA)"/>
+<path d="M286 138 C286 176 340 176 366 146" fill="none" class="fail-s" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#exF)"/>
+<text x="326" y="192" text-anchor="middle" class="fail" font-size="10" font-weight="600">+1 rung</text>
+<line x1="548" y1="108" x2="562" y2="108" class="n-stroke" stroke-width="1.5" marker-end="url(#exA)"/>
+<path d="M628 138 C628 172 690 172 708 146" fill="none" class="fail-s" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#exF)"/>
+<line x1="812" y1="108" x2="826" y2="108" class="warn-s" stroke-width="1.7" marker-end="url(#exW)"/>
+<!-- pulses -->
+<line x1="206" y1="108" x2="220" y2="108" class="flow s" stroke-width="2"/>
+<path d="M286 138 C286 176 340 176 366 146" class="flow f s d2" stroke-width="2"/>
+<line x1="548" y1="108" x2="562" y2="108" class="flow s d3" stroke-width="2"/>
+<path d="M628 138 C628 172 690 172 708 146" class="flow f s d4" stroke-width="2"/>
+<line x1="812" y1="108" x2="826" y2="108" class="flow w s d5" stroke-width="2"/>
+<!-- receipt tape -->
+<rect x="24" y="238" width="952" height="72" rx="12" class="n-fill warn-s glow-w" stroke-width="1.5"/>
+<text x="46" y="266" class="ink" font-size="12" font-weight="640">receipt · served_from best_attempt</text>
+<text x="46" y="290" class="warn m" font-size="11" font-weight="640">UNPROVEN</text>
+<text x="200" y="290" class="ink-mut m" font-size="11">served $0.0197</text>
+<text x="380" y="290" class="ink-mut m" font-size="11">served_rung 1</text>
+<text x="560" y="290" class="ink-mut m" font-size="11">baseline $0.0630</text>
+<text x="760" y="290" class="ink-mut m" font-size="11">no gate passed</text>
+<line x1="902" y1="144" x2="902" y2="236" class="warn-s" stroke-width="1.3" stroke-dasharray="3 3" marker-end="url(#exW)"/>
+<line x1="24" y1="274" x2="976" y2="274" class="flow w l d3" stroke-width="2"/>
+</svg>
+  <figcaption>No rung cleared the gate, so the best attempt is served — honestly flagged. <code>served_from: "best_attempt"</code> is the machine-readable signal that the answer shipped unproven; the receipt still counts every dollar spent.</figcaption>
+</div>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># a genuinely hard ask behind a strict json-valid gate</span>
+curl localhost:8080/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "auto",
+    "max_tokens": 512,
+    "messages": [{"role": "user",
+      "content": "Return ONLY valid JSON: every US state with its capital and 2020 population."}]
+  }'</code></pre></div>
+<p>Both rungs run, both fail the gate, the cap stops the climb before opus, and rung 1's output — the best of a bad set — is served. The receipt tells the whole story, and the honesty is in one field:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
+  &quot;trace_id&quot;: &quot;c4a2e1f0-…-9f31&quot;,
+  &quot;mode&quot;: &quot;enforce&quot;,
+  &quot;request&quot;: { &quot;api&quot;: &quot;anthropic.messages&quot;, &quot;prompt_hash&quot;: &quot;sha256:7b1e…&quot; },
+  &quot;attempts&quot;: [
+    { &quot;rung&quot;: 0, &quot;model&quot;: &quot;anthropic/claude-haiku-4-5&quot;, &quot;provider&quot;: &quot;anthropic&quot;,
+      &quot;in_tokens&quot;: 60, &quot;out_tokens&quot;: 900, &quot;cost_usd&quot;: 0.0012, &quot;latency_ms&quot;: 1400,
+      &quot;gates&quot;: [{ &quot;gate_id&quot;: &quot;json-valid&quot;, &quot;verdict&quot;: &quot;fail&quot;, &quot;reason&quot;: &quot;prose before JSON&quot; }],
+      &quot;verdict&quot;: &quot;fail&quot; },
+    { &quot;rung&quot;: 1, &quot;model&quot;: &quot;anthropic/claude-sonnet-5&quot;, &quot;provider&quot;: &quot;anthropic&quot;,
+      &quot;in_tokens&quot;: 60, &quot;out_tokens&quot;: 1100, &quot;cost_usd&quot;: 0.0185, &quot;latency_ms&quot;: 2100,
+      &quot;gates&quot;: [{ &quot;gate_id&quot;: &quot;json-valid&quot;, &quot;verdict&quot;: &quot;fail&quot;, &quot;reason&quot;: &quot;trailing comma, line 148&quot; }],
+      &quot;verdict&quot;: &quot;fail&quot; }
+  ],
+  &quot;final&quot;: {
+    &quot;served_rung&quot;: 1,
+    &quot;served_from&quot;: &quot;best_attempt&quot;,          <span class="tk-c">// ← no gate passed; best effort shipped, flagged</span>
+    &quot;total_cost_usd&quot;: 0.0197,
+    &quot;total_latency_ms&quot;: 3500,
+    &quot;escalations&quot;: 1,
+    &quot;counterfactual_baseline_usd&quot;: 0.0630
+  }
+}</code></pre></div>
+<div class="note"><span class="nt">The served-failure guarantee, stated precisely</span> You always get bytes back — the strongest answer the budget bought — and the receipt marks it <em>unproven</em> so you can retry, flag, or fall back. It is never a silent bad answer dressed up as a good one. Prefer a hard error over a best-effort serve? Set <code>on_exhausted = "error"</code> and an exhausted ladder returns a structured error with <code>served_from: "error"</code> instead of a body. Either way the outcome is explicit — see <a href="guarantee.html">the guarantee</a>.</div>
+
+<h2 id="failover">A provider is down<a class="anchor" href="#failover" aria-label="Link to this section">#</a></h2>
+<p>Providers have bad minutes. When a rung returns a <code>5xx</code> or drops the connection, Firstpass treats it as an <strong>abstain</strong> on that rung — not a gate failure, not a served answer — and moves to the next rung, which can live on a <em>different provider</em> entirely. The client sees one ordinary response; only the receipt reveals the failover. The ladder here crosses providers on purpose:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 320" role="img" aria-labelledby="foT">
+<title id="foT">Rung 0 on Anthropic returns HTTP 503, so it is recorded as an abstain rather than a failure. The cascade fails over to rung 1 on OpenAI, which answers and passes its gate. The served response is re-rendered into the caller's Anthropic dialect, and the receipt shows the abstain, the provider switch, and served_from attempt on rung 1.</title>
+<defs>
+  <marker id="foA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="foW" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
+  <marker id="foP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+</defs>
+<text x="40" y="30" class="ink" font-size="13" font-weight="640">503 on one provider → abstain → the next provider serves</text>
+<!-- rung 0 -->
+<rect x="36" y="66" width="196" height="72" rx="12" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="52" y="92" class="ink m" font-size="12" font-weight="640">rung 0 · anthropic</text>
+<text x="52" y="112" class="ink-mut m" font-size="10.5">claude-haiku-4-5</text>
+<text x="52" y="130" class="ink-mut m" font-size="10">the ladder's first rung</text>
+<!-- 503 abstain -->
+<rect x="272" y="72" width="150" height="60" rx="11" class="n-fill warn-s glow-w" stroke-width="1.6"/>
+<text x="347" y="96" text-anchor="middle" class="warn m" font-size="12" font-weight="640">HTTP 503</text>
+<text x="347" y="116" text-anchor="middle" class="warn m" font-size="11" font-weight="600">abstain</text>
+<!-- rung 1 (provider switch) -->
+<rect x="480" y="66" width="196" height="72" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="496" y="92" class="ink m" font-size="12" font-weight="640">rung 1 · openai</text>
+<text x="496" y="112" class="accent-ink m" font-size="10.5" font-weight="600">gpt-4o-mini · provider switch</text>
+<text x="496" y="130" class="ink-mut m" font-size="10">same request, sent elsewhere</text>
+<!-- gate pass -->
+<rect x="716" y="72" width="150" height="60" rx="11" class="n-fill pass-s glow-p" stroke-width="1.6"/>
+<text x="791" y="96" text-anchor="middle" class="pass m" font-size="12" font-weight="640">non-empty</text>
+<text x="791" y="116" text-anchor="middle" class="pass m" font-size="11" font-weight="600">pass</text>
+<!-- serve -->
+<rect x="888" y="66" width="84" height="72" rx="12" class="n-fill pass-s glow-p" stroke-width="1.7"/>
+<text x="930" y="96" text-anchor="middle" class="ink" font-size="12" font-weight="700">serve</text>
+<text x="930" y="116" text-anchor="middle" class="pass m" font-size="10" font-weight="600">rung 1</text>
+<!-- connectors -->
+<line x1="232" y1="102" x2="270" y2="102" class="n-stroke" stroke-width="1.5" marker-end="url(#foA)"/>
+<path d="M347 132 C347 176 458 176 480 140" fill="none" class="warn-s" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#foW)"/>
+<text x="410" y="196" text-anchor="middle" class="warn" font-size="10.5" font-weight="600">fail over</text>
+<line x1="676" y1="102" x2="714" y2="102" class="n-stroke" stroke-width="1.5" marker-end="url(#foA)"/>
+<line x1="866" y1="102" x2="886" y2="102" class="pass-s" stroke-width="1.6" marker-end="url(#foP)"/>
+<!-- pulses -->
+<line x1="232" y1="102" x2="270" y2="102" class="flow s" stroke-width="2"/>
+<path d="M347 132 C347 176 458 176 480 140" class="flow w s d2" stroke-width="2"/>
+<line x1="676" y1="102" x2="714" y2="102" class="flow s d3" stroke-width="2"/>
+<line x1="866" y1="102" x2="886" y2="102" class="flow p s d4" stroke-width="2"/>
+<!-- receipt tape -->
+<rect x="36" y="222" width="936" height="72" rx="12" class="n-fill accent-s glow" stroke-width="1.5"/>
+<text x="58" y="250" class="ink" font-size="12" font-weight="640">receipt · served_from attempt</text>
+<text x="58" y="274" class="warn m" font-size="11" font-weight="600">rung 0 abstain (503)</text>
+<text x="250" y="274" class="pass m" font-size="11" font-weight="600">rung 1 pass</text>
+<text x="400" y="274" class="ink-mut m" font-size="11">provider anthropic → openai</text>
+<text x="680" y="274" class="ink-mut m" font-size="11">served_rung 1 · stayed up</text>
+<line x1="930" y1="138" x2="930" y2="220" class="pass-s" stroke-width="1.3" stroke-dasharray="3 3" marker-end="url(#foP)"/>
+<line x1="36" y1="258" x2="972" y2="258" class="flow p l d2" stroke-width="2"/>
+</svg>
+  <figcaption>A provider-side fault costs nothing and serves nothing — it abstains, and the cascade tries the next rung. Because the ladder spans providers, an Anthropic outage is answered by OpenAI, in your original dialect, without the client noticing.</figcaption>
+</div>
+<p>The response comes back in your dialect as always — the only tell is the <code>model</code> field, which names the rung that actually ran:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
+  &quot;id&quot;: &quot;msg_01Rb7…&quot;,
+  &quot;type&quot;: &quot;message&quot;,
+  &quot;role&quot;: &quot;assistant&quot;,
+  &quot;model&quot;: &quot;openai/gpt-4o-mini&quot;,          <span class="tk-c">// answered by the failover rung — in Anthropic shape</span>
+  &quot;content&quot;: [{ &quot;type&quot;: &quot;text&quot;, &quot;text&quot;: &quot;Paris.&quot; }],
+  &quot;stop_reason&quot;: &quot;end_turn&quot;,
+  &quot;usage&quot;: { &quot;input_tokens&quot;: 14, &quot;output_tokens&quot;: 4 }
+}</code></pre></div>
+<p>The receipt records the abstain and the cross-provider serve — the failover is auditable after the fact:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
+  &quot;trace_id&quot;: &quot;e91c3d55-…-2a70&quot;,
+  &quot;mode&quot;: &quot;enforce&quot;,
+  &quot;attempts&quot;: [
+    { &quot;rung&quot;: 0, &quot;model&quot;: &quot;anthropic/claude-haiku-4-5&quot;, &quot;provider&quot;: &quot;anthropic&quot;,
+      &quot;in_tokens&quot;: 0, &quot;out_tokens&quot;: 0, &quot;cost_usd&quot;: 0.0, &quot;latency_ms&quot;: 240,
+      &quot;gates&quot;: [],                                <span class="tk-c">// provider errored before any output could be gated</span>
+      &quot;verdict&quot;: &quot;abstain&quot; },
+    { &quot;rung&quot;: 1, &quot;model&quot;: &quot;openai/gpt-4o-mini&quot;, &quot;provider&quot;: &quot;openai&quot;,
+      &quot;in_tokens&quot;: 14, &quot;out_tokens&quot;: 4, &quot;cost_usd&quot;: 0.0001, &quot;latency_ms&quot;: 380,
+      &quot;gates&quot;: [{ &quot;gate_id&quot;: &quot;non-empty&quot;, &quot;verdict&quot;: &quot;pass&quot; }],
+      &quot;verdict&quot;: &quot;pass&quot; }
+  ],
+  &quot;final&quot;: {
+    &quot;served_rung&quot;: 1,
+    &quot;served_from&quot;: &quot;attempt&quot;,
+    &quot;total_cost_usd&quot;: 0.0001,
+    &quot;total_latency_ms&quot;: 620,
+    &quot;escalations&quot;: 1
+  }
+}</code></pre></div>
+<div class="note"><span class="nt">A hard 4xx is not a failover</span> A <code>4xx</code> means the request itself was wrong — malformed body, bad auth — and a stronger model on another provider can't fix that. So the ladder stops immediately with <code>served_from: "error"</code> and a structured error to the caller. Failover is only for provider-side faults (<code>5xx</code>, transport), where the <em>same</em> request may well succeed elsewhere.</div>
+
+<h2 id="observe">Observe mode: shadow, zero change<a class="anchor" href="#observe" aria-label="Link to this section">#</a></h2>
+<p>Before Firstpass changes a single response, run it in <strong>observe</strong> — the default on a fresh install. Every request is forwarded <em>byte-for-byte</em> to the exact model you asked for, and the response you get is precisely what the provider returns. Firstpass still scores the cascade <em>in the shadow</em> and writes a receipt, so you collect the savings estimate and the audit trail with <strong>zero behavior change</strong>. Set it per route, or per request with a header:</p>
+<div class="figure"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="obT">
+<title id="obT">In observe mode the request is forwarded byte-for-byte to the model the client asked for and that provider's response is served unchanged — the top path. In parallel, in the shadow, Firstpass runs the cascade and gate for learning and writes a receipt marked mode observe, which carries the savings estimate. The served path never changes; only the receipt is produced.</title>
+<defs>
+  <marker id="obA" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
+  <marker id="obP" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
+  <marker id="obM" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-grid)"/></marker>
+</defs>
+<text x="40" y="30" class="ink" font-size="13" font-weight="640">Served path unchanged · the cascade runs only in the shadow</text>
+<!-- request -->
+<rect x="30" y="118" width="150" height="66" rx="12" class="n-fill n-stroke" stroke-width="1.6"/>
+<text x="105" y="146" text-anchor="middle" class="ink m" font-size="12" font-weight="640">your request</text>
+<text x="105" y="165" text-anchor="middle" class="ink-mut m" font-size="10">model: sonnet-5</text>
+<!-- firstpass -->
+<rect x="242" y="116" width="150" height="70" rx="12" class="n-fill accent-s glow" stroke-width="1.7"/>
+<text x="317" y="144" text-anchor="middle" class="ink" font-size="12.5" font-weight="700">Firstpass</text>
+<text x="317" y="163" text-anchor="middle" class="accent-ink m" font-size="10.5" font-weight="600">observe</text>
+<!-- top path: forward + serve -->
+<rect x="516" y="52" width="196" height="60" rx="11" class="n-fill n-stroke" stroke-width="1.5"/>
+<text x="614" y="76" text-anchor="middle" class="ink m" font-size="11" font-weight="600">claude-sonnet-5</text>
+<text x="614" y="94" text-anchor="middle" class="ink-mut m" font-size="9.5">exactly what you asked for</text>
+<rect x="760" y="52" width="210" height="60" rx="11" class="n-fill pass-s glow-p" stroke-width="1.6"/>
+<text x="865" y="76" text-anchor="middle" class="ink" font-size="11.5" font-weight="640">response served</text>
+<text x="865" y="94" text-anchor="middle" class="pass m" font-size="9.5" font-weight="600">provider's own bytes</text>
+<!-- bottom path: shadow + receipt -->
+<rect x="516" y="192" width="196" height="60" rx="11" class="n-fill n-stroke" stroke-width="1.4" opacity="0.72"/>
+<text x="614" y="216" text-anchor="middle" class="ink-mut m" font-size="11" font-weight="600">shadow cascade + gate</text>
+<text x="614" y="234" text-anchor="middle" class="ink-mut m" font-size="9.5">would rung 0 have passed?</text>
+<rect x="760" y="192" width="210" height="60" rx="11" class="n-fill accent-s" stroke-width="1.4"/>
+<text x="865" y="216" text-anchor="middle" class="ink m" font-size="11.5" font-weight="640">receipt · estimate</text>
+<text x="865" y="234" text-anchor="middle" class="accent-ink m" font-size="9.5" font-weight="600">mode: observe</text>
+<!-- labels -->
+<text x="470" y="44" class="pass m" font-size="10" font-weight="640">SERVED — unchanged</text>
+<text x="470" y="284" class="ink-mut m" font-size="10" font-weight="600">SHADOW — write-only</text>
+<!-- connectors -->
+<line x1="180" y1="151" x2="240" y2="151" class="n-stroke" stroke-width="1.5" marker-end="url(#obA)"/>
+<path d="M392 138 C440 120 470 92 514 86" fill="none" class="pass-s" stroke-width="1.6" marker-end="url(#obP)"/>
+<line x1="712" y1="82" x2="758" y2="82" class="pass-s" stroke-width="1.6" marker-end="url(#obP)"/>
+<path d="M392 166 C440 188 470 216 514 222" fill="none" class="grid" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#obM)"/>
+<line x1="712" y1="222" x2="758" y2="222" class="grid" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#obM)"/>
+<!-- pulses -->
+<line x1="180" y1="151" x2="240" y2="151" class="flow s" stroke-width="2"/>
+<path d="M392 138 C440 120 470 92 514 86" class="flow p s d2" stroke-width="2"/>
+<line x1="712" y1="82" x2="758" y2="82" class="flow p s d3" stroke-width="2"/>
+</svg>
+  <figcaption>Observe is the safe on-ramp: the client keeps getting the model it asked for, byte-for-byte, while Firstpass quietly measures what a cascade <em>would</em> have saved. When the shadow receipts convince you, flip the route to enforce.</figcaption>
+</div>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># x-firstpass-mode: observe forwards byte-for-byte and only shadows the cascade</span>
+curl localhost:8080/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-firstpass-mode: observe' \
+  -d '{
+    "model": "claude-sonnet-5",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Summarize this PR in one line."}]
+  }'</code></pre></div>
+<p>The response is the upstream model's, untouched — <code>model</code> is the one you requested, not a rung. The receipt records the mode and the shadow verdict that feeds the savings estimate over time:</p>
+<div class="codeblock"><div class="cb-head"><span>json</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>{
+  &quot;trace_id&quot;: &quot;7f0a19c2-…-1c88&quot;,
+  &quot;mode&quot;: &quot;observe&quot;,                          <span class="tk-c">// nothing was changed — this receipt is measurement only</span>
+  &quot;request&quot;: { &quot;api&quot;: &quot;anthropic.messages&quot;, &quot;prompt_hash&quot;: &quot;sha256:11ac…&quot; },
+  &quot;attempts&quot;: [
+    { &quot;rung&quot;: 0, &quot;model&quot;: &quot;anthropic/claude-sonnet-5&quot;, &quot;provider&quot;: &quot;anthropic&quot;,
+      &quot;in_tokens&quot;: 900, &quot;out_tokens&quot;: 40, &quot;cost_usd&quot;: 0.0126, &quot;latency_ms&quot;: 1100,
+      &quot;gates&quot;: [{ &quot;gate_id&quot;: &quot;non-empty&quot;, &quot;verdict&quot;: &quot;pass&quot; }],   <span class="tk-c">// gated in the shadow, for learning</span>
+      &quot;verdict&quot;: &quot;pass&quot; }
+  ],
+  &quot;final&quot;: {
+    &quot;served_rung&quot;: 0,
+    &quot;served_from&quot;: &quot;attempt&quot;,
+    &quot;total_cost_usd&quot;: 0.0126,
+    &quot;escalations&quot;: 0
+  }
+}</code></pre></div>
+<div class="note"><span class="nt">Observe → enforce, when the data convinces you</span> Read a week of shadow receipts, see the savings and the gate pass-rate on <em>your</em> real traffic, then flip the route to an enforce mode — one line per route. See <a href="how-it-works.html#observe">observe vs enforce</a> and <a href="configuration.html">Configuration</a>.</div>
 
 <h2 id="subagents">Subagents<a class="anchor" href="#subagents" aria-label="Link to this section">#</a></h2>
 <p>When the main agent spawns a subagent, the subagent runs its <em>own</em> loop — and every call in that loop is, again, an independent <code>POST</code> to Firstpass. Nothing about a subagent call is structurally different from a main-loop call. So how does Firstpass route a planner subagent to a strong model and a mechanical one to a cheap model? <strong>You tag the request.</strong> The orchestrator sets <code>x-firstpass-subagent</code> on the subagent's calls, and a route matches on it:</p>
@@ -588,7 +867,7 @@ const client = new Anthropic({ baseURL: "http://localhost:8080" });
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="how-it-works.html"><span class="dir">← Previous</span><span class="t">How it works</span></a><a class="next" href="gates.html"><span class="dir">Next →</span><span class="t">Gates</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#one-idea" class="">The one idea</a><a href="#unit" class="">The unit of routing</a><a href="#why-expensive" class="">Why it gets expensive</a><a href="#lifecycle" class="">Life of one request</a><a href="#simple" class="">A simple question</a><a href="#complex" class="">A complex question</a><a href="#subagents" class="">Subagents</a><a href="#teams" class="">Teams &amp; workflows</a><a href="#multiturn" class="">Multi-turn &amp; context</a><a href="#modes" class="">Claude Code vs SDK</a><a href="#limits" class="">Configure vs automatic</a><a href="#tackle" class="">How we tackle it</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#one-idea" class="">The one idea</a><a href="#unit" class="">The unit of routing</a><a href="#why-expensive" class="">Why it gets expensive</a><a href="#lifecycle" class="">Life of one request</a><a href="#scenarios" class="">Every scenario</a><a href="#simple" class="">A simple question</a><a href="#complex" class="">A complex question</a><a href="#exhausted" class="">Nothing clears the gate</a><a href="#failover" class="">A provider is down</a><a href="#observe" class="">Observe mode</a><a href="#subagents" class="">Subagents</a><a href="#teams" class="">Teams &amp; workflows</a><a href="#multiturn" class="">Multi-turn &amp; context</a><a href="#modes" class="">Claude Code vs SDK</a><a href="#limits" class="">Configure vs automatic</a><a href="#tackle" class="">How we tackle it</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">
