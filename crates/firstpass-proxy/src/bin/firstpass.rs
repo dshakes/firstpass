@@ -154,7 +154,12 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
 /// channel ships an updater we own, so that one runs in place; every other channel is owned by a
 /// package manager and gets its exact command printed rather than mutated behind its back.
 fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve symlinks before matching. `current_exe()` hands back the path the binary was
+    // launched through, not the file itself — and pipx (plus uv tool, and Homebrew) put a
+    // symlink on PATH pointing into a private directory. Matching the link means seeing
+    // `~/.local/bin` and concluding nothing, which is exactly what happened in the field.
     let exe = std::env::current_exe().unwrap_or_default();
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let in_container = std::path::Path::new("/.dockerenv").exists();
     let path_var = std::env::var("PATH").ok();
     // The updater sits beside the binary the installer placed, or on PATH.
