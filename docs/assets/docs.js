@@ -124,6 +124,63 @@
   });
 
 
+
+  /* ---- scroll reveal (landing) ---------------------------------------------
+     A reveal that hides content in CSS and un-hides it from script can strand
+     the page blank, so this is built to fail open in every direction:
+
+       - nothing is armed unless the tab is actually visible. rAF and
+         IntersectionObserver are both throttled in background tabs, so arming
+         a hidden tab is what leaves cmd-clicked pages blank;
+       - elements already on screen are revealed synchronously, not in a frame
+         callback that a hidden tab will never run;
+       - a failsafe timer strips the hiding class from anything still unshown,
+         so the worst case is "no animation", never "no content";
+       - reduced motion never arms at all.                                    */
+  function armReveal() {
+    if (document.visibilityState !== 'visible') return false;
+    var targets = document.querySelectorAll(
+      '.sec .card, .sec .figure, .sec .vs, .sec .statcol, .sec .install, .rig'
+    );
+    if (!targets.length) return true;
+    var list = Array.prototype.slice.call(targets);
+    var show = function (el) { el.classList.add('shown'); };
+
+    if (!('IntersectionObserver' in window)) { return true; }   // leave content as-is
+
+    var obs = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) {
+        if (!en.isIntersecting) return;
+        show(en.target);
+        obs.unobserve(en.target);                                // one-shot; never re-hides
+      });
+    }, { rootMargin: '0px 0px -8% 0px', threshold: 0.06 });
+
+    list.forEach(function (el, i) {
+      el.classList.add('js-reveal');
+      el.style.transitionDelay = Math.min(i % 4, 3) * 55 + 'ms';
+      // Synchronous, because anything already on screen must not wait on a frame.
+      if (el.getBoundingClientRect().top < window.innerHeight) show(el);
+      else obs.observe(el);
+    });
+
+    // Failsafe: whatever has not been revealed within 4s gets un-hidden outright.
+    setTimeout(function () {
+      list.forEach(function (el) {
+        if (!el.classList.contains('shown')) el.classList.remove('js-reveal');
+      });
+    }, 4000);
+    return true;
+  }
+
+  var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!reduceMotion && !armReveal()) {
+    // Backgrounded at load — wait until the tab is actually looked at.
+    document.addEventListener('visibilitychange', function once() {
+      if (armReveal()) document.removeEventListener('visibilitychange', once);
+    });
+  }
+
   /* ---- config builder ------------------------------------------------------
      The docs used to hand you a TOML blob to retype. Pick provider, workload and
      mode; a COMPLETE runnable file writes itself — including the [[provider]] and

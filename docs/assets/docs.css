@@ -669,10 +669,35 @@ hr.rule{border:0;border-top:1px solid var(--border);margin:40px 0}
   box-shadow:0 0 0 3px var(--accent-soft)}
 .rig-tag{margin-left:auto;color:var(--text-3);border:1px solid var(--border);border-radius:999px;
   padding:4px 10px;font-size:11px}
-/* Below ~820px the 960-unit viewBox would scale 11px labels down to unreadable, so the
-   panel scrolls horizontally instead of shrinking — the same trade .tblwrap makes. */
-.rig-scroll{overflow-x:auto;overscroll-behavior-x:contain}
-.rig-svg{display:block;width:100%;min-width:760px;height:auto;padding:8px 10px 0}
+/* The diagram and the readout are deliberately separate elements. Putting the cost figures
+   inside the SVG looked fine on a desktop and hid the entire payoff off-screen on a phone —
+   an SVG cannot reflow. As HTML the readout drops below the ladder instead, and the numbers
+   become selectable text a screen reader can announce. */
+.rig-grid{display:grid;grid-template-columns:minmax(0,1fr) 250px;align-items:center;gap:8px}
+.rig-scroll{overflow-x:auto;overscroll-behavior-x:contain;min-width:0}
+.rig-svg{display:block;width:100%;min-width:520px;height:auto;padding:8px 4px 0}
+.rig-read{padding:6px 20px 14px 8px;border-left:1px solid var(--border)}
+.rig-read-h{margin:0 0 16px;font-size:11px;letter-spacing:.06em;color:var(--text-3)}
+.rig-meter{margin:0 0 4px}
+.rig-meter-k{display:block;font-size:12px;color:var(--text-3);margin-bottom:6px}
+.rig-bar{display:block;height:9px;border-radius:5px;background:var(--d-track);overflow:hidden}
+.rig-bar-f{display:block;height:100%;border-radius:5px;background:var(--accent);
+  transform-origin:left center}
+.rig-bar-g{display:block;height:100%;border-radius:5px;border:1px dashed var(--d-stroke);
+  box-sizing:border-box}
+.rig-meter-v{display:block;margin:8px 0 16px;font-size:17px;font-weight:600;color:var(--text)}
+.rig-meter-v.ghost{color:var(--text-3);font-weight:500}
+.rig-save{margin:18px 0 0}
+.rig-save b{display:block;font-size:25px;font-weight:700;color:var(--accent-strong);
+  letter-spacing:-.01em}
+.rig-save span{display:block;margin-top:5px;font-size:11.5px;color:var(--text-3)}
+@media (max-width:860px){
+  /* Stack instead of scrolling the payoff off the side of a phone. */
+  .rig-grid{grid-template-columns:minmax(0,1fr)}
+  .rig-read{border-left:0;border-top:1px solid var(--border);padding:16px 20px}
+  .rig-save{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  .rig-save b{font-size:22px}
+}
 .rig-seal{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
   padding:13px 18px;border-top:1px solid var(--border);background:var(--surface-2);
   font:500 12px/1.5 var(--mono);color:var(--text-3)}
@@ -693,7 +718,53 @@ hr.rule{border:0;border-top:1px solid var(--border);margin:40px 0}
   /* The cost fill grows from its left edge ONCE and stays. It must not loop: the bar
      sits beside the literal figure, and a looping bar spends most of its time showing
      a width that contradicts the number next to it. */
-  .rig-svg .fill{transform-box:fill-box;transform-origin:left center;
-    animation:fp-rig-fill 1.1s cubic-bezier(.22,.9,.28,1) .25s 1 both}
+  .rig-bar-f{animation:fp-rig-fill 1.1s cubic-bezier(.22,.9,.28,1) .25s 1 both}
   @keyframes fp-rig-fill{from{transform:scaleX(.02)}to{transform:scaleX(1)}}
+}
+
+
+/* ============================================================================
+   Landing: depth, rhythm and reveal.
+   These are system-level — they lift all twelve sections at once instead of
+   restyling each. Nothing here is load-bearing for comprehension: with JS off
+   or motion reduced every element sits at its final, fully legible state.
+   ========================================================================== */
+
+/* ---- cards: a lit edge instead of a flat hairline --------------------------
+   The border becomes a gradient that catches brand light at the top-left, and
+   the card lifts fractionally on hover. Depth, not decoration — it separates
+   twenty-odd cards from the page without adding a single new element.        */
+.sec .card{position:relative;isolation:isolate;
+  background:
+    linear-gradient(var(--surface),var(--surface)) padding-box,
+    linear-gradient(145deg,var(--accent-line),var(--border) 42%,var(--border)) border-box;
+  border:1px solid transparent}
+.sec .card::after{content:"";position:absolute;inset:0;border-radius:inherit;z-index:-1;
+  opacity:0;transition:opacity .22s;
+  background:radial-gradient(120% 90% at 12% 0%,var(--accent-soft),transparent 62%)}
+.sec .card:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg);
+  background:
+    linear-gradient(var(--surface),var(--surface)) padding-box,
+    linear-gradient(145deg,var(--accent),var(--border-2) 46%,var(--border)) border-box}
+.sec .card:hover::after{opacity:1}
+
+/* ---- section rhythm -------------------------------------------------------
+   A hairline rail with a brand node marks each section start, so the page
+   reads as a sequence of instrument panels rather than stacked text blocks.  */
+.sec>.wrap>.sec-head{position:relative}
+.sec>.wrap>.sec-head::before{content:"";position:absolute;left:-26px;top:6px;bottom:6px;width:1px;
+  background:linear-gradient(180deg,var(--accent-line),transparent 78%)}
+@media (max-width:1100px){.sec>.wrap>.sec-head::before{display:none}}
+.sec-head h2{letter-spacing:-.03em}
+.eyebrow{position:relative}
+
+/* ---- scroll reveal --------------------------------------------------------
+   Opt-IN via .js-reveal, which docs.js only adds when it is going to observe
+   the element. JS off or observer unsupported => the class is never added and
+   content renders normally. This ordering is deliberate: content must never
+   depend on a script to become visible.                                      */
+@media (prefers-reduced-motion:no-preference){
+  .js-reveal{opacity:0;transform:translateY(14px);
+    transition:opacity .6s cubic-bezier(.22,.9,.28,1),transform .6s cubic-bezier(.22,.9,.28,1)}
+  .js-reveal.shown{opacity:1;transform:none}
 }
