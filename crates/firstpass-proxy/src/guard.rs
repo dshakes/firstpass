@@ -244,4 +244,77 @@ mod tests {
             "reset did not clear the demotion"
         );
     }
+
+    /// The reason route attribution exists: a failing route must not hide behind a healthy
+    /// sibling. Before outcomes carried their route, every tenant's feedback pooled onto route 0,
+    /// so a config with one bad route and one good one could stay green while the bad one
+    /// degraded — the guard sitting quiet exactly when it was needed.
+    #[test]
+    fn a_failing_route_is_demoted_without_dragging_down_a_healthy_sibling() {
+        let r = GuardrailRegistry::new();
+        let c = cfg(GuardrailAction::Demote);
+        // Route 0 fails hard; route 1 is clean. Interleaved, as real traffic would arrive.
+        for i in 0..600 {
+            r.record("t", 0, &c, i % 10 >= 3, 1_000, 3_600);
+            r.record("t", 1, &c, true, 1_000, 3_600);
+        }
+        assert!(
+            r.is_demoted("t", 0, 1_000),
+            "the failing route was not demoted"
+        );
+        assert!(
+            !r.is_demoted("t", 1, 1_000),
+            "a healthy route was demoted by its sibling's failures — attribution is not working"
+        );
+    }
+
+    /// The mirror, and the concrete reason this fix matters: pooled onto one bucket, a healthy
+    /// sibling's successes can dilute a failing route below the target so the guardrail never
+    /// fires.
+    ///
+    /// The arithmetic, spelled out because the effect depends on it (delta=0.05, alpha=0.10).
+    /// Note the guardrail evaluates on EVERY outcome, so what matters is the bound at `min_n`,
+    /// where the slack is widest — not at the full window:
+    ///   min_n=800 -> slack 0.043
+    ///   attributed: rate 0.10 + 0.043 = 0.143  -> breaches
+    ///   pooled:     rate 0.05 + 0.043 = 0.093  -> does NOT breach
+    ///
+    /// Two earlier attempts at this test were wrong and both taught something. A 30% rate halves
+    /// to 15% and still breaches — dilution only masks when it pulls the bound under alpha. And
+    /// min_n=400 gives slack 0.061, so even the diluted 5% breached at the moment judging began:
+    /// staying under needs n > ln(1/delta) / (2*(alpha-rate)^2), which is 600 here.
+    #[test]
+    fn a_healthy_sibling_can_mask_a_failing_route_when_outcomes_are_pooled() {
+        let wide = Guardrail {
+            alpha: 0.10,
+            delta: 0.05,
+            window: 4000,
+            min_n: 800,
+            action: GuardrailAction::Demote,
+        };
+        let pooled = GuardrailRegistry::new();
+        let attributed = GuardrailRegistry::new();
+        for i in 0..2000 {
+            let failing = i % 10 != 0; // 10% failures on the bad route
+            // Pre-fix behaviour: both streams land on route 0.
+            pooled.record("t", 0, &wide, failing, 1_000, 3_600);
+            pooled.record("t", 0, &wide, true, 1_000, 3_600);
+            // With attribution: each stream to the route that produced it.
+            attributed.record("t", 0, &wide, failing, 1_000, 3_600);
+            attributed.record("t", 1, &wide, true, 1_000, 3_600);
+        }
+        assert!(
+            attributed.is_demoted("t", 0, 1_000),
+            "attributed: the failing route must be caught"
+        );
+        assert!(
+            !attributed.is_demoted("t", 1, 1_000),
+            "attributed: the healthy sibling must be left alone"
+        );
+        assert!(
+            !pooled.is_demoted("t", 0, 1_000),
+            "pooling was expected to mask this failure — that masking is exactly what route \
+             attribution fixes, so if this fires the demonstration needs new numbers"
+        );
+    }
 }

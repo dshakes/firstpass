@@ -443,6 +443,25 @@ async fn feedback(
                     .set(g.realized_served_failure());
             }
 
+            // Which route produced the decision this outcome is about. Read from the trace
+            // rather than assumed, and tenant-scoped by the same ownership check `trace_exists`
+            // makes. Traces written before route recording fall back to 0 — the previous
+            // behaviour — so old logs keep working rather than being silently dropped.
+            let attributed_route = tokio::task::spawn_blocking({
+                let (db, ten, tid) = (
+                    state.config.db_path.clone(),
+                    tenant.clone(),
+                    trace_id.clone(),
+                );
+                move || store::trace_route(&db, &ten, &tid)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .flatten()
+            .unwrap_or(0) as usize;
+
             // Feed the guardrail (ADR 0009 D3). This is deliberately the ONLY thing that feeds
             // it: a resolved downstream outcome, not a gate verdict. Gate verdicts are
             // Firstpass's own opinion, and a guardrail fed on them would be grading its own
@@ -456,12 +475,9 @@ async fn feedback(
                     .routing
                     .as_ref()
                     .map_or(3_600, |r| r.guardrail_cooldown_secs);
-                // Route 0 until deferred verdicts carry the route they came from; a
-                // single-route deployment (the common case) is exact, and a multi-route one
-                // pools conservatively rather than silently guarding nothing.
                 let reaction = state.guardrails.record(
                     &tenant,
-                    0,
+                    attributed_route,
                     &cfg,
                     correct,
                     jiff::Timestamp::now().as_second(),
@@ -827,6 +843,7 @@ async fn messages(
                     &body,
                     features,
                     &route,
+                    route_ix,
                     session_header,
                     tenant,
                     routing_mode,
@@ -974,6 +991,9 @@ async fn handle_enforce(
     body: &Bytes,
     features: Features,
     route: &Route,
+    // Index of the matched route, stamped on the trace so a downstream outcome arriving
+    // later can be attributed back to the route that produced it (ADR 0009 D3).
+    route_ix: usize,
     session_header: Option<String>,
     tenant: String,
     routing_mode: RoutingMode,
@@ -996,6 +1016,7 @@ async fn handle_enforce(
                 &body_c,
                 features,
                 &route_c,
+                route_ix,
                 session_header,
                 tenant,
                 routing_mode,
@@ -1011,6 +1032,7 @@ async fn handle_enforce(
         body,
         features,
         route,
+        route_ix,
         session_header,
         tenant,
         routing_mode,
@@ -1037,6 +1059,7 @@ async fn enforce_pipeline_inner(
     tenant: String,
     api: &str,
     routing_mode: RoutingMode,
+    route_ix: usize,
 ) -> Result<ModelResponse, ProxyError> {
     let gate_defs = state
         .config
@@ -1216,6 +1239,10 @@ async fn enforce_pipeline_inner(
 
     let (outcome, mut trace) = route_enforce(ctx).await;
 
+    // Stamp which route produced this decision, so a downstream outcome arriving minutes later
+    // can be attributed back to it (ADR 0009 D3). Without it the guardrail pools every outcome
+    // onto one route, and in a multi-route config a failing route hides behind healthy siblings.
+    trace.route_ix = Some(u32::try_from(route_ix).unwrap_or(0));
     // Patch explore/propensity onto the trace now that we know whether the epsilon branch fired.
     // route_enforce leaves these at (false, None); we own the trace before it's hashed+stored.
     trace.policy.explore = explore_flag;
@@ -1386,6 +1413,8 @@ async fn enforce_pipeline(
     body: &Bytes,
     features: Features,
     route: &Route,
+    // Route that produced this decision; threaded through for outcome attribution.
+    route_ix: usize,
     session_header: Option<String>,
     tenant: String,
     routing_mode: RoutingMode,
@@ -1407,6 +1436,7 @@ async fn enforce_pipeline(
         tenant,
         "anthropic.messages",
         routing_mode,
+        route_ix,
     )
     .await?;
     Ok(anthropic_response_json(&resp))
@@ -1421,6 +1451,8 @@ async fn enforce_pipeline_openai(
     body: &Bytes,
     features: Features,
     route: &Route,
+    // Route that produced this decision; threaded through for outcome attribution.
+    route_ix: usize,
     session_header: Option<String>,
     tenant: String,
     routing_mode: RoutingMode,
@@ -1450,6 +1482,7 @@ async fn enforce_pipeline_openai(
         tenant,
         "openai.chat_completions",
         routing_mode,
+        route_ix,
     )
     .await?;
     Ok(openai_response_json(&resp))
@@ -2078,6 +2111,7 @@ fn base_trace(
         probe: None,
         rollout: None,
         shadow: None,
+        route_ix: None,
         predicted_pass: None,
         elastic: None,
     }
@@ -2604,6 +2638,9 @@ async fn handle_enforce_openai(
     body: &Bytes,
     features: Features,
     route: &Route,
+    // Index of the matched route, stamped on the trace so a downstream outcome arriving
+    // later can be attributed back to the route that produced it (ADR 0009 D3).
+    route_ix: usize,
     session_header: Option<String>,
     tenant: String,
     routing_mode: RoutingMode,
@@ -2619,6 +2656,7 @@ async fn handle_enforce_openai(
                 &body_c,
                 features,
                 &route_c,
+                route_ix,
                 session_header,
                 tenant,
                 routing_mode,
@@ -2634,6 +2672,7 @@ async fn handle_enforce_openai(
         body,
         features,
         route,
+        route_ix,
         session_header,
         tenant,
         routing_mode,
@@ -2736,6 +2775,12 @@ async fn chat_completions(
             .route_for(&features)
             .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
         {
+            // Index of the matched route, for outcome attribution (ADR 0009 D3).
+            let route_ix = routing
+                .routes
+                .iter()
+                .position(|r| std::ptr::eq(r, route))
+                .unwrap_or(0);
             let route = route.clone();
             // Resolve routing-mode preset (header > route > global default).
             let routing_mode = resolve_mode(&headers, &route, &state.config);
@@ -2758,6 +2803,7 @@ async fn chat_completions(
                     &body,
                     features,
                     &route,
+                    route_ix,
                     session_header,
                     tenant,
                     routing_mode,
