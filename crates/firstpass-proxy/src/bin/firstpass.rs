@@ -11,6 +11,8 @@ const HELP: &str = "\
 firstpass — the cheapest model that provably passes, with a receipt for every call.
 
 USAGE:
+    firstpass demo                no keys, no config: run one real gated decision and print
+                                  its receipt (local mock upstream, real proxy)
     firstpass onboard [--apply]   agentic setup: ask three questions, write firstpass.toml,
                                   start the proxy, route your agent, verify
         [--provider anthropic|openai|google|local] [--shape json|code|prose|mixed]
@@ -56,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run::init_tracing();
             run::serve(ProxyConfig::from_env()?).await
         }
+        "demo" => firstpass_proxy::demo::run().await,
         "onboard" => cmd_onboard(args.iter().any(|a| a == "--apply")),
         "offboard" => cmd_offboard(),
         "doctor" => cmd_doctor(),
