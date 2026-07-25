@@ -30,6 +30,7 @@ pub mod features;
 pub mod hashchain;
 pub mod ltt;
 pub mod predictor;
+pub mod rollout;
 pub mod trace;
 pub mod verdict;
 
@@ -45,6 +46,7 @@ pub use features::{FEATURE_VERSION, Features, TaskKind};
 pub use hashchain::{Chained, GENESIS_HASH, canonical_json, record_hash, verify_chain};
 pub use ltt::{LttDiagnostic, LttResult};
 pub use predictor::PassPredictor;
+pub use rollout::{Rollout, RolloutDecision, RolloutKey};
 pub use trace::{
     Attempt, DeferredVerdict, ElasticAction, ElasticDecision, FinalOutcome, PolicyRef, ProbeRegime,
     ProbeSignal, RequestInfo, ServedFrom, Trace,

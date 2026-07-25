@@ -528,6 +528,32 @@ async fn messages(
             if routing_mode == RoutingMode::Observe {
                 return observe_passthrough(state, headers, body, session_header, tenant).await;
             }
+            // Percentage rollout (ADR 0009 D1). Bucketing is a pure function of a STABLE key, so
+            // a conversation stays in one arm for its whole life — a per-request draw would flip
+            // a multi-turn agent mid-thread and, worse, would make the served population an
+            // unstable sample, which is exactly the population the published bound is over.
+            if let Some(rollout) = route.rollout.as_ref() {
+                let key_value = match rollout.key {
+                    firstpass_core::RolloutKey::Session => session_header
+                        .clone()
+                        .unwrap_or_else(|| firstpass_core::rollout::request_identity(&body)),
+                    // No session to hold constant, so each request is bucketed independently.
+                    // NOTE: unlike the session and tenant keys — whose values are recorded on the
+                    // trace — this bucket is recorded but NOT recomputable by an auditor, because
+                    // the input it hashes is the request body and raw prompts are deliberately
+                    // never stored. The recorded `bucket`/`enforced` remain authoritative.
+                    firstpass_core::RolloutKey::Request => {
+                        firstpass_core::rollout::request_identity(&body)
+                    }
+                    firstpass_core::RolloutKey::Tenant => tenant.to_string(),
+                };
+                let decision =
+                    firstpass_core::rollout::decide(&state.config.prompt_salt, rollout, &key_value);
+                if !decision.enforced {
+                    // The control arm. Served exactly as it would be without Firstpass.
+                    return observe_passthrough(state, headers, body, session_header, tenant).await;
+                }
+            }
             if enforce_can_handle(
                 &features,
                 &body,
@@ -1791,6 +1817,7 @@ fn base_trace(
             savings_usd: 0.0,
         },
         probe: None,
+        rollout: None,
         predicted_pass: None,
         elastic: None,
     }
@@ -2885,6 +2912,7 @@ mod tests {
             gates: vec![],
             deferred_gates: vec![],
             routing_mode: None,
+            rollout: None,
         }
     }
 
@@ -4734,5 +4762,180 @@ mod tests {
             .predicted_pass
             .expect("predictor on => predicted_pass recorded");
         assert!(p > 0.0 && p < 1.0, "shadow prediction in (0,1): {p}");
+    }
+
+    /// Build enforce state with a rollout attached to the route.
+    fn rollout_state(
+        percent: f64,
+        key: &str,
+        outcomes: Vec<(&str, Result<ModelResponse, ProviderError>)>,
+    ) -> (AppState, mpsc::Receiver<Trace>) {
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"anthropic/claude-haiku-4-5\"]\ngates = [\"non-empty\"]\n\
+             [route.rollout]\npercent = {percent}\nkey = \"{key}\"\n"
+        );
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.clone()),
+            "FIRSTPASS_MODE" => Some("enforce".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let mut outs = HashMap::new();
+        for (model, out) in outcomes {
+            outs.insert(model.to_owned(), out);
+        }
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        let (traces, rx) = mpsc::channel(64);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(map),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            traces,
+            adaptive: None,
+            bandit: None,
+            predictor: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+        (state, rx)
+    }
+
+    /// `percent = 0` must enforce nothing. This is how an operator backs out of a bad ramp, so
+    /// it has to be exact rather than "very unlikely" — a single enforced request here would mean
+    /// traffic still routing after someone pulled the cord.
+    #[tokio::test]
+    async fn rollout_at_zero_percent_never_enforces() {
+        for i in 0..25 {
+            let (state, mut rx) = rollout_state(
+                0.0,
+                "session",
+                vec![(
+                    "anthropic/claude-haiku-4-5",
+                    Ok(model_resp("anthropic/claude-haiku-4-5", "hello")),
+                )],
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert("x-firstpass-session", format!("s{i}").parse().unwrap());
+            let resp = messages(
+                State(state),
+                Extension(TenantId("default".to_owned())),
+                headers,
+                user_body(),
+            )
+            .await;
+            // The control arm forwards upstream; with no live upstream it fails rather than
+            // routing through the ladder. Either way it must NOT have produced an enforce trace.
+            let _ = resp;
+            if let Ok(t) = rx.try_recv() {
+                assert!(
+                    t.attempts.is_empty(),
+                    "0% rollout produced an enforced decision for session s{i}"
+                );
+            }
+        }
+    }
+
+    /// `percent = 100` must enforce everything — the ramp's far end has to be complete, or an
+    /// operator who finished rolling out would still have a silent slice bypassing the gate.
+    #[tokio::test]
+    async fn rollout_at_hundred_percent_always_enforces() {
+        for i in 0..25 {
+            let (state, mut rx) = rollout_state(
+                100.0,
+                "session",
+                vec![(
+                    "anthropic/claude-haiku-4-5",
+                    Ok(model_resp("anthropic/claude-haiku-4-5", "hello")),
+                )],
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert("x-firstpass-session", format!("s{i}").parse().unwrap());
+            let resp = messages(
+                State(state),
+                Extension(TenantId("default".to_owned())),
+                headers,
+                user_body(),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            let t = rx.try_recv().expect("trace enqueued");
+            assert!(
+                !t.attempts.is_empty(),
+                "100% rollout skipped enforcement for session s{i}"
+            );
+        }
+    }
+
+    /// The property the design rests on, proven through the real dispatch path rather than only
+    /// the pure function.
+    ///
+    /// Asserts the CONCRETE arm predicted by `rollout::decide` for each session, not merely that
+    /// a session is self-consistent. Self-consistency alone is satisfied by a broken gate that
+    /// enforces everything — an earlier version of this test passed with the gate disabled, which
+    /// is why it now compares against the predicted arm.
+    #[tokio::test]
+    async fn dispatch_arm_matches_the_predicted_arm_per_session() {
+        let mut checked_enforced = 0;
+        let mut checked_control = 0;
+        for i in 0..24 {
+            let session = format!("session-{i}");
+            let (state, mut rx) = rollout_state(
+                50.0,
+                "session",
+                vec![(
+                    "anthropic/claude-haiku-4-5",
+                    Ok(model_resp("anthropic/claude-haiku-4-5", "hello")),
+                )],
+            );
+            // What the pure function says this session's arm must be, using the very salt the
+            // running proxy is configured with.
+            let expected = firstpass_core::rollout::decide(
+                &state.config.prompt_salt,
+                &firstpass_core::Rollout {
+                    percent: 50.0,
+                    key: firstpass_core::RolloutKey::Session,
+                },
+                &session,
+            )
+            .enforced;
+
+            let mut headers = HeaderMap::new();
+            headers.insert("x-firstpass-session", session.parse().unwrap());
+            let _ = messages(
+                State(state),
+                Extension(TenantId("default".to_owned())),
+                headers,
+                user_body(),
+            )
+            .await;
+            let observed = rx
+                .try_recv()
+                .map(|t| !t.attempts.is_empty())
+                .unwrap_or(false);
+
+            assert_eq!(
+                observed,
+                expected,
+                "{session}: dispatch put it in the {} arm, bucketing predicted the {} arm",
+                if observed { "enforced" } else { "control" },
+                if expected { "enforced" } else { "control" }
+            );
+            if expected {
+                checked_enforced += 1;
+            } else {
+                checked_control += 1;
+            }
+        }
+        // Both arms must actually be exercised, or the assertion above proves nothing.
+        assert!(
+            checked_enforced > 0 && checked_control > 0,
+            "test saw only one arm ({checked_enforced} enforced, {checked_control} control)"
+        );
     }
 }

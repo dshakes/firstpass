@@ -392,6 +392,11 @@ pub struct Route {
     /// global default, then `Balanced` — byte-identical to existing behaviour.
     #[serde(default)]
     pub routing_mode: Option<RoutingMode>,
+    /// Percentage rollout (ADR 0009 D1): enforce only a slice of this route's matched traffic,
+    /// held constant per session so a conversation never flips arm mid-thread. Absent (the
+    /// default) enforces all matched traffic — byte-identical to existing behaviour.
+    #[serde(default)]
+    pub rollout: Option<crate::rollout::Rollout>,
 }
 
 /// Predicate over a request's [`Features`]. Every present field is an AND-constraint; absent
@@ -834,6 +839,15 @@ impl Config {
     /// `[0,1]`, or a duplicate/blank `id`).
     pub fn parse(toml_str: &str) -> Result<Self> {
         let config: Self = toml::from_str(toml_str)?;
+        // A nonsensical rollout percent must fail loudly at parse: silently clamping it would
+        // ramp a different amount of traffic than the operator asked for, and they would only
+        // notice via a savings figure that never moved.
+        for (i, route) in config.routes.iter().enumerate() {
+            if let Some(r) = &route.rollout {
+                r.validate()
+                    .map_err(|e| Error::InvalidConfig(format!("route[{i}]: {e}")))?;
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         for def in &config.gate_defs {
             if def.id.trim().is_empty() {
