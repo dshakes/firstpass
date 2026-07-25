@@ -45,17 +45,76 @@
     <span><b>v0.2.3</b> · open source</span>
   </div>
 
-  <div class="term" aria-label="Example routing decision stream">
-    <div class="bar"><i class="d1"></i><i class="d2"></i><i class="d3"></i><span class="mono">firstpass · enforce · POST /v1/messages</span></div>
-    <div class="body" id="stream">
-      <div class="ln"><span class="pre c-mut">→</span><span class="c-ink">route</span><span class="c-mut">   open cheapest rung</span><span class="c-mint"> anthropic/haiku</span></div>
-      <div class="ln"><span class="pre c-mut">·</span><span class="c-mut">candidate produced · 214 tokens · $0.0003</span></div>
-      <div class="ln"><span class="pre c-mut">→</span><span class="c-ink">gate</span><span class="c-mut">    json-valid</span><span class="c-mint"> pass</span><span class="c-mut"> · schema</span><span class="c-red"> fail</span><span class="c-mut"> (missing "total")</span></div>
-      <div class="ln"><span class="pre c-amber">↑</span><span class="c-amber">escalate</span><span class="c-mut"> rung 1 → 2 ·</span><span class="c-ink"> openai/gpt-mini</span></div>
-      <div class="ln"><span class="pre c-mut">·</span><span class="c-mut">candidate produced · 231 tokens · $0.0018</span></div>
-      <div class="ln"><span class="pre c-mut">→</span><span class="c-ink">gate</span><span class="c-mut">    json-valid</span><span class="c-mint"> pass</span><span class="c-mut"> · schema</span><span class="c-mint"> pass</span><span class="c-mut"> · conf 0.83 ≥ 0.50</span></div>
-      <div class="ln"><span class="pre c-mint">✓</span><span class="c-mint">serve</span><span class="c-mut">   rung 2 · verified · total $0.0021</span></div>
-      <div class="ln"><span class="pre c-mut">◆</span><span class="c-mut">receipt</span><span class="c-mut"> sealed · </span><span class="c-blue">sha256:5c02…a91f</span><span class="c-mut"> · chain ok</span><span class="cursor"></span></div>
+  <div class="rig" aria-label="One request decided: it opens on the cheapest rung, a gate proves the output, it escalates one rung only on failure, and the frontier rung is never reached">
+    <div class="rig-bar">
+      <span class="rig-led" aria-hidden="true"></span>
+      <span class="mono">firstpass · enforce · POST /v1/messages</span>
+      <span class="rig-tag mono">one decision</span>
+    </div>
+    <div class="rig-scroll"><svg class="fp-svg rig-svg" viewBox="0 0 960 322" role="img"
+         aria-label="Rung 0 haiku opens and its gate fails; the request escalates to rung 1 sonnet, whose gate passes and is served. Rung 2 opus is never reached. Spend is $0.0092 against an always-frontier baseline of $0.0345 — 73% cheaper.">
+      <!-- ── rung 2 · the money not spent ─────────────────────────────────── -->
+      <text class="m ink-mut" x="28" y="52" font-size="11" letter-spacing=".06em">RUNG 2</text>
+      <text class="m ink-mut" x="28" y="72" font-size="13" opacity=".55">anthropic/opus</text>
+      <line class="grid" x1="176" y1="64" x2="470" y2="64" stroke-width="1" stroke-dasharray="3 6"/>
+      <g opacity=".4">
+        <path class="n-stroke" d="M497 46 L515 64 L497 82 L479 64 Z" fill="none" stroke-width="1.5" stroke-dasharray="3 5"/>
+      </g>
+      <text class="m ink-mut" x="540" y="69" font-size="12" opacity=".62">never reached</text>
+
+      <!-- ── rung 1 · gated, served ───────────────────────────────────────── -->
+      <text class="m ink-mut" x="28" y="150" font-size="11" letter-spacing=".06em">RUNG 1</text>
+      <text class="m ink" x="28" y="170" font-size="13">anthropic/sonnet</text>
+      <line class="n-stroke" x1="176" y1="162" x2="470" y2="162" stroke-width="2" stroke-linecap="round"/>
+      <path class="flow p" d="M176 162 H470" stroke-width="2.5"/>
+      <path class="pass-s" d="M497 144 L515 162 L497 180 L479 162 Z" fill="none" stroke-width="2"/>
+      <path class="pass-s glow-p" d="M489 162 l6 6 l12 -14" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <line class="pass-s" x1="522" y1="162" x2="596" y2="162" stroke-width="2" stroke-linecap="round"/>
+      <path class="pass" d="M596 156 l12 6 l-12 6 z"/>
+      <text class="m pass" x="540" y="150" font-size="12" font-weight="600">SERVED</text>
+
+      <!-- ── rung 0 · opened cheapest, gate refused it ────────────────────── -->
+      <text class="m ink-mut" x="28" y="238" font-size="11" letter-spacing=".06em">RUNG 0</text>
+      <text class="m ink" x="28" y="258" font-size="13">anthropic/haiku</text>
+      <circle class="accent" cx="176" cy="250" r="5"/>
+      <circle class="accent halo" cx="176" cy="250" r="5" opacity=".5"/>
+      <line class="n-stroke" x1="176" y1="250" x2="470" y2="250" stroke-width="2" stroke-linecap="round"/>
+      <path class="flow" d="M176 250 H470" stroke-width="2.5"/>
+      <path class="fail-s" d="M497 232 L515 250 L497 268 L479 250 Z" fill="none" stroke-width="2"/>
+      <path class="fail-s" d="M491 244 l12 12 M503 244 l-12 12" stroke-width="2.2" stroke-linecap="round"/>
+      <text class="m fail" x="540" y="238" font-size="12" font-weight="600">GATE FAILED</text>
+      <text class="m ink-mut" x="540" y="258" font-size="11" opacity=".8">missing "total"</text>
+
+      <!-- escalation: the ONLY thing that buys a more expensive model -->
+      <path class="warn-s" d="M470 250 C 300 250, 320 162, 176 162" fill="none" stroke-width="2"
+            stroke-dasharray="5 5" opacity=".8"/>
+      <path class="flow w l" d="M470 250 C 300 250, 320 162, 176 162" stroke-width="2.5"/>
+      <text class="m warn" x="248" y="212" font-size="11" font-weight="600">escalate ×1</text>
+
+      <!-- ── readout ──────────────────────────────────────────────────────── -->
+      <line class="grid" x1="672" y1="26" x2="672" y2="296" stroke-width="1"/>
+
+      <text class="m ink-mut" x="704" y="52" font-size="11" letter-spacing=".06em">WHAT IT COST</text>
+
+      <text class="m ink-mut" x="704" y="92" font-size="12">spent</text>
+      <rect class="track" x="704" y="102" width="216" height="9" rx="4.5"/>
+      <rect class="accent fill" x="704" y="102" width="58" height="9" rx="4.5"/>
+      <text class="m ink" x="704" y="134" font-size="17" font-weight="600">$0.0092</text>
+
+      <text class="m ink-mut" x="704" y="176" font-size="12" opacity=".8">always frontier</text>
+      <rect class="track" x="704" y="186" width="216" height="9" rx="4.5"/>
+      <rect class="n-stroke" x="704" y="186" width="216" height="9" rx="4.5" fill="none"
+            stroke-width="1" stroke-dasharray="4 4"/>
+      <text class="m ink-mut" x="704" y="218" font-size="17" font-weight="600" opacity=".75">$0.0345</text>
+
+      <text class="m accent-ink" x="704" y="262" font-size="26" font-weight="700">73% cheaper</text>
+      <text class="m ink-mut" x="704" y="284" font-size="11">at proven quality — not predicted</text>
+    </svg></div>
+    <div class="rig-seal mono">
+      <span class="rig-seal-d" aria-hidden="true">◆</span>
+      <span class="rig-hash">sha256:5c02…a91f</span>
+      <span class="rig-ok">chain ok</span>
+      <span class="rig-note">every decision seals a receipt an auditor can re-derive</span>
     </div>
   </div>
 </div></section>

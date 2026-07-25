@@ -58,7 +58,7 @@
 <h1>Overview</h1>
 <p class="page-sub">Firstpass is an open-source adaptive LLM router. Every request opens on the cheapest model in a ladder; a gate checks the actual output; it serves the first output that passes and escalates one rung only on gate failure. Every decision gets a tamper-evident, hash-chained receipt.</p>
 
-<div class="tldr">Firstpass is an <b>open-source verification-gated LLM cascade router</b>, v0.2.1, pre-GA. Every request opens on the cheapest model; a gate <b>proves the real output</b> before serving it; on gate failure, it escalates exactly one rung. Four moves — <b>Route → Prove → Escalate → Learn</b> — on every request. It sits as an HTTP reverse proxy between your agent and any provider; your agent code doesn't change.</div>
+<div class="tldr">Firstpass is an <b>open-source verification-gated LLM cascade router</b>, v0.2.3, pre-GA. Every request opens on the cheapest model; a gate <b>proves the real output</b> before serving it; on gate failure, it escalates exactly one rung. Four moves — <b>Route → Prove → Escalate → Learn</b> — on every request. It sits as an HTTP reverse proxy between your agent and any provider; your agent code doesn't change.</div>
 
 <div class="chips">
   <div class="chip good"><div class="cn">≤10<span class="u">%</span></div><div class="cl">served-failure, 95% conf.</div></div>
@@ -155,8 +155,8 @@
 <div class="recap">Firstpass fits best when you have a definition of "good" you can run, and a cost problem you can see in the bill.</div>
 
 <h2 id="status">Status<a class="anchor" href="#status" aria-label="Link to this section">#</a></h2>
-<div class="tldr">v0.2.1 is <b>shipped and running</b>. The "Shipped &amp; verified" column is available and on by default. The "Next / research" column is gated on further validation — nothing there ships as a default, and every feature is <b>opt-in only</b>.</div>
-<p>Firstpass is <strong>v0.2.1, pre-GA</strong>, and honest about the line between shipped and researched.</p>
+<div class="tldr">v0.2.3 is <b>shipped and running</b>. The "Shipped &amp; verified" column is available and on by default. The "Next / research" column is gated on further validation — nothing there ships as a default, and every feature is <b>opt-in only</b>.</div>
+<p>Firstpass is <strong>v0.2.3, pre-GA</strong>, and honest about the line between shipped and researched.</p>
 <p class="subh">Shipped vs. in progress</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Shipped &amp; verified</th><th>Next / research</th></tr></thead>
