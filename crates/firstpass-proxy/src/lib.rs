@@ -41,6 +41,7 @@ pub mod provider;
 pub mod proxy;
 pub mod router;
 pub mod run;
+pub mod shadow;
 pub mod store;
 pub mod subprocess;
 pub mod tenant_auth;

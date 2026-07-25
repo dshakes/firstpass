@@ -78,6 +78,78 @@ impl Rollout {
     }
 }
 
+/// Shadow scoring settings for a route (ADR 0009 D2).
+///
+/// Observe mode records what traffic looked like; it never runs the ladder, so it cannot answer
+/// the one question it exists for — *what would Firstpass have served, and what would it have
+/// cost?* Shadow answers that by scoring a sample of observed requests off the hot path.
+///
+/// It makes real model calls, so there is deliberately no default-on sample rate and a hard daily
+/// ceiling is required. A measurement that quietly runs up a bill is worse than no measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shadow {
+    /// Fraction of observed requests scored counterfactually, in `[0, 1]`.
+    pub sample_rate: f64,
+    /// Hard ceiling on shadow spend per UTC day, in USD. Shadow stops when exhausted, and the
+    /// fact that it stopped is recorded — silently degrading a measurement is its own bug.
+    pub max_usd_per_day: f64,
+}
+
+impl Shadow {
+    /// Whether this shadow config is coherent.
+    ///
+    /// # Errors
+    /// If `sample_rate` is outside `[0, 1]` or `max_usd_per_day` is negative or non-finite.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.sample_rate.is_finite() || !(0.0..=1.0).contains(&self.sample_rate) {
+            return Err(format!(
+                "route.shadow.sample_rate must be finite and within [0, 1], got {}",
+                self.sample_rate
+            ));
+        }
+        if !self.max_usd_per_day.is_finite() || self.max_usd_per_day < 0.0 {
+            return Err(format!(
+                "route.shadow.max_usd_per_day must be finite and >= 0, got {}",
+                self.max_usd_per_day
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this request is in the shadow sample.
+    ///
+    /// Uses the same salted bucketing as rollout, under its own domain tag, so shadow sampling is
+    /// deterministic and — critically — *independent* of the rollout arm. If the two shared a
+    /// hash, the shadow sample would be a biased subset of one arm and the projection it produces
+    /// would not describe the traffic an operator is about to enforce on.
+    #[must_use]
+    pub fn sampled(&self, salt: &str, key_value: &str) -> bool {
+        if self.sample_rate <= 0.0 {
+            return false;
+        }
+        if self.sample_rate >= 1.0 {
+            return true;
+        }
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(salt.as_bytes());
+        h.update([0u8]);
+        h.update(b"shadow"); // distinct tag: shadow sampling must not correlate with the arm
+        h.update([0u8]);
+        h.update(key_value.as_bytes());
+        let d = h.finalize();
+        let bucket = u32::from_be_bytes([d[0], d[1], d[2], d[3]]) % BUCKETS;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "sample_rate is validated finite in [0,1]"
+        )]
+        let cutoff = (self.sample_rate * f64::from(BUCKETS)) as u32;
+        bucket < cutoff
+    }
+}
+
 /// The bucket `key_value` falls in, within `0..`[`BUCKETS`].
 ///
 /// Deterministic for a fixed `salt`. The salt is the per-deployment secret already used for
@@ -303,5 +375,100 @@ mod tests {
                 .is_ok()
             );
         }
+    }
+
+    /// Shadow sampling must be INDEPENDENT of the rollout arm. If both hashed the same input
+    /// under the same tag, every shadow-sampled request would sit in the same arm, and the
+    /// projection would describe a biased subset of traffic rather than the traffic an operator
+    /// is about to enforce on.
+    #[test]
+    fn shadow_sampling_is_independent_of_the_rollout_arm() {
+        let roll = Rollout {
+            percent: 50.0,
+            key: RolloutKey::Session,
+        };
+        let shadow = Shadow {
+            sample_rate: 0.5,
+            max_usd_per_day: 5.0,
+        };
+        let (mut both, mut only_shadow, mut only_arm, mut neither) = (0, 0, 0, 0);
+        for i in 0..4000 {
+            let k = format!("s{i}");
+            match (
+                decide("salt", &roll, &k).enforced,
+                shadow.sampled("salt", &k),
+            ) {
+                (true, true) => both += 1,
+                (false, true) => only_shadow += 1,
+                (true, false) => only_arm += 1,
+                (false, false) => neither += 1,
+            }
+        }
+        // Independent 50/50 splits put ~25% in each cell; a shared hash would empty two of them.
+        for (name, n) in [
+            ("both", both),
+            ("shadow-only", only_shadow),
+            ("arm-only", only_arm),
+            ("neither", neither),
+        ] {
+            let pct = f64::from(n) / 4000.0 * 100.0;
+            assert!(
+                (pct - 25.0).abs() < 3.0,
+                "{name} cell held {pct:.1}% — shadow sampling correlates with the rollout arm"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_sample_rate_endpoints_are_exact() {
+        for i in 0..300 {
+            let k = format!("s{i}");
+            assert!(
+                !Shadow {
+                    sample_rate: 0.0,
+                    max_usd_per_day: 1.0
+                }
+                .sampled("salt", &k)
+            );
+            assert!(
+                Shadow {
+                    sample_rate: 1.0,
+                    max_usd_per_day: 1.0
+                }
+                .sampled("salt", &k)
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_validate_rejects_impossible_settings() {
+        for bad in [-0.1, 1.1, f64::NAN] {
+            assert!(
+                Shadow {
+                    sample_rate: bad,
+                    max_usd_per_day: 1.0
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for bad in [-1.0, f64::INFINITY] {
+            assert!(
+                Shadow {
+                    sample_rate: 0.1,
+                    max_usd_per_day: bad
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            Shadow {
+                sample_rate: 0.1,
+                max_usd_per_day: 5.0
+            }
+            .validate()
+            .is_ok()
+        );
     }
 }
