@@ -796,6 +796,7 @@ mod tests {
                 savings_usd: 0.0,
             },
             probe: None,
+            rollout: None,
             predicted_pass: None,
             elastic: None,
         };
@@ -875,6 +876,7 @@ mod tests {
                 savings_usd: 0.0,
             },
             probe: None,
+            rollout: None,
             predicted_pass: None,
             elastic: None,
         };
@@ -1286,6 +1288,7 @@ serve_threshold = 0.75
                 savings_usd: 0.0,
             },
             probe: None,
+            rollout: None,
             predicted_pass: None,
             elastic: None,
         };

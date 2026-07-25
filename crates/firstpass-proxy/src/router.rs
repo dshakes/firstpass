@@ -171,6 +171,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
             savings_usd: 0.0,
         },
         probe: None,
+        rollout: None,
         predicted_pass: None,
         elastic,
     };

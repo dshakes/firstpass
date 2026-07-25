@@ -287,6 +287,7 @@ mod tests {
                 savings_usd: 0.0,
             },
             probe: None,
+            rollout: None,
             predicted_pass: None,
             elastic: None,
         };

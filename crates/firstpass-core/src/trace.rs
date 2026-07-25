@@ -104,6 +104,22 @@ pub struct ElasticDecision {
     pub calibration_id: Option<String>,
 }
 
+/// The rollout arm this request landed in (ADR 0009 D1), recorded so an auditor can re-derive
+/// arm membership from the receipt alone. Absent when the route has no rollout — byte-identical
+/// to pre-rollout traces and hash-chain compatible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolloutRecord {
+    /// Configured percent at decision time. Recorded because it changes as an operator ramps,
+    /// and a bound computed over a window spanning a ramp must be able to see that.
+    pub percent: f64,
+    /// Which identity was held constant (`session` / `request` / `tenant`).
+    pub key: String,
+    /// The bucket this request fell in, within `0..10_000`.
+    pub bucket: u32,
+    /// Whether this request enforced. The observed arm is not a failure — it is the control.
+    pub enforced: bool,
+}
+
 /// A single routing decision, start to finish.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trace {
@@ -136,6 +152,10 @@ pub struct Trace {
     /// and hash-chain compatible (the `skip_serializing_if` keeps absent = absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<ProbeSignal>,
+    /// Which rollout arm this request was in (ADR 0009 D1). Absent when the route has no
+    /// rollout configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<RolloutRecord>,
     /// Shadow prediction of `P(gate-pass)` for the start rung (ADR 0008 Phase 2), from the
     /// per-query predictor. Absent when the predictor is off (the default) — byte-identical to
     /// pre-predictor traces and hash-chain compatible. Recorded but never acted on in this phase.
@@ -357,6 +377,7 @@ mod tests {
                 savings_usd: 0.0,
             },
             probe: None,
+            rollout: None,
             predicted_pass: None,
             elastic: None,
         };
