@@ -31,6 +31,7 @@ pub mod consistency;
 pub mod demo;
 pub mod error;
 pub mod gate;
+pub mod guard;
 pub mod judge;
 pub mod key_custody;
 pub mod mcp;
