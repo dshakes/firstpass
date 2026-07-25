@@ -168,6 +168,130 @@ pub fn command_on_path(program: &str, path_var: Option<&str>) -> bool {
     std::env::split_paths(path).any(|dir| dir.join(program).is_file())
 }
 
+/// How this binary got onto the machine. Upgrading is channel-specific — running the wrong
+/// updater either does nothing or fights the package manager that owns the file — so
+/// `firstpass upgrade` detects the channel instead of guessing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// The shell/powershell installer, which ships its own `firstpass-update` (dist-workspace.toml
+    /// sets `install-updater = true`). This is the only channel we can upgrade in place.
+    Dist,
+    /// `brew install dshakes/tap/firstpass-proxy`.
+    Homebrew,
+    /// `cargo install --git`.
+    Cargo,
+    /// pip / uv / uvx / pipx wheel.
+    Python,
+    /// The npm installer package.
+    Npm,
+    /// Running inside the container image.
+    Docker,
+    /// Built from source, vendored, or something we do not recognise.
+    Unknown,
+}
+
+impl Channel {
+    /// Human label used in the report.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dist => "installer script (self-updating)",
+            Self::Homebrew => "Homebrew",
+            Self::Cargo => "cargo install",
+            Self::Python => "Python wheel (pip / uv / uvx)",
+            Self::Npm => "npm",
+            Self::Docker => "Docker image",
+            Self::Unknown => "unrecognised",
+        }
+    }
+
+    /// The command that upgrades this channel. `None` when we cannot tell.
+    #[must_use]
+    pub const fn upgrade_command(self) -> Option<&'static str> {
+        match self {
+            Self::Dist => Some("firstpass-update"),
+            Self::Homebrew => Some("brew upgrade firstpass-proxy"),
+            Self::Cargo => Some(
+                "cargo install --git https://github.com/dshakes/firstpass firstpass-proxy --force",
+            ),
+            Self::Python => Some("uv tool upgrade firstpass    # or: pip install -U firstpass"),
+            Self::Npm => Some("npm install -g @dshakesnotbot/firstpass-proxy@latest"),
+            Self::Docker => Some("docker pull ghcr.io/dshakes/firstpass:latest"),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// Work out how this binary was installed from the path it runs as. Pure: the executable path,
+/// the updater probe and the container check are all injected, so every branch is unit-tested
+/// without installing anything.
+///
+/// Package-manager path markers are checked BEFORE the updater probe: a Homebrew or wheel install
+/// can still carry the dist updater alongside it, and in that case the package manager owns the
+/// file — running the self-updater would leave the manager's metadata pointing at a binary it no
+/// longer controls.
+#[must_use]
+pub fn detect_channel(exe: &std::path::Path, updater_present: bool, in_container: bool) -> Channel {
+    let p = exe.to_string_lossy().to_lowercase().replace('\\', "/");
+    let has = |needle: &str| p.contains(needle);
+    if in_container {
+        return Channel::Docker;
+    }
+    if has("/.cargo/bin/") || has("/.cargo/registry/") {
+        return Channel::Cargo;
+    }
+    if has("/cellar/") || has("/homebrew/") || has("/linuxbrew/") {
+        return Channel::Homebrew;
+    }
+    if has("/site-packages/")
+        || has("/dist-packages/")
+        || has("/.venv/")
+        || has("/pipx/")
+        || has("/uv/")
+        || has("/uv-cache/")
+    {
+        return Channel::Python;
+    }
+    if has("/node_modules/") {
+        return Channel::Npm;
+    }
+    if updater_present {
+        return Channel::Dist;
+    }
+    Channel::Unknown
+}
+
+/// The text `firstpass upgrade` prints. Separated from the doing so the wording is testable.
+#[must_use]
+pub fn upgrade_report(channel: Channel, current_version: &str) -> String {
+    let mut out = format!(
+        "firstpass {current_version} · installed via {}\n",
+        channel.label()
+    );
+    match channel.upgrade_command() {
+        Some(cmd) if channel == Channel::Dist => {
+            out.push_str(&format!("\nupgrading in place — running `{cmd}`\n"));
+        }
+        Some(cmd) => {
+            out.push_str(&format!(
+                "\nthis channel is owned by its package manager, so upgrade with:\n    {cmd}\n"
+            ));
+        }
+        None => {
+            out.push_str(
+                "\ncould not tell how this binary was installed. Pick the line that matches:\n\
+                 \x20   firstpass-update                              # installer script\n\
+                 \x20   brew upgrade firstpass-proxy                  # Homebrew\n\
+                 \x20   uv tool upgrade firstpass                     # uv / pip: pip install -U firstpass\n\
+                 \x20   npm install -g @dshakesnotbot/firstpass-proxy@latest\n\
+                 \x20   docker pull ghcr.io/dshakes/firstpass:latest\n\
+                 \x20   cargo install --git https://github.com/dshakes/firstpass firstpass-proxy --force\n",
+            );
+        }
+    }
+    out
+}
+
 /// Probe whether the trace DB's directory is writable, without creating the DB itself.
 fn can_write_db(db_path: &str) -> bool {
     let path = std::path::Path::new(db_path);
@@ -842,5 +966,114 @@ mod tests {
         let e = evaluate_predictor(&[], 0.05, 1e-4);
         assert_eq!(e.n, 0);
         assert!(e.auc.is_none());
+    }
+
+    /// Each channel must be recognised from a realistic install path. Getting this wrong is not
+    /// cosmetic: it would print an upgrade command that silently does nothing.
+    #[test]
+    fn detect_channel_reads_real_install_paths() {
+        use std::path::Path;
+        let cases = [
+            ("/Users/u/.cargo/bin/firstpass", Channel::Cargo),
+            (
+                "/opt/homebrew/Cellar/firstpass-proxy/0.2.2/bin/firstpass",
+                Channel::Homebrew,
+            ),
+            (
+                "/home/linuxbrew/.linuxbrew/bin/firstpass",
+                Channel::Homebrew,
+            ),
+            (
+                "/Users/u/.venv/lib/python3.12/site-packages/firstpass/firstpass",
+                Channel::Python,
+            ),
+            // Both observed on a real machine rather than invented: uvx runs from an ephemeral
+            // env under archive-v0, and `uv tool install` lands under the uv tools dir.
+            (
+                "/Users/u/.cache/uv/archive-v0/DQ4usH_XuqNyywgHKB8qB/bin/firstpass",
+                Channel::Python,
+            ),
+            (
+                "/Users/u/.local/share/uv/tools/firstpass/bin/firstpass",
+                Channel::Python,
+            ),
+            (
+                "/usr/local/lib/node_modules/@dshakesnotbot/firstpass-proxy/bin/firstpass",
+                Channel::Npm,
+            ),
+            (r"C:\Users\u\.cargo\bin\firstpass.exe", Channel::Cargo),
+        ];
+        for (path, want) in cases {
+            assert_eq!(
+                detect_channel(Path::new(path), false, false),
+                want,
+                "misread {path}"
+            );
+        }
+        // The installer channel is identified by its updater, not by its path.
+        assert_eq!(
+            detect_channel(Path::new("/Users/u/.local/bin/firstpass"), true, false),
+            Channel::Dist
+        );
+        assert_eq!(
+            detect_channel(Path::new("/Users/u/.local/bin/firstpass"), false, false),
+            Channel::Unknown
+        );
+        // A container wins outright — nothing on the host owns that file.
+        assert_eq!(
+            detect_channel(Path::new("/usr/local/bin/firstpass"), true, true),
+            Channel::Docker
+        );
+    }
+
+    /// A package manager owning the file must beat the updater probe: a brew or wheel install can
+    /// carry the updater too, and self-updating underneath the manager desynchronises its metadata.
+    #[test]
+    fn package_manager_paths_win_over_the_self_updater() {
+        use std::path::Path;
+        for (path, want) in [
+            (
+                "/opt/homebrew/Cellar/firstpass-proxy/0.2.2/bin/firstpass",
+                Channel::Homebrew,
+            ),
+            ("/Users/u/.venv/bin/firstpass", Channel::Python),
+            ("/Users/u/.cargo/bin/firstpass", Channel::Cargo),
+        ] {
+            assert_eq!(detect_channel(Path::new(path), true, false), want, "{path}");
+        }
+    }
+
+    /// Only the channel we own may be upgraded in place; the rest must be advice, and the
+    /// unknown case must still leave the user with something runnable.
+    #[test]
+    fn upgrade_report_runs_only_our_own_channel() {
+        assert!(upgrade_report(Channel::Dist, "0.2.2").contains("upgrading in place"));
+        for c in [
+            Channel::Homebrew,
+            Channel::Python,
+            Channel::Npm,
+            Channel::Docker,
+            Channel::Cargo,
+        ] {
+            let r = upgrade_report(c, "0.2.2");
+            assert!(
+                !r.contains("upgrading in place"),
+                "{c:?} must not self-update"
+            );
+            assert!(
+                r.contains("owned by its package manager"),
+                "{c:?} must explain why"
+            );
+            assert!(
+                r.contains(c.upgrade_command().expect("has a command")),
+                "{c:?} must print its exact command"
+            );
+        }
+        let unknown = upgrade_report(Channel::Unknown, "0.2.2");
+        assert!(unknown.contains("brew upgrade") && unknown.contains("docker pull"));
+        assert!(
+            unknown.contains("0.2.2"),
+            "always states the running version"
+        );
     }
 }

@@ -58,7 +58,7 @@
 <h1>Quickstart</h1>
 <p class="page-sub">The fastest way to understand Firstpass is to watch it prove one decision. In about a minute, with no API keys, you'll run a real routing loop — cheap model first, gate the output, escalate on failure — and read the tamper-evident receipt it seals. Then you'll point your own agent at it, safely.</p>
 
-<div class="tldr">Run <b>two commands with no API keys</b> to watch Firstpass prove one decision end to end. Then point your own agent at it in <b>observe mode</b> — requests forward <b>byte-identical</b> to your provider while Firstpass writes shadow receipts off the hot path. Flip to <b>enforce</b> when the numbers convince you.</div>
+<div class="tldr">Run <b>one command with no API keys</b> to watch Firstpass prove one decision end to end. Then point your own agent at it in <b>observe mode</b> — requests forward <b>byte-identical</b> to your provider while Firstpass writes shadow receipts off the hot path. Flip to <b>enforce</b> when the numbers convince you.</div>
 
 <div class="chips">
   <div class="chip good"><div class="cn">~60<span class="u">s</span></div><div class="cl">to your first receipt</div></div>
@@ -67,12 +67,20 @@
 </div>
 
 <h2 id="demo">1 · See it prove one decision<a class="anchor" href="#demo" aria-label="Link to this section">#</a></h2>
-<div class="tldr">Two commands, no keys, no config. The demo stands up a mock upstream and drives a request through the full loop — <b>cheap model first, gate the output, escalate on failure</b> — then prints the hash-sealed receipt. You're watching the whole product in miniature.</div>
-<p>The demo needs no keys and talks to no provider. It stands up a mock upstream, drives one request through the full loop — open the cheap rung, gate the output, escalate one rung when the gate fails, serve the passing answer — and prints the receipt to your terminal. All you need is <code>git</code> and a Rust toolchain (<a href="https://rustup.rs" rel="noopener">rustup.rs</a>).</p>
-<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>git clone https://github.com/dshakes/firstpass &amp;&amp; cd firstpass
-cargo run -p firstpass-proxy --example demo</code></pre></div>
+<div class="tldr">One command, no keys, no config, nothing installed. The demo stands up a mock upstream and drives a request through the full loop — <b>cheap model first, gate the output, escalate on failure</b> — then prints the hash-sealed receipt. You're watching the whole product in miniature.</div>
+<p>The demo needs no keys and talks to no provider. It stands up a mock upstream, drives one request through the full loop — open the cheap rung, gate the output, escalate one rung when the gate fails, serve the passing answer — and prints the receipt to your terminal. No clone, no toolchain, nothing left behind:</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>uvx firstpass demo</code></pre></div>
+<p>That runs the real proxy — the same binary you'd deploy — against a local upstream. Only the upstream is fake; the routing, the gate, the escalation, the cost accounting and the hash chain are all the production code paths. Working from a clone instead? <code>cargo run -p firstpass-proxy --example demo</code> does the same thing from source.</p>
+<div class="codeblock"><div class="cb-head"><span>output</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>── audit receipt ──────────────────────────────────
+  rung 0 · anthropic/claude-haiku-4-5   · FAIL · $0.0023
+  rung 1 · anthropic/claude-sonnet-5    · PASS · $0.0069
+  ─────────────────────────────────────────────────
+  total     $0.0092
+  baseline  $0.0345   (always top-tier)
+  SAVED     $0.0253   (73% cheaper at proven quality)
+  chain     verified ✓</code></pre></div>
 <p>You don't have to install anything or read the config first. The point is to see the shape of a decision before you learn the parts — everything after this is that same loop, made real.</p>
-<div class="recap">Clone and run — no keys, no config; the demo drives the <b>full routing loop</b> and prints the tamper-evident receipt in about 60 seconds.</div>
+<div class="recap">One command, no keys, no toolchain — the demo drives the <b>full routing loop</b> and prints the tamper-evident receipt in seconds.</div>
 
 <h2 id="receipt">2 · Read the receipt<a class="anchor" href="#receipt" aria-label="Link to this section">#</a></h2>
 <div class="tldr">The receipt is Firstpass's proof artifact — a <b>hash-chained record</b> of every rung tried, each gate verdict, cost, and counterfactual. Not a log line: the complete, auditable account of one decision. Read it top to bottom and you've read the architecture.</div>
