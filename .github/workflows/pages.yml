@@ -3,7 +3,8 @@ name: pages
 on:
   push:
     branches: [main]
-    paths: ["docs/**", ".github/workflows/pages.yml"]
+    paths:
+      ["docs/**", "llms.txt", "AGENTS.md", "README.md", "SPEC.md", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +25,14 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      # The agent-facing entry points live at the repo root, but Pages serves docs/ as the site
+      # root — so /llms.txt would 404 for the very agents it's written for. Copy them in at
+      # publish time (single source of truth stays at the root) and disable Jekyll so .md and
+      # .txt are served verbatim instead of being converted or dropped.
+      - name: Stage agent-readable entry points at the site root
+        run: |
+          touch docs/.nojekyll
+          cp llms.txt AGENTS.md README.md SPEC.md docs/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
