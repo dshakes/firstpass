@@ -33,11 +33,264 @@ pub struct Environment {
     pub bind: String,
 }
 
+/// Which provider the ladder opens on. Only `anthropic` and `openai` are built into the provider
+/// registry; the other two must carry a `[[provider]]` block or the config will not resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    /// Built in.
+    Anthropic,
+    /// Built in.
+    OpenAi,
+    /// Gemini dialect; needs a `[[provider]]` block and `GEMINI_API_KEY`.
+    Google,
+    /// A local OpenAI-compatible server (Ollama), escalating to a frontier rung.
+    Local,
+}
+
+impl Provider {
+    /// Every choice, in prompt order.
+    pub const ALL: [Self; 4] = [Self::Anthropic, Self::OpenAi, Self::Google, Self::Local];
+
+    /// Stable id accepted by `--provider`.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Google => "google",
+            Self::Local => "local",
+        }
+    }
+
+    /// One-line description shown next to the option when prompting.
+    #[must_use]
+    pub const fn blurb(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Claude — haiku opens, sonnet catches (built in)",
+            Self::OpenAi => "GPT — 4.1-mini opens, 5.5 catches (built in)",
+            Self::Google => "Gemini — flash opens, pro catches (needs GEMINI_API_KEY)",
+            Self::Local => "Ollama on localhost, escalating to Claude sonnet",
+        }
+    }
+
+    /// Cheapest-first ladder. Every id here is priced by the built-in table, so `firstpass savings`
+    /// is meaningful out of the box (the local rung is the exception — it is free to run).
+    #[must_use]
+    pub const fn ladder(self) -> [&'static str; 2] {
+        match self {
+            Self::Anthropic => ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"],
+            Self::OpenAi => ["openai/gpt-4.1-mini", "openai/gpt-5.5"],
+            Self::Google => ["google/gemini-3.1-flash", "google/gemini-3.1-pro"],
+            Self::Local => ["ollama/qwen2.5-coder:7b", "anthropic/claude-sonnet-5"],
+        }
+    }
+
+    /// A model for the judge gate that is deliberately NOT on the ladder — the runner enforces
+    /// maker != checker, so a judge drawn from the ladder would be rejected.
+    #[must_use]
+    pub const fn judge_model(self) -> &'static str {
+        match self {
+            Self::Anthropic | Self::Local => "anthropic/claude-opus-4-8",
+            Self::OpenAi | Self::Google => "anthropic/claude-haiku-4-5",
+        }
+    }
+
+    /// The `[[provider]]` block this choice requires, if it is not built in.
+    #[must_use]
+    pub const fn provider_block(self) -> Option<&'static str> {
+        match self {
+            Self::Anthropic | Self::OpenAi => None,
+            Self::Google => Some(
+                "[[provider]]                # only anthropic + openai are built in\n\
+                 id          = \"google\"\n\
+                 dialect     = \"gemini\"\n\
+                 base_url    = \"https://generativelanguage.googleapis.com\"\n\
+                 api_key_env = \"GEMINI_API_KEY\"\n",
+            ),
+            Self::Local => Some(
+                "[[provider]]                # local rung; escalates to a frontier model\n\
+                 id       = \"ollama\"\n\
+                 dialect  = \"openai\"\n\
+                 base_url = \"http://localhost:11434\"   # keyless\n",
+            ),
+        }
+    }
+}
+
+/// What the model is being asked to produce. This is what actually picks the gate — the whole
+/// product rests on gating the real output, so it is the one question worth asking carefully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// Structured output — checked against a schema.
+    Json,
+    /// Code — checked by running the caller's tests.
+    Code,
+    /// Prose — graded by a judge on a different model.
+    Prose,
+    /// Mixed traffic — scored by k-sample self-consistency.
+    Mixed,
+}
+
+impl Shape {
+    /// Every choice, in prompt order.
+    pub const ALL: [Self; 4] = [Self::Json, Self::Code, Self::Prose, Self::Mixed];
+
+    /// Stable id accepted by `--shape`.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Code => "code",
+            Self::Prose => "prose",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    /// One-line description shown next to the option when prompting.
+    #[must_use]
+    pub const fn blurb(self) -> &'static str {
+        match self {
+            Self::Json => "JSON / API responses — schema gate, cheapest proof there is",
+            Self::Code => "Code — your own test suite is the gate",
+            Self::Prose => "Prose — an LLM judge grades it (maker != checker)",
+            Self::Mixed => "Mixed — k-sample self-consistency scores agreement",
+        }
+    }
+
+    /// Gate ids the route names. `non-empty` and `json-valid` are built in; the rest are declared
+    /// by [`Self::gate_block`] below, because a route naming an undeclared gate will not resolve.
+    #[must_use]
+    pub const fn gates(self) -> [&'static str; 2] {
+        match self {
+            Self::Json => ["json-valid", "extract-shape"],
+            Self::Code => ["json-valid", "unit-tests"],
+            Self::Prose => ["non-empty", "judge"],
+            Self::Mixed => ["non-empty", "uncertainty"],
+        }
+    }
+
+    /// The `[[gate]]` block defining this shape's non-built-in gate.
+    #[must_use]
+    pub fn gate_block(self, provider: Provider) -> String {
+        match self {
+            Self::Json => "[[gate]]\n\
+                 id         = \"extract-shape\"\n\
+                 schema     = { type = \"object\", required = [\"id\", \"total\"] }\n\
+                 on_abstain = \"fail_closed\"\n"
+                .to_owned(),
+            // Deliberately a placeholder, not `cargo test` / `npm test`: a gate is not just any
+            // command. It must read the candidate as JSON on stdin and print
+            // {"verdict":"pass|fail|abstain"} on stdout, so naming a real test runner here would
+            // look wired up while silently abstaining on every call. `doctor` flags this until
+            // it is replaced, which is the intended nudge.
+            Self::Code => {
+                "[[gate]]\n\
+                 # REPLACE ME. A gate reads the candidate as JSON on stdin and prints\n\
+                 #   {\"verdict\":\"pass|fail|abstain\", \"score\"?: 0.0-1.0, \"reason\"?: \"...\"}\n\
+                 # on stdout. Wrap your real test command in that contract — a bare `cargo test`\n\
+                 # or `npm test` will not work, it would abstain on every request.\n\
+                 # `firstpass doctor` fails on this line until you point it at your wrapper.\n\
+                 id  = \"unit-tests\"\n\
+                 cmd = [\"your-test-runner\", \"--from-stdin\"]\n"
+                    .to_owned()
+            }
+            Self::Prose => format!(
+                "[[gate]]                    # judge sits OUTSIDE the ladder: maker != checker\n\
+                 id    = \"judge\"\n\
+                 judge = {{ model = \"{}\", threshold = 0.7, rubric = \"The response fully and \
+                 correctly resolves the request, with no errors.\" }}\n",
+                provider.judge_model()
+            ),
+            Self::Mixed => format!(
+                "[[gate]]                    # k samples; agreement becomes the score\n\
+                 id          = \"uncertainty\"\n\
+                 consistency = {{ model = \"{}\", k = 3, threshold = 0.6 }}\n",
+                provider.ladder()[0]
+            ),
+        }
+    }
+}
+
+/// The three answers that decide a starting ladder. Everything else in the generated file follows
+/// from these, which is why onboarding asks exactly three questions and not a wizard's worth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LadderChoice {
+    /// Which provider the ladder opens on.
+    pub provider: Provider,
+    /// What the output is, which picks the gate.
+    pub shape: Shape,
+    /// `observe` forwards unchanged; `enforce` serves from the cheap rung once a gate passes.
+    pub mode: firstpass_core::Mode,
+}
+
+impl Default for LadderChoice {
+    /// The answer set used when nothing is on a terminal to ask: Claude, JSON, and observe — the
+    /// combination that changes no behavior at all.
+    fn default() -> Self {
+        Self {
+            provider: Provider::Anthropic,
+            shape: Shape::Json,
+            mode: firstpass_core::Mode::Observe,
+        }
+    }
+}
+
+/// Render a complete, runnable `firstpass.toml` for these answers — including the `[[provider]]`
+/// and `[[gate]]` blocks the choice requires. Emitting a fragment would be worse than emitting
+/// nothing: only `anthropic`/`openai` are built-in providers and only `non-empty`/`json-valid`
+/// are built-in gates, so anything else must be declared here or the file will not resolve.
+#[must_use]
+pub fn render_config(choice: &LadderChoice) -> String {
+    let enforce = choice.mode == firstpass_core::Mode::Enforce;
+    let mode = if enforce { "enforce" } else { "observe" };
+    let quoted = |xs: [&str; 2]| -> String { format!("\"{}\", \"{}\"", xs[0], xs[1]) };
+    let mut out = format!(
+        "# firstpass.toml — written by `firstpass onboard`. Re-run onboard to regenerate.\n\
+         #   FIRSTPASS_MODE={mode} FIRSTPASS_CONFIG=./firstpass.toml firstpass up\n\n"
+    );
+    if let Some(block) = choice.provider.provider_block() {
+        out.push_str(block);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "[[route]]                   # routes match top to bottom; first match wins\n\
+         match  = {{}}                 # everything\n\
+         mode   = \"{mode}\"\n\
+         ladder = [{}]\n\
+         gates  = [{}]\n\n",
+        quoted(choice.provider.ladder()),
+        quoted(choice.shape.gates()),
+    ));
+    out.push_str(&choice.shape.gate_block(choice.provider));
+    if enforce {
+        out.push_str(
+            "\n[escalation]\nmax_rungs_per_request = 2   # one rung up, never a runaway\n",
+        );
+    } else {
+        out.push_str(
+            "\n# observe: every request is forwarded unchanged and a receipt is written off\n\
+             # the hot path. Nothing routes differently until mode = \"enforce\".\n",
+        );
+    }
+    out
+}
+
 /// One onboarding step: what it is, and whether it's already satisfied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
+    /// Write the generated routing config. Never overwrites an existing file — the caller checks.
+    WriteConfig {
+        /// Where the file goes (`./firstpass.toml`).
+        path: PathBuf,
+        /// Full rendered contents.
+        toml: String,
+    },
     /// Spawn `firstpass up` detached (observe mode), logging to `firstpass-proxy.log`.
-    StartProxy,
+    StartProxy {
+        /// Config to hand the child via `FIRSTPASS_CONFIG`. The proxy has no default config path,
+        /// so a written file is inert unless it is passed explicitly.
+        config: Option<PathBuf>,
+    },
     /// Append the marked `ANTHROPIC_BASE_URL` export to the shell rc file.
     WireShell {
         /// Rc file the line goes into.
@@ -102,15 +355,40 @@ pub fn shell_wiring(shell: &str, home: &std::path::Path, bind: &str) -> (PathBuf
     }
 }
 
+/// A config the caller wants written: where it goes and the answers behind it. `None` means the
+/// step is skipped — either a `firstpass.toml` is already there or the user opted out.
+#[derive(Debug, Clone)]
+pub struct ConfigPlan {
+    /// Destination, normally `./firstpass.toml`.
+    pub path: PathBuf,
+    /// The three answers.
+    pub choice: LadderChoice,
+}
+
 /// Build the ordered plan for this environment. `rc_already_wired` is whether the rc file already
-/// carries the marker line (checked by the caller, injected here to stay pure).
+/// carries the marker line (checked by the caller, injected here to stay pure). `config` is the
+/// routing file to generate, if any — it is written *before* the proxy starts so the child can be
+/// handed it, since a config the proxy never loads is worse than no config at all.
 #[must_use]
-pub fn plan(env: &Environment, home: &std::path::Path, rc_already_wired: bool) -> Vec<Step> {
+pub fn plan(
+    env: &Environment,
+    home: &std::path::Path,
+    rc_already_wired: bool,
+    config: Option<&ConfigPlan>,
+) -> Vec<Step> {
     let mut steps = Vec::new();
+    if let Some(c) = config {
+        steps.push(Step::WriteConfig {
+            path: c.path.clone(),
+            toml: render_config(&c.choice),
+        });
+    }
     if env.proxy_running {
         steps.push(Step::AlreadyDone("proxy already answering /healthz"));
     } else {
-        steps.push(Step::StartProxy);
+        steps.push(Step::StartProxy {
+            config: config.map(|c| c.path.clone()),
+        });
     }
     if env.already_routed || rc_already_wired {
         steps.push(Step::AlreadyDone("ANTHROPIC_BASE_URL already wired"));
@@ -136,9 +414,23 @@ pub fn render(env: &Environment, steps: &[Step], apply: bool) -> String {
     for (i, s) in steps.iter().enumerate() {
         let n = i + 1;
         match s {
-            Step::StartProxy => out.push_str(&format!(
-                "{n}. start the proxy — `firstpass up` (observe mode: watches, changes nothing), log → firstpass-proxy.log\n"
-            )),
+            Step::WriteConfig { path, toml } => {
+                out.push_str(&format!("{n}. write {} —\n", path.display()));
+                for line in toml.lines() {
+                    out.push_str(&format!("     {line}\n"));
+                }
+            }
+            Step::StartProxy { config } => {
+                out.push_str(&format!(
+                    "{n}. start the proxy — `firstpass up` (observe mode: watches, changes nothing), log → firstpass-proxy.log\n"
+                ));
+                if let Some(c) = config {
+                    out.push_str(&format!(
+                        "     with FIRSTPASS_CONFIG={} — the proxy has no default config path\n",
+                        c.display()
+                    ));
+                }
+            }
             Step::WireShell { rc, line } => out.push_str(&format!(
                 "{n}. route your agents — append to {}:\n     {line}\n",
                 rc.display()
@@ -175,11 +467,30 @@ pub fn execute(env: &Environment, steps: &[Step]) -> Result<String, std::io::Err
     let mut out = String::new();
     for s in steps {
         match s {
-            Step::StartProxy => {
+            Step::WriteConfig { path, toml } => {
+                // Never clobber a config the operator already has; the caller only plans this
+                // step when the path is free, but re-check rather than trust the gap between.
+                if path.exists() {
+                    out.push_str(&format!(
+                        "✓ {} already present — left untouched\n",
+                        path.display()
+                    ));
+                } else {
+                    std::fs::write(path, toml)?;
+                    out.push_str(&format!("✓ wrote {}\n", path.display()));
+                }
+            }
+            Step::StartProxy { config } => {
                 let log = std::fs::File::create("firstpass-proxy.log")?;
                 let exe = std::env::current_exe()?;
-                let child = std::process::Command::new(exe)
-                    .arg("up")
+                let mut cmd = std::process::Command::new(exe);
+                cmd.arg("up");
+                if let Some(c) = config {
+                    // A written config is inert unless it is named: `ProxyConfig::from_env` reads
+                    // `FIRSTPASS_CONFIG` and has no default path to fall back on.
+                    cmd.env("FIRSTPASS_CONFIG", c);
+                }
+                let child = cmd
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::from(log.try_clone()?))
                     .stderr(std::process::Stdio::from(log))
@@ -410,8 +721,8 @@ mod tests {
             has_claude_cli: true,
             bind: "127.0.0.1:8080".into(),
         };
-        let steps = plan(&fresh, home, false);
-        assert!(matches!(steps[0], Step::StartProxy));
+        let steps = plan(&fresh, home, false, None);
+        assert!(matches!(steps[0], Step::StartProxy { .. }));
         assert!(matches!(steps[1], Step::WireShell { .. }));
         assert!(matches!(steps[2], Step::SuggestClaudeMcp));
         assert!(matches!(steps.last(), Some(Step::Verify)));
@@ -423,7 +734,7 @@ mod tests {
             has_claude_cli: false,
             ..fresh
         };
-        let steps = plan(&done, home, true);
+        let steps = plan(&done, home, true, None);
         assert!(
             steps
                 .iter()
@@ -442,7 +753,7 @@ mod tests {
             has_claude_cli: false,
             bind: "127.0.0.1:8080".into(),
         };
-        let text = render(&e, &plan(&e, home, false), false);
+        let text = render(&e, &plan(&e, home, false, None), false);
         assert!(text.contains("dry run — nothing changed"));
         assert!(text.contains("ANTHROPIC_API_KEY is not set"));
         assert!(text.contains(".bashrc"));
@@ -472,7 +783,7 @@ mod tests {
         assert!(report.contains("✓ wired"));
         assert!(rc_wired(&rc_path), "marker written");
         // Re-planning with the marker present must not wire again (idempotent onboarding).
-        let steps = plan(&e, &dir, rc_wired(&rc_path));
+        let steps = plan(&e, &dir, rc_wired(&rc_path), None);
         assert!(!steps.iter().any(|s| matches!(s, Step::WireShell { .. })));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -505,5 +816,176 @@ mod tests {
         assert!(report.contains("unset ANTHROPIC_BASE_URL"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole point of generating a config is that it runs. Every answer combination must
+    /// survive the real parser — including the `[[provider]]`/`[[gate]]` blocks each one implies,
+    /// since only `anthropic`/`openai` and `non-empty`/`json-valid` are built in.
+    #[test]
+    fn every_generated_config_parses_and_resolves() {
+        use firstpass_core::Mode;
+        let mut n = 0;
+        for provider in Provider::ALL {
+            for shape in Shape::ALL {
+                for mode in [Mode::Observe, Mode::Enforce] {
+                    n += 1;
+                    let choice = LadderChoice {
+                        provider,
+                        shape,
+                        mode,
+                    };
+                    let toml = render_config(&choice);
+                    let cfg = firstpass_core::Config::parse(&toml).unwrap_or_else(|e| {
+                        panic!(
+                            "{}/{}/{mode:?} did not parse: {e}\n{toml}",
+                            provider.id(),
+                            shape.id()
+                        )
+                    });
+                    let route = &cfg.routes[0];
+                    assert_eq!(
+                        route.mode, mode,
+                        "route mode is what actually gates enforcement"
+                    );
+                    assert_eq!(
+                        route.ladder.len(),
+                        2,
+                        "a ladder needs somewhere to escalate to"
+                    );
+
+                    // Every gate the route names must be built in or declared here.
+                    for g in &route.gates {
+                        let builtin = g == "non-empty" || g == "json-valid";
+                        assert!(
+                            builtin || cfg.gate_defs.iter().any(|d| &d.id == g),
+                            "{}/{}: gate {g:?} is neither built in nor declared",
+                            provider.id(),
+                            shape.id()
+                        );
+                    }
+                    // Same for every provider a rung names.
+                    for rung in &route.ladder {
+                        let pid = rung.split('/').next().unwrap();
+                        let builtin = pid == "anthropic" || pid == "openai";
+                        assert!(
+                            builtin || cfg.providers.iter().any(|d| d.id == pid),
+                            "{}/{}: provider {pid:?} is neither built in nor declared",
+                            provider.id(),
+                            shape.id()
+                        );
+                    }
+                    // maker != checker: a judge drawn from the ladder would be rejected at runtime.
+                    if let Some(j) = cfg.gate_defs.iter().find_map(|d| d.judge.as_ref()) {
+                        assert!(
+                            !route.ladder.contains(&j.model),
+                            "{}: judge {} is on its own ladder",
+                            provider.id(),
+                            j.model
+                        );
+                    }
+                    // Observe must stay inert — an escalation cap implies enforcement.
+                    assert_eq!(
+                        toml.contains("[escalation]"),
+                        mode == Mode::Enforce,
+                        "escalation block should track enforce only"
+                    );
+                }
+            }
+        }
+        assert_eq!(n, 32, "4 providers x 4 shapes x 2 modes");
+    }
+
+    /// A written config the proxy never loads is worse than no config: `ProxyConfig::from_env`
+    /// reads `FIRSTPASS_CONFIG` and has no default path, so the plan must carry it to the child.
+    #[test]
+    fn planned_config_is_written_before_the_proxy_starts_and_is_handed_to_it() {
+        let home = std::path::Path::new("/home/u");
+        let env = Environment {
+            shell: "zsh".into(),
+            proxy_running: false,
+            already_routed: false,
+            has_api_key: true,
+            has_claude_cli: false,
+            bind: "127.0.0.1:8080".into(),
+        };
+        let cfg = ConfigPlan {
+            path: PathBuf::from("firstpass.toml"),
+            choice: LadderChoice::default(),
+        };
+        let steps = plan(&env, home, false, Some(&cfg));
+        assert!(
+            matches!(&steps[0], Step::WriteConfig { path, .. } if path == &cfg.path),
+            "config is written first, before anything reads it"
+        );
+        assert!(
+            matches!(&steps[1], Step::StartProxy { config: Some(p) } if p == &cfg.path),
+            "the spawned proxy is handed the config explicitly"
+        );
+
+        // Without a config the plan is exactly what it always was.
+        let steps = plan(&env, home, false, None);
+        assert!(matches!(steps[0], Step::StartProxy { config: None }));
+        assert!(!steps.iter().any(|s| matches!(s, Step::WriteConfig { .. })));
+    }
+
+    /// Re-running onboard must never clobber a routing file the operator already edited.
+    #[test]
+    fn write_config_refuses_to_overwrite_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("fp-cfg-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("firstpass.toml");
+        std::fs::write(&path, "# hand-tuned, do not touch\n").unwrap();
+        let env = Environment {
+            shell: "zsh".into(),
+            proxy_running: true, // no spawn
+            already_routed: true,
+            has_api_key: true,
+            has_claude_cli: false,
+            bind: "127.0.0.1:1".into(),
+        };
+        let steps = vec![Step::WriteConfig {
+            path: path.clone(),
+            toml: render_config(&LadderChoice::default()),
+        }];
+        let report = execute(&env, &steps).unwrap();
+        assert!(report.contains("already present"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# hand-tuned, do not touch\n",
+            "existing config survived untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dry run has to show the actual file, or "onboard asks then writes" is unverifiable
+    /// before the fact.
+    #[test]
+    fn dry_run_shows_the_config_it_would_write() {
+        let home = std::path::Path::new("/home/u");
+        let env = Environment {
+            shell: "bash".into(),
+            proxy_running: false,
+            already_routed: false,
+            has_api_key: true,
+            has_claude_cli: false,
+            bind: "127.0.0.1:8080".into(),
+        };
+        let cfg = ConfigPlan {
+            path: PathBuf::from("firstpass.toml"),
+            choice: LadderChoice {
+                provider: Provider::Local,
+                shape: Shape::Code,
+                mode: firstpass_core::Mode::Enforce,
+            },
+        };
+        let text = render(&env, &plan(&env, home, false, Some(&cfg)), false);
+        assert!(text.contains("write firstpass.toml"));
+        assert!(text.contains("ollama"), "provider block is shown");
+        assert!(text.contains("unit-tests"), "gate block is shown");
+        assert!(
+            text.contains("FIRSTPASS_CONFIG="),
+            "explains how the proxy finds it"
+        );
+        assert!(text.contains("dry run — nothing changed"));
     }
 }
