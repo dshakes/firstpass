@@ -987,8 +987,14 @@ mod tests {
                 "/Users/u/.venv/lib/python3.12/site-packages/firstpass/firstpass",
                 Channel::Python,
             ),
+            // Both observed on a real machine rather than invented: uvx runs from an ephemeral
+            // env under archive-v0, and `uv tool install` lands under the uv tools dir.
             (
-                "/Users/u/.cache/uv/archive-v0/abc123/bin/firstpass",
+                "/Users/u/.cache/uv/archive-v0/DQ4usH_XuqNyywgHKB8qB/bin/firstpass",
+                Channel::Python,
+            ),
+            (
+                "/Users/u/.local/share/uv/tools/firstpass/bin/firstpass",
                 Channel::Python,
             ),
             (
