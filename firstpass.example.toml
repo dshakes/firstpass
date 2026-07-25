@@ -251,3 +251,47 @@ speculation = 0
 # [escalation.predictor]
 # lr = 0.05     # SGD learning rate (0, 1]
 # l2 = 0.0001   # L2 shrinkage (>= 0)
+
+# ── Progressive delivery (ADR 0009) ──────────────────────────────────────────────
+# All three are DEFAULT-OFF. A config that omits them behaves exactly as before.
+#
+# 1. Percentage rollout — enforce only a slice of a route's matched traffic.
+#    Bucketing is a pure function of a stable key, so a conversation never flips arm
+#    mid-thread. That matters beyond user experience: the published served-failure
+#    bound is computed over the population that was served, and a per-request coin
+#    flip would make that population an unstable sample of nothing.
+#      key = "session" (default) | "request" | "tenant"
+#    Ramp by raising `percent`; going 5 -> 25 never ejects a session already enforcing.
+#
+# [route.rollout]
+# percent = 5.0
+# key     = "session"
+#
+# 2. Shadow scoring — on a sample of OBSERVED requests, run the ladder off the hot
+#    path and record what would have been served and what it would have cost. This is
+#    how you get your own number before enforcing anything. It makes REAL model calls,
+#    which is why there is no default sample rate and the daily ceiling is required.
+#    The served response is never touched: shadow runs after it has already gone back.
+#
+# [route.shadow]
+# sample_rate     = 0.10
+# max_usd_per_day = 5.00
+#
+# 3. Guardrail — watch the served-failure bound and act when it breaches. Fed only by
+#    resolved outcomes from /v1/feedback, never by gate verdicts: a guardrail scored on
+#    the system's own opinion would keep enforcing exactly when that opinion had drifted.
+#    `demote` reverts the route to observe, so the failure mode is "you stop saving
+#    money", never "you keep serving worse answers". `alarm` reports and changes nothing.
+#
+#    min_n is not a formality. Below ln(1/delta) / (2*alpha^2) the confidence slack alone
+#    exceeds alpha, so even a ZERO-failure window would breach and every healthy route
+#    would be demoted. That config is rejected at parse with the arithmetic shown.
+#    For alpha = 0.10, delta = 0.05 the floor is 150.
+#
+# [guardrail]
+# alpha    = 0.10
+# delta    = 0.05
+# window   = 500
+# min_n    = 200
+# action   = "demote"        # demote | alarm
+# guardrail_cooldown_secs = 3600

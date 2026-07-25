@@ -170,6 +170,15 @@ pub struct Config {
     /// Escalation limits and promotion rules.
     #[serde(default)]
     pub escalation: Escalation,
+    /// Served-failure guardrail (ADR 0009 D3). Absent (the default) means nothing watches the
+    /// served-failure rate and behaviour is byte-identical to before.
+    #[serde(default)]
+    pub guardrail: Option<crate::guardrail::Guardrail>,
+    /// Seconds a demoted route stays demoted before the guardrail will consider it again.
+    /// Deliberately long: re-promoting on one good window makes routing flap, and every flap is
+    /// a visible behaviour change for real users.
+    #[serde(default = "default_guardrail_cooldown")]
+    pub guardrail_cooldown_secs: i64,
     /// User-defined subprocess gates (SPEC §8.1), referenced by `id` from a route's `gates` /
     /// `deferred_gates`. Declared as `[[gate]]` sections in TOML.
     #[serde(rename = "gate", default)]
@@ -836,6 +845,10 @@ impl ModelRef {
     }
 }
 
+const fn default_guardrail_cooldown() -> i64 {
+    3_600
+}
+
 impl Config {
     /// Parse a TOML configuration document.
     ///
@@ -857,6 +870,9 @@ impl Config {
                 sh.validate()
                     .map_err(|e| Error::InvalidConfig(format!("route[{i}]: {e}")))?;
             }
+        }
+        if let Some(g) = &config.guardrail {
+            g.validate().map_err(Error::InvalidConfig)?;
         }
         let mut seen = std::collections::HashSet::new();
         for def in &config.gate_defs {

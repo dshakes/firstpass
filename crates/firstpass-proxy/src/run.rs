@@ -154,6 +154,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         providers,
         gate_health: Arc::new(gate_health),
         shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+        guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
         traces,
         adaptive,
         bandit,

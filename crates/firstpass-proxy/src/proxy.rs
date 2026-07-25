@@ -54,6 +54,9 @@ pub struct AppState {
     /// Per-(tenant, route) shadow spend for the current UTC day (ADR 0009 D2). Shadow makes real
     /// model calls, so the daily ceiling is enforced through this rather than trusted.
     pub shadow_ledger: Arc<crate::shadow::ShadowLedger>,
+    /// Per-(tenant, route) guardrail state (ADR 0009 D3): the trailing window of resolved
+    /// outcomes and whether a route is currently demoted.
+    pub guardrails: Arc<crate::guard::GuardrailRegistry>,
     /// Fire-and-forget sender to the background trace writer.
     pub traces: store::TraceSender,
     /// Optional online/adaptive conformal serve threshold (Gibbs-Candès ACI). `None` = fixed
@@ -439,6 +442,57 @@ async fn feedback(
                 metrics::gauge!("firstpass_realized_served_failure")
                     .set(g.realized_served_failure());
             }
+
+            // Feed the guardrail (ADR 0009 D3). This is deliberately the ONLY thing that feeds
+            // it: a resolved downstream outcome, not a gate verdict. Gate verdicts are
+            // Firstpass's own opinion, and a guardrail fed on them would be grading its own
+            // homework — it would keep enforcing precisely when its own judgement had drifted.
+            if let (Some(cfg), Some(correct)) = (
+                state.config.routing.as_ref().and_then(|r| r.guardrail),
+                feedback_signal,
+            ) {
+                let cooldown = state
+                    .config
+                    .routing
+                    .as_ref()
+                    .map_or(3_600, |r| r.guardrail_cooldown_secs);
+                // Route 0 until deferred verdicts carry the route they came from; a
+                // single-route deployment (the common case) is exact, and a multi-route one
+                // pools conservatively rather than silently guarding nothing.
+                let reaction = state.guardrails.record(
+                    &tenant,
+                    0,
+                    &cfg,
+                    correct,
+                    jiff::Timestamp::now().as_second(),
+                    cooldown,
+                );
+                match &reaction {
+                    crate::guard::Reaction::Demoted(v) => {
+                        metrics::counter!("firstpass_guardrail_demotions_total").increment(1);
+                        tracing::error!(
+                            tenant = %tenant,
+                            n = v.n,
+                            rate = v.rate,
+                            bound = v.bound,
+                            alpha = cfg.alpha,
+                            "GUARDRAIL: served-failure bound exceeded target — route demoted to                              observe; traffic now serves as it would without Firstpass"
+                        );
+                    }
+                    crate::guard::Reaction::Alarmed(v) => {
+                        metrics::counter!("firstpass_guardrail_breaches_total").increment(1);
+                        tracing::error!(
+                            tenant = %tenant,
+                            n = v.n,
+                            rate = v.rate,
+                            bound = v.bound,
+                            alpha = cfg.alpha,
+                            "GUARDRAIL: served-failure bound exceeded target (alarm only —                              routing unchanged)"
+                        );
+                    }
+                    crate::guard::Reaction::None => {}
+                }
+            }
             (
                 axum::http::StatusCode::ACCEPTED,
                 Json(serde_json::json!({ "status": "recorded", "trace_id": trace_id })),
@@ -693,6 +747,15 @@ async fn messages(
             let routing_mode = resolve_mode(&headers, &route, &state.config);
             // Observe mode forces the observe passthrough path — no gating, no escalation.
             if routing_mode == RoutingMode::Observe {
+                return observe_passthrough(state, headers, body, session_header, tenant).await;
+            }
+            // Guardrail demotion (ADR 0009 D3). A route whose served-failure bound has breached
+            // serves exactly as it would without Firstpass until the cooldown lapses. This is
+            // checked BEFORE rollout so a demotion cannot be partially overridden by an arm.
+            if state
+                .guardrails
+                .is_demoted(&tenant, route_ix, jiff::Timestamp::now().as_second())
+            {
                 return observe_passthrough(state, headers, body, session_header, tenant).await;
             }
             // Percentage rollout (ADR 0009 D1). Bucketing is a pure function of a STABLE key, so
@@ -2905,6 +2968,7 @@ mod tests {
             providers,
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -3082,6 +3146,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -3417,6 +3482,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -3546,6 +3612,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -3797,6 +3864,7 @@ mod tests {
             providers: ProviderRegistry::from_map(providers),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -4164,6 +4232,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -4526,6 +4595,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -4642,6 +4712,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -4916,6 +4987,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -5004,6 +5076,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
             bandit: None,
