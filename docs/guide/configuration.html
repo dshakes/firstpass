@@ -213,6 +213,35 @@ routing_mode = &quot;cost&quot;        # observe|cost|balanced|quality|latency|m
 </table></div>
 <div class="recap">Routes scope a ladder to a URL path; modes control how aggressively Firstpass optimises within that ladder. See <a href="routing.html">Routing &amp; escalation</a> for full semantics.</div>
 
+<h2 id="progressive">Progressive delivery<a class="anchor" href="#progressive" aria-label="Link to this section">#</a></h2>
+<div class="tldr">Three default-off mechanisms that turn "flip to enforce and hope" into a path you can walk: <b>shadow</b> measures what Firstpass would have done, <b>rollout</b> ramps a slice of traffic, and the <b>guardrail</b> watches the served-failure bound and pulls back if it degrades. Omit them and behavior is byte-identical to before.</div>
+<p>Enforce used to be all-or-nothing, and observe couldn't answer the question it existed for. These three compose into <b>shadow → ramp → guard</b>. Design rationale is in <a href="https://github.com/dshakes/firstpass/blob/main/docs/adr/0009-progressive-delivery.md" rel="noopener">ADR 0009</a>.</p>
+
+<p class="subh">Shadow — get your own number first</p>
+<p>On a sample of <em>observed</em> requests, Firstpass runs the ladder off the hot path and records what it would have served and what that would have cost. The response your caller gets is untouched — shadow work starts only after it has already gone back. It makes <b>real model calls</b>, which is why there is no default sample rate and the daily ceiling is required rather than optional.</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[route.shadow]
+sample_rate     = 0.10      # fraction of observed requests scored
+max_usd_per_day = 5.00      # hard ceiling; shadow stops and records that it stopped</code></pre></div>
+
+<p class="subh">Rollout — ramp a slice, not a guess</p>
+<p>Enforce only part of a route's matched traffic. Bucketing is a deterministic function of a <b>stable key</b>, so a conversation never flips arm mid-thread. That matters for more than user experience: the published served-failure bound is computed over the population that was served, and a per-request coin flip would make that population an unstable sample of nothing. Raising <code>percent</code> never ejects a session that was already enforcing.</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[route.rollout]
+percent = 5.0
+key     = "session"         # session (default) | request | tenant</code></pre></div>
+
+<p class="subh">Guardrail — defend the number you published</p>
+<p>Watches the same Hoeffding bound that earns the published guarantee, over a trailing window of <b>resolved outcomes</b> from <code>/v1/feedback</code>. Never gate verdicts: a guardrail scored on Firstpass's own opinion would keep enforcing exactly when that opinion had drifted.</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[guardrail]
+alpha    = 0.10             # the served-failure target being defended
+delta    = 0.05             # confidence; matches the published bound
+window   = 500              # trailing resolved outcomes
+min_n    = 200              # never act on less evidence than this
+action   = "demote"         # demote | alarm
+guardrail_cooldown_secs = 3600</code></pre></div>
+<div class="note"><span class="nt">Why demote is the default</span> A demoted route serves exactly as it would without Firstpass. The failure mode is <b>you stop saving money</b>, never <b>you keep serving worse answers</b>. Demotion is sticky for the cooldown because re-promoting on one good window makes routing flap, and every flap is a visible change for real users. Use <code>alarm</code> if you want a human in the loop.</div>
+<div class="note warn"><span class="nt">min_n is not a formality</span> Below <code>ln(1/delta) / (2·alpha²)</code> the confidence slack <em>alone</em> exceeds <code>alpha</code> — so a window with <b>zero failures</b> would breach and every healthy route would be demoted. For <code>alpha=0.10, delta=0.05</code> the floor is <b>150</b>. Such a config is rejected at parse with the arithmetic shown, rather than quietly demoting everything.</div>
+<div class="recap"><b>shadow → ramp → guard.</b> Measure on your own traffic, enforce a slice, and let the bound you published defend itself. All three off by default.</div>
+
 <h2 id="env">Environment variables<a class="anchor" href="#env" aria-label="Link to this section">#</a></h2>
 <div class="tldr">Seven variables control listen address, config file, and operating mode. <b>Start with <code>FIRSTPASS_MODE=observe</code></b> — it records receipts and passes every request through unchanged.</div>
 <div class="tblwrap"><table>
@@ -238,7 +267,7 @@ routing_mode = &quot;cost&quot;        # observe|cost|balanced|quality|latency|m
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="providers.html"><span class="dir">← Previous</span><span class="t">Providers</span></a><a class="next" href="cli.html"><span class="dir">Next →</span><span class="t">CLI reference</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#shape" class="">Config shape</a><a href="#ladder" class="">[ladder]</a><a href="#gate" class="">[[gate]]</a><a href="#bandit" class="">[bandit]</a><a href="#speculation" class="">[speculation] &amp; budgets</a><a href="#provider" class="">[[provider]]</a><a href="#routes" class="">[[route]] &amp; modes</a><a href="#env" class="">Environment variables</a><a href="#tenancy" class="">Multi-tenant</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#shape" class="">Config shape</a><a href="#ladder" class="">[ladder]</a><a href="#gate" class="">[[gate]]</a><a href="#bandit" class="">[bandit]</a><a href="#speculation" class="">[speculation] &amp; budgets</a><a href="#provider" class="">[[provider]]</a><a href="#routes" class="">[[route]] &amp; modes</a><a href="#progressive" class="">Progressive delivery</a><a href="#env" class="">Environment variables</a><a href="#tenancy" class="">Multi-tenant</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">
