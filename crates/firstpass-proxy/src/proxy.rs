@@ -37,6 +37,7 @@ use crate::upstream::{
     forward_anthropic, forward_anthropic_streaming, forward_openai, forward_openai_streaming,
 };
 use firstpass_core::Route;
+use firstpass_core::trace::ShadowSignal;
 
 /// Shared state handed to every request handler. Cheap to clone: an `Arc`ed config, a
 /// pooled HTTP client, and a bounded channel sender.
@@ -50,6 +51,9 @@ pub struct AppState {
     pub providers: ProviderRegistry,
     /// Per-gate error budgets (auto-disable), shared across requests.
     pub gate_health: Arc<GateHealthRegistry>,
+    /// Per-(tenant, route) shadow spend for the current UTC day (ADR 0009 D2). Shadow makes real
+    /// model calls, so the daily ceiling is enforced through this rather than trusted.
+    pub shadow_ledger: Arc<crate::shadow::ShadowLedger>,
     /// Fire-and-forget sender to the background trace writer.
     pub traces: store::TraceSender,
     /// Optional online/adaptive conformal serve threshold (Gibbs-Candès ACI). `None` = fixed
@@ -460,6 +464,162 @@ const SESSION_HEADER: &str = "x-firstpass-session";
 const AGENT_HEADER: &str = "x-firstpass-agent";
 /// Header carrying the calling subagent identity.
 const SUBAGENT_HEADER: &str = "x-firstpass-subagent";
+/// Kick off a shadow evaluation for an observed request, detached (ADR 0009 D2).
+///
+/// Called only once the caller's response already exists, so nothing here can change what was
+/// served, how long it took, or whether it succeeded. The join handle is dropped deliberately —
+/// nothing waits on this, because a measurement must never be able to delay a served answer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the enforce context it evaluates; a wrapper struct would only move the list"
+)]
+fn spawn_shadow(
+    state: &AppState,
+    route: &firstpass_core::Route,
+    route_ix: usize,
+    body: Bytes,
+    auth: Auth,
+    features: Features,
+    tenant: String,
+    session_id: String,
+    api: &str,
+) {
+    let Some(shadow) = route.shadow else {
+        return;
+    };
+    // Keyed on the session so a conversation is consistently in or out of the sample, and under
+    // its own hash tag so the sample does not correlate with the rollout arm.
+    if !shadow.sampled(&state.config.prompt_salt, &session_id) {
+        return;
+    }
+    let (state, route, api) = (state.clone(), route.clone(), api.to_owned());
+    tokio::spawn(async move {
+        let signal = evaluate_shadow(
+            &state, &route, shadow, route_ix, &body, auth, &features, tenant, session_id, &api, 0.0,
+        )
+        .await;
+        // A shadow failure is data, not an incident: recorded, never surfaced to the caller.
+        tracing::debug!(
+            would_pass = signal.would_pass,
+            projected_usd = signal.projected_cost_usd,
+            skipped = ?signal.skipped,
+            "shadow evaluation complete"
+        );
+    });
+}
+
+/// Run one shadow evaluation and return the counterfactual signal (ADR 0009 D2).
+///
+/// Called from a detached task *after* the observed response has already been handed to the
+/// caller, so nothing here can affect what was served, its timing, or its bytes. Every failure
+/// path returns a signal describing the failure rather than propagating: a measurement must never
+/// be able to take down a request path that already succeeded.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the enforce context; grouping them into a struct would only move the list"
+)]
+async fn evaluate_shadow(
+    state: &AppState,
+    route: &firstpass_core::Route,
+    shadow: firstpass_core::rollout::Shadow,
+    route_ix: usize,
+    body: &Bytes,
+    auth: Auth,
+    features: &Features,
+    tenant: String,
+    session_id: String,
+    api: &str,
+    actual_cost_usd: f64,
+) -> ShadowSignal {
+    let skipped = |why: &str| ShadowSignal {
+        would_serve_rung: None,
+        would_pass: false,
+        projected_cost_usd: 0.0,
+        actual_cost_usd,
+        skipped: Some(why.to_owned()),
+    };
+
+    let now = jiff::Timestamp::now();
+    if !state
+        .shadow_ledger
+        .may_spend(&tenant, route_ix, shadow.max_usd_per_day, now)
+    {
+        // Recorded, not silent: an operator whose projection quietly stopped tracking would keep
+        // trusting a number that no longer describes their traffic.
+        return skipped("budget_exhausted");
+    }
+
+    let Some(base_request) = parse_model_request(body) else {
+        return skipped("unparseable_request");
+    };
+    let gate_defs = state
+        .config
+        .routing
+        .as_ref()
+        .map_or(&[][..], |cfg| &cfg.gate_defs);
+    let gates = resolve_gates(
+        &route.gates,
+        gate_defs,
+        &state.providers,
+        &auth,
+        &state.config.prices,
+    );
+    let (budget, max_rungs) = state
+        .config
+        .routing
+        .as_ref()
+        .map_or((None, u32::MAX), |cfg| {
+            (
+                cfg.budget.per_request_usd,
+                cfg.escalation.max_rungs_per_request,
+            )
+        });
+
+    let ctx = EnforceCtx {
+        ladder: &route.ladder,
+        gates: &gates,
+        health: &state.gate_health,
+        base_request: &base_request,
+        providers: &state.providers,
+        auth: &auth,
+        prices: &state.config.prices,
+        budget_per_request_usd: budget,
+        max_rungs,
+        // Shadow is a measurement, not a latency-sensitive serve: no speculation (it would spend
+        // more to save time nobody is waiting on) and no elastic verification.
+        speculation: 0,
+        serve_threshold: None,
+        elastic: None,
+        features: features.clone(),
+        start_rung: 0,
+        tenant_id: tenant.clone(),
+        session_id,
+        prompt_hash: prompt_hash(&state.config.prompt_salt, body),
+        api: api.to_owned(),
+        policy_id: "shadow".to_owned(),
+    };
+
+    let (outcome, trace) = route_enforce(ctx).await;
+    let spent = trace.final_.total_cost_usd;
+    state.shadow_ledger.debit(&tenant, route_ix, spent, now);
+
+    // The served rung is recorded on the trace's final outcome; read it there rather than
+    // re-deriving it from the attempts, so shadow and enforce agree by construction.
+    let would_pass = matches!(outcome, EngineOutcome::Served(_));
+    let would_serve_rung = if would_pass {
+        trace.final_.served_rung
+    } else {
+        None
+    };
+    ShadowSignal {
+        would_serve_rung,
+        would_pass,
+        projected_cost_usd: spent,
+        actual_cost_usd,
+        skipped: None,
+    }
+}
+
 /// Per-request routing-mode override. Case-insensitive; unknown values are logged and ignored
 /// (fall through to route-level / global-default). Valid values: observe|cost|balanced|quality|latency|max.
 const MODE_PROFILE_HEADER: &str = "x-firstpass-mode";
@@ -519,6 +679,13 @@ async fn messages(
             .route_for(&features)
             .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
         {
+            // Index of the matched route, so shadow spend is budgeted per route rather than
+            // pooled across a config that may define several.
+            let route_ix = routing
+                .routes
+                .iter()
+                .position(|r| std::ptr::eq(r, route))
+                .unwrap_or(0);
             // Clone the matched route so no borrow of `state.config` is held across the await;
             // routes are tiny (a handful of strings).
             let route = route.clone();
@@ -551,7 +718,36 @@ async fn messages(
                     firstpass_core::rollout::decide(&state.config.prompt_salt, rollout, &key_value);
                 if !decision.enforced {
                     // The control arm. Served exactly as it would be without Firstpass.
-                    return observe_passthrough(state, headers, body, session_header, tenant).await;
+                    let shadow_ctx = route.shadow.map(|_| {
+                        (
+                            body.clone(),
+                            Auth::from_headers(&headers),
+                            features.clone(),
+                            tenant.clone(),
+                            session_header
+                                .clone()
+                                .unwrap_or_else(|| Uuid::now_v7().to_string()),
+                        )
+                    });
+                    let resp =
+                        observe_passthrough(state.clone(), headers, body, session_header, tenant)
+                            .await;
+                    // Strictly after the response object exists: shadow cannot affect what was
+                    // served, only what we later know about what we would have served.
+                    if let Some((b, auth, feats, ten, sess)) = shadow_ctx {
+                        spawn_shadow(
+                            &state,
+                            &route,
+                            route_ix,
+                            b,
+                            auth,
+                            feats,
+                            ten,
+                            sess,
+                            "anthropic",
+                        );
+                    }
+                    return resp;
                 }
             }
             if enforce_can_handle(
@@ -1818,6 +2014,7 @@ fn base_trace(
         },
         probe: None,
         rollout: None,
+        shadow: None,
         predicted_pass: None,
         elastic: None,
     }
@@ -2707,6 +2904,7 @@ mod tests {
             http: reqwest::Client::new(),
             providers,
             gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -2883,6 +3081,7 @@ mod tests {
             http: reqwest::Client::new(),
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -2913,6 +3112,7 @@ mod tests {
             deferred_gates: vec![],
             routing_mode: None,
             rollout: None,
+            shadow: None,
         }
     }
 
@@ -3216,6 +3416,7 @@ mod tests {
             http: reqwest::Client::new(),
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -3344,6 +3545,7 @@ mod tests {
             http: reqwest::Client::new(),
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -3594,6 +3796,7 @@ mod tests {
             http: reqwest::Client::new(),
             providers: ProviderRegistry::from_map(providers),
             gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -3960,6 +4163,7 @@ mod tests {
             http: reqwest::Client::new(),
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -4321,6 +4525,7 @@ mod tests {
             http: reqwest::Client::new(),
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -4436,6 +4641,7 @@ mod tests {
             http: reqwest::Client::new(),
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -4709,6 +4915,7 @@ mod tests {
             http: reqwest::Client::new(),
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             traces,
             adaptive: None,
             bandit: None,
@@ -4796,6 +5003,7 @@ mod tests {
             http: reqwest::Client::new(),
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             traces,
             adaptive: None,
             bandit: None,

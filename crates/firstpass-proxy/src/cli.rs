@@ -838,6 +838,7 @@ mod tests {
             },
             probe: None,
             rollout: None,
+            shadow: None,
             predicted_pass: None,
             elastic: None,
         };
@@ -951,6 +952,7 @@ mod tests {
             },
             probe: None,
             rollout: None,
+            shadow: None,
             predicted_pass: None,
             elastic: None,
         };

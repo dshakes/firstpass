@@ -106,6 +106,28 @@ pub struct ElasticDecision {
 
 /// The rollout arm this request landed in (ADR 0009 D1), recorded so an auditor can re-derive
 /// arm membership from the receipt alone. Absent when the route has no rollout — byte-identical
+/// What Firstpass *would* have done for an observed request (ADR 0009 D2).
+///
+/// This describes a counterfactual that was never served, so it must never enter the conformal
+/// calibration set for served failures — it is a separate estimate with its own sample size.
+/// Pooling it with served outcomes would let a projection contaminate the published bound.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowSignal {
+    /// Rung that would have been served, if any gate passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub would_serve_rung: Option<u32>,
+    /// Whether the ladder would have produced a servable answer at all.
+    pub would_pass: bool,
+    /// What the shadow evaluation cost to run.
+    pub projected_cost_usd: f64,
+    /// What the request actually cost upstream, for comparison.
+    pub actual_cost_usd: f64,
+    /// Present when shadow did not run, saying why — a skipped measurement is recorded rather
+    /// than silently absent, so a projection that has stopped tracking is visible in the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+}
+
 /// to pre-rollout traces and hash-chain compatible.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RolloutRecord {
@@ -156,6 +178,9 @@ pub struct Trace {
     /// rollout configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout: Option<RolloutRecord>,
+    /// Counterfactual signal from shadow scoring (ADR 0009 D2). Absent unless shadow is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<ShadowSignal>,
     /// Shadow prediction of `P(gate-pass)` for the start rung (ADR 0008 Phase 2), from the
     /// per-query predictor. Absent when the predictor is off (the default) — byte-identical to
     /// pre-predictor traces and hash-chain compatible. Recorded but never acted on in this phase.
@@ -378,6 +403,7 @@ mod tests {
             },
             probe: None,
             rollout: None,
+            shadow: None,
             predicted_pass: None,
             elastic: None,
         };
