@@ -51,8 +51,9 @@
       <span class="mono">firstpass · enforce · POST /v1/messages</span>
       <span class="rig-tag mono">one decision</span>
     </div>
-    <div class="rig-scroll"><svg class="fp-svg rig-svg" viewBox="0 0 960 322" role="img"
-         aria-label="Rung 0 haiku opens and its gate fails; the request escalates to rung 1 sonnet, whose gate passes and is served. Rung 2 opus is never reached. Spend is $0.0092 against an always-frontier baseline of $0.0345 — 73% cheaper.">
+    <div class="rig-grid">
+    <div class="rig-scroll"><svg class="fp-svg rig-svg" viewBox="0 0 660 322" role="img"
+         aria-label="Rung 0 haiku opens and its gate fails; the request escalates to rung 1 sonnet, whose gate passes and is served. Rung 2 opus is never reached.">
       <!-- ── rung 2 · the money not spent ─────────────────────────────────── -->
       <text class="m ink-mut" x="28" y="52" font-size="11" letter-spacing=".06em">RUNG 2</text>
       <text class="m ink-mut" x="28" y="72" font-size="13" opacity=".55">anthropic/opus</text>
@@ -91,25 +92,22 @@
       <path class="flow w l" d="M470 250 C 300 250, 320 162, 176 162" stroke-width="2.5"/>
       <text class="m warn" x="248" y="212" font-size="11" font-weight="600">escalate ×1</text>
 
-      <!-- ── readout ──────────────────────────────────────────────────────── -->
-      <line class="grid" x1="672" y1="26" x2="672" y2="296" stroke-width="1"/>
-
-      <text class="m ink-mut" x="704" y="52" font-size="11" letter-spacing=".06em">WHAT IT COST</text>
-
-      <text class="m ink-mut" x="704" y="92" font-size="12">spent</text>
-      <rect class="track" x="704" y="102" width="216" height="9" rx="4.5"/>
-      <rect class="accent fill" x="704" y="102" width="58" height="9" rx="4.5"/>
-      <text class="m ink" x="704" y="134" font-size="17" font-weight="600">$0.0092</text>
-
-      <text class="m ink-mut" x="704" y="176" font-size="12" opacity=".8">always frontier</text>
-      <rect class="track" x="704" y="186" width="216" height="9" rx="4.5"/>
-      <rect class="n-stroke" x="704" y="186" width="216" height="9" rx="4.5" fill="none"
-            stroke-width="1" stroke-dasharray="4 4"/>
-      <text class="m ink-mut" x="704" y="218" font-size="17" font-weight="600" opacity=".75">$0.0345</text>
-
-      <text class="m accent-ink" x="704" y="262" font-size="26" font-weight="700">73% cheaper</text>
-      <text class="m ink-mut" x="704" y="284" font-size="11">at proven quality — not predicted</text>
-    </svg></div>
+      </svg></div>
+    <div class="rig-read">
+      <p class="rig-read-h mono">WHAT IT COST</p>
+      <div class="rig-meter">
+        <span class="rig-meter-k mono">spent</span>
+        <span class="rig-bar"><i class="rig-bar-f" style="width:26.7%"></i></span>
+        <span class="rig-meter-v mono">$0.0092</span>
+      </div>
+      <div class="rig-meter">
+        <span class="rig-meter-k mono">always frontier</span>
+        <span class="rig-bar"><i class="rig-bar-g"></i></span>
+        <span class="rig-meter-v mono ghost">$0.0345</span>
+      </div>
+      <p class="rig-save"><b class="mono">73% cheaper</b><span>at proven quality — not predicted</span></p>
+    </div>
+    </div>
     <div class="rig-seal mono">
       <span class="rig-seal-d" aria-hidden="true">◆</span>
       <span class="rig-hash">sha256:5c02…a91f</span>
