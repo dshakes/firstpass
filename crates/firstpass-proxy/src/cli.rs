@@ -180,8 +180,10 @@ pub enum Channel {
     Homebrew,
     /// `cargo install --git`.
     Cargo,
-    /// pip / uv / uvx / pipx wheel.
+    /// pip / uv / uvx wheel.
     Python,
+    /// pipx-managed install (its own venv, symlinked onto PATH).
+    Pipx,
     /// The npm installer package.
     Npm,
     /// Running inside the container image.
@@ -199,6 +201,7 @@ impl Channel {
             Self::Homebrew => "Homebrew",
             Self::Cargo => "cargo install",
             Self::Python => "Python wheel (pip / uv / uvx)",
+            Self::Pipx => "pipx",
             Self::Npm => "npm",
             Self::Docker => "Docker image",
             Self::Unknown => "unrecognised",
@@ -215,6 +218,7 @@ impl Channel {
                 "cargo install --git https://github.com/dshakes/firstpass firstpass-proxy --force",
             ),
             Self::Python => Some("uv tool upgrade firstpass    # or: pip install -U firstpass"),
+            Self::Pipx => Some("pipx upgrade firstpass"),
             Self::Npm => Some("npm install -g @dshakesnotbot/firstpass-proxy@latest"),
             Self::Docker => Some("docker pull ghcr.io/dshakes/firstpass:latest"),
             Self::Unknown => None,
@@ -243,10 +247,12 @@ pub fn detect_channel(exe: &std::path::Path, updater_present: bool, in_container
     if has("/cellar/") || has("/homebrew/") || has("/linuxbrew/") {
         return Channel::Homebrew;
     }
+    if has("/pipx/") {
+        return Channel::Pipx; // before the generic markers: a pipx venv also has site-packages
+    }
     if has("/site-packages/")
         || has("/dist-packages/")
         || has("/.venv/")
-        || has("/pipx/")
         || has("/uv/")
         || has("/uv-cache/")
     {
@@ -283,6 +289,7 @@ pub fn upgrade_report(channel: Channel, current_version: &str) -> String {
                  \x20   firstpass-update                              # installer script\n\
                  \x20   brew upgrade firstpass-proxy                  # Homebrew\n\
                  \x20   uv tool upgrade firstpass                     # uv / pip: pip install -U firstpass\n\
+                 \x20   pipx upgrade firstpass                        # pipx\n\
                  \x20   npm install -g @dshakesnotbot/firstpass-proxy@latest\n\
                  \x20   docker pull ghcr.io/dshakes/firstpass:latest\n\
                  \x20   cargo install --git https://github.com/dshakes/firstpass firstpass-proxy --force\n",
@@ -1074,6 +1081,39 @@ mod tests {
         assert!(
             unknown.contains("0.2.2"),
             "always states the running version"
+        );
+    }
+
+    /// Regression: reported from a real machine. pipx installs into its own venv and puts a
+    /// symlink on PATH, so the launch path is `~/.local/bin/firstpass` and carries no marker at
+    /// all. Detection runs on the CANONICAL path; these are the two forms of that install.
+    #[test]
+    fn pipx_install_is_recognised_from_its_real_path() {
+        use std::path::Path;
+        let real = "/Users/u/.local/pipx/venvs/firstpass/bin/firstpass";
+        assert_eq!(detect_channel(Path::new(real), false, false), Channel::Pipx);
+        assert_eq!(
+            Channel::Pipx.upgrade_command(),
+            Some("pipx upgrade firstpass")
+        );
+
+        // The launch path alone is genuinely unidentifiable — which is why the caller must
+        // canonicalize rather than this function pretending it can tell.
+        assert_eq!(
+            detect_channel(Path::new("/Users/u/.local/bin/firstpass"), false, false),
+            Channel::Unknown
+        );
+
+        // A pipx venv also contains site-packages; pipx must win so the command is right.
+        assert_eq!(
+            detect_channel(
+                Path::new(
+                    "/Users/u/.local/pipx/venvs/firstpass/lib/python3.14/site-packages/x/firstpass"
+                ),
+                false,
+                false
+            ),
+            Channel::Pipx
         );
     }
 }
