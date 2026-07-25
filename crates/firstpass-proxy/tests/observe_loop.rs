@@ -56,6 +56,7 @@ async fn spawn_proxy(upstream: &str) -> (String, std::path::PathBuf) {
         http: reqwest::Client::new(),
         providers,
         gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
+        shadow_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
         traces,
         adaptive: None,
         bandit: None,

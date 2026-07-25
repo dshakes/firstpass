@@ -397,6 +397,12 @@ pub struct Route {
     /// default) enforces all matched traffic — byte-identical to existing behaviour.
     #[serde(default)]
     pub rollout: Option<crate::rollout::Rollout>,
+    /// Shadow scoring (ADR 0009 D2): on a sample of *observed* requests, run the ladder off the
+    /// hot path and record what would have been served and what it would have cost. Absent (the
+    /// default) leaves observe exactly as it was. Makes real model calls when enabled, which is
+    /// why `max_usd_per_day` is required rather than defaulted.
+    #[serde(default)]
+    pub shadow: Option<crate::rollout::Shadow>,
 }
 
 /// Predicate over a request's [`Features`]. Every present field is an AND-constraint; absent
@@ -845,6 +851,10 @@ impl Config {
         for (i, route) in config.routes.iter().enumerate() {
             if let Some(r) = &route.rollout {
                 r.validate()
+                    .map_err(|e| Error::InvalidConfig(format!("route[{i}]: {e}")))?;
+            }
+            if let Some(sh) = &route.shadow {
+                sh.validate()
                     .map_err(|e| Error::InvalidConfig(format!("route[{i}]: {e}")))?;
             }
         }
@@ -1683,5 +1693,50 @@ discount = 0.98
         assert!(Config::parse(&base.replace("lr = 0.05", "lr = 0.0")).is_err());
         assert!(Config::parse(&base.replace("lr = 0.05", "lr = 1.5")).is_err());
         assert!(Config::parse(&base.replace("l2 = 0.001", "l2 = -1.0")).is_err());
+    }
+
+    /// Shadow is off unless asked for, and a nonsensical setting must fail loudly at parse rather
+    /// than being clamped — a silently-corrected ceiling would spend a different amount than the
+    /// operator authorised.
+    #[test]
+    fn shadow_config_parses_and_validates() {
+        let base = "[[route]]\nmatch = {}\nmode = \"observe\"\nladder = [\"anthropic/a\"]\n";
+        let none = Config::parse(base).unwrap();
+        assert!(
+            none.routes[0].shadow.is_none(),
+            "shadow must be off by default"
+        );
+
+        let ok = Config::parse(&format!(
+            "{base}[route.shadow]\nsample_rate = 0.25\nmax_usd_per_day = 5.0\n"
+        ))
+        .unwrap();
+        let sh = ok.routes[0].shadow.expect("shadow parsed");
+        assert!((sh.sample_rate - 0.25).abs() < f64::EPSILON);
+        assert!((sh.max_usd_per_day - 5.0).abs() < f64::EPSILON);
+
+        for bad in [
+            "sample_rate = 1.5\nmax_usd_per_day = 5.0",
+            "sample_rate = -0.1\nmax_usd_per_day = 5.0",
+            "sample_rate = 0.1\nmax_usd_per_day = -1.0",
+        ] {
+            assert!(
+                Config::parse(&format!("{base}[route.shadow]\n{bad}\n")).is_err(),
+                "invalid shadow config accepted: {bad}"
+            );
+        }
+    }
+
+    /// Same for rollout: absent by default, invalid percent rejected at parse.
+    #[test]
+    fn rollout_config_parses_and_validates() {
+        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/a\"]\n";
+        assert!(Config::parse(base).unwrap().routes[0].rollout.is_none());
+        let ok = Config::parse(&format!(
+            "{base}[route.rollout]\npercent = 5.0\nkey = \"session\"\n"
+        ))
+        .unwrap();
+        assert!((ok.routes[0].rollout.unwrap().percent - 5.0).abs() < f64::EPSILON);
+        assert!(Config::parse(&format!("{base}[route.rollout]\npercent = 140.0\n")).is_err());
     }
 }
