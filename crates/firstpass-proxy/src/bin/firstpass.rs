@@ -11,6 +11,8 @@ const HELP: &str = "\
 firstpass — the cheapest model that provably passes, with a receipt for every call.
 
 USAGE:
+    firstpass upgrade             upgrade in place, or print the exact command for however
+                                  this copy was installed (brew / uv / npm / docker / cargo)
     firstpass demo                no keys, no config: run one real gated decision and print
                                   its receipt (local mock upstream, real proxy)
     firstpass onboard [--apply]   agentic setup: ask three questions, write firstpass.toml,
@@ -59,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run::serve(ProxyConfig::from_env()?).await
         }
         "demo" => firstpass_proxy::demo::run().await,
+        "upgrade" => cmd_upgrade(),
         "onboard" => cmd_onboard(args.iter().any(|a| a == "--apply")),
         "offboard" => cmd_offboard(),
         "doctor" => cmd_doctor(),
@@ -145,6 +148,40 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
+}
+
+/// `firstpass upgrade` — the discoverable front door to updating. Only the installer-script
+/// channel ships an updater we own, so that one runs in place; every other channel is owned by a
+/// package manager and gets its exact command printed rather than mutated behind its back.
+fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let in_container = std::path::Path::new("/.dockerenv").exists();
+    let path_var = std::env::var("PATH").ok();
+    // The updater sits beside the binary the installer placed, or on PATH.
+    let updater_present = exe
+        .parent()
+        .is_some_and(|d| d.join("firstpass-update").is_file())
+        || cli::command_on_path("firstpass-update", path_var.as_deref());
+
+    let channel = cli::detect_channel(&exe, updater_present, in_container);
+    print!(
+        "{}",
+        cli::upgrade_report(channel, env!("CARGO_PKG_VERSION"))
+    );
+
+    if channel == cli::Channel::Dist {
+        let updater = exe
+            .parent()
+            .map(|d| d.join("firstpass-update"))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| "firstpass-update".into());
+        let status = std::process::Command::new(updater).status()?;
+        if !status.success() {
+            eprintln!("\nupdater exited with {status} — see the output above");
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+    Ok(())
 }
 
 /// Ask one question and return the chosen variant. Only ever called when stdin is a terminal.

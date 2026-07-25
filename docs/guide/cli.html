@@ -80,6 +80,8 @@ cargo install --git https://github.com/dshakes/firstpass</code></pre></div>
     <tr><td><code>firstpass offboard</code></td><td>Reverses onboarding cleanly — removes the proxy from the path.</td></tr>
     <tr><td><code>firstpass up</code></td><td>Start the proxy.</td></tr>
     <tr><td><code>firstpass doctor</code></td><td>Diagnose config, keys, connectivity, and sandbox readiness.</td></tr>
+    <tr><td><code>firstpass demo</code></td><td>One real gated decision against a local mock upstream, with its receipt. No keys, no config.</td></tr>
+    <tr><td><code>firstpass upgrade</code></td><td>Upgrade in place if this copy came from the installer script; otherwise print the exact command for the channel that owns it.</td></tr>
   </tbody>
 </table></div>
 <div class="note"><span class="nt">Key idea</span> <code>firstpass onboard</code> without <code>--apply</code> is a <strong>dry run</strong> — it shows you exactly what it would change without writing anything. Add <code>--apply</code> to commit. This is the only command that modifies your environment; every other subcommand is read-only against your receipts and config.</div>

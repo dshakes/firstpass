@@ -37,7 +37,7 @@
     <a class="btn lg" href="guide/index.html">Read the docs</a>
     <a class="btn lg" href="https://github.com/dshakes/firstpass" rel="noopener">★ Star on GitHub</a>
   </div>
-  <p class="hero-run" style="margin-top:14px;font-size:14px;opacity:.72">No API keys to start — <span class="mono">cargo run -p firstpass-proxy --example demo</span> prints a signed receipt.</p>
+  <p class="hero-run" style="margin-top:14px;font-size:14px;opacity:.72">No API keys, nothing installed — <span class="mono">uvx firstpass demo</span> prints a signed receipt.</p>
   <div class="hero-trust">
     <span><b>cheapest-first</b> · gated</span>
     <span><b>≤10%</b> served-fail @ 95%</span>
@@ -572,8 +572,7 @@
     <h2>See the whole loop in ~10 seconds.</h2>
     <p class="lead">No API keys — the demo stands up a mock upstream and drives one real decision, escalation and all. It builds from source, so it needs a Rust toolchain; installing the proxy below doesn't.</p>
   </div>
-  <div class="codeblock" style="margin-top:28px"><div class="cb-head"><span>bash · run the demo</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>git clone https://github.com/dshakes/firstpass &amp;&amp; cd firstpass
-cargo run -p firstpass-proxy --example demo   # clone &amp; watch the receipt print</code></pre></div>
+  <div class="codeblock" style="margin-top:28px"><div class="cb-head"><span>bash · run the demo</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>uvx firstpass demo   # no keys, no clone, no toolchain — watch the receipt print</code></pre></div>
   <h3 style="font-size:16px;font-weight:600;color:var(--text-2);margin:40px 0 0">Or install the proxy</h3>
   <div class="install" data-tabs>
     <div class="tabs" role="tablist" aria-label="Install method">
