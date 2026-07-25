@@ -7,14 +7,14 @@
 <meta name="description" content="An open-source adaptive LLM router. The cheapest model takes the first pass; a gate proves the real output before it serves; it escalates one rung only on proof of need. A distribution-free ≤10% served-failure guarantee, earned live on 974 real coding tasks, and a signed receipt for every decision. Proof over prediction.">
 <meta name="theme-color" content="#ffffff">
 <meta name="color-scheme" content="light dark">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2319E3B1'/><path d='M7 21 L14 11 L19 16 L25 8' fill='none' stroke='%23041410' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7.5' fill='%2319E3B1'/><path d='M6.5 25.2H14.4V17.2H22.2V9.2H26.4' fill='none' stroke='%23041410' stroke-width='2.5' stroke-opacity='.38' stroke-linecap='round' stroke-linejoin='round'/><path d='M6.5 25.2H14.4' stroke='%23041410' stroke-width='4.6' stroke-linecap='round'/></svg>">
 <link rel="stylesheet" href="./assets/docs.css?v=5">
 <script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <header class="topnav"><div class="bar">
-  <a class="brand" href="index.html"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
+  <a class="brand" href="index.html"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass <span class="ver">v0.2.1</span></a>
   <nav class="navlinks" aria-label="Primary"><a href="guide/index.html">Docs</a><a href="guide/guarantee.html">Guarantee</a><a href="guide/benchmarks.html">Benchmarks</a><a href="guide/cli.html">CLI</a></nav>
   <span class="nav-sp"></span>
   <div class="nav-right">
@@ -27,7 +27,8 @@
 </header>
 <main id="main">
 <!-- HERO -->
-<section class="hero"><div class="hero-glow"></div><div class="wrap">
+<section class="hero"><div class="hero-glow"></div>
+  <div class="hero-rungs" aria-hidden="true"><span class="hero-mote m1" style="left:14%;top:62%"></span><span class="hero-mote m2" style="left:31%;top:70%"></span><span class="hero-mote m3" style="left:57%;top:66%"></span><span class="hero-mote m4" style="left:73%;top:74%"></span><span class="hero-mote m5" style="left:88%;top:60%"></span></div><div class="wrap">
   <span class="pill"><b>◆ verified cascade routing</b> · proof over prediction</span>
   <h1 class="title"><span class="grad">Cheap until</span> proven otherwise.</h1>
   <p class="sub">The cheapest model takes the first pass. It clears <b>your gate</b> — proven on the real output, not guessed from the prompt — or it escalates. Wrong answers <b>capped at ≤10% at 95% confidence</b>, and the router <b>tunes itself</b> as your traffic drifts.</p>
@@ -576,13 +577,16 @@ cargo run -p firstpass-proxy --example demo   # clone &amp; watch the receipt pr
   <h3 style="font-size:16px;font-weight:600;color:var(--text-2);margin:40px 0 0">Or install the proxy</h3>
   <div class="install" data-tabs>
     <div class="tabs" role="tablist" aria-label="Install method">
-      <button class="tab" role="tab" aria-selected="true">pip / uvx</button>
+      <button class="tab" role="tab" aria-selected="true">🤖 agent</button><button class="tab" role="tab" aria-selected="false">pip / uvx</button>
       <button class="tab" role="tab" aria-selected="false">brew</button>
       <button class="tab" role="tab" aria-selected="false">curl</button>
       <button class="tab" role="tab" aria-selected="false">docker</button>
       <button class="tab" role="tab" aria-selected="false">cargo</button>
     </div>
-    <div class="tabpanel active"><div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>uvx firstpass            # run without installing
+    <div class="tabpanel active"><div class="codeblock"><div class="cb-head"><span>prompt · paste into Claude Code, Codex, Cursor…</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>Read https://dshakes.github.io/firstpass/llms.txt, then install Firstpass and
+route this project through it. Run `firstpass onboard` first and show me the
+plan before you apply anything. Keep it in observe mode; don't touch my keys.</code></pre></div></div>
+    <div class="tabpanel"><div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>uvx firstpass            # run without installing
 pip install firstpass    # or install it</code></pre></div></div>
     <div class="tabpanel"><div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>brew install dshakes/tap/firstpass-proxy</code></pre></div></div>
     <div class="tabpanel"><div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>curl --proto '=https' --tlsv1.2 -LsSf \
@@ -591,7 +595,7 @@ pip install firstpass    # or install it</code></pre></div></div>
   ghcr.io/dshakes/firstpass:latest</code></pre></div></div>
     <div class="tabpanel"><div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>cargo install --git https://github.com/dshakes/firstpass firstpass-proxy</code></pre></div></div>
   </div>
-  <p style="margin-top:16px;color:var(--text-3);font-size:14px">Every tab is live today and republishes on each release — pip · uvx · Homebrew · Docker · curl | sh · prebuilt binaries. (Cargo builds from source and needs a Rust toolchain.) Then point your agent at it: run <code>firstpass-proxy</code>, set <code>ANTHROPIC_BASE_URL=http://127.0.0.1:8080</code>, and <code>unset</code> it to offboard — one env var, same wire format your agent already speaks.</p>
+  <p style="margin-top:16px;color:var(--text-3);font-size:14px">The first tab is the one you hand to your agent — every other tab is a live install channel that republishes on each release: pip · uvx · Homebrew · Docker · curl | sh · prebuilt binaries. (Cargo builds from source and needs a Rust toolchain.) Then point your agent at it: run <code>firstpass-proxy</code>, set <code>ANTHROPIC_BASE_URL=http://127.0.0.1:8080</code>, and <code>unset</code> it to offboard — one env var, same wire format your agent already speaks.</p>
 </div></section>
 
 <!-- STATUS: shipped vs next -->
@@ -645,7 +649,7 @@ pip install firstpass    # or install it</code></pre></div></div>
 <!-- FOOTER (landing-scoped links) -->
 <footer class="foot"><div class="wrap">
   <div class="cols">
-    <div><span class="brand" style="margin-bottom:14px"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0c8f6c"/><path d="M7 21 L14 11 L19 16 L25 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Firstpass</span>
+    <div><span class="brand" style="margin-bottom:14px"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass</span>
       <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
     <div><h4>Product</h4><a href="guide/index.html">Overview</a><a href="guide/how-it-works.html">How it works</a><a href="guide/guarantee.html">The guarantee</a><a href="guide/benchmarks.html">Benchmarks</a></div>
     <div><h4>Reference</h4><a href="guide/configuration.html">Configuration</a><a href="guide/cli.html">CLI</a><a href="guide/api.html">API &amp; MCP</a><a href="guide/providers.html">Providers</a></div>

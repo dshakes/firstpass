@@ -11,7 +11,11 @@ const HELP: &str = "\
 firstpass — the cheapest model that provably passes, with a receipt for every call.
 
 USAGE:
-    firstpass onboard [--apply]   agentic setup: detect env, start proxy, route your agent, verify
+    firstpass onboard [--apply]   agentic setup: ask three questions, write firstpass.toml,
+                                  start the proxy, route your agent, verify
+        [--provider anthropic|openai|google|local] [--shape json|code|prose|mixed]
+        [--mode observe|enforce]  answer non-interactively (an agent piping input never blocks)
+        [--yes] [--no-config]     take the defaults / skip config generation entirely
     firstpass offboard            undo it: strip the rc line, stop the proxy, print the unset
     firstpass up                  start the proxy (serves until Ctrl-C)
     firstpass doctor              validate config, provider key, and gate binaries
@@ -140,8 +144,121 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// `firstpass onboard [--apply]` — agentic setup: detect the environment, plan the exact steps,
-/// execute them under `--apply` (dry run otherwise), and verify end-to-end.
+/// Ask one question and return the chosen variant. Only ever called when stdin is a terminal.
+fn ask<T: Copy>(prompt: &str, opts: &[(T, &str, &str)], default_ix: usize) -> T {
+    use std::io::Write as _;
+    println!("\n{prompt}");
+    for (i, (_, id, blurb)) in opts.iter().enumerate() {
+        let mark = if i == default_ix { "*" } else { " " };
+        println!("  {mark} {}) {id:<9} {blurb}", i + 1);
+    }
+    print!(
+        "  choice [1-{}, enter = {}]: ",
+        opts.len(),
+        opts[default_ix].1
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return opts[default_ix].0;
+    }
+    let line = line.trim();
+    if line.is_empty() {
+        return opts[default_ix].0;
+    }
+    // Accept either the number or the id itself, so an agent piping answers can use words.
+    line.parse::<usize>()
+        .ok()
+        .filter(|n| (1..=opts.len()).contains(n))
+        .map_or_else(
+            || {
+                opts.iter()
+                    .find(|(_, id, _)| *id == line)
+                    .map_or(opts[default_ix].0, |o| o.0)
+            },
+            |n| opts[n - 1].0,
+        )
+}
+
+/// Resolve the three ladder answers: explicit flags win, then an interactive prompt when stdin is
+/// a terminal, then the do-nothing defaults. The non-interactive path never blocks — an agent
+/// running `onboard --apply` in a pipe must not hang waiting on a question.
+fn resolve_choice(
+    args: &[String],
+    interactive: bool,
+) -> (firstpass_proxy::onboard::LadderChoice, bool) {
+    use firstpass_core::Mode;
+    use firstpass_proxy::onboard::{LadderChoice, Provider, Shape};
+    let flag = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let d = LadderChoice::default();
+    let provider = flag("--provider")
+        .and_then(|v| Provider::ALL.into_iter().find(|p| p.id() == v))
+        .unwrap_or(d.provider);
+    let shape = flag("--shape")
+        .and_then(|v| Shape::ALL.into_iter().find(|s| s.id() == v))
+        .unwrap_or(d.shape);
+    let mode = match flag("--mode").as_deref() {
+        Some("enforce") => Mode::Enforce,
+        Some("observe") => Mode::Observe,
+        _ => d.mode,
+    };
+    let all_given =
+        flag("--provider").is_some() && flag("--shape").is_some() && flag("--mode").is_some();
+    if !interactive || all_given || args.iter().any(|a| a == "--yes" || a == "-y") {
+        return (
+            LadderChoice {
+                provider,
+                shape,
+                mode,
+            },
+            false,
+        );
+    }
+    println!("\nThree questions and onboarding writes your firstpass.toml.");
+    let provider = ask(
+        "1/3 · Which provider should the ladder open on?",
+        &Provider::ALL.map(|p| (p, p.id(), p.blurb())),
+        0,
+    );
+    let shape = ask(
+        "2/3 · What do these requests produce? (this picks the gate)",
+        &Shape::ALL.map(|s| (s, s.id(), s.blurb())),
+        0,
+    );
+    let mode = ask(
+        "3/3 · Start in which mode?",
+        &[
+            (
+                Mode::Observe,
+                "observe",
+                "forward unchanged, just collect receipts (recommended)",
+            ),
+            (
+                Mode::Enforce,
+                "enforce",
+                "serve from the cheap rung once a gate passes",
+            ),
+        ],
+        0,
+    );
+    (
+        LadderChoice {
+            provider,
+            shape,
+            mode,
+        },
+        true,
+    )
+}
+
+/// `firstpass onboard [--apply]` — agentic setup: detect the environment, ask the three questions
+/// that decide a starting ladder, plan the exact steps, execute them under `--apply` (dry run
+/// otherwise), and verify end-to-end.
 fn cmd_onboard(apply: bool) -> Result<(), Box<dyn std::error::Error>> {
     use firstpass_proxy::onboard;
     let env = onboard::detect(
@@ -163,10 +280,54 @@ fn cmd_onboard(apply: bool) -> Result<(), Box<dyn std::error::Error>> {
     );
     let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     let (rc, _) = onboard::shell_wiring(&env.shell, &home, &env.bind);
-    let steps = onboard::plan(&env, &home, onboard::rc_wired(&rc));
+
+    // Config generation. Skipped entirely with --no-config, and never when a firstpass.toml is
+    // already there — onboarding must be safe to re-run, and clobbering an operator's routing
+    // file is the one mistake there is no undo for.
+    let args: Vec<String> = std::env::args().collect();
+    let cfg_path = std::path::PathBuf::from("firstpass.toml");
+    let config = if args.iter().any(|a| a == "--no-config") {
+        None
+    } else if cfg_path.exists() {
+        println!("firstpass.toml already present — leaving it alone (--no-config to silence).\n");
+        None
+    } else {
+        let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        let (choice, asked) = resolve_choice(&args, interactive);
+        if !asked {
+            println!(
+                "config: provider={} shape={} mode={} \
+                 (set with --provider/--shape/--mode; asked interactively on a terminal)\n",
+                choice.provider.id(),
+                choice.shape.id(),
+                if choice.mode == firstpass_core::Mode::Enforce {
+                    "enforce"
+                } else {
+                    "observe"
+                },
+            );
+        }
+        Some(onboard::ConfigPlan {
+            path: cfg_path,
+            choice,
+        })
+    };
+
+    let steps = onboard::plan(&env, &home, onboard::rc_wired(&rc), config.as_ref());
     print!("{}", onboard::render(&env, &steps, apply));
     if apply {
         print!("\n{}", onboard::execute(&env, &steps)?);
+    }
+    // The code gate ships as a placeholder on purpose (see `Shape::gate_block`), so say plainly
+    // that one step remains rather than letting `doctor` be the first to mention it.
+    if let Some(c) = &config
+        && c.choice.shape == firstpass_proxy::onboard::Shape::Code
+    {
+        println!(
+            "\nnext: the `unit-tests` gate is a placeholder. Point its `cmd` at a wrapper that \
+             reads\n      the candidate as JSON on stdin and prints a verdict on stdout, then run \
+             `firstpass doctor`."
+        );
     }
     Ok(())
 }

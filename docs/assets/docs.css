@@ -567,3 +567,83 @@ hr.rule{border:0;border-top:1px solid var(--border);margin:40px 0}
 .docs.docs-course{grid-template-columns:264px minmax(0,1fr)}
 .docs.docs-course .content{max-width:1040px}
 @media (max-width:900px){.docs.docs-course{grid-template-columns:1fr}}
+
+
+/* ============================================================================
+   Mark, hero backdrop, and config builder.
+   Every rule here follows the motion contract set out above: the HTML/SVG is
+   authored in its finished state, and motion is layered only inside
+   prefers-reduced-motion:no-preference. Turn animation off and nothing is lost.
+   ========================================================================== */
+
+/* ---- the mark -------------------------------------------------------------
+   The ladder draws itself, the first rung snaps lit, and it climbs on hover.  */
+.fp-mark{flex:none;overflow:visible}
+@media (prefers-reduced-motion:no-preference){
+  .fp-mark .st{stroke-dasharray:46;animation:fp-mark-draw .85s cubic-bezier(.22,.9,.28,1) .08s both}
+  @keyframes fp-mark-draw{from{stroke-dashoffset:46}to{stroke-dashoffset:0}}
+  .fp-mark .lit{transform-box:fill-box;transform-origin:left center;
+    animation:fp-mark-lit .42s cubic-bezier(.2,1.2,.3,1) .52s both}
+  @keyframes fp-mark-lit{from{transform:scaleX(.06)}to{transform:scaleX(1)}}
+  /* hover — the request tries the next rungs, then settles back on the first */
+  .brand:hover .fp-mark .lit{animation:fp-mark-climb .9s cubic-bezier(.5,0,.3,1)}
+  @keyframes fp-mark-climb{
+    0%{transform:translate(0,0)}
+    28%{transform:translate(7.8px,-8px)}
+    56%{transform:translate(15.6px,-16px)}
+    100%{transform:translate(0,0)}}
+}
+
+/* ---- hero backdrop --------------------------------------------------------
+   Not decoration for its own sake: the rungs are the ladder, and the motes are
+   requests rising and settling on the first one. Sits behind the text at low
+   contrast, masked to fade out well before it reaches any copy.               */
+.hero-glow{background:
+    radial-gradient(52% 46% at 50% -2%,var(--accent-soft),transparent 68%),
+    radial-gradient(30% 34% at 12% 4%,rgba(25,227,177,.10),transparent 70%),
+    radial-gradient(26% 30% at 88% 10%,rgba(59,125,221,.07),transparent 72%)}
+.hero-rungs{position:absolute;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
+/* the ladder itself — evenly spaced hairlines, faded top and bottom */
+.hero-rungs::before{content:"";position:absolute;inset:0;opacity:.55;
+  background:repeating-linear-gradient(to bottom,var(--accent-line) 0 1px,transparent 1px 76px);
+  -webkit-mask-image:radial-gradient(72% 62% at 50% 22%,#000 12%,transparent 78%);
+  mask-image:radial-gradient(72% 62% at 50% 22%,#000 12%,transparent 78%)}
+.hero-mote{position:absolute;width:5px;height:5px;border-radius:50%;background:var(--accent);
+  opacity:0;box-shadow:0 0 12px 2px var(--accent-line)}
+@media (prefers-reduced-motion:no-preference){
+  /* rise through the ghost rungs, then settle and seal on the first one */
+  .hero-mote{animation:fp-mote 7s cubic-bezier(.35,0,.25,1) infinite}
+  @keyframes fp-mote{
+    0%{opacity:0;transform:translateY(0) scale(.6)}
+    8%{opacity:.85;transform:translateY(-12px) scale(1)}
+    46%{opacity:.85;transform:translateY(-152px) scale(1)}
+    62%{opacity:.5;transform:translateY(-176px) scale(.9)}
+    78%,100%{opacity:0;transform:translateY(-196px) scale(.5)}}
+  .hero-mote.m2{animation-duration:9s;animation-delay:-3.1s}
+  .hero-mote.m3{animation-duration:8s;animation-delay:-5.6s}
+  .hero-mote.m4{animation-duration:10.5s;animation-delay:-1.4s}
+  .hero-mote.m5{animation-duration:7.6s;animation-delay:-7.2s}
+}
+
+/* ---- config builder -------------------------------------------------------
+   Replaces a hand-written TOML blob: pick the three things that actually change
+   between setups and the file writes itself into the codeblock below.         */
+.fpb{border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface);
+  overflow:hidden;margin:22px 0}
+.fpb-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:2px;
+  background:var(--border);border-bottom:1px solid var(--border)}
+.fpb-f{background:var(--surface-2);padding:14px 16px}
+.fpb-f>label{display:block;font:600 11px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase;
+  color:var(--text-3);margin:0 0 10px}
+.fpb-opts{display:flex;flex-wrap:wrap;gap:6px}
+.fpb-opts button{font:500 13px/1 var(--sans);padding:7px 12px;border-radius:7px;cursor:pointer;
+  border:1px solid var(--border-2);background:var(--surface);color:var(--text-2);
+  transition:background .14s,color .14s,border-color .14s}
+.fpb-opts button:hover{border-color:var(--border-3);color:var(--text)}
+.fpb-opts button[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent-line);
+  color:var(--accent-strong);font-weight:600}
+.fpb-opts button:focus-visible{outline:2px solid var(--accent-strong);outline-offset:2px}
+.fpb .codeblock{margin:0;border:0;border-radius:0}
+.fpb-why{padding:12px 16px;border-top:1px solid var(--border);background:var(--surface-2);
+  font:400 13px/1.55 var(--sans);color:var(--text-3)}
+.fpb-why b{color:var(--text-2);font-weight:600}
