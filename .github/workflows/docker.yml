@@ -19,13 +19,32 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      # Surfaced here so the login step's `if` can test them; empty when unset, which is what
+      # makes the whole thing fail open.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      # BuildKit is pulled from Docker Hub. An earlier attempt to redirect this at
-      # ghcr.io/moby/buildkit failed 100% of runs — that mirror does not exist (403 on every
-      # tag), so it turned an occasional timeout into a guaranteed outage. Docker Hub's
-      # anonymous pull can still time out under load; the correct mitigation is a re-run, or
-      # authenticating to Docker Hub if that ever becomes frequent enough to be worth a secret.
+      # BuildKit is pulled from Docker Hub, whose ANONYMOUS pull limit is what actually failed
+      # runs here (registry-1.docker.io DeadlineExceeded) — not the build. Authenticating lifts
+      # that limit substantially.
+      #
+      # Gated on the secret being present so this FAILS OPEN: with no credentials configured the
+      # step simply skips and the build behaves exactly as before. A login step that hard-failed
+      # on a missing secret would break every fork and every run before the secret is added —
+      # and an earlier attempt to fix this flake by redirecting BuildKit to ghcr.io/moby/buildkit
+      # (a mirror that does not exist, 403 on every tag) already turned an occasional timeout
+      # into a 100% outage. Not twice.
+      # Gate on `env`, not on `secrets`: the secrets context is not dependably available in a
+      # step-level `if`, and a condition that silently evaluates false would leave this never
+      # firing even once the credentials exist — a fix that looks applied and isn't.
+      - name: Log in to Docker Hub (raises the anonymous pull limit)
+        if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
