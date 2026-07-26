@@ -181,6 +181,15 @@ pub struct Trace {
     /// Counterfactual signal from shadow scoring (ADR 0009 D2). Absent unless shadow is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow: Option<ShadowSignal>,
+    /// Index of the route that handled this request, so a downstream outcome arriving later can
+    /// be attributed to the route that actually produced it (ADR 0009 D3).
+    ///
+    /// Without this the guardrail has to pool every tenant's outcomes onto one route, which in a
+    /// multi-route config means a failing route can be masked by healthy siblings — the guard
+    /// would sit green while the thing it guards degrades. Absent on traces written before this
+    /// field existed; the guardrail treats absent as route 0, its prior behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_ix: Option<u32>,
     /// Shadow prediction of `P(gate-pass)` for the start rung (ADR 0008 Phase 2), from the
     /// per-query predictor. Absent when the predictor is off (the default) — byte-identical to
     /// pre-predictor traces and hash-chain compatible. Recorded but never acted on in this phase.
@@ -404,6 +413,7 @@ mod tests {
             probe: None,
             rollout: None,
             shadow: None,
+            route_ix: None,
             predicted_pass: None,
             elastic: None,
         };

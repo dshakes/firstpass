@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use firstpass_core::{DeferredVerdict, GENESIS_HASH, Score, Trace, Verdict};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -402,6 +402,34 @@ pub fn trace_exists(
     Ok(n > 0)
 }
 
+/// The route index recorded on `trace_id`, scoped to `tenant`.
+///
+/// `Ok(None)` means the trace is not visible to this tenant (or does not exist) — the same
+/// ownership check [`trace_exists`] makes, so this cannot be used to probe another tenant's
+/// traces. `Ok(Some(None))` means the trace exists but predates route recording.
+///
+/// # Errors
+/// On a store read failure.
+pub fn trace_route(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+    trace_id: &str,
+) -> Result<Option<Option<u32>>, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let body: Option<String> = conn
+        .query_row(
+            "SELECT body FROM traces WHERE tenant = ?1 AND trace_id = ?2",
+            [tenant, trace_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(body.map(|b: String| {
+        serde_json::from_str::<firstpass_core::Trace>(&b)
+            .ok()
+            .and_then(|t| t.route_ix)
+    }))
+}
+
 /// Append a deferred verdict for `trace_id` (a downstream outcome or async gate result). This
 /// writes ONLY to the `deferred_verdicts` table; the sealed trace and its hash are untouched, so
 /// the audit chain remains verifiable (SPEC §8.3.4 — the outcome-feedback loop).
@@ -562,6 +590,7 @@ mod tests {
             probe: None,
             rollout: None,
             shadow: None,
+            route_ix: None,
             predicted_pass: None,
             elastic: None,
         };

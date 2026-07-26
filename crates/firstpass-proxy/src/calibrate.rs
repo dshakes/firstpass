@@ -289,6 +289,7 @@ mod tests {
             probe: None,
             rollout: None,
             shadow: None,
+            route_ix: None,
             predicted_pass: None,
             elastic: None,
         };
