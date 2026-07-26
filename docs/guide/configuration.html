@@ -14,7 +14,7 @@
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <header class="topnav"><div class="bar">
-  <a class="brand" href="../index.html"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass <span class="ver">v0.2.5</span></a>
+  <a class="brand" href="../index.html"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass <span class="ver">v0.2.6</span></a>
   <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
   <span class="nav-sp"></span>
   <div class="nav-right">
@@ -240,6 +240,7 @@ action   = "demote"         # demote | alarm
 guardrail_cooldown_secs = 3600</code></pre></div>
 <div class="note"><span class="nt">Why demote is the default</span> A demoted route serves exactly as it would without Firstpass. The failure mode is <b>you stop saving money</b>, never <b>you keep serving worse answers</b>. Demotion is sticky for the cooldown because re-promoting on one good window makes routing flap, and every flap is a visible change for real users. Use <code>alarm</code> if you want a human in the loop.</div>
 <div class="note warn"><span class="nt">min_n is not a formality</span> Below <code>ln(1/delta) / (2·alpha²)</code> the confidence slack <em>alone</em> exceeds <code>alpha</code> — so a window with <b>zero failures</b> would breach and every healthy route would be demoted. For <code>alpha=0.10, delta=0.05</code> the floor is <b>150</b>. Such a config is rejected at parse with the arithmetic shown, rather than quietly demoting everything.</div>
+<div class="note warn"><span class="nt">Sizing min_n for your real failure rate</span> That floor only guarantees a <em>zero-failure</em> window can't breach. The guardrail judges on <b>every</b> resolved outcome, so what governs sensitivity is the bound at <code>min_n</code> — where the slack is widest — not at the full window. A route genuinely running at rate <code>r</code> below your target stays under only once <code>n &gt; ln(1/delta) / (2·(alpha−r)²)</code>. At <code>alpha=0.10, delta=0.05</code> a route sitting at <b>5%</b> needs <b>n &gt; 600</b>, well above the 150 floor — set <code>min_n</code> too low and a perfectly acceptable route trips the moment judging begins.</div>
 <div class="recap"><b>shadow → ramp → guard.</b> Measure on your own traffic, enforce a slice, and let the bound you published defend itself. All three off by default.</div>
 
 <h2 id="env">Environment variables<a class="anchor" href="#env" aria-label="Link to this section">#</a></h2>
@@ -277,7 +278,7 @@ guardrail_cooldown_secs = 3600</code></pre></div>
     <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
     <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
   </div>
-  <div class="legal"><span>Firstpass v0.2.5 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+  <div class="legal"><span>Firstpass v0.2.6 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
 <script src="../assets/docs.js?v=5"></script>
 </body></html>
