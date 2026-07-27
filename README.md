@@ -273,3 +273,5 @@ GA is a checklist we publish ([ADR 0003](docs/adr/0003-production-ga-readiness.m
 <sub>proof over prediction · receipts over adjectives</sub>
 
 </div>
+
+<sub>PRs here are gated by <a href="https://github.com/dshakes/compass">compass</a>: agent review · security · cross-model audits · tests — then a human merges.</sub>
