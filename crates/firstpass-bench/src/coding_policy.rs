@@ -28,6 +28,7 @@ use crate::coding::{
 use crate::sandbox::{Limits, Sandbox};
 use crate::stats::{Ci, bootstrap_mean_ci, bootstrap_ratio_ci};
 use firstpass_core::cost::PriceTable;
+use std::collections::HashMap;
 
 /// One rung of the ladder: the ladder id used for pricing, and the solver that speaks for it.
 pub struct Rung<'a> {
@@ -47,7 +48,7 @@ impl std::fmt::Debug for Rung<'_> {
 }
 
 /// What one task cost and produced at one rung.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RungOutcome {
     /// Fraction of visible (gate) cases passed, in `[0, 1]`.
     pub gate_score: f64,
@@ -143,8 +144,43 @@ pub fn measure_judged(
     limits: &Limits,
     judge: Option<&dyn Judge>,
 ) -> Result<Vec<Vec<RungOutcome>>, String> {
+    measure_resumable(tasks, rungs, sb, prices, limits, judge, None)
+}
+
+/// As [`measure_judged`], but checkpoints each finished task to `checkpoint` and resumes from it.
+///
+/// A 974-task run is ~2000 paid calls over hours, and it has now been killed twice — once by a
+/// starved response, once by a transient network drop — each time discarding every call already
+/// bought. Retries alone cannot fix that: the failure that matters is the one that outlives the
+/// retry budget. So the completed work goes to disk as it happens, and a re-run skips what is
+/// already measured. Nothing about the result changes; only whether an interruption costs the
+/// whole run or just the tail of it.
+///
+/// The checkpoint is keyed by task id, so it is safe to resume with a different `--limit` or a
+/// reordered file; tasks not present are simply measured.
+///
+/// # Errors
+/// Any solver, judge, or environment failure, verbatim — but the checkpoint keeps whatever
+/// completed before it, so the retry resumes rather than restarts.
+pub fn measure_resumable(
+    tasks: &[CodingTask],
+    rungs: &[Rung<'_>],
+    sb: &dyn Sandbox,
+    prices: &PriceTable,
+    limits: &Limits,
+    judge: Option<&dyn Judge>,
+    checkpoint: Option<&std::path::Path>,
+) -> Result<Vec<Vec<RungOutcome>>, String> {
+    let mut done = load_checkpoint(checkpoint);
+    if !done.is_empty() {
+        eprintln!("resuming: {} tasks already measured", done.len());
+    }
     let mut matrix = Vec::with_capacity(tasks.len());
     for task in tasks {
+        if let Some(row) = done.remove(&task.id) {
+            matrix.push(row);
+            continue;
+        }
         let mut row = Vec::with_capacity(rungs.len());
         for rung in rungs {
             let o: TaskOutcome = match judge {
@@ -168,9 +204,52 @@ pub fn measure_judged(
                 judge_score: o.judge_score,
             });
         }
+        append_checkpoint(checkpoint, &task.id, &row);
         matrix.push(row);
     }
     Ok(matrix)
+}
+
+/// Read a checkpoint into `task_id -> row`. A malformed or absent file yields nothing and the run
+/// simply measures everything: a checkpoint is an optimisation, never a source of truth, so it
+/// must not be able to fail a run or — worse — inject a row nobody measured.
+fn load_checkpoint(path: Option<&std::path::Path>) -> HashMap<String, Vec<RungOutcome>> {
+    let Some(p) = path else {
+        return HashMap::new();
+    };
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return HashMap::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<CheckpointRow>(l).ok())
+        .map(|r| (r.task_id, r.rungs))
+        .collect()
+}
+
+/// Append one finished task. Best-effort by the same reasoning: a failure to checkpoint must not
+/// discard a measurement that was already paid for.
+fn append_checkpoint(path: Option<&std::path::Path>, task_id: &str, row: &[RungOutcome]) {
+    let Some(p) = path else { return };
+    let line = serde_json::to_string(&CheckpointRow {
+        task_id: task_id.to_owned(),
+        rungs: row.to_vec(),
+    });
+    if let Ok(line) = line {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CheckpointRow {
+    task_id: String,
+    rungs: Vec<RungOutcome>,
 }
 
 /// Replay every policy over an already-measured matrix. Pure — no I/O, no spend, deterministic.
@@ -595,6 +674,46 @@ mod tests {
         assert!(
             (judged.escalation_rate - 0.0).abs() < 1e-9,
             "abstention is not a veto"
+        );
+    }
+
+    /// A checkpoint must resume real work and never invent it. Two failure modes matter and they
+    /// pull in opposite directions: losing finished tasks wastes money, and *trusting* a bad file
+    /// would put rows into a published result that nobody measured. So a valid entry is reused
+    /// verbatim, and anything unreadable is ignored rather than allowed to fail — or fake — a run.
+    #[test]
+    fn a_checkpoint_resumes_real_work_and_ignores_a_corrupt_file() {
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("fp-ckpt-{}.jsonl", std::process::id()));
+
+        let row = vec![o(true, true, 0.01), o(true, true, 0.10)];
+        append_checkpoint(Some(&p), "mbpp-1", &row);
+        append_checkpoint(Some(&p), "mbpp-2", &row);
+        let loaded = load_checkpoint(Some(&p));
+        assert_eq!(loaded.len(), 2);
+        let back = &loaded["mbpp-1"];
+        assert_eq!(back.len(), 2);
+        assert!(
+            (back[0].cost_usd - 0.01).abs() < 1e-12 && back[0].oracle_correct,
+            "a resumed row must be the measurement, not a default"
+        );
+
+        // A truncated final line — exactly what an interrupted write leaves behind — must cost
+        // only that row, not the whole file.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        writeln!(f, "{{\"task_id\": \"mbpp-3\", \"rungs\": [{{\"gate_sc").unwrap();
+        drop(f);
+        assert_eq!(
+            load_checkpoint(Some(&p)).len(),
+            2,
+            "a torn line is skipped; the intact rows survive"
+        );
+
+        std::fs::remove_file(&p).ok();
+        assert!(
+            load_checkpoint(Some(&p)).is_empty() && load_checkpoint(None).is_empty(),
+            "a missing checkpoint just means measure everything"
         );
     }
 
