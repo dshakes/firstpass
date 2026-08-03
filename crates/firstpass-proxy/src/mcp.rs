@@ -84,6 +84,11 @@ fn tool_schemas() -> Value {
             }
         },
         {
+            "name": "handshake",
+            "description": "Agent-native setup report: which provider keys are present, the routing config that would run, and the exact environment variables to route traffic through firstpass and to undo it. Reports only — writes nothing. Run the `firstpass handshake` CLI for the keyless end-to-end self-test.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "list_modes",
             "description": "List the supported routing-mode profiles with their knob overrides and honest tradeoffs. Set a mode via the x-firstpass-mode header, per-route routing_mode, or FIRSTPASS_MODE_PROFILE env var.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -143,6 +148,8 @@ fn handle_tool_call(id: Value, params: Option<&Value>, db_path: &str, tenant: &s
         "get_trace" => tool_get_trace(&args, db_path, tenant),
         "submit_feedback" => tool_submit_feedback(&args, db_path, tenant),
         "list_modes" => tool_list_modes(),
+        "handshake" => serde_json::to_string(&crate::kiosk::handshake_static())
+            .map_err(|e| format!("encode error: {e}")),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -369,6 +376,7 @@ mod tests {
                 "rehearse_policy",
                 "verify_receipts",
                 "submit_feedback",
+                "handshake",
                 "list_modes",
             ]
         );

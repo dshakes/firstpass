@@ -213,6 +213,102 @@ pub async fn run() -> Result<(), Fail> {
     Ok(())
 }
 
+/// The agent-native form of the kiosk: no prose, no colours, no prompts — one structured document
+/// describing what was found, what config would run, whether the pipeline actually works, and the
+/// exact environment variables to route and to leave.
+///
+/// The self-test is deliberately **keyless**: it exercises the whole path (route → gate →
+/// escalate → serve → receipt → chain) against a local upstream, so an agent can confirm the
+/// install is sound without spending the operator's money on a call it did not ask for. Whether a
+/// provider key exists is reported as a fact, not proven by billing it.
+///
+/// Every value is machine-readable. An agent that has to regex a paragraph has not been onboarded.
+pub async fn handshake() -> Value {
+    let mut doc = handshake_static();
+    doc["selftest"] = selftest().await;
+    doc
+}
+
+/// The part of the handshake that needs no runtime: what keys exist, what config would run, and
+/// how to route and unroute. Split out so the MCP server — whose dispatch is synchronous — can
+/// answer the same question without blocking a runtime thread to do it.
+#[must_use]
+pub fn handshake_static() -> Value {
+    let pick = pick_provider(|k| std::env::var(k).ok());
+    let detected: Vec<&str> = CANDIDATES
+        .iter()
+        .filter(|(_, k)| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+        .map(|(_, k)| *k)
+        .collect();
+    let selftest = json!({
+        "ok": null,
+        "reason": "not run here — `firstpass handshake` runs the keyless self-test",
+    });
+    json!({
+        "product": "firstpass",
+        "version": env!("CARGO_PKG_VERSION"),
+        "provider": {
+            "picked": pick.map(|p| p.provider.id()),
+            "key_env": pick.map(|p| p.key_env),
+            "keys_present": detected,
+        },
+        "config": {
+            "path": "firstpass.toml",
+            "exists": std::path::Path::new("firstpass.toml").exists(),
+            // The config is RETURNED, not written: a handshake reports, it does not mutate the
+            // working tree behind the agent's back. `firstpass kiosk` is the command that writes.
+            "toml": pick.map(kiosk_config),
+        },
+        "selftest": selftest,
+        "route_your_agent": { "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080" } },
+        "offboard": { "unset": ["ANTHROPIC_BASE_URL"] },
+        "next": [
+            "firstpass kiosk    — write the config and put one real request through it",
+            "firstpass up       — run the proxy",
+            "firstpass doctor   — validate config, key, and gate binaries",
+        ],
+    })
+}
+
+/// Exercise the whole path — route, gate, escalate, serve, receipt, chain — against a local
+/// upstream. Keyless on purpose: an agent must be able to confirm the install is sound without
+/// spending the operator's money on a call nobody asked for.
+async fn selftest() -> Value {
+    if let Ok(upstream) = crate::demo::spawn_upstream().await {
+        let db =
+            std::env::temp_dir().join(format!("firstpass-handshake-{}.db", uuid::Uuid::now_v7()));
+        if let Ok((proxy, _w)) = crate::demo::spawn_proxy(&upstream, &db).await {
+            let served = reqwest::Client::new()
+                .post(format!("{proxy}/v1/messages"))
+                .header("x-api-key", "keyless-selftest")
+                .json(&json!({
+                    "model": "claude-haiku-4-5",
+                    "max_tokens": 64,
+                    "messages": [{ "role": "user", "content": "selftest" }],
+                }))
+                .send()
+                .await;
+            let ok_http = served.is_ok_and(|r| r.status().is_success());
+            let trace = wait_for_trace(&db).await;
+            let chain_ok = trace
+                .as_ref()
+                .is_some_and(|t| verify_chain(std::slice::from_ref(t), &t.prev_hash).is_ok());
+            let out = json!({
+                "ok": ok_http && trace.is_some() && chain_ok,
+                "keyless": true,
+                "served": ok_http,
+                "receipt": trace.is_some(),
+                "escalated": trace.as_ref().is_some_and(|t| t.attempts.len() > 1),
+                "chain_verified": chain_ok,
+            });
+            let _ = std::fs::remove_file(&db);
+            return out;
+        }
+        let _ = std::fs::remove_file(&db);
+    }
+    json!({ "ok": false, "keyless": true, "reason": "could not stand up the local self-test" })
+}
+
 /// Stand up the real proxy on an ephemeral port with `toml` as its routing config.
 async fn spawn(toml: &str, db: &Path) -> Result<(String, tokio::task::JoinHandle<()>), Fail> {
     let toml = toml.to_owned();
@@ -302,6 +398,31 @@ mod tests {
         assert_eq!(
             pick_provider(|k| (k == "ANTHROPIC_API_KEY").then(|| "   ".to_owned())),
             None
+        );
+    }
+
+    /// The handshake reports; it does not act. An agent calling it to *find out* whether it is
+    /// set up must not discover that asking rewrote the working tree.
+    #[test]
+    fn handshake_is_machine_readable_and_writes_nothing() {
+        let before = std::path::Path::new("firstpass.toml").exists();
+        let doc = handshake_static();
+
+        // Every field an agent needs is a value, not prose it would have to parse.
+        assert_eq!(doc["product"], "firstpass");
+        assert!(doc["version"].is_string());
+        assert!(doc["provider"]["keys_present"].is_array());
+        assert!(doc["config"]["exists"].is_boolean());
+        assert!(doc["route_your_agent"]["env"]["ANTHROPIC_BASE_URL"].is_string());
+        // Offboarding stays one env var — the invariant the whole product rests on.
+        assert_eq!(doc["offboard"]["unset"][0], "ANTHROPIC_BASE_URL");
+        // The static form must not claim a self-test it did not run.
+        assert!(doc["selftest"]["ok"].is_null());
+
+        assert_eq!(
+            std::path::Path::new("firstpass.toml").exists(),
+            before,
+            "handshake must not create or remove config"
         );
     }
 
