@@ -77,7 +77,7 @@ jobs:
           # Provider id `google`, not `gemini`: that is the id the built-in price table and
           # `firstpass onboard` both use, so this smoke exercises the config we actually ship.
           - provider: gemini
-            model: google/gemini-3.1-flash
+            model: google/gemini-3.5-flash-lite
             secret: GEMINI_API_KEY
             toml: |
               [[provider]]

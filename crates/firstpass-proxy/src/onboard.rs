@@ -80,7 +80,10 @@ impl Provider {
         match self {
             Self::Anthropic => ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"],
             Self::OpenAi => ["openai/gpt-4.1-mini", "openai/gpt-5.5"],
-            Self::Google => ["google/gemini-3.1-flash", "google/gemini-3.1-pro"],
+            // Flash-Lite → Flash, not Flash → Pro: Google prices Flash at $1.50/$7.50 and Pro at
+            // $1.25/$10.00, so a Flash→Pro ladder has a ~8% gradient and escalation buys nothing.
+            // Lite→Flash is 5x on input, 3x on output — a ladder worth climbing.
+            Self::Google => ["google/gemini-3.5-flash-lite", "google/gemini-3.6-flash"],
             Self::Local => ["ollama/qwen2.5-coder:7b", "anthropic/claude-sonnet-5"],
         }
     }

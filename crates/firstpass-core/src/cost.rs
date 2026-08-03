@@ -64,9 +64,15 @@ impl PriceTable {
         // OpenAI
         put("openai/gpt-4.1-mini", 0.4, 1.6);
         put("openai/gpt-5.5", 5.0, 15.0);
-        // Google
-        put("google/gemini-3.1-flash", 0.35, 1.05);
-        put("google/gemini-3.1-pro", 3.5, 10.5);
+        // Google. `gemini-3.1-flash`/`-pro` were priced here but never existed on the API —
+        // `generateContent` 404s them — so the shipped Google ladder failed on its first call.
+        // These two are GA per Google's model + pricing docs.
+        // ponytail: Google prices Pro in tiers (>200k-token prompts cost more) and this table
+        // is flat; these are the ≤200k rates. Pin your own with `[[price]]` if you run long
+        // prompts on Pro.
+        put("google/gemini-3.5-flash-lite", 0.3, 2.5);
+        put("google/gemini-3.6-flash", 1.5, 7.5);
+        put("google/gemini-2.5-pro", 1.25, 10.0);
         Self { prices }
     }
 
