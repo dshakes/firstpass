@@ -539,7 +539,7 @@ impl LiveSolver {
     #[must_use]
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: crate::live::live_client(),
             base_url: "https://api.anthropic.com".to_owned(),
             api_key,
             model,
@@ -605,7 +605,7 @@ impl LiveJudge {
     #[must_use]
     pub fn new(api_key: String, model: String, samples: u32) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: crate::live::live_client(),
             base_url: "https://api.anthropic.com".to_owned(),
             api_key,
             model,
