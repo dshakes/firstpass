@@ -12,6 +12,7 @@
 
 pub mod ablation;
 pub mod coding;
+pub mod coding_policy;
 pub mod dataset;
 pub mod elastic;
 pub mod live;

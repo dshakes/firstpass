@@ -12,6 +12,7 @@ use firstpass_bench::coding::{
     CandidateSolver, CodingReport, GeneratedSolver, Judge, LiveJudge, LiveSolver, coding_suite,
     generated_coding_suite, mock_solutions, run_coding_benchmark, run_coding_benchmark_judged,
 };
+use firstpass_bench::coding_policy::Rung;
 use firstpass_bench::dataset::load_coding_dataset;
 use firstpass_bench::sandbox::establish_sandbox;
 use firstpass_bench::{BenchConfig, run_benchmark, run_benchmark_live};
@@ -130,6 +131,91 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("probe study failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // The policy study: does the first-pass LOGIC beat the baselines on real coding tasks? This
+    // is a different question from `--coding`, which measures how good the gate is. Solves each
+    // task once per rung and replays every policy over that one matrix, so the cost is
+    // tasks x rungs regardless of how many policies are compared.
+    if args.iter().any(|a| a == "--coding-policy") {
+        let key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                eprintln!("--coding-policy needs ANTHROPIC_API_KEY set (BYOK)");
+                std::process::exit(2);
+            }
+        };
+        let dataset_path = match std::env::var("FIRSTPASS_CODING_DATASET") {
+            Ok(p) if !p.is_empty() => p,
+            _ => {
+                eprintln!(
+                    "--coding-policy needs FIRSTPASS_CODING_DATASET=<path.jsonl> (see scripts/fetch-bigcodebench.py)"
+                );
+                std::process::exit(2);
+            }
+        };
+        let tasks = match load_coding_dataset(&dataset_path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("failed to load coding dataset {dataset_path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let sb = match establish_sandbox(&sandbox_image()) {
+            Ok(sb) => sb,
+            Err(e) => {
+                eprintln!("cannot run policy study — sandbox not established: {e}");
+                std::process::exit(1);
+            }
+        };
+        // Ladder, cheapest first. Overridable so the study is not welded to one pair of models.
+        let ladder: Vec<String> = std::env::var("FIRSTPASS_CODING_LADDER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(',').map(|m| m.trim().to_owned()).collect())
+            .unwrap_or_else(|| {
+                vec![
+                    "anthropic/claude-haiku-4-5".to_owned(),
+                    "anthropic/claude-sonnet-5".to_owned(),
+                ]
+            });
+        let solvers: Vec<LiveSolver> = ladder
+            .iter()
+            .map(|m| {
+                LiveSolver::new(
+                    key.clone(),
+                    m.split_once('/').map_or(m.as_str(), |(_, r)| r).to_owned(),
+                )
+            })
+            .collect();
+        let rungs: Vec<Rung> = ladder
+            .iter()
+            .zip(solvers.iter())
+            .map(|(model, solver)| Rung {
+                model: model.clone(),
+                solver,
+            })
+            .collect();
+        let prices = firstpass_core::cost::PriceTable::defaults();
+        let limits = firstpass_bench::sandbox::Limits::default();
+        eprintln!(
+            "measuring {} tasks x {} rungs = {} live calls...",
+            tasks.len(),
+            rungs.len(),
+            tasks.len() * rungs.len()
+        );
+        match firstpass_bench::coding_policy::measure(&tasks, &rungs, sb.as_ref(), &prices, &limits)
+        {
+            Ok(matrix) => {
+                let study = firstpass_bench::coding_policy::replay(&matrix, &ladder, sb.runtime());
+                println!("{}", study.render());
+            }
+            Err(e) => {
+                eprintln!("policy study aborted: {e}");
                 std::process::exit(1);
             }
         }
