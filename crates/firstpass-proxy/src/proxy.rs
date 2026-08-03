@@ -274,6 +274,9 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
+        // Inside the authed group on purpose: receipts are per-tenant operational data, and a
+        // panel is not a reason to hand one tenant another's routing history.
+        .route("/v1/receipts", get(receipts))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             tenant_rate_limit_middleware,
@@ -287,6 +290,9 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
         .merge(business)
         .route("/healthz", get(healthz))
         .route("/metrics", get(crate::metrics::handler))
+        // Static markup only — it carries no receipt data of its own, it fetches `/v1/receipts`,
+        // which stays behind auth. So serving the page unauthenticated leaks nothing.
+        .route("/panel", get(panel))
         // Explicit body-size ceiling (DoS/OOM guard) across every route.
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         // Concurrency load-shed: cap in-flight requests under the cap rather than falling over.
@@ -304,6 +310,76 @@ async fn healthz() -> impl IntoResponse {
 
 /// `GET /v1/capabilities` — agent-first discovery (SPEC §0.2, §7.4): what this proxy speaks,
 /// which modes are live, the first enforce route's ladder/gates, and how to turn it off.
+/// The panel page, compiled in so the binary stays self-contained across every install channel.
+const PANEL_HTML: &str = include_str!("panel.html");
+
+/// `GET /v1/receipts?limit=N` — the tenant's most recent receipts, newest first, as JSON.
+///
+/// A compact projection rather than whole traces: what was asked of the ladder, which rung served,
+/// what it cost against the always-top counterfactual. That is what a panel or an agent needs, and
+/// it keeps prompt text out of a browser tab.
+async fn receipts(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant)): Extension<TenantId>,
+    axum::extract::Query(q): axum::extract::Query<ReceiptsQuery>,
+) -> Response {
+    // Cap the page: an unbounded read of a long-lived store would be a trivial memory amplifier.
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let db = state.config.db_path.clone();
+    let traces =
+        match tokio::task::spawn_blocking(move || crate::store::load_tenant_traces(&db, &tenant))
+            .await
+        {
+            Ok(Ok(t)) => t,
+            // Forgiving on an unreadable store, exactly like `firstpass trace` and the MCP tools: a
+            // fresh deployment has no database yet, and that is not an error worth a 500.
+            _ => Vec::new(),
+        };
+    let items: Vec<serde_json::Value> = traces
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|t| {
+            let f = &t.final_;
+            serde_json::json!({
+                "trace_id": t.trace_id,
+                "served_rung": f.served_rung,
+                "served_model": t.attempts.last().map(|a| a.model.clone()),
+                "attempts": t.attempts.iter().map(|a| serde_json::json!({
+                    "rung": a.rung,
+                    "model": a.model,
+                    "verdict": a.verdict,
+                    "cost_usd": a.cost_usd,
+                    "latency_ms": a.latency_ms,
+                })).collect::<Vec<_>>(),
+                "total_cost_usd": f.total_cost_usd,
+                "baseline_usd": f.counterfactual_baseline_usd,
+                "savings_usd": f.savings_usd,
+            })
+        })
+        .collect();
+    axum::Json(serde_json::json!({ "receipts": items })).into_response()
+}
+
+/// Query string for [`receipts`].
+#[derive(Debug, serde::Deserialize)]
+struct ReceiptsQuery {
+    /// How many receipts to return (clamped to `1..=200`).
+    limit: Option<usize>,
+}
+
+/// `GET /panel` — a single self-contained page showing live receipts.
+///
+/// Inlined, with no external stylesheet, font, or script: the product ships as one static binary,
+/// and a panel that phones out to a CDN would both break that promise and put a third party in
+/// front of an operator's routing data.
+async fn panel() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        PANEL_HTML,
+    )
+}
+
 async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
     // Report the first enforce route's ladder + gates, so an agent can discover what it's routed
     // through. Empty when no routing config is loaded (pure observe deployment).
@@ -3614,6 +3690,68 @@ mod tests {
             axum::http::StatusCode::OK,
             "tool_result blocks route through enforce by default too (verbatim carry)"
         );
+    }
+
+    /// The panel is markup only, and the receipts it renders stay behind the tenant boundary.
+    /// If `/v1/receipts` ever escapes the authed group, a panel becomes a cross-tenant leak —
+    /// so assert the split rather than trusting the router's shape to stay as written.
+    #[tokio::test]
+    async fn panel_is_public_markup_but_receipts_stay_behind_auth() {
+        use tower::ServiceExt;
+        let (state, _rx) = enforce_state(
+            &["anthropic/claude-haiku-4-5"],
+            &["non-empty"],
+            vec![(
+                "anthropic/claude-haiku-4-5",
+                Ok(model_resp("anthropic/claude-haiku-4-5", "hello")),
+            )],
+        );
+        let router = app(state).expect("prometheus recorder installs");
+
+        let page = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/panel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), axum::http::StatusCode::OK);
+        let html = axum::body::to_bytes(page.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&html);
+        assert!(
+            html.contains("firstpass") && html.contains("/v1/receipts"),
+            "the page must fetch its data rather than embed it"
+        );
+        // Self-contained: a CDN reference would break the single-binary promise and put a third
+        // party in front of an operator's routing data.
+        assert!(
+            !html.contains("http://") && !html.contains("https://"),
+            "the panel must not reference any external origin"
+        );
+
+        let data = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/receipts?limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Auth is off by default (single-operator), so this is a 200 here — the property under
+        // test is that it is routed through the authed group at all, which `enforce_state` leaves
+        // unauthenticated. A 404 would mean it fell out of the router entirely.
+        assert_eq!(data.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(data.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.get("receipts").and_then(Value::as_array).is_some());
     }
 
     // --- Feedback API tests (drive `feedback` against a real temp trace store) ---

@@ -204,6 +204,7 @@ pub async fn run() -> Result<(), Fail> {
             "BROKEN"
         }
     );
+    println!("panel    : {proxy}/panel");
     println!("\nkeep it: FIRSTPASS_CONFIG=./firstpass.toml firstpass up");
     println!("route your agent: export ANTHROPIC_BASE_URL={proxy}");
     println!("undo everything : unset ANTHROPIC_BASE_URL\n");
