@@ -3503,7 +3503,7 @@ mod tests {
     /// proven by the tool request hitting the (bogus) upstream instead of the enforcing mock.
     #[tokio::test]
     async fn enforce_falls_back_to_observe_for_tool_requests() {
-        let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n";
+        let toml = "[[price]]\nmodel = \"anthropic/m\"\ninput_per_mtok = 1.0\noutput_per_mtok = 5.0\n[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n";
         let config = ProxyConfig::from_lookup(|k| match k {
             "FIRSTPASS_CONFIG_TOML" => Some(toml.to_owned()),
             "FIRSTPASS_MODE" => Some("enforce".to_owned()),
@@ -3573,7 +3573,7 @@ mod tests {
 
         // Opt-out (enforce_structured = false): the same tool request falls back to observe —
         // it hits the bogus upstream and is not 200.
-        let toml_off = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n[escalation]\nenforce_structured = false\n";
+        let toml_off = "[[price]]\nmodel = \"anthropic/m\"\ninput_per_mtok = 1.0\noutput_per_mtok = 5.0\n[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n[escalation]\nenforce_structured = false\n";
         let config_off = ProxyConfig::from_lookup(|k| match k {
             "FIRSTPASS_CONFIG_TOML" => Some(toml_off.to_owned()),
             "FIRSTPASS_MODE" => Some("enforce".to_owned()),
@@ -4253,7 +4253,7 @@ mod tests {
     /// `text/event-stream` whose body carries the full gated event sequence.
     #[tokio::test]
     async fn streaming_enforce_serves_full_sse_sequence() {
-        let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n";
+        let toml = "[[price]]\nmodel = \"anthropic/m\"\ninput_per_mtok = 1.0\noutput_per_mtok = 5.0\n[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n";
         let config = ProxyConfig::from_lookup(|k| match k {
             "FIRSTPASS_CONFIG_TOML" => Some(toml.to_owned()),
             "FIRSTPASS_MODE" => Some("enforce".to_owned()),
@@ -4621,7 +4621,7 @@ mod tests {
 
     /// Build a minimal enforce AppState backed by MockProvider for OpenAI-inbound tests.
     fn openai_enforce_state(mock_resp: ModelResponse) -> AppState {
-        let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"mock/m\"]\ngates = [\"non-empty\"]\n";
+        let toml = "[[price]]\nmodel = \"mock/m\"\ninput_per_mtok = 1.0\noutput_per_mtok = 5.0\n[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"mock/m\"]\ngates = [\"non-empty\"]\n";
         let config = ProxyConfig::from_lookup(|k| match k {
             "FIRSTPASS_CONFIG_TOML" => Some(toml.to_owned()),
             "FIRSTPASS_MODE" => Some("enforce".to_owned()),

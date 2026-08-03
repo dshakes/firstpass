@@ -651,9 +651,19 @@ fn abstain_attempt(rung: u32, model: &str, provider: &str, reason: &str, ms: u64
 }
 
 /// Map a hard (non-failover) provider error to an abstain reason + a caller-facing message.
+///
+/// The caller-facing string stays deliberately generic (an upstream body can echo request
+/// content), but the body is logged server-side first: it is the only thing that says *why*.
+/// A bare "upstream http 404" hid a broken provider for weeks — the body it dropped named the
+/// exact model id that did not exist.
 fn hard_reason(err: &ProviderError) -> (&'static str, String) {
     match err {
-        ProviderError::Http { status, .. } => {
+        ProviderError::Http { status, body } => {
+            tracing::warn!(
+                status = *status,
+                body = %body.chars().take(512).collect::<String>(),
+                "provider rejected the call"
+            );
             (reason::PROVIDER_ERROR, format!("upstream http {status}"))
         }
         ProviderError::Decode(_) => (reason::PROVIDER_ERROR, "upstream decode error".to_owned()),

@@ -111,8 +111,21 @@ async fn spawn_proxy(
         .map(|m| format!("\"{m}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    // These fixtures use synthetic model ids (`anthropic/claude-fail5xx`) that no price table
+    // knows, and config now rejects an unpriced rung rather than let it bank a $0.00 receipt.
+    // Declare a nominal price for each so the fixture states its cost instead of inferring it.
+    // Only the synthetic ones: overriding a real model would flatten the ladder's price
+    // gradient, and the escalation test asserts savings > 0.
+    let builtin = firstpass_core::cost::PriceTable::defaults();
+    let price_toml: String = ladder
+        .iter()
+        .filter(|m| builtin.get(m).is_none())
+        .map(|m| {
+            format!("[[price]]\nmodel = \"{m}\"\ninput_per_mtok = 1.0\noutput_per_mtok = 5.0\n")
+        })
+        .collect();
     let routing = format!(
-        "{providers_toml}\n[[route]]\nmatch = {{}}\nmode = \"enforce\"\nladder = [{ladder_toml}]\ngates = [\"non-empty\"]\n"
+        "{providers_toml}\n{price_toml}\n[[route]]\nmatch = {{}}\nmode = \"enforce\"\nladder = [{ladder_toml}]\ngates = [\"non-empty\"]\n"
     );
     let upstream = upstream.to_owned();
     let db_str = db_path.to_string_lossy().into_owned();
