@@ -168,10 +168,41 @@ the ones it got wrong. Against always-top it is cheaper but scored lower, with
 overlapping intervals at this n.
 
 That is a finding about the *gate*, not about the ladder: on this workload a
-visible-test prefix does not separate haiku's good answers from its bad ones. The
-levers it points at are a better gate signal (the judge or self-consistency gates
-already in the proxy) or harder tasks — not more traffic through the same setup,
-and certainly not a SWE-bench run at 20× the cost hoping the shape changes.
+visible-test prefix does not separate haiku's good answers from its bad ones. So
+the obvious follow-up ran too — the same 24 tasks with a judge as a second
+opinion, serving the cheap rung only when the tests pass **and** the judge is
+confident:
+
+| policy | success | total $ (see note) | escalated | converted |
+|---|---|---|---|---|
+| always-cheap | 0.83 | $0.0614 | 0% | — |
+| always-top | 0.92 | $0.1282 | 0% | — |
+| first-pass | 0.83 | $0.0786 | 8% | 0% |
+| first-pass+judge | 0.88 | $0.1151 | 33% | 12% |
+
+The judge works as a *signal*: quality moved 0.83 → 0.88, escalation rose 8% →
+33%, and 12% of those escalations converted a wrong answer into a right one. It
+sees what the tests cannot.
+
+It does not work as *economics*. That $0.1151 omits the judge's own 48 calls,
+which are not yet metered. At haiku's published rate those add roughly $0.07,
+which would put the arm near **$0.19 against always-top's $0.128** — about 45%
+more expensive, at lower quality. That is an estimate rather than a measurement,
+which is exactly why the harness now withholds a $/success it cannot account for.
+
+**The likely root cause is the workload, not the design.** haiku already solves
+0.83 of these tasks and sonnet 0.92 — nine points of headroom for any amount of
+verification to recover. Cascade economics need a real capability gap between
+rungs; when the cheap model is nearly as good as the expensive one, no gate can
+pay for itself, because there is almost nothing to catch. The stdlib-only subset
+selected for cheap infrastructure is also, unavoidably, the easier end of
+BigCodeBench.
+
+So the next experiment is neither a better gate nor SWE-bench: it is **harder
+tasks, or a wider ladder**. The full BigCodeBench (third-party libs, needs a
+dependency-carrying image), or a genuinely weak rung 0. If the gap between rungs
+stays this narrow, the honest conclusion is that this workload does not need a
+router — and that is worth knowing for a fifth of a dollar.
 
 ## Status of the work
 
