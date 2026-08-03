@@ -208,8 +208,32 @@ fn main() {
             rungs.len(),
             tasks.len() * rungs.len()
         );
-        match firstpass_bench::coding_policy::measure(&tasks, &rungs, sb.as_ref(), &prices, &limits)
-        {
+        // FIRSTPASS_CODING_JUDGE=<model> adds a second opinion the tests do not have. The first
+        // pilot's finding was that a visible-test prefix passes the cheap rung's wrong answers,
+        // so this decides whether first-pass loses on the workload or merely on the gate.
+        let judge: Option<LiveJudge> = std::env::var("FIRSTPASS_CODING_JUDGE")
+            .ok()
+            .filter(|m| !m.is_empty())
+            .map(|model| {
+                let samples = std::env::var("FIRSTPASS_CODING_JUDGE_SAMPLES")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+                LiveJudge::new(key.clone(), model, samples)
+            });
+        if judge.is_some() {
+            eprintln!("judge enabled — one extra call per candidate");
+        }
+        match firstpass_bench::coding_policy::measure_judged(
+            &tasks,
+            &rungs,
+            sb.as_ref(),
+            &prices,
+            &limits,
+            judge
+                .as_ref()
+                .map(|j| j as &dyn firstpass_bench::coding::Judge),
+        ) {
             Ok(matrix) => {
                 let study = firstpass_bench::coding_policy::replay(&matrix, &ladder, sb.runtime());
                 println!("{}", study.render());

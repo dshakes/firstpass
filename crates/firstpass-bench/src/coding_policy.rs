@@ -22,7 +22,9 @@
 //! removes sampling noise from the comparison entirely. Re-solving per policy would both cost more
 //! and make the difference between policies partly an artifact of which samples each one drew.
 
-use crate::coding::{CandidateSolver, CodingTask, TaskOutcome, evaluate_task};
+use crate::coding::{
+    CandidateSolver, CodingTask, Judge, TaskOutcome, evaluate_task, evaluate_task_judged,
+};
 use crate::sandbox::{Limits, Sandbox};
 use crate::stats::{Ci, bootstrap_mean_ci, bootstrap_ratio_ci};
 use firstpass_core::cost::PriceTable;
@@ -55,6 +57,10 @@ pub struct RungOutcome {
     pub oracle_correct: bool,
     /// USD for this call, from the shared price table.
     pub cost_usd: f64,
+    /// A second, independent opinion on the same candidate in `[0, 1]` — present only when the
+    /// study was run with a judge. `None` also covers an abstention, which must defer to the test
+    /// gate rather than be read as a low score.
+    pub judge_score: Option<f64>,
 }
 
 /// One policy's measured result over the suite.
@@ -82,6 +88,14 @@ pub struct PolicyResult {
     /// This is what the gate is *for*; if it is near zero the gate is not earning its keep on
     /// this workload, whatever the headline $/success says.
     pub escalation_conversion: f64,
+    /// Whether every model call this policy made is represented in `total_cost_usd`.
+    ///
+    /// False for the judged arm: `Judge::score` returns an opinion but not its token usage, so a
+    /// judge's calls are currently invisible to the price table. Reporting a $/success that omits
+    /// them would make adding a judge look free, which is the same fabricated-cost bug the
+    /// unpriced-rung validator exists to prevent — so the figure is withheld rather than shown
+    /// wrong. Metering judge tokens (the proxy already does this as `gate_cost_usd`) is the fix.
+    pub cost_metered: bool,
 }
 
 /// The whole study.
@@ -109,11 +123,34 @@ pub fn measure(
     prices: &PriceTable,
     limits: &Limits,
 ) -> Result<Vec<Vec<RungOutcome>>, String> {
+    measure_judged(tasks, rungs, sb, prices, limits, None)
+}
+
+/// As [`measure`], but also asks a judge for a second opinion on every candidate.
+///
+/// The first pilot's whole finding was that a visible-test prefix does not separate the cheap
+/// rung's good answers from its bad ones — it passed both. A judge is a signal the tests do not
+/// have, so this is the experiment that decides whether first-pass loses on *this workload* or on
+/// *this gate*. Costs one extra (cheap) call per candidate.
+///
+/// # Errors
+/// Any solver, judge, or environment failure, verbatim.
+pub fn measure_judged(
+    tasks: &[CodingTask],
+    rungs: &[Rung<'_>],
+    sb: &dyn Sandbox,
+    prices: &PriceTable,
+    limits: &Limits,
+    judge: Option<&dyn Judge>,
+) -> Result<Vec<Vec<RungOutcome>>, String> {
     let mut matrix = Vec::with_capacity(tasks.len());
     for task in tasks {
         let mut row = Vec::with_capacity(rungs.len());
         for rung in rungs {
-            let o: TaskOutcome = evaluate_task(sb, rung.solver, task, limits)?;
+            let o: TaskOutcome = match judge {
+                Some(j) => evaluate_task_judged(sb, rung.solver, j, task, limits)?,
+                None => evaluate_task(sb, rung.solver, task, limits)?,
+            };
             let cost = prices
                 .cost_usd(&rung.model, o.in_tokens, o.out_tokens)
                 .map_err(|e| {
@@ -128,6 +165,7 @@ pub fn measure(
                 gate_full_pass: o.gate_full_pass,
                 oracle_correct: o.oracle_correct,
                 cost_usd: cost,
+                judge_score: o.judge_score,
             });
         }
         matrix.push(row);
@@ -139,11 +177,23 @@ pub fn measure(
 #[must_use]
 pub fn replay(matrix: &[Vec<RungOutcome>], ladder: &[String], runtime_tier: &str) -> PolicyStudy {
     let top = ladder.len().saturating_sub(1);
-    let policies = vec![
+    let mut policies = vec![
         eval_policy("always-cheap", matrix, |row| serve_fixed(row, 0)),
         eval_policy("always-top", matrix, |row| serve_fixed(row, top)),
         eval_policy("first-pass", matrix, serve_first_pass),
     ];
+    // Only meaningful if a judge actually scored something; otherwise the row would duplicate
+    // first-pass and imply an experiment that was never run.
+    if matrix
+        .iter()
+        .any(|row| row.iter().any(|o| o.judge_score.is_some()))
+    {
+        let mut judged = eval_policy("first-pass+judge", matrix, |row| {
+            serve_first_pass_judged(row, JUDGE_THRESHOLD)
+        });
+        judged.cost_metered = false;
+        policies.push(judged);
+    }
     PolicyStudy {
         runtime_tier: runtime_tier.to_owned(),
         n: matrix.len(),
@@ -174,6 +224,33 @@ fn serve_first_pass(row: &[RungOutcome]) -> (bool, f64, usize) {
     // Every rung failed its gate. Best-attempt fallback: the top rung is served anyway, because
     // refusing to answer is not on the table for a proxy. It is counted as served, so a policy
     // that fails everywhere cannot hide its failures by declining to serve them.
+    (
+        row.last().is_some_and(|o| o.oracle_correct),
+        spent,
+        row.len(),
+    )
+}
+
+/// How confident the judge must be for its opinion to let a candidate through. Deliberately a
+/// constant rather than a tuned knob: tuning it on the same 24 tasks it is evaluated on would be
+/// fitting the threshold to the answer.
+const JUDGE_THRESHOLD: f64 = 0.8;
+
+/// First-pass with a second opinion: serve the cheap rung only when the tests pass **and** the
+/// judge is confident. The pilot showed the tests alone pass the cheap rung's wrong answers, so
+/// this is the arm that tests whether a signal the tests do not have changes the verdict.
+///
+/// A judge that abstains (`None`) defers to the tests rather than blocking — an abstention is an
+/// absence of evidence, and treating it as a veto would escalate everything the judge found hard.
+fn serve_first_pass_judged(row: &[RungOutcome], threshold: f64) -> (bool, f64, usize) {
+    let mut spent = 0.0;
+    for (i, o) in row.iter().enumerate() {
+        spent += o.cost_usd;
+        let judge_ok = o.judge_score.is_none_or(|j| j >= threshold);
+        if o.gate_full_pass && judge_ok {
+            return (o.oracle_correct, spent, i + 1);
+        }
+    }
     (
         row.last().is_some_and(|o| o.oracle_correct),
         spent,
@@ -220,6 +297,7 @@ fn eval_policy(
         },
         usd_per_success_ci: bootstrap_ratio_ci(&costs, &successes, 2000, 42, 0.05),
         served_failure_rate: 1.0 - success_rate,
+        cost_metered: true,
         escalation_rate: escalations as f64 / n,
         escalation_conversion: if escalations > 0 {
             converted as f64 / escalations as f64
@@ -247,17 +325,32 @@ impl PolicyStudy {
         s.push_str("|---|---|---|---|---|---|---|---|\n");
         for p in &self.policies {
             s.push_str(&format!(
-                "| {} | {:.2} | [{:.2}, {:.2}] | ${:.4} | ${:.4} | {:.2} | {:.0}% | {:.0}% |\n",
+                "| {} | {:.2} | [{:.2}, {:.2}] | {} | {} | {:.2} | {:.0}% | {:.0}% |\n",
                 p.name,
                 p.success_rate,
                 p.success_ci.lo,
                 p.success_ci.hi,
-                p.total_cost_usd,
-                p.usd_per_success,
+                if p.cost_metered {
+                    format!("${:.4}", p.total_cost_usd)
+                } else {
+                    "—".to_owned()
+                },
+                if p.cost_metered {
+                    format!("${:.4}", p.usd_per_success)
+                } else {
+                    "—".to_owned()
+                },
                 p.served_failure_rate,
                 p.escalation_rate * 100.0,
                 p.escalation_conversion * 100.0
             ));
+        }
+        if self.policies.iter().any(|p| !p.cost_metered) {
+            s.push_str(
+                "\n\u{2014} cost withheld: the judge's own model calls are not yet metered, so any \
+                 $/success for that arm would omit them. Its quality and conversion columns are \
+                 measured normally; those are what the arm exists to answer.\n",
+            );
         }
         s.push('\n');
         s.push_str(&self.verdict());
@@ -359,6 +452,15 @@ mod tests {
             gate_full_pass: gate,
             oracle_correct: oracle,
             cost_usd: cost,
+            judge_score: None,
+        }
+    }
+
+    /// Same, with a judge opinion attached.
+    fn oj(gate: bool, oracle: bool, cost: f64, judge: f64) -> RungOutcome {
+        RungOutcome {
+            judge_score: Some(judge),
+            ..o(gate, oracle, cost)
         }
     }
 
@@ -457,6 +559,78 @@ mod tests {
             v.contains("STOP") && v.contains("did not earn its cost"),
             "a gate that converts nothing must not read as a win: {v}"
         );
+    }
+
+    /// The judged arm exists to catch exactly what the test gate misses: a wrong answer that
+    /// passes the visible tests. The judge only helps if it can veto that; and it must NOT veto
+    /// on an abstention, or every task it finds hard gets escalated for no evidence.
+    #[test]
+    fn a_judge_vetoes_a_test_passing_wrong_answer_but_an_abstention_defers() {
+        // Cheap rung is wrong and the tests wave it through — the pilot's actual failure mode.
+        // The judge is unconvinced (0.2), so the judged arm escalates and gets it right.
+        let caught = vec![vec![oj(true, false, 0.01, 0.2), oj(true, true, 0.10, 0.95)]];
+        let study = replay(&caught, &ladder(), "test");
+        let plain = study.find("first-pass").unwrap();
+        let judged = study.find("first-pass+judge").expect("judged arm present");
+        assert!(
+            (plain.success_rate - 0.0).abs() < 1e-9,
+            "tests alone serve the wrong answer"
+        );
+        assert!(
+            (judged.success_rate - 1.0).abs() < 1e-9,
+            "the judge's veto should have escalated to a correct answer"
+        );
+
+        // An abstaining judge must defer to the tests, not block: same outcome as plain
+        // first-pass, and no escalation bought on the strength of a shrug.
+        let abstained = vec![vec![
+            RungOutcome {
+                judge_score: None,
+                ..o(true, true, 0.01)
+            },
+            oj(true, true, 0.10, 0.95),
+        ]];
+        let study = replay(&abstained, &ladder(), "test");
+        let judged = study.find("first-pass+judge").expect("judged arm present");
+        assert!(
+            (judged.escalation_rate - 0.0).abs() < 1e-9,
+            "abstention is not a veto"
+        );
+    }
+
+    /// The judged arm must not publish a $/success while the judge's own calls are unmetered.
+    /// Showing one would make adding a judge look free — the same fabricated-cost failure the
+    /// unpriced-rung validator exists to stop, just moved into the benchmark.
+    #[test]
+    fn the_judged_arm_withholds_a_cost_it_cannot_account_for() {
+        let matrix = vec![vec![oj(true, false, 0.01, 0.2), oj(true, true, 0.10, 0.95)]];
+        let study = replay(&matrix, &ladder(), "test");
+        let judged = study.find("first-pass+judge").expect("judged arm present");
+        assert!(!judged.cost_metered, "judge tokens are not counted yet");
+        for p in study
+            .policies
+            .iter()
+            .filter(|p| p.name != "first-pass+judge")
+        {
+            assert!(p.cost_metered, "{} must report a real cost", p.name);
+        }
+        let out = study.render();
+        assert!(
+            out.contains("cost withheld"),
+            "the table must say why a cost is missing: {out}"
+        );
+    }
+
+    /// The judged arm must not appear at all when no judge ran — a row identical to first-pass
+    /// would imply an experiment nobody paid for.
+    #[test]
+    fn the_judged_arm_is_absent_without_a_judge() {
+        let study = replay(
+            &[vec![o(true, true, 0.01), o(true, true, 0.10)]],
+            &ladder(),
+            "t",
+        );
+        assert!(study.find("first-pass+judge").is_none());
     }
 
     /// Starting at the top rung is not escalating to it. The first version counted an escalation
