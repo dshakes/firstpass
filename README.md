@@ -168,6 +168,28 @@ detected: shell=zsh · proxy_running=false · routed=false · claude_cli=true
 
 Auto-detects your shell (zsh/bash/fish), whether the proxy is running, whether you're already routed, and which agents you have — then does only what's missing. **Idempotent** (re-run any time), **transparent** (`firstpass onboard` alone is a dry run showing the exact plan), and **reversible** (`firstpass offboard` strips the shell line, stops the proxy, prints the unset). For agents onboarding *themselves*: [`llms.txt`](llms.txt) + [`AGENTS.md`](AGENTS.md) ship machine-readable setup, `GET /v1/capabilities` gives runtime discovery, and `firstpass mcp` exposes traces, savings, evals, policy rehearsal, and receipt verification as tools.
 
+### ⚡ …or just press the button
+
+Three surfaces, no questions asked in any of them:
+
+```console
+$ firstpass kiosk          # finds the provider key already in your environment,
+                           # writes a config, puts ONE REAL request through the
+                           # ladder, prints the receipt. No key? It runs the
+                           # keyless demo instead — the button always works.
+
+$ firstpass handshake      # the same thing for a caller with no terminal: one
+                           # JSON document — keys found, the config that would
+                           # run, a KEYLESS self-test of route→gate→escalate→
+                           # serve→receipt→chain, and the env var to route.
+                           # It reports; it never writes. Also an MCP tool.
+```
+
+And once anything is running, **`GET /panel`** is a live receipts view served by the
+binary itself — every rung tried, what the gate said, what it cost against always
+calling the top of the ladder. No CDN, no build step, no external origin: the
+receipts stay behind the same tenant boundary as `/v1/receipts`.
+
 ---
 
 ## Architecture
