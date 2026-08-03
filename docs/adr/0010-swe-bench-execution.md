@@ -1,7 +1,9 @@
 # ADR 0010 — Running SWE-bench without quietly dismantling the sandbox
 
-- Status: Proposed — design only; no code written against it yet
-- Date: 2026-08-03
+- Status: **Accepted** (design; implementation deferred behind BigCodeBench results)
+- Date: 2026-08-03, revised same day — see *"D1, corrected"*: the premise that SWE-bench
+  requires a writable rootfs turned out to be false when tested, so no isolation
+  invariant is relaxed after all.
 - Related: ADR 0002 (bench code-execution sandbox, **D2 isolation invariants**),
   `crates/firstpass-bench/src/sandbox.rs`, `crates/firstpass-bench/src/coding.rs`,
   `crates/firstpass-bench/src/dataset.rs` (BigCodeBench loader)
@@ -45,29 +47,44 @@ number.
 
 ## Decision
 
-### D1 — A separate `Sandbox` implementation, not a flag on the existing one
+### D1, corrected — seed the tmpfs workdir from the image; change no invariant
 
-Add `RepoSandbox` alongside `ContainerSandbox`, behind the same `Sandbox` seam.
-It is a different threat model with a different, explicitly weaker ceiling, and
-it should be a different type so that no existing caller can silently acquire it.
-`ContainerSandbox`'s invariants stay exactly as ADR 0002 wrote them.
+The first draft of this ADR proposed a `RepoSandbox` with a **writable rootfs**,
+on the reasoning that patching and building a repository cannot happen on a
+read-only filesystem. That reasoning was never tested. When tested, it is wrong.
 
-`RepoSandbox` runs a per-instance image with a **writable container filesystem**
-and keeps every other control:
+The repository does not have to be modified *where the image put it*. It can be
+copied into the existing `tmpfs` workdir — which is already writable, already
+size-capped, and already discarded with the container — and patched, built, and
+tested there. Verified directly:
 
-- `--network none` at eval time (see D2)
-- no host bind-mounts, ever — the repo comes from the image, not from the host
-- `--rm`, `kill_on_drop`, wall-clock watchdog, cpu/mem/pids caps
-- `--cap-drop ALL`, `--security-opt no-new-privileges`
-- non-root where the image permits it (many SWE-bench images assume root; when
-  it does not permit it, that is recorded in the run report rather than waived
-  silently)
+```
+docker run --rm --network none --read-only --tmpfs /work:rw,size=256m \
+           --user 65534:65534 --cap-drop ALL python:3.12-alpine sh -c '
+  cp -r "$SRC" /work/repo
+  echo "# patch applied" >> /work/repo/__init__.py   # COPY+PATCH: ok
+  python3 -c "import sys; sys.path.insert(0,\"/work\"); import repo"  # IMPORT FROM COPY: ok
+  touch "$SRC/evil"                                   # ROOTFS STILL READ-ONLY: ok
+'
+```
 
-The honest statement of the ceiling: **container-grade isolation with a writable
-rootfs.** That is weaker than ADR 0002's dev-time tier. It is acceptable only for
-a single-operator, dev-time benchmark run, and it must never become the sandbox
-that a hosted plane runs customer gates in (ADR 0001 §D3 remains untouched).
-`RepoSandbox::runtime()` reports the weakened tier so it appears in the report.
+So the decision is the opposite of the one first drafted: **no new sandbox type,
+no weaker tier, and every ADR 0002 D2 invariant holds unchanged.** What
+`ContainerSandbox` gains is one capability — seeding the workdir from a path
+inside the image before the command runs (`seed_from: Option<String>`) — which is
+strictly less power than it already has, since the workdir is writable either way.
+
+Two limits worth stating rather than discovering later:
+
+- **The workdir is RAM.** `Limits::workdir_mb` must cover the repository; large
+  instances need it raised, and a repo that does not fit is an abort, not a
+  silent truncation.
+- **Import precedence must favour the copy.** An image with the package installed
+  editable against the original path could shadow the patched copy, and the
+  failure mode is a run that silently scores the *unpatched* code. The
+  `PASS_TO_PASS` preflight in D3 is what catches that: it is run after the copy,
+  so a mis-wired import shows up as a broken control before any result is
+  attributed to a model.
 
 ### D2 — Network stays off at eval time; provisioning is a separate, explicit step
 
@@ -121,18 +138,82 @@ scaffold, and the model ladder. A subset is honest; an unlabelled subset is not.
 
 ## Consequences
 
-- ADR 0002's invariants remain literally true for `ContainerSandbox`; the weaker
-  tier is a named, separate type whose report says so.
-- A run needs real operator resources: per-instance images (gigabytes), a
-  provisioning step with a network, and per-instance model spend. None of that
-  can be hidden inside the benchmark.
-- `Limits` grows no `writable` flag, so no existing caller can drift into the
-  weaker mode by passing a bool.
-- If we later want kernel-grade isolation for this tier, it slots in behind the
-  same `Sandbox` seam (gVisor/microVM), exactly as ADR 0002 planned.
+- **ADR 0002 D2 is untouched.** No writable rootfs, no second threat model, no
+  weaker tier to keep out of the hosted plane later. The thing this ADR was
+  opened to authorise turned out not to need authorising.
+- `Limits` grows no `writable` flag, so no caller can drift into a weaker mode by
+  passing a bool.
+- A run still needs real operator resources: per-instance images (gigabytes), a
+  provisioning step with a network, and per-instance model spend. None of that is
+  hidden inside the benchmark.
+- The workdir is RAM, so instance size becomes a resource limit to set rather
+  than an isolation property to trade away.
+
+## What the BigCodeBench pilot said first
+
+Before spending anything on SWE-bench, `--coding-policy` ran the same question on
+24 stdlib-only BigCodeBench tasks (haiku → sonnet, 48 live calls, cents). The
+answer was **not** the one the roadmap assumed:
+
+| policy | success | $/success |
+|---|---|---|
+| always-cheap | 0.88 | $0.0032 |
+| always-top | 0.92 | $0.0059 |
+| first-pass | 0.88 | $0.0041 |
+
+First-pass tied always-cheap on quality and cost **more** than it. The gate
+escalated, and those escalations converted nothing — it was spending money to
+re-derive answers the cheap rung had already gotten right, while waving through
+the ones it got wrong. Against always-top it is cheaper but scored lower, with
+overlapping intervals at this n.
+
+That is a finding about the *gate*, not about the ladder: on this workload a
+visible-test prefix does not separate haiku's good answers from its bad ones. So
+the obvious follow-up ran too — the same 24 tasks with a judge as a second
+opinion, serving the cheap rung only when the tests pass **and** the judge is
+confident:
+
+| policy | success | total $ (see note) | escalated | converted |
+|---|---|---|---|---|
+| always-cheap | 0.83 | $0.0614 | 0% | — |
+| always-top | 0.92 | $0.1282 | 0% | — |
+| first-pass | 0.83 | $0.0786 | 8% | 0% |
+| first-pass+judge | 0.88 | $0.1151 | 33% | 12% |
+
+The judge works as a *signal*: quality moved 0.83 → 0.88, escalation rose 8% →
+33%, and 12% of those escalations converted a wrong answer into a right one. It
+sees what the tests cannot.
+
+It does not work as *economics*. That $0.1151 omits the judge's own 48 calls,
+which are not yet metered. At haiku's published rate those add roughly $0.07,
+which would put the arm near **$0.19 against always-top's $0.128** — about 45%
+more expensive, at lower quality. That is an estimate rather than a measurement,
+which is exactly why the harness now withholds a $/success it cannot account for.
+
+**The likely root cause is the workload, not the design.** haiku already solves
+0.83 of these tasks and sonnet 0.92 — nine points of headroom for any amount of
+verification to recover. Cascade economics need a real capability gap between
+rungs; when the cheap model is nearly as good as the expensive one, no gate can
+pay for itself, because there is almost nothing to catch. The stdlib-only subset
+selected for cheap infrastructure is also, unavoidably, the easier end of
+BigCodeBench.
+
+So the next experiment is neither a better gate nor SWE-bench: it is **harder
+tasks, or a wider ladder**. The full BigCodeBench (third-party libs, needs a
+dependency-carrying image), or a genuinely weak rung 0. If the gap between rungs
+stays this narrow, the honest conclusion is that this workload does not need a
+router — and that is worth knowing for a fifth of a dollar.
 
 ## Status of the work
 
-Design only. Nothing here is implemented. The BigCodeBench path shipped first on
-purpose: it needs no new isolation posture, and it is the one that can produce a
-non-degenerate conformal bound, which is the open scientific gap.
+Design accepted; implementation deliberately **not** started, and the pilot above
+is now the reason rather than the sandbox question. SWE-bench scores an agent
+scaffold; what we need answered is narrower — *is the routing policy better?* —
+and `--coding-policy` answers that for cents by holding the scaffold fixed and
+varying only the policy. Paying twenty times as much for a benchmark whose name
+is more famous, while the cheap version of the same question is still returning
+"the gate did not earn its cost", would be buying recognition instead of
+evidence.
+
+The one thing this ADR changes today: it removes "we would have to weaken the
+sandbox" from the list of reasons not to.
