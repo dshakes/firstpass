@@ -1,0 +1,110 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firstpass — receipts</title>
+<style>
+  :root {
+    --ink: #0c1116; --panel: #141b22; --line: #232d38; --text: #e6edf3;
+    --dim: #8b9bab; --mint: #19E3B1; --amber: #f5a524; --red: #f4506a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ink); color: var(--text);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    padding: 24px;
+  }
+  h1 { font-size: 15px; margin: 0 0 2px; letter-spacing: .04em; }
+  h1 b { color: var(--mint); }
+  .sub { color: var(--dim); font-size: 12px; margin-bottom: 20px; }
+  .totals { display: flex; gap: 28px; flex-wrap: wrap; margin-bottom: 20px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; min-width: 130px; }
+  .stat .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+  .stat .v { font-size: 20px; margin-top: 4px; }
+  .saved .v { color: var(--mint); }
+  .r { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; }
+  .rh { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; color: var(--dim); font-size: 12px; }
+  .rung { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; }
+  .rung .n { color: var(--dim); min-width: 52px; }
+  .rung .m { flex: 1; min-width: 180px; }
+  .pass { color: var(--mint); } .fail { color: var(--red); } .abstain { color: var(--amber); }
+  .cost { color: var(--dim); }
+  .empty { color: var(--dim); border: 1px dashed var(--line); border-radius: 8px; padding: 28px; text-align: center; }
+  code { color: var(--mint); }
+  /* Wide content scrolls inside its own box; the page itself never scrolls sideways. */
+  .wrap { overflow-x: auto; }
+</style>
+
+<h1><b>firstpass</b> — receipts</h1>
+<div class="sub">every routing decision this proxy made, and what it cost against always calling the top rung</div>
+
+<div class="totals">
+  <div class="stat"><div class="k">requests</div><div class="v" id="n">—</div></div>
+  <div class="stat"><div class="k">spent</div><div class="v" id="spent">—</div></div>
+  <div class="stat"><div class="k">baseline</div><div class="v" id="base">—</div></div>
+  <div class="stat saved"><div class="k">saved</div><div class="v" id="saved">—</div></div>
+</div>
+
+<div class="wrap" id="list"></div>
+
+<script>
+  // Sign goes outside the symbol: "-$0.0027" reads as money lost, "$-0.0027" reads as a typo.
+  const usd = n => (Number(n || 0) < 0 ? '-$' : '$') + Math.abs(Number(n || 0)).toFixed(4);
+  const cls = v => ({ pass: 'pass', fail: 'fail', abstain: 'abstain' })[String(v).toLowerCase()] || '';
+
+  // Receipt fields are ATTACKER-CONTROLLED. `model` is echoed from the caller's request body on
+  // the observe path and stored in the trace, so anyone who can send one request through this
+  // proxy can plant markup that runs when an operator opens this page. Everything interpolated
+  // below goes through here.
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+  async function tick() {
+    let data;
+    try {
+      const res = await fetch('/v1/receipts?limit=50');
+      if (res.status === 401) return render(null, 'This proxy requires auth. The panel is meant for local use; receipts stay behind the tenant key.');
+      data = await res.json();
+    } catch (e) {
+      return render(null, 'Cannot reach the proxy.');
+    }
+    render(data.receipts || []);
+  }
+
+  function render(receipts, note) {
+    const list = document.getElementById('list');
+    if (!receipts) { list.innerHTML = `<div class="empty">${note}</div>`; return; }
+    if (!receipts.length) {
+      list.innerHTML = '<div class="empty">No receipts yet. Send a request through the proxy — try <code>firstpass kiosk</code>.</div>';
+      return;
+    }
+    let spent = 0, base = 0, saved = 0;
+    for (const r of receipts) { spent += r.total_cost_usd; base += r.baseline_usd; saved += r.savings_usd; }
+    document.getElementById('n').textContent = receipts.length;
+    document.getElementById('spent').textContent = usd(spent);
+    document.getElementById('base').textContent = usd(base);
+    // Escalating past the top rung genuinely costs MORE than going straight there. Showing that
+    // loss in the same mint as a win would make the panel flatter the product it is auditing.
+    const savedEl = document.getElementById('saved');
+    savedEl.textContent = usd(saved) + (base > 0 ? ` (${Math.round(saved / base * 100)}%)` : '');
+    savedEl.style.color = saved < 0 ? 'var(--amber)' : 'var(--mint)';
+
+    const num = n => Number(n || 0).toLocaleString();
+    list.innerHTML = receipts.map(r => `
+      <div class="r">
+        <div class="rh">
+          <span>${esc(r.trace_id)}</span>
+          <span>served rung ${esc(r.served_rung ?? '—')} · ${usd(r.total_cost_usd)} of ${usd(r.baseline_usd)}</span>
+        </div>
+        ${(r.attempts || []).map(a => `
+          <div class="rung">
+            <span class="n">rung ${esc(a.rung)}</span>
+            <span class="m">${esc(a.model)}</span>
+            <span class="${cls(a.verdict)}">${esc(String(a.verdict).toUpperCase())}</span>
+            <span class="cost">${usd(a.cost_usd)} · ${num(a.latency_ms)}ms</span>
+          </div>`).join('')}
+      </div>`).join('');
+  }
+
+  tick();
+  setInterval(tick, 2000);
+</script>

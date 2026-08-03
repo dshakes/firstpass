@@ -146,7 +146,7 @@ pub async fn run() -> Result<(), Fail> {
 
 /// A local stand-in for the Anthropic API: haiku returns an empty answer (so the gate fails and the
 /// ladder escalates), anything above it returns real code.
-async fn spawn_upstream() -> Result<String, Fail> {
+pub(crate) async fn spawn_upstream() -> Result<String, Fail> {
     async fn messages(body: Bytes) -> Json<Value> {
         let model = serde_json::from_slice::<Value>(&body)
             .ok()
@@ -174,7 +174,7 @@ async fn spawn_upstream() -> Result<String, Fail> {
 
 /// Stand up the real proxy against the local upstream. Returns its base URL and the trace-writer
 /// task handle, kept alive alongside the server for the life of the demo.
-async fn spawn_proxy(
+pub(crate) async fn spawn_proxy(
     upstream: &str,
     db: &std::path::Path,
 ) -> Result<(String, tokio::task::JoinHandle<()>), Fail> {
@@ -213,7 +213,7 @@ async fn spawn_proxy(
 }
 
 /// Traces are written off the hot path, so poll briefly for the first one to land.
-async fn wait_for_trace(db: &std::path::Path) -> Option<firstpass_core::Trace> {
+pub(crate) async fn wait_for_trace(db: &std::path::Path) -> Option<firstpass_core::Trace> {
     for _ in 0..150 {
         if let Ok(t) = store::load_all_traces(db)
             && let Some(first) = t.into_iter().next()

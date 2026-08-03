@@ -12,12 +12,20 @@ use firstpass_bench::coding::{
     CandidateSolver, CodingReport, GeneratedSolver, Judge, LiveJudge, LiveSolver, coding_suite,
     generated_coding_suite, mock_solutions, run_coding_benchmark, run_coding_benchmark_judged,
 };
-use firstpass_bench::dataset::load_mbpp_jsonl;
+use firstpass_bench::dataset::load_coding_dataset;
 use firstpass_bench::sandbox::establish_sandbox;
 use firstpass_bench::{BenchConfig, run_benchmark, run_benchmark_live};
 
 /// Container image for the sandbox self-check (needs `python3` + busybox `base64`/`timeout`).
-const SANDBOX_IMAGE: &str = "python:3.12-alpine";
+/// Default sandbox image. Override with `FIRSTPASS_SANDBOX_IMAGE` — BigCodeBench tasks import
+/// numpy/pandas/etc, and the sandbox has no network to install them, so those runs need an image
+/// that already carries the dataset's libraries.
+const DEFAULT_SANDBOX_IMAGE: &str = "python:3.12-alpine";
+
+/// The sandbox image to run candidates in.
+fn sandbox_image() -> String {
+    std::env::var("FIRSTPASS_SANDBOX_IMAGE").unwrap_or_else(|_| DEFAULT_SANDBOX_IMAGE.to_owned())
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -27,7 +35,7 @@ fn main() {
     // Operator's isolation proof surface (ADR 0002 §D3): establish the sandbox and run the isolation
     // probes against the REAL runtime. Fails closed — a breach or missing runtime exits non-zero.
     if args.iter().any(|a| a == "--sandbox-selfcheck") {
-        match establish_sandbox(SANDBOX_IMAGE) {
+        match establish_sandbox(&sandbox_image()) {
             Ok(sb) => {
                 println!(
                     "sandbox OK: isolation proven (runtime tier: {})",
@@ -86,7 +94,7 @@ fn main() {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
-        let sb = match establish_sandbox(SANDBOX_IMAGE) {
+        let sb = match establish_sandbox(&sandbox_image()) {
             Ok(sb) => sb,
             Err(e) => {
                 eprintln!("cannot run probe study — sandbox not established: {e}");
@@ -97,7 +105,7 @@ fn main() {
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
         let tasks = match &dataset_path {
-            Some(path) => match load_mbpp_jsonl(path) {
+            Some(path) => match load_coding_dataset(path) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("failed to load coding dataset {path}: {e}");
@@ -137,7 +145,7 @@ fn main() {
             );
             std::process::exit(2);
         }
-        let sb = match establish_sandbox(SANDBOX_IMAGE) {
+        let sb = match establish_sandbox(&sandbox_image()) {
             Ok(sb) => sb,
             Err(e) => {
                 eprintln!("cannot run coding benchmark — sandbox not established: {e}");
@@ -149,7 +157,7 @@ fn main() {
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
         let tasks = match &dataset_path {
-            Some(path) => match load_mbpp_jsonl(path) {
+            Some(path) => match load_coding_dataset(path) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("failed to load coding dataset {path}: {e}");

@@ -34,6 +34,7 @@ pub mod gate;
 pub mod guard;
 pub mod judge;
 pub mod key_custody;
+pub mod kiosk;
 pub mod mcp;
 pub mod metrics;
 pub mod onboard;

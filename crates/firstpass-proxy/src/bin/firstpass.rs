@@ -13,6 +13,12 @@ firstpass — the cheapest model that provably passes, with a receipt for every 
 USAGE:
     firstpass upgrade             upgrade in place, or print the exact command for however
                                   this copy was installed (brew / uv / npm / docker / cargo)
+    firstpass kiosk               one press, no questions: find your provider key, write a
+                                  config, route one REAL request, print the receipt. Falls
+                                  through to the keyless demo when no key is set.
+    firstpass handshake           agent-native setup report as JSON: provider keys found, the
+                                  config that would run, a KEYLESS self-test of the whole path,
+                                  and the exact env vars to route and to undo
     firstpass demo                no keys, no config: run one real gated decision and print
                                   its receipt (local mock upstream, real proxy)
     firstpass onboard [--apply]   agentic setup: ask three questions, write firstpass.toml,
@@ -61,6 +67,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run::serve(ProxyConfig::from_env()?).await
         }
         "demo" => firstpass_proxy::demo::run().await,
+        "kiosk" => firstpass_proxy::kiosk::run().await,
+        "handshake" => {
+            // Agent-native: JSON on stdout, nothing else, always exit 0 with a readable document.
+            let doc = firstpass_proxy::kiosk::handshake().await;
+            println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+            Ok(())
+        }
         "upgrade" => cmd_upgrade(),
         "onboard" => cmd_onboard(args.iter().any(|a| a == "--apply")),
         "offboard" => cmd_offboard(),

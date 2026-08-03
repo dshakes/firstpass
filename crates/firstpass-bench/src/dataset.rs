@@ -9,6 +9,14 @@
 //!
 //! `visible_cases` is a strict prefix of `hidden_cases` (the first half, rounded up) — a real
 //! coverage gap the candidate can exploit, same shape as the gappy suites in `coding.rs`.
+//!
+//! **BigCodeBench** is the reason `CodingTask::unit_test` exists. Its tasks call real libraries
+//! (numpy, pandas, requests…) and ship a whole `unittest.TestCase` per task instead of a list of
+//! assertions, so they cannot be flattened into `eval`-able expressions without losing exactly
+//! what makes them hard: setup, mocking, and tolerance-based comparisons. Those are also where a
+//! test suite's genuine coverage gaps live, which is why this dataset is the one that can produce
+//! a non-degenerate served-failure bound — every suite tried before it had a near-perfect gate,
+//! and a gate with no error leaves conformal nothing to control.
 
 use crate::coding::CodingTask;
 
@@ -77,6 +85,7 @@ fn parse_mbpp_line(line: &str) -> Result<CodingTask, String> {
         entrypoint: "solution.py".to_owned(),
         visible_cases,
         hidden_cases,
+        unit_test: None,
     })
 }
 
@@ -145,6 +154,7 @@ fn parse_humaneval_line(line: &str) -> Result<CodingTask, String> {
         entrypoint: "solution.py".to_owned(),
         visible_cases,
         hidden_cases,
+        unit_test: None,
     })
 }
 
@@ -197,6 +207,155 @@ fn top_level_comma(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Load a coding dataset, detecting which of the three supported shapes it is from its first
+/// record. Nothing about a `.jsonl` path says which benchmark it holds, and picking the wrong
+/// loader does not fail loudly — it produces subtly wrong cases — so the shape decides.
+///
+/// # Errors
+/// The file can't be read, is empty, has an unrecognisable first record, or fails the chosen
+/// loader. The error names which shape was detected so a mis-detection is obvious.
+pub fn load_coding_dataset(path: &str) -> Result<Vec<CodingTask>, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    let first = content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .ok_or_else(|| format!("{path} is empty"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(first).map_err(|e| format!("{path}:1: invalid JSON: {e}"))?;
+
+    if v.get("test_list").is_some() {
+        return load_mbpp_jsonl(path);
+    }
+    match v.get("test").and_then(serde_json::Value::as_str) {
+        Some(t) if t.contains("unittest") => load_bigcodebench_jsonl(path),
+        Some(t) if t.contains("def check(") => load_humaneval_jsonl(path),
+        _ => Err(format!(
+            "{path}: unrecognised dataset shape — expected MBPP (`test_list`), BigCodeBench \
+             (`test` holding a unittest.TestCase), or HumanEval (`test` holding `def check(`)"
+        )),
+    }
+}
+
+/// Load BigCodeBench-style JSONL: one
+/// `{"task_id", "instruct_prompt"|"complete_prompt", "test", "entry_point", "libs"}` per line.
+///
+/// The `test` field is a `unittest.TestCase` source. Its `test_*` methods are split the same way
+/// every other loader here splits cases: the first half (rounded up) is **visible** — the gate the
+/// candidate is shown and scored on — and the whole set is the **hidden oracle**. Because these
+/// are real suites, the gap between them is a real coverage gap rather than a synthetic one.
+///
+/// The candidate is shown the visible method sources so it knows the exact contract (BigCodeBench
+/// prompts name a function but the suite pins the behaviour). The held-out half never appears.
+///
+/// # Errors
+/// The path can't be read, a line isn't valid JSON, a required field is missing or mistyped, or a
+/// task's `test` source declares no `test_*` methods (nothing to score, so it would silently
+/// contribute a zero to every rate).
+pub fn load_bigcodebench_jsonl(path: &str) -> Result<Vec<CodingTask>, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+        .map(|(i, line)| {
+            parse_bigcodebench_line(line).map_err(|e| format!("{path}:{}: {e}", i + 1))
+        })
+        .collect()
+}
+
+fn parse_bigcodebench_line(line: &str) -> Result<CodingTask, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| format!("invalid JSON: {e}"))?;
+    let task_id = v
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing task_id")?;
+    // `instruct_prompt` is the natural-language form; `complete_prompt` is the signature+docstring
+    // completion form. Prefer instruct, fall back, so both released splits load.
+    let prompt_text = v
+        .get("instruct_prompt")
+        .or_else(|| v.get("complete_prompt"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing instruct_prompt/complete_prompt")?;
+    let entry_point = v
+        .get("entry_point")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("task_func");
+    let test_src = v
+        .get("test")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing test")?;
+
+    let hidden_cases = test_method_names(test_src);
+    if hidden_cases.is_empty() {
+        return Err(format!(
+            "task {task_id:?} declares no `test_*` methods, so it cannot be scored"
+        ));
+    }
+    let n_visible = hidden_cases.len().div_ceil(2);
+    let visible_cases = hidden_cases[..n_visible].to_vec();
+
+    let prompt = format!(
+        "{prompt_text}\n\nYour solution must pass these tests:\n{}\n\nWrite the complete solution defining `{entry_point}`. Output only Python code.",
+        visible_method_sources(test_src, &visible_cases)
+    );
+    Ok(CodingTask {
+        id: format!("bigcodebench-{task_id}"),
+        prompt,
+        entrypoint: "solution.py".to_owned(),
+        visible_cases,
+        hidden_cases,
+        unit_test: Some(test_src.to_owned()),
+    })
+}
+
+/// Names of every `def test_*(...)` in a `unittest` source, in declaration order.
+///
+/// Deliberately textual rather than a Python parse: the harness never executes this source on the
+/// host — it only selects names to run *inside* the sandbox — so reading it is a string operation,
+/// not an evaluation. Declaration order is what makes the visible/hidden split reproducible.
+fn test_method_names(src: &str) -> Vec<String> {
+    src.lines()
+        .filter_map(|l| {
+            let t = l.trim_start();
+            let rest = t.strip_prefix("def ")?;
+            let name = rest.split('(').next()?.trim();
+            (name.starts_with("test") && !name.is_empty()).then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// The source lines of just the visible test methods, for showing the candidate its own gate.
+/// A method runs from its `def` line to the next line at the same or lower indentation.
+fn visible_method_sources(src: &str, visible: &[String]) -> String {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("def ") else {
+            continue;
+        };
+        let Some(name) = rest.split('(').next().map(str::trim) else {
+            continue;
+        };
+        if !visible.iter().any(|v| v == name) {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        out.push(*line);
+        for next in &lines[i + 1..] {
+            let next_indent = next.len() - next.trim_start().len();
+            if !next.trim().is_empty() && next_indent <= indent {
+                break;
+            }
+            out.push(next);
+        }
+    }
+    out.join("\n")
 }
 
 #[cfg(test)]
@@ -289,6 +448,90 @@ mod tests {
     /// A minimal HumanEval-shaped fixture: single-line asserts inside `def check(candidate):`.
     const HUMANEVAL_FIXTURE: &str = r#"{"task_id": "HumanEval/0", "prompt": "def has_close_elements(numbers, threshold):\n", "entry_point": "has_close_elements", "test": "def check(candidate):\n    assert candidate([1.0, 2.0, 3.0], 0.5) == False\n    assert candidate([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3) == True\n"}
 "#;
+
+    /// A BigCodeBench-shaped fixture: a real `unittest.TestCase` with four methods, one of which
+    /// uses a numeric tolerance — the kind of assertion that cannot survive being flattened into
+    /// an `eval`-able boolean expression.
+    const BCB_FIXTURE: &str = r#"{"task_id": "BigCodeBench/7", "instruct_prompt": "Compute the mean of a column.", "entry_point": "task_func", "libs": ["numpy"], "test": "import unittest\nimport numpy as np\n\nclass TestCases(unittest.TestCase):\n    def setUp(self):\n        self.rows = [1, 2, 3, 4]\n\n    def test_basic(self):\n        self.assertEqual(task_func([2, 4]), 3)\n\n    def test_single(self):\n        self.assertEqual(task_func([5]), 5)\n\n    def test_tolerance(self):\n        self.assertAlmostEqual(task_func([1, 2]), 1.5, places=6)\n\n    def test_empty(self):\n        with self.assertRaises(ValueError):\n            task_func([])\n"}
+"#;
+
+    #[test]
+    fn bigcodebench_splits_test_methods_into_a_gate_and_a_held_out_oracle() {
+        let tmp = std::env::temp_dir().join(format!("bcb-fixture-{}.jsonl", std::process::id()));
+        std::fs::write(&tmp, BCB_FIXTURE).expect("write fixture");
+        let tasks = load_bigcodebench_jsonl(tmp.to_str().expect("utf8 path")).expect("parse");
+        std::fs::remove_file(&tmp).ok();
+
+        assert_eq!(tasks.len(), 1);
+        let t = &tasks[0];
+        assert_eq!(t.id, "bigcodebench-BigCodeBench/7");
+        // `setUp` is not a case; the four `test_*` methods are.
+        assert_eq!(
+            t.hidden_cases,
+            ["test_basic", "test_single", "test_tolerance", "test_empty"]
+        );
+        // Visible is a STRICT PREFIX of hidden — the coverage gap the candidate can fall into.
+        assert_eq!(t.visible_cases, ["test_basic", "test_single"]);
+        assert_eq!(t.hidden_cases[..2], t.visible_cases[..]);
+
+        // The suite source rides along so the sandbox can run the real assertions.
+        let suite = t.unit_test.as_deref().expect("unit_test carried");
+        assert!(suite.contains("assertAlmostEqual"));
+
+        // The candidate sees its gate and ONLY its gate: showing a held-out method would close
+        // the very coverage gap the measurement depends on.
+        assert!(t.prompt.contains("def test_basic"));
+        assert!(t.prompt.contains("assertEqual(task_func([2, 4]), 3)"));
+        assert!(
+            !t.prompt.contains("test_tolerance") && !t.prompt.contains("test_empty"),
+            "held-out oracle methods leaked into the prompt: {}",
+            t.prompt
+        );
+    }
+
+    /// Detection must route each shape to its own loader. Picking the wrong one does not error —
+    /// it silently yields wrong cases — so this is the check that keeps a run honest.
+    #[test]
+    fn dataset_shape_is_detected_not_assumed() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        for (name, body, want_prefix) in [
+            ("mbpp", MBPP_FIXTURE, "mbpp-"),
+            ("bcb", BCB_FIXTURE, "bigcodebench-"),
+            ("he", HUMANEVAL_FIXTURE, "humaneval-"),
+        ] {
+            let p = dir.join(format!("detect-{name}-{pid}.jsonl"));
+            std::fs::write(&p, body).expect("write fixture");
+            let tasks = load_coding_dataset(p.to_str().expect("utf8 path"))
+                .unwrap_or_else(|e| panic!("{name} must load: {e}"));
+            std::fs::remove_file(&p).ok();
+            assert!(
+                tasks[0].id.starts_with(want_prefix),
+                "{name} routed to the wrong loader: got id {:?}",
+                tasks[0].id
+            );
+            // Only BigCodeBench carries a unittest suite.
+            assert_eq!(tasks[0].unit_test.is_some(), name == "bcb");
+        }
+
+        let p = dir.join(format!("detect-junk-{pid}.jsonl"));
+        std::fs::write(&p, "{\"task_id\": 1}\n").expect("write fixture");
+        let err = load_coding_dataset(p.to_str().expect("utf8 path"))
+            .expect_err("an unrecognisable shape must not be guessed at");
+        std::fs::remove_file(&p).ok();
+        assert!(err.contains("unrecognised dataset shape"), "got: {err}");
+    }
+
+    #[test]
+    fn bigcodebench_rejects_a_task_with_nothing_to_score() {
+        let line = r#"{"task_id": "X/1", "instruct_prompt": "p", "test": "import unittest\nclass T(unittest.TestCase):\n    def helper(self):\n        pass\n"}"#;
+        let tmp = std::env::temp_dir().join(format!("bcb-empty-{}.jsonl", std::process::id()));
+        std::fs::write(&tmp, line).expect("write fixture");
+        let err = load_bigcodebench_jsonl(tmp.to_str().expect("utf8 path"))
+            .expect_err("a task with no test_* methods must not load");
+        std::fs::remove_file(&tmp).ok();
+        assert!(err.contains("no `test_*` methods"), "got: {err}");
+    }
 
     #[test]
     fn parses_humaneval_fixture_and_rewrites_candidate() {
