@@ -551,20 +551,39 @@ impl CandidateSolver for LiveSolver {
     fn solve(&self, task: &CodingTask) -> Result<Solution, String> {
         let system = "You are a Python coding assistant. Output ONLY the full contents of the \
                       requested file — no explanation, no markdown code fences.";
-        let (text, in_tokens, out_tokens) = crate::live::anthropic_call(
-            &self.client,
-            &self.base_url,
-            &self.api_key,
-            &self.model,
-            Some(system),
-            &task.prompt,
-            1024,
-        )?;
-        Ok(Solution {
-            code: strip_fences(&text),
-            in_tokens,
-            out_tokens,
-        })
+        // Escalating token budget, exactly as `LiveJudge` already does and for the same reason:
+        // an empty reply ("no text content") means the response budget was exhausted before any
+        // text was emitted, and retrying at the SAME budget just reproduces it. A fixed 1024 here
+        // aborted a 200-task run partway — every candidate call is a paid call, so one starved
+        // response must not be able to discard the ones already bought.
+        let mut last = String::new();
+        for max_tokens in [1024u32, 2048, 4096] {
+            match crate::live::anthropic_call(
+                &self.client,
+                &self.base_url,
+                &self.api_key,
+                &self.model,
+                Some(system),
+                &task.prompt,
+                max_tokens,
+            ) {
+                Ok((text, in_tokens, out_tokens)) => {
+                    return Ok(Solution {
+                        code: strip_fences(&text),
+                        in_tokens,
+                        out_tokens,
+                    });
+                }
+                // Only an empty response is worth more budget. Anything else (auth, 4xx, decode)
+                // will not improve by asking for more room, so it aborts as before.
+                Err(e) if e.contains("no text content") => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(format!(
+            "{last} on {:?} even at 4096 max_tokens — the model emitted no text at any budget",
+            task.id
+        ))
     }
 }
 
@@ -1126,6 +1145,44 @@ mod tests {
         assert!(
             runner.contains("test_a") && !runner.contains("test_b"),
             "the runner must select only the visible methods"
+        );
+    }
+
+    /// An empty response must escalate the token budget, not abort. Retrying at the same budget
+    /// reproduces the same starved reply, and a fixed budget already killed a 200-task paid run
+    /// partway — the calls bought before the anomaly are gone with it.
+    #[test]
+    fn an_empty_response_retries_with_more_room_and_only_then_gives_up() {
+        // A stand-in for the real HTTP path: fails with "no text content" below `needs`, then
+        // succeeds — the exact shape of a budget-starved response.
+        fn attempt(max_tokens: u32, needs: u32) -> Result<String, String> {
+            if max_tokens < needs {
+                Err("no text content in response".to_owned())
+            } else {
+                Ok("def task_func(): pass".to_owned())
+            }
+        }
+        let budgets = [1024u32, 2048, 4096];
+
+        // Needs 2048: the first budget starves, the second succeeds.
+        let got = budgets.iter().find_map(|&b| attempt(b, 2048).ok());
+        assert!(got.is_some(), "escalating the budget must recover the call");
+
+        // Needs more than any budget: it gives up rather than looping.
+        assert!(
+            budgets
+                .iter()
+                .find_map(|&b| attempt(b, 8192).ok())
+                .is_none(),
+            "an unrecoverable empty response must still terminate"
+        );
+
+        // The real solver only escalates on THIS error; anything else aborts immediately, since
+        // more room cannot fix an auth failure or a decode error.
+        let src = include_str!("coding.rs");
+        assert!(
+            src.contains(r#"Err(e) if e.contains("no text content") => last = e"#),
+            "only an empty response should buy another attempt"
         );
     }
 
