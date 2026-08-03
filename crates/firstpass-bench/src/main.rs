@@ -153,7 +153,7 @@ fn main() {
             Ok(p) if !p.is_empty() => p,
             _ => {
                 eprintln!(
-                    "--coding-policy needs FIRSTPASS_CODING_DATASET=<path.jsonl> (see scripts/fetch-bigcodebench.py)"
+                    "--coding-policy needs FIRSTPASS_CODING_DATASET=<path.jsonl> (see scripts/fetch-coding-dataset.py)"
                 );
                 std::process::exit(2);
             }
