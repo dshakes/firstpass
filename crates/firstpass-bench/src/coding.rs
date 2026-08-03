@@ -30,11 +30,18 @@ pub struct CodingTask {
     pub prompt: String,
     /// File the candidate's code is written to, e.g. `"solution.py"`.
     pub entrypoint: String,
-    /// The **gate**: Python boolean expressions (each must eval truthy). Deliberate coverage gaps —
-    /// passing all of them does not guarantee correctness.
+    /// The **gate**: deliberate coverage gaps — passing all of them does not guarantee correctness.
+    /// Python boolean expressions, or `unittest` method names when [`Self::unit_test`] is set.
     pub visible_cases: Vec<String>,
-    /// The **oracle** (ground truth): thorough Python boolean expressions; all-pass = correct.
+    /// The **oracle** (ground truth): all-pass = correct. Same two readings as `visible_cases`.
     pub hidden_cases: Vec<String>,
+    /// `unittest` module source (BigCodeBench ships whole `TestCase` classes, not expressions).
+    ///
+    /// When set, the case lists hold **test method names** to select out of that source rather
+    /// than expressions to `eval`. Real suites are the point: a hand-written boolean expression
+    /// cannot express setup, mocking, or a numeric tolerance, and those are where a gate's real
+    /// coverage gaps live.
+    pub unit_test: Option<String>,
 }
 
 /// Candidate code plus its token cost.
@@ -126,6 +133,41 @@ fn build_runner(cases: &[String]) -> String {
     )
 }
 
+/// Build the runner for a `unittest` task: import the case module (candidate code + the suite),
+/// run only the named test methods, and print `FP_SCORE p n`.
+///
+/// It imports inside a `try` so a **missing third-party library is reported as `FP_ENVERR`, not
+/// as a failed test**. That distinction decides whether the benchmark is measuring anything: a
+/// sandbox without `numpy` would score every numpy-using task 0, which reads as an enormous gate
+/// error rate and would produce a completely fictitious conformal bound. The harness aborts on
+/// `FP_ENVERR` instead of publishing it.
+fn build_unittest_runner(names: &[String]) -> String {
+    let json = serde_json::to_string(names).unwrap_or_else(|_| "[]".to_owned());
+    format!(
+        "import json, os, sys, unittest\n\
+         NAMES = json.loads(r'''{json}''')\n\
+         try:\n\
+         \x20   import fp_case\n\
+         except ModuleNotFoundError as e:\n\
+         \x20   print('FP_ENVERR %s' % e.name); sys.exit(0)\n\
+         except Exception as e:\n\
+         \x20   print('FP_SCORE 0 %d' % len(NAMES)); sys.exit(0)\n\
+         suite = unittest.TestSuite()\n\
+         found = 0\n\
+         for obj in list(vars(fp_case).values()):\n\
+         \x20   if isinstance(obj, type) and issubclass(obj, unittest.TestCase):\n\
+         \x20       for n in NAMES:\n\
+         \x20           if callable(getattr(obj, n, None)):\n\
+         \x20               suite.addTest(obj(n)); found += 1\n\
+         with open(os.devnull, 'w') as devnull:\n\
+         \x20   res = unittest.TextTestRunner(stream=devnull, verbosity=0).run(suite)\n\
+         for _t, tb in res.errors:\n\
+         \x20   if 'ModuleNotFoundError' in tb:\n\
+         \x20       print('FP_ENVERR lazy-import'); sys.exit(0)\n\
+         print('FP_SCORE %d %d' % (found - len(res.failures) - len(res.errors), found))\n"
+    )
+}
+
 /// Parse `FP_SCORE p n` out of runner stdout.
 fn parse_score(stdout: &str) -> Option<(usize, usize)> {
     let line = stdout.lines().find(|l| l.starts_with("FP_SCORE "))?;
@@ -137,21 +179,35 @@ fn parse_score(stdout: &str) -> Option<(usize, usize)> {
 
 /// Run one case list against candidate code in the sandbox; returns `(passed, total)`. A sandbox
 /// error, crash, or timeout counts as zero passed — never a panic, never a host fallback.
+///
+/// # Errors
+/// Only for an *environment* failure (`FP_ENVERR`): the sandbox image is missing a library the
+/// task needs, so the result would say nothing about the candidate. Scoring that as a failure
+/// would silently invent gate error, so it aborts the run instead.
 fn suite_score(
     sb: &dyn Sandbox,
     task: &CodingTask,
     code: &str,
     cases: &[String],
     limits: &Limits,
-) -> (usize, usize) {
+) -> Result<(usize, usize), String> {
     if cases.is_empty() {
-        return (0, 0);
+        return Ok((0, 0));
     }
-    let unit = ExecUnit {
-        files: vec![
+    // A `unittest` task runs candidate code and the suite in one module, because BigCodeBench
+    // suites call the entry point as a bare name rather than importing it.
+    let files = match &task.unit_test {
+        Some(src) => vec![
+            ("fp_case.py".to_owned(), format!("{code}\n\n{src}\n")),
+            ("fp_runner.py".to_owned(), build_unittest_runner(cases)),
+        ],
+        None => vec![
             (task.entrypoint.clone(), code.to_owned()),
             ("fp_runner.py".to_owned(), build_runner(cases)),
         ],
+    };
+    let unit = ExecUnit {
+        files,
         command: "python3 fp_runner.py".to_owned(),
     };
     match sb.run(&unit, limits) {
@@ -159,9 +215,27 @@ fn suite_score(
             exit_code: 0,
             stdout,
             ..
-        }) => parse_score(&stdout).unwrap_or((0, cases.len())),
-        _ => (0, cases.len()),
+        }) => {
+            if let Some(module) = parse_enverr(&stdout) {
+                return Err(format!(
+                    "sandbox image is missing the Python module {module:?} that task {:?} needs. \
+                     Scoring this as a failed test would fabricate gate error, so the run stops. \
+                     Pin an image that carries the dataset's libraries (FIRSTPASS_SANDBOX_IMAGE).",
+                    task.id
+                ));
+            }
+            Ok(parse_score(&stdout).unwrap_or((0, cases.len())))
+        }
+        _ => Ok((0, cases.len())),
     }
+}
+
+/// Parse the module name out of an `FP_ENVERR <module>` line.
+fn parse_enverr(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("FP_ENVERR "))
+        .map(|m| m.trim().to_owned())
 }
 
 /// Evaluate one task: solve, then score the visible (gate) and hidden (oracle) case lists.
@@ -175,8 +249,8 @@ pub fn evaluate_task(
     limits: &Limits,
 ) -> Result<TaskOutcome, String> {
     let sol = solver.solve(task)?;
-    let (vp, vt) = suite_score(sb, task, &sol.code, &task.visible_cases, limits);
-    let (hp, ht) = suite_score(sb, task, &sol.code, &task.hidden_cases, limits);
+    let (vp, vt) = suite_score(sb, task, &sol.code, &task.visible_cases, limits)?;
+    let (hp, ht) = suite_score(sb, task, &sol.code, &task.hidden_cases, limits)?;
     let gate_score = ratio(vp, vt);
     Ok(TaskOutcome {
         id: task.id.clone(),
@@ -260,8 +334,8 @@ pub fn evaluate_task_judged(
     let sol = solver
         .solve(task)
         .map_err(|e| format!("solve failed on {}: {e}", task.id))?;
-    let (vp, vt) = suite_score(sb, task, &sol.code, &task.visible_cases, limits);
-    let (hp, ht) = suite_score(sb, task, &sol.code, &task.hidden_cases, limits);
+    let (vp, vt) = suite_score(sb, task, &sol.code, &task.visible_cases, limits)?;
+    let (hp, ht) = suite_score(sb, task, &sol.code, &task.hidden_cases, limits)?;
     // `None` = judge abstained → combined_score defers to the deterministic test gate for this task.
     let judge_score = judge
         .score(task, &sol.code)
@@ -575,6 +649,7 @@ fn task(id: &str, prompt: &str, visible: &[&str], hidden: &[&str]) -> CodingTask
         entrypoint: "solution.py".to_owned(),
         visible_cases: visible.iter().map(|s| (*s).to_owned()).collect(),
         hidden_cases: hidden.iter().map(|s| (*s).to_owned()).collect(),
+        unit_test: None,
     }
 }
 
@@ -689,6 +764,7 @@ pub fn generated_coding_suite(n: usize) -> Vec<CodingTask> {
                 entrypoint: "solution.py".to_owned(),
                 visible_cases: visible,
                 hidden_cases: hidden,
+                unit_test: None,
             }
         })
         .collect()
@@ -954,6 +1030,93 @@ mod tests {
         assert!(err.contains("no mock solution"), "{err}");
     }
 
+    /// A `unittest` task must ship candidate code and the suite as ONE module (BigCodeBench
+    /// suites call the entry point as a bare name), and select only the named methods.
+    #[test]
+    fn unittest_task_bundles_code_with_the_suite_and_selects_only_named_methods() {
+        struct CaptureSandbox(std::sync::Mutex<Vec<(String, String)>>);
+        impl Sandbox for CaptureSandbox {
+            fn runtime(&self) -> &str {
+                "capture"
+            }
+            fn run(
+                &self,
+                u: &ExecUnit,
+                _: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                self.0.lock().unwrap().clone_from(&u.files);
+                Ok(ExecOutcome::Completed {
+                    exit_code: 0,
+                    stdout: "FP_SCORE 1 2\n".to_owned(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let sb = CaptureSandbox(std::sync::Mutex::new(Vec::new()));
+        let mut t = task("u", "p", &["test_a"], &["test_a", "test_b"]);
+        t.unit_test = Some("import unittest\nclass T(unittest.TestCase):\n    pass\n".to_owned());
+
+        let (p, n) = suite_score(
+            &sb,
+            &t,
+            "def task_func(): return 1",
+            &t.visible_cases,
+            &Limits::default(),
+        )
+        .expect("a healthy run must not abort");
+        assert_eq!((p, n), (1, 2));
+
+        let files = sb.0.lock().unwrap().clone();
+        let case = &files.iter().find(|(p, _)| p == "fp_case.py").unwrap().1;
+        assert!(
+            case.contains("def task_func()") && case.contains("class T(unittest.TestCase)"),
+            "candidate code and suite must share one module: {case}"
+        );
+        let runner = &files.iter().find(|(p, _)| p == "fp_runner.py").unwrap().1;
+        assert!(
+            runner.contains("test_a") && !runner.contains("test_b"),
+            "the runner must select only the visible methods"
+        );
+    }
+
+    /// A sandbox image missing a library is an ENVIRONMENT failure, not a wrong answer. Scoring it
+    /// as a failed test would manufacture gate error out of nothing and hand back a conformal
+    /// bound computed from a fiction, so the run must abort instead.
+    #[test]
+    fn a_missing_library_aborts_the_run_rather_than_scoring_zero() {
+        struct EnvErrSandbox;
+        impl Sandbox for EnvErrSandbox {
+            fn runtime(&self) -> &str {
+                "enverr"
+            }
+            fn run(
+                &self,
+                _: &ExecUnit,
+                _: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                Ok(ExecOutcome::Completed {
+                    exit_code: 0,
+                    stdout: "FP_ENVERR numpy\n".to_owned(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let mut t = task("u", "p", &["test_a"], &["test_a"]);
+        t.unit_test = Some("import unittest\n".to_owned());
+        let err = suite_score(
+            &EnvErrSandbox,
+            &t,
+            "code",
+            &t.visible_cases,
+            &Limits::default(),
+        )
+        .expect_err("a missing module must abort, not score 0");
+        assert!(
+            err.contains("numpy") && err.contains("fabricate"),
+            "the error must name the module and say why it stops: {err}"
+        );
+    }
+
     /// Wiring end-to-end with a fake sandbox that reports partial visible scores via `FP_SCORE`.
     #[test]
     fn run_wires_continuous_scores_into_report() {
@@ -1027,6 +1190,62 @@ mod tests {
 
     // ---- real Docker pipeline (opt-in; needs a daemon; NO model spend — uses offline solvers) ----
     //   cargo test -p firstpass-bench --lib coding::tests::real_ -- --ignored --nocapture
+
+    /// The `unittest` path against REAL Python, on a BigCodeBench-shaped task. Offline tests only
+    /// prove the wiring; this proves the generated runner is valid Python that selects the right
+    /// methods, that a genuine coverage gap produces a genuine false-accept, and — the part that
+    /// decides whether any published number is real — that a missing library aborts instead of
+    /// masquerading as a failed test.
+    #[test]
+    #[ignore = "requires a running container daemon"]
+    fn real_unittest_task_scores_a_gap_and_refuses_to_score_a_missing_library() {
+        use crate::sandbox::establish_sandbox;
+        let sb = establish_sandbox("python:3.12-alpine").expect("sandbox");
+        let limits = Limits::default();
+
+        // A suite where the visible half accepts any positive-mean input and the held-out half
+        // pins the empty-list contract — exactly the shape of a real coverage gap.
+        let suite = "import unittest\n\
+             \n\
+             class TestCases(unittest.TestCase):\n\
+             \x20   def test_basic(self):\n\
+             \x20       self.assertEqual(task_func([2, 4]), 3)\n\
+             \x20   def test_single(self):\n\
+             \x20       self.assertEqual(task_func([5]), 5)\n\
+             \x20   def test_empty(self):\n\
+             \x20       with self.assertRaises(ValueError):\n\
+             \x20           task_func([])\n";
+        let mut t = task(
+            "bcb-mean",
+            "mean",
+            &["test_basic", "test_single"],
+            &["test_basic", "test_single", "test_empty"],
+        );
+        t.unit_test = Some(suite.to_owned());
+
+        // Buggy: correct on the visible half, ZeroDivisionError (not ValueError) on empty.
+        let buggy = "def task_func(xs):\n    return sum(xs) / len(xs)\n";
+        let (vp, vt) = suite_score(sb.as_ref(), &t, buggy, &t.visible_cases, &limits).expect("run");
+        assert_eq!((vp, vt), (2, 2), "buggy code passes the whole visible gate");
+        let (hp, ht) = suite_score(sb.as_ref(), &t, buggy, &t.hidden_cases, &limits).expect("run");
+        assert_eq!(
+            (hp, ht),
+            (2, 3),
+            "and fails the held-out case — a false accept"
+        );
+
+        // Correct: passes both halves.
+        let good = "def task_func(xs):\n    if not xs:\n        raise ValueError('empty')\n    return sum(xs) / len(xs)\n";
+        let (gp, gt) = suite_score(sb.as_ref(), &t, good, &t.hidden_cases, &limits).expect("run");
+        assert_eq!((gp, gt), (3, 3));
+
+        // Now the environment failure: alpine has no numpy, so this task cannot be scored.
+        let mut np = t.clone();
+        np.unit_test = Some(format!("import numpy as np\n{suite}"));
+        let err = suite_score(sb.as_ref(), &np, good, &np.visible_cases, &limits)
+            .expect_err("a missing library must abort the run");
+        assert!(err.contains("numpy"), "must name the module: {err}");
+    }
 
     #[test]
     #[ignore = "requires a running container daemon"]
@@ -1190,7 +1409,7 @@ pub fn run_probe_study(
         let mut samples: Vec<(String, bool)> = Vec::with_capacity(k as usize);
         for _ in 0..k {
             let sol = solver.solve(task)?;
-            let (vp, vt) = suite_score(sb, task, &sol.code, &task.visible_cases, &limits);
+            let (vp, vt) = suite_score(sb, task, &sol.code, &task.visible_cases, &limits)?;
             let full = vt > 0 && vp == vt;
             samples.push((sol.code, full));
         }
@@ -1207,7 +1426,7 @@ pub fn run_probe_study(
             .map(|(c, _)| c.clone())
             .unwrap_or_default();
         let served_visible_full_pass = visible_pass_count > 0;
-        let (hp, ht) = suite_score(sb, task, &served_code, &task.hidden_cases, &limits);
+        let (hp, ht) = suite_score(sb, task, &served_code, &task.hidden_cases, &limits)?;
         let served_oracle_correct = ht > 0 && hp == ht;
 
         points.push(ProbePoint {
