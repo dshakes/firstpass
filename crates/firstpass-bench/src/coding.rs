@@ -580,10 +580,25 @@ impl CandidateSolver for LiveSolver {
                 Err(e) => return Err(e),
             }
         }
-        Err(format!(
-            "{last} on {:?} even at 4096 max_tokens — the model emitted no text at any budget",
+        // Out of budgets. This is NOT a harness failure — it is the candidate failing to produce
+        // a solution, which is an ordinary benchmark outcome and must be scored, not escalated
+        // into an abort. Treating it as fatal is what killed this run on task 31 of 974, throwing
+        // away 30 tasks' worth of paid calls over one model that would not answer.
+        //
+        // Empty code scores 0 on both the visible and hidden suites, so it lands as the wrong
+        // answer it is. The warning is what stops that being silent: a handful of these is the
+        // model having a bad day, a hundred is an API problem, and the log has to let you tell
+        // the difference.
+        eprintln!(
+            "WARNING: {:?} produced no text at any budget ({last}) — scoring it as a failed \
+             candidate. Many of these in one run means an API problem, not a model one.",
             task.id
-        ))
+        );
+        Ok(Solution {
+            code: String::new(),
+            in_tokens: 0,
+            out_tokens: 0,
+        })
     }
 }
 
@@ -1145,6 +1160,42 @@ mod tests {
         assert!(
             runner.contains("test_a") && !runner.contains("test_b"),
             "the runner must select only the visible methods"
+        );
+    }
+
+    /// An empty candidate is a WRONG ANSWER, not a broken harness. Scored against any real suite
+    /// it fails every case, which is exactly what "the model produced no solution" means. The
+    /// first version aborted instead, and one such task (mbpp-31 of 974) discarded thirty tasks
+    /// of paid calls.
+    #[test]
+    fn an_empty_candidate_scores_zero_rather_than_stopping_the_run() {
+        struct EmptyEcho;
+        impl Sandbox for EmptyEcho {
+            fn runtime(&self) -> &str {
+                "empty"
+            }
+            fn run(
+                &self,
+                u: &ExecUnit,
+                _: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                // Stand in for real Python: empty solution ⇒ nothing importable ⇒ no case passes.
+                let code = &u.files.first().expect("a file").1;
+                let n = if code.trim().is_empty() { 0 } else { 2 };
+                Ok(ExecOutcome::Completed {
+                    exit_code: 0,
+                    stdout: format!("FP_SCORE {n} 2\n"),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let t = task("t", "p", &["a", "b"], &["a", "b"]);
+        let empty = MockSolver::new(vec![(t.id.as_str(), "")]);
+        let o = evaluate_task(&EmptyEcho, &empty, &t, &Limits::default())
+            .expect("an empty candidate must be scored, not aborted");
+        assert!(
+            (o.gate_score - 0.0).abs() < 1e-9 && !o.gate_full_pass && !o.oracle_correct,
+            "an empty candidate is simply wrong: {o:?}"
         );
     }
 
