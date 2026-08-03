@@ -1234,7 +1234,7 @@ serve_threshold = 0.75
 
     #[test]
     fn from_toml_no_threshold_is_none() {
-        let toml = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"m\"]\n";
+        let toml = "[[price]]\nmodel = \"m\"\ninput_per_mtok = 1.0\noutput_per_mtok = 5.0\n[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"m\"]\n";
         let p = CandidatePolicy::from_toml(toml).unwrap();
         assert!(p.serve_threshold.is_none());
     }

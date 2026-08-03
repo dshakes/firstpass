@@ -111,7 +111,12 @@ impl Provider {
                 "[[provider]]                # local rung; escalates to a frontier model\n\
                  id       = \"ollama\"\n\
                  dialect  = \"openai\"\n\
-                 base_url = \"http://localhost:11434\"   # keyless\n",
+                 base_url = \"http://localhost:11434\"   # keyless\n\
+                 \n\
+                 [[price]]                   # you host it, so the tokens really are free —\n\
+                 model          = \"ollama/qwen2.5-coder:7b\"   # but the receipt has to SAY so,\n\
+                 input_per_mtok  = 0.0       # rather than infer $0.00 from a missing price\n\
+                 output_per_mtok = 0.0\n",
             ),
         }
     }

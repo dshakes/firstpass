@@ -49,7 +49,12 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          git fetch --quiet origin "refs/pull/$PR/merge"
+          # `refs/pull/N/head` (the PR's own tip), NOT `refs/pull/N/merge`: the merge ref is
+          # ephemeral — GitHub deletes it the moment the PR merges or closes, so a run that
+          # starts near the merge fetches a ref that no longer exists and dies `fatal:
+          # couldn't find remote ref`. The head ref is permanent. Three-dot diff against the
+          # base still yields exactly the PR's own changes.
+          git fetch --quiet origin "refs/pull/$PR/head"
           git diff "$BASE"...FETCH_HEAD > pr-diff.patch
           wc -l pr-diff.patch
       - name: Gemini cross-audit

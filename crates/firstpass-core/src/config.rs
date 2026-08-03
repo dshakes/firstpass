@@ -938,6 +938,7 @@ impl Config {
                 )));
             }
         }
+        config.validate_ladders_are_priced()?;
         if let Some(b) = &config.escalation.bandit {
             if !b.exploration.is_finite() || b.exploration < 0.0 {
                 return Err(Error::InvalidConfig(format!(
@@ -1016,6 +1017,50 @@ impl Config {
     #[must_use]
     pub fn route_for(&self, f: &Features) -> Option<&Route> {
         self.routes.iter().find(|r| r.match_.matches(f))
+    }
+
+    /// The effective price table: built-in defaults with this config's `[[price]]` blocks applied.
+    #[must_use]
+    pub fn price_table(&self) -> crate::cost::PriceTable {
+        self.price_defs
+            .iter()
+            .fold(crate::cost::PriceTable::defaults(), |table, p| {
+                table.with_override(
+                    p.model.clone(),
+                    crate::cost::ModelPrice {
+                        input_per_mtok: p.input_per_mtok,
+                        output_per_mtok: p.output_per_mtok,
+                    },
+                )
+            })
+    }
+
+    /// Every ladder rung must resolve to a price.
+    ///
+    /// An unpriced rung is not a missing number, it is a **fabricated one**: the router falls
+    /// back to `$0.00` for that call, so the receipt reports a spend nobody measured and a
+    /// `[budget]` cap fed by that total can never trip. The built-in table only knows the
+    /// first-party models, so this is precisely the bring-your-own-provider path.
+    ///
+    /// A genuinely free rung (a local model you host) is still legal — declare it as an
+    /// explicit `[[price]]` of `0`, so the receipt's `$0.00` is a stated fact rather than a
+    /// silent fallback.
+    fn validate_ladders_are_priced(&self) -> Result<()> {
+        let prices = self.price_table();
+        for (i, route) in self.routes.iter().enumerate() {
+            for rung in &route.ladder {
+                if prices.get(rung).is_none() {
+                    return Err(Error::InvalidConfig(format!(
+                        "route[{i}] ladder rung {rung:?} has no price, so its cost would be \
+                         recorded as $0.00 and any [budget] cap would never trip. Declare it:\n\n\
+                         [[price]]\nmodel = {rung:?}\ninput_per_mtok = 0.0\noutput_per_mtok = 0.0\n\n\
+                         (use the real per-1M-token prices; 0.0 is correct only for a model you \
+                         host yourself)"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1218,6 +1263,13 @@ api_key_env = "GROQ_API_KEY"
 id = "ollama"
 dialect = "openai"
 base_url = "http://localhost:11434"
+
+# A bring-your-own provider has no built-in price, so the ladder must declare one or the
+# receipt would report $0.00 for every Groq call.
+[[price]]
+model = "groq/llama-3.3-70b-versatile"
+input_per_mtok = 0.59
+output_per_mtok = 0.79
 
 [[route]]
 match = {}
@@ -1711,12 +1763,46 @@ discount = 0.98
         assert!(Config::parse(&base.replace("l2 = 0.001", "l2 = -1.0")).is_err());
     }
 
+    /// An unpriced ladder rung must be rejected at parse. The router prices a call with
+    /// `cost_usd(..).unwrap_or(0.0)`, so accepting one would put a spend nobody measured into a
+    /// tamper-evident receipt and leave every `[budget]` cap permanently un-trippable — the two
+    /// failures this product can least afford.
+    #[test]
+    fn unpriced_ladder_rung_is_rejected_and_an_explicit_price_fixes_it() {
+        let unpriced =
+            "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"ollama/qwen2.5-coder:7b\"]\n";
+        let err = Config::parse(unpriced).expect_err("an unpriced rung must not parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ollama/qwen2.5-coder:7b") && msg.contains("[[price]]"),
+            "the error must name the rung and the fix, got: {msg}"
+        );
+
+        // A self-hosted model really is free — but it has to SAY so.
+        let declared = format!(
+            "[[price]]\nmodel = \"ollama/qwen2.5-coder:7b\"\ninput_per_mtok = 0.0\noutput_per_mtok = 0.0\n{unpriced}"
+        );
+        let cfg = Config::parse(&declared).expect("an explicit zero price is legal");
+        assert_eq!(
+            cfg.price_table()
+                .get("ollama/qwen2.5-coder:7b")
+                .unwrap()
+                .input_per_mtok,
+            0.0
+        );
+
+        // The built-in first-party models still need no ceremony.
+        assert!(
+            Config::parse("[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n").is_ok()
+        );
+    }
+
     /// Shadow is off unless asked for, and a nonsensical setting must fail loudly at parse rather
     /// than being clamped — a silently-corrected ceiling would spend a different amount than the
     /// operator authorised.
     #[test]
     fn shadow_config_parses_and_validates() {
-        let base = "[[route]]\nmatch = {}\nmode = \"observe\"\nladder = [\"anthropic/a\"]\n";
+        let base = "[[route]]\nmatch = {}\nmode = \"observe\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n";
         let none = Config::parse(base).unwrap();
         assert!(
             none.routes[0].shadow.is_none(),
@@ -1746,7 +1832,7 @@ discount = 0.98
     /// Same for rollout: absent by default, invalid percent rejected at parse.
     #[test]
     fn rollout_config_parses_and_validates() {
-        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/a\"]\n";
+        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n";
         assert!(Config::parse(base).unwrap().routes[0].rollout.is_none());
         let ok = Config::parse(&format!(
             "{base}[route.rollout]\npercent = 5.0\nkey = \"session\"\n"

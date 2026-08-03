@@ -31,6 +31,10 @@ jobs:
             model: openai/gpt-4.1-mini
             secret: OPENAI_API_KEY
             toml: ""
+          # A bring-your-own provider has no built-in price, and an unpriced rung is now
+          # rejected at config parse (it would bank a $0.00 receipt). The values below are
+          # nominal smoke placeholders, NOT a price reference — the smoke asserts a served
+          # response and a receipt, never a cost figure.
           - provider: groq
             model: groq/llama-3.3-70b-versatile
             secret: GROQ_API_KEY
@@ -40,6 +44,10 @@ jobs:
               dialect = "openai"
               base_url = "https://api.groq.com/openai"
               api_key_env = "GROQ_API_KEY"
+              [[price]]
+              model = "groq/llama-3.3-70b-versatile"
+              input_per_mtok = 0.59
+              output_per_mtok = 0.79
           - provider: deepseek
             model: deepseek/deepseek-chat
             secret: DEEPSEEK_API_KEY
@@ -49,6 +57,10 @@ jobs:
               dialect = "openai"
               base_url = "https://api.deepseek.com"
               api_key_env = "DEEPSEEK_API_KEY"
+              [[price]]
+              model = "deepseek/deepseek-chat"
+              input_per_mtok = 0.27
+              output_per_mtok = 1.10
           - provider: openrouter
             model: openrouter/openai/gpt-4.1-mini
             secret: OPENROUTER_API_KEY
@@ -58,12 +70,18 @@ jobs:
               dialect = "openai"
               base_url = "https://openrouter.ai/api"
               api_key_env = "OPENROUTER_API_KEY"
+              [[price]]
+              model = "openrouter/openai/gpt-4.1-mini"
+              input_per_mtok = 0.40
+              output_per_mtok = 1.60
+          # Provider id `google`, not `gemini`: that is the id the built-in price table and
+          # `firstpass onboard` both use, so this smoke exercises the config we actually ship.
           - provider: gemini
-            model: gemini/gemini-3.1-flash
+            model: google/gemini-3.1-flash
             secret: GEMINI_API_KEY
             toml: |
               [[provider]]
-              id = "gemini"
+              id = "google"
               dialect = "gemini"
               base_url = "https://generativelanguage.googleapis.com"
               api_key_env = "GEMINI_API_KEY"
@@ -79,6 +97,9 @@ jobs:
           if [ -z "$KEY" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "::notice::${{ matrix.provider }}: secret ${{ matrix.secret }} not configured — skipped (NOT verified)"
+            # A skipped job still reports GREEN, so the run summary read "5 of 6 providers
+            # passing" while five of them had never placed a call. Say so where it is read.
+            echo "| ${{ matrix.provider }} | \`${{ matrix.model }}\` | ⏭️ **skipped** — no \`${{ matrix.secret }}\` secret, NOT verified |" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -101,4 +122,9 @@ jobs:
           EXTRA_TOML: ${{ matrix.toml }}
         run: |
           set -euo pipefail
-          bash scripts/provider-smoke.sh
+          if bash scripts/provider-smoke.sh; then
+            echo "| ${{ matrix.provider }} | \`${{ matrix.model }}\` | ✅ wire-verified (served + receipt) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| ${{ matrix.provider }} | \`${{ matrix.model }}\` | ❌ **FAILED** against the real endpoint |" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
