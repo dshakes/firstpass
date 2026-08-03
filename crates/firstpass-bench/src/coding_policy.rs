@@ -202,7 +202,8 @@ pub fn measure_resumable(
     judge: Option<&dyn Judge>,
     checkpoint: Option<&std::path::Path>,
 ) -> Result<Vec<Vec<RungOutcome>>, String> {
-    let mut done = load_checkpoint(checkpoint);
+    let ladder_ids: Vec<String> = rungs.iter().map(|r| r.model.clone()).collect();
+    let mut done = load_checkpoint(checkpoint, &ladder_ids);
     if !done.is_empty() {
         eprintln!("resuming: {} tasks already measured", done.len());
     }
@@ -235,7 +236,7 @@ pub fn measure_resumable(
                 judge_score: o.judge_score,
             });
         }
-        append_checkpoint(checkpoint, &task.id, &row);
+        append_checkpoint(checkpoint, &task.id, &ladder_ids, &row);
         matrix.push(row);
     }
     Ok(matrix)
@@ -244,7 +245,10 @@ pub fn measure_resumable(
 /// Read a checkpoint into `task_id -> row`. A malformed or absent file yields nothing and the run
 /// simply measures everything: a checkpoint is an optimisation, never a source of truth, so it
 /// must not be able to fail a run or — worse — inject a row nobody measured.
-fn load_checkpoint(path: Option<&std::path::Path>) -> HashMap<String, Vec<RungOutcome>> {
+fn load_checkpoint(
+    path: Option<&std::path::Path>,
+    ladder: &[String],
+) -> HashMap<String, Vec<RungOutcome>> {
     let Some(p) = path else {
         return HashMap::new();
     };
@@ -253,16 +257,25 @@ fn load_checkpoint(path: Option<&std::path::Path>) -> HashMap<String, Vec<RungOu
     };
     text.lines()
         .filter_map(|l| serde_json::from_str::<CheckpointRow>(l).ok())
+        // Only rows measured with THIS ladder. One file can therefore hold several ladders
+        // safely, and a mismatch costs a re-measure rather than a wrong number.
+        .filter(|r| r.ladder == ladder)
         .map(|r| (r.task_id, r.rungs))
         .collect()
 }
 
 /// Append one finished task. Best-effort by the same reasoning: a failure to checkpoint must not
 /// discard a measurement that was already paid for.
-fn append_checkpoint(path: Option<&std::path::Path>, task_id: &str, row: &[RungOutcome]) {
+fn append_checkpoint(
+    path: Option<&std::path::Path>,
+    task_id: &str,
+    ladder: &[String],
+    row: &[RungOutcome],
+) {
     let Some(p) = path else { return };
     let line = serde_json::to_string(&CheckpointRow {
         task_id: task_id.to_owned(),
+        ladder: ladder.to_vec(),
         rungs: row.to_vec(),
     });
     if let Ok(line) = line {
@@ -280,6 +293,12 @@ fn append_checkpoint(path: Option<&std::path::Path>, task_id: &str, row: &[RungO
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CheckpointRow {
     task_id: String,
+    /// The ladder these measurements were taken with. **Load-bearing.** A checkpoint keyed only by
+    /// task id would hand haiku->sonnet rows back to a haiku->opus run and report them as opus —
+    /// a fabricated result with no symptom at all, since every field would look perfectly normal.
+    /// Rows whose ladder differs from the current one are ignored and re-measured.
+    #[serde(default)]
+    ladder: Vec<String>,
     rungs: Vec<RungOutcome>,
 }
 
@@ -856,9 +875,9 @@ mod tests {
         let p = dir.join(format!("fp-ckpt-{}.jsonl", std::process::id()));
 
         let row = vec![o(true, true, 0.01), o(true, true, 0.10)];
-        append_checkpoint(Some(&p), "mbpp-1", &row);
-        append_checkpoint(Some(&p), "mbpp-2", &row);
-        let loaded = load_checkpoint(Some(&p));
+        append_checkpoint(Some(&p), "mbpp-1", &ladder(), &row);
+        append_checkpoint(Some(&p), "mbpp-2", &ladder(), &row);
+        let loaded = load_checkpoint(Some(&p), &ladder());
         assert_eq!(loaded.len(), 2);
         let back = &loaded["mbpp-1"];
         assert_eq!(back.len(), 2);
@@ -874,14 +893,24 @@ mod tests {
         writeln!(f, "{{\"task_id\": \"mbpp-3\", \"rungs\": [{{\"gate_sc").unwrap();
         drop(f);
         assert_eq!(
-            load_checkpoint(Some(&p)).len(),
+            load_checkpoint(Some(&p), &ladder()).len(),
             2,
             "a torn line is skipped; the intact rows survive"
         );
 
+        // A DIFFERENT ladder must not reuse these rows. Without this, measuring haiku->opus
+        // would silently return the haiku->sonnet numbers and label them opus — a fabricated
+        // result with no symptom, because every field would look entirely normal.
+        let other = vec!["cheap".to_owned(), "different-top".to_owned()];
+        assert!(
+            load_checkpoint(Some(&p), &other).is_empty(),
+            "rows measured with another ladder must be re-measured, never reused"
+        );
+
         std::fs::remove_file(&p).ok();
         assert!(
-            load_checkpoint(Some(&p)).is_empty() && load_checkpoint(None).is_empty(),
+            load_checkpoint(Some(&p), &ladder()).is_empty()
+                && load_checkpoint(None, &ladder()).is_empty(),
             "a missing checkpoint just means measure everything"
         );
     }
