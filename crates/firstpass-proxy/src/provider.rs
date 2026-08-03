@@ -581,8 +581,9 @@ fn gemini_parse_response(json: &Value) -> Result<(String, u64, u64), ProviderErr
 /// API). The API key goes in the `x-goog-api-key` header — never the URL query string, so it stays
 /// out of logs and proxies.
 ///
-// LIVE-UNVERIFIED: the request/response translation is unit-tested offline; it has not yet been
-// exercised against a real Gemini endpoint. Verify against a real key before relying on it.
+// LIVE-VERIFIED (2026-08-03): served `google/gemini-3.5-flash-lite` end to end through the real
+// proxy against the real endpoint, with a receipt, in the `provider-smoke` matrix. Note the
+// timestamp — that is a claim about a commit, not a standing property.
 #[derive(Debug, Clone)]
 pub struct GeminiProvider {
     /// Ladder prefix / trace label (usually `"gemini"` or `"google"`).
