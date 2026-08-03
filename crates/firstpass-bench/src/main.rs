@@ -224,7 +224,12 @@ fn main() {
         if judge.is_some() {
             eprintln!("judge enabled — one extra call per candidate");
         }
-        match firstpass_bench::coding_policy::measure_judged(
+        // Checkpoint beside the dataset. A ~2000-call run WILL be interrupted eventually; without
+        // this, every call already paid for goes with it.
+        let ckpt = std::env::var("FIRSTPASS_CODING_CHECKPOINT")
+            .unwrap_or_else(|_| format!("{dataset_path}.checkpoint.jsonl"));
+        eprintln!("checkpoint: {ckpt} (delete it to force a clean re-measure)");
+        match firstpass_bench::coding_policy::measure_resumable(
             &tasks,
             &rungs,
             sb.as_ref(),
@@ -233,6 +238,7 @@ fn main() {
             judge
                 .as_ref()
                 .map(|j| j as &dyn firstpass_bench::coding::Judge),
+            Some(std::path::Path::new(&ckpt)),
         ) {
             Ok(matrix) => {
                 let study = firstpass_bench::coding_policy::replay(&matrix, &ladder, sb.runtime());
