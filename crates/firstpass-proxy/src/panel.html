@@ -51,6 +51,13 @@
   const usd = n => (Number(n || 0) < 0 ? '-$' : '$') + Math.abs(Number(n || 0)).toFixed(4);
   const cls = v => ({ pass: 'pass', fail: 'fail', abstain: 'abstain' })[String(v).toLowerCase()] || '';
 
+  // Receipt fields are ATTACKER-CONTROLLED. `model` is echoed from the caller's request body on
+  // the observe path and stored in the trace, so anyone who can send one request through this
+  // proxy can plant markup that runs when an operator opens this page. Everything interpolated
+  // below goes through here.
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
   async function tick() {
     let data;
     try {
@@ -81,18 +88,19 @@
     savedEl.textContent = usd(saved) + (base > 0 ? ` (${Math.round(saved / base * 100)}%)` : '');
     savedEl.style.color = saved < 0 ? 'var(--amber)' : 'var(--mint)';
 
+    const num = n => Number(n || 0).toLocaleString();
     list.innerHTML = receipts.map(r => `
       <div class="r">
         <div class="rh">
-          <span>${r.trace_id}</span>
-          <span>served rung ${r.served_rung ?? '—'} · ${usd(r.total_cost_usd)} of ${usd(r.baseline_usd)}</span>
+          <span>${esc(r.trace_id)}</span>
+          <span>served rung ${esc(r.served_rung ?? '—')} · ${usd(r.total_cost_usd)} of ${usd(r.baseline_usd)}</span>
         </div>
         ${(r.attempts || []).map(a => `
           <div class="rung">
-            <span class="n">rung ${a.rung}</span>
-            <span class="m">${a.model}</span>
-            <span class="${cls(a.verdict)}">${String(a.verdict).toUpperCase()}</span>
-            <span class="cost">${usd(a.cost_usd)} · ${a.latency_ms}ms</span>
+            <span class="n">rung ${esc(a.rung)}</span>
+            <span class="m">${esc(a.model)}</span>
+            <span class="${cls(a.verdict)}">${esc(String(a.verdict).toUpperCase())}</span>
+            <span class="cost">${usd(a.cost_usd)} · ${num(a.latency_ms)}ms</span>
           </div>`).join('')}
       </div>`).join('');
   }

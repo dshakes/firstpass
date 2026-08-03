@@ -136,11 +136,13 @@ fn build_runner(cases: &[String]) -> String {
 /// Build the runner for a `unittest` task: import the case module (candidate code + the suite),
 /// run only the named test methods, and print `FP_SCORE p n`.
 ///
-/// It imports inside a `try` so a **missing third-party library is reported as `FP_ENVERR`, not
-/// as a failed test**. That distinction decides whether the benchmark is measuring anything: a
-/// sandbox without `numpy` would score every numpy-using task 0, which reads as an enormous gate
-/// error rate and would produce a completely fictitious conformal bound. The harness aborts on
-/// `FP_ENVERR` instead of publishing it.
+/// A missing module is reported as `FP_MISSING <name>` — deliberately NOT as a verdict. `fp_case`
+/// is candidate code *concatenated with* the suite, so a missing import there has two completely
+/// different meanings and the runner cannot tell them apart: the sandbox image genuinely lacks a
+/// library the task needs (an environment failure that must abort the run), or the candidate wrote
+/// `import numppy` (an ordinary model mistake that must score zero). Treating the second as the
+/// first would let one bad candidate kill an entire benchmark run. [`attribute_missing_module`]
+/// decides which it was by re-running the suite alone.
 fn build_unittest_runner(names: &[String]) -> String {
     let json = serde_json::to_string(names).unwrap_or_else(|_| "[]".to_owned());
     format!(
@@ -149,8 +151,8 @@ fn build_unittest_runner(names: &[String]) -> String {
          try:\n\
          \x20   import fp_case\n\
          except ModuleNotFoundError as e:\n\
-         \x20   print('FP_ENVERR %s' % e.name); sys.exit(0)\n\
-         except Exception as e:\n\
+         \x20   print('FP_MISSING %s' % e.name); sys.exit(0)\n\
+         except Exception:\n\
          \x20   print('FP_SCORE 0 %d' % len(NAMES)); sys.exit(0)\n\
          suite = unittest.TestSuite()\n\
          found = 0\n\
@@ -163,9 +165,46 @@ fn build_unittest_runner(names: &[String]) -> String {
          \x20   res = unittest.TextTestRunner(stream=devnull, verbosity=0).run(suite)\n\
          for _t, tb in res.errors:\n\
          \x20   if 'ModuleNotFoundError' in tb:\n\
-         \x20       print('FP_ENVERR lazy-import'); sys.exit(0)\n\
+         \x20       print('FP_MISSING lazy-import'); sys.exit(0)\n\
          print('FP_SCORE %d %d' % (found - len(res.failures) - len(res.errors), found))\n"
     )
+}
+
+/// Import the task's suite **without** the candidate's code, to decide who is responsible for a
+/// missing module.
+///
+/// If the suite alone cannot import, the image is missing a library the dataset needs and the run
+/// must stop. If it imports cleanly, the missing module came from the candidate — an ordinary
+/// wrong answer, scored zero like any other. Only run on the error path, so it costs nothing in
+/// the common case.
+fn build_suite_probe() -> String {
+    "try:\n\
+     \x20   import fp_suite\n\
+     except ModuleNotFoundError as e:\n\
+     \x20   print('FP_SUITE_MISSING %s' % e.name)\n\
+     except Exception:\n\
+     \x20   pass\n\
+     print('FP_PROBE_DONE')\n"
+        .to_owned()
+}
+
+/// `Some(module)` when the dataset's own suite cannot import — i.e. the sandbox image is at fault.
+fn attribute_missing_module(sb: &dyn Sandbox, suite_src: &str, limits: &Limits) -> Option<String> {
+    let unit = ExecUnit {
+        files: vec![
+            ("fp_suite.py".to_owned(), suite_src.to_owned()),
+            ("fp_probe.py".to_owned(), build_suite_probe()),
+        ],
+        command: "python3 fp_probe.py".to_owned(),
+    };
+    match sb.run(&unit, limits) {
+        Ok(ExecOutcome::Completed { stdout, .. }) => stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("FP_SUITE_MISSING "))
+            .map(|m| m.trim().to_owned()),
+        // The probe itself could not run; do not claim the environment is broken on that basis.
+        _ => None,
+    }
 }
 
 /// Parse `FP_SCORE p n` out of runner stdout.
@@ -216,13 +255,23 @@ fn suite_score(
             stdout,
             ..
         }) => {
-            if let Some(module) = parse_enverr(&stdout) {
-                return Err(format!(
-                    "sandbox image is missing the Python module {module:?} that task {:?} needs. \
-                     Scoring this as a failed test would fabricate gate error, so the run stops. \
-                     Pin an image that carries the dataset's libraries (FIRSTPASS_SANDBOX_IMAGE).",
-                    task.id
-                ));
+            if parse_missing(&stdout).is_some() {
+                // Ask who is actually responsible before blaming the environment: `fp_case` holds
+                // the candidate's code as well as the suite, and a candidate that typos an import
+                // must be scored wrong, not allowed to abort the run.
+                if let Some(suite_src) = &task.unit_test
+                    && let Some(module) = attribute_missing_module(sb, suite_src, limits)
+                {
+                    return Err(format!(
+                        "sandbox image is missing the Python module {module:?} that task {:?} \
+                         needs — the dataset's own test suite cannot import without it. Scoring \
+                         this as a failed test would fabricate gate error, so the run stops. Pin \
+                         an image carrying the dataset's libraries (FIRSTPASS_SANDBOX_IMAGE).",
+                        task.id
+                    ));
+                }
+                // The suite imports fine, so the missing module came from the candidate.
+                return Ok((0, cases.len()));
             }
             Ok(parse_score(&stdout).unwrap_or((0, cases.len())))
         }
@@ -230,11 +279,12 @@ fn suite_score(
     }
 }
 
-/// Parse the module name out of an `FP_ENVERR <module>` line.
-fn parse_enverr(stdout: &str) -> Option<String> {
+/// Parse the module name out of an `FP_MISSING <module>` line. Says a module was missing, not
+/// whose fault that was — see [`attribute_missing_module`].
+fn parse_missing(stdout: &str) -> Option<String> {
     stdout
         .lines()
-        .find_map(|l| l.strip_prefix("FP_ENVERR "))
+        .find_map(|l| l.strip_prefix("FP_MISSING "))
         .map(|m| m.trim().to_owned())
 }
 
@@ -1079,42 +1129,76 @@ mod tests {
         );
     }
 
-    /// A sandbox image missing a library is an ENVIRONMENT failure, not a wrong answer. Scoring it
-    /// as a failed test would manufacture gate error out of nothing and hand back a conformal
-    /// bound computed from a fiction, so the run must abort instead.
+    /// A missing module means two different things and they must not be conflated. `fp_case` is
+    /// candidate code concatenated with the suite, so the runner alone cannot tell "the image
+    /// lacks numpy" from "the candidate typed `import numppy`". Blaming the environment for the
+    /// second lets one bad candidate abort an entire run; blaming the candidate for the first
+    /// invents gate error and yields a bound computed from fiction.
     #[test]
-    fn a_missing_library_aborts_the_run_rather_than_scoring_zero() {
-        struct EnvErrSandbox;
-        impl Sandbox for EnvErrSandbox {
+    fn a_missing_module_is_attributed_before_it_is_blamed() {
+        /// Reports the module missing from `fp_case`; the suite-only probe reports what it is
+        /// told to, which is how the two cases are separated.
+        struct MissingSandbox {
+            suite_also_fails: bool,
+        }
+        impl Sandbox for MissingSandbox {
             fn runtime(&self) -> &str {
-                "enverr"
+                "missing"
             }
             fn run(
                 &self,
-                _: &ExecUnit,
+                u: &ExecUnit,
                 _: &Limits,
             ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                let is_probe = u.files.iter().any(|(p, _)| p == "fp_probe.py");
+                let stdout = if is_probe {
+                    if self.suite_also_fails {
+                        "FP_SUITE_MISSING numpy\nFP_PROBE_DONE\n"
+                    } else {
+                        "FP_PROBE_DONE\n"
+                    }
+                } else {
+                    "FP_MISSING numpy\n"
+                };
                 Ok(ExecOutcome::Completed {
                     exit_code: 0,
-                    stdout: "FP_ENVERR numpy\n".to_owned(),
+                    stdout: stdout.to_owned(),
                     stderr: String::new(),
                 })
             }
         }
         let mut t = task("u", "p", &["test_a"], &["test_a"]);
-        t.unit_test = Some("import unittest\n".to_owned());
+        t.unit_test = Some("import numpy\nimport unittest\n".to_owned());
+
+        // The dataset's own suite cannot import: the image is at fault, so the run stops.
         let err = suite_score(
-            &EnvErrSandbox,
+            &MissingSandbox {
+                suite_also_fails: true,
+            },
             &t,
             "code",
             &t.visible_cases,
             &Limits::default(),
         )
-        .expect_err("a missing module must abort, not score 0");
+        .expect_err("a library the DATASET needs must abort");
         assert!(
             err.contains("numpy") && err.contains("fabricate"),
             "the error must name the module and say why it stops: {err}"
         );
+
+        // The suite imports fine, so the bad import was the candidate's: score it wrong and carry
+        // on. An ordinary model mistake must never be able to kill an entire run.
+        let scored = suite_score(
+            &MissingSandbox {
+                suite_also_fails: false,
+            },
+            &t,
+            "import numppy",
+            &t.visible_cases,
+            &Limits::default(),
+        )
+        .expect("a candidate's own bad import must be scored, not aborted");
+        assert_eq!(scored, (0, 1));
     }
 
     /// Wiring end-to-end with a fake sandbox that reports partial visible scores via `FP_SCORE`.
@@ -1239,12 +1323,21 @@ mod tests {
         let (gp, gt) = suite_score(sb.as_ref(), &t, good, &t.hidden_cases, &limits).expect("run");
         assert_eq!((gp, gt), (3, 3));
 
-        // Now the environment failure: alpine has no numpy, so this task cannot be scored.
+        // Environment failure: alpine has no numpy and the DATASET's suite needs it, so the run
+        // must stop rather than score every numpy task zero.
         let mut np = t.clone();
         np.unit_test = Some(format!("import numpy as np\n{suite}"));
         let err = suite_score(sb.as_ref(), &np, good, &np.visible_cases, &limits)
-            .expect_err("a missing library must abort the run");
+            .expect_err("a library the dataset needs must abort the run");
         assert!(err.contains("numpy"), "must name the module: {err}");
+
+        // Candidate failure, same symptom, opposite verdict: the suite is fine and the CANDIDATE
+        // typo'd an import. That is an ordinary wrong answer and must be scored, never allowed to
+        // abort — one bad model output would otherwise take the whole benchmark down.
+        let typo = format!("import numppy\n{good}");
+        let (cp, ct) = suite_score(sb.as_ref(), &t, &typo, &t.visible_cases, &limits)
+            .expect("a candidate's own bad import must be scored, not aborted");
+        assert_eq!((cp, ct), (0, 2), "scored zero, run intact");
     }
 
     #[test]

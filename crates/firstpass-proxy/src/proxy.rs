@@ -344,7 +344,13 @@ async fn receipts(
             serde_json::json!({
                 "trace_id": t.trace_id,
                 "served_rung": f.served_rung,
-                "served_model": t.attempts.last().map(|a| a.model.clone()),
+                // The attempt matching `served_rung`, NOT the last one recorded. Under speculative
+                // escalation the rungs resolve out of order, and under best-attempt fallback the
+                // served rung is not the final entry — so `attempts.last()` would name a model
+                // that never served this response.
+                "served_model": f.served_rung
+                    .and_then(|r| t.attempts.iter().find(|a| a.rung == r))
+                    .map(|a| a.model.clone()),
                 "attempts": t.attempts.iter().map(|a| serde_json::json!({
                     "rung": a.rung,
                     "model": a.model,
@@ -3733,6 +3739,23 @@ mod tests {
             !html.contains("http://") && !html.contains("https://"),
             "the panel must not reference any external origin"
         );
+        // Stored XSS guard. `model` is echoed from the CALLER's request body on the observe path
+        // and stored in the trace, so anyone who can send one request through this proxy can
+        // plant markup that runs when an operator opens this page. Every receipt field that
+        // reaches innerHTML must go through the escaper.
+        assert!(html.contains("const esc ="), "the escaper must exist");
+        for raw in [
+            "${a.model}",
+            "${a.rung}",
+            "${a.verdict}",
+            "${r.trace_id}",
+            "${r.served_rung}",
+        ] {
+            assert!(
+                !html.contains(raw),
+                "receipt field interpolated unescaped into innerHTML: {raw}"
+            );
+        }
 
         let data = router
             .oneshot(
