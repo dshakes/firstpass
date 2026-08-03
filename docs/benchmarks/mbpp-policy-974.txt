@@ -1,0 +1,28 @@
+# firstpass-bench --coding-policy · MBPP · routing-policy comparison
+# date: 2026-08-03 · candidate: live Anthropic · sandbox: docker (runc tier)
+# dataset: mbpp-974.jsonl (974 rows, Muennighoff/mbpp full/test — the same rows behind
+#          mbpp-live-base.txt; `google-research/mbpp` is refused by the datasets-server)
+# ladder: anthropic/claude-haiku-4-5 -> anthropic/claude-sonnet-5  (a 3x price gap — the
+#         NARROWEST realistic ladder, so these savings are a floor, not a headline)
+# command: FIRSTPASS_CODING_DATASET=mbpp-974.jsonl firstpass-bench --coding-policy
+# note: 5 of 974 tasks (0.5%) returned no text from the candidate at any token budget and are
+#       scored as failed candidates; they depress every policy equally.
+## Routing policy on real coding tasks
+
+n = 974 tasks · ladder = anthropic/claude-haiku-4-5 → anthropic/claude-sonnet-5 · sandbox tier = runc
+
+| policy | success | 95% CI | total $ | $/success | served-failure | escalated | converted |
+|---|---|---|---|---|---|---|---|
+| always-cheap | 0.77 | [0.75, 0.80] | $1.3036 | $0.0017 | 0.23 | 0% | 0% |
+| always-top | 0.95 | [0.93, 0.96] | $2.8633 | $0.0031 | 0.05 | 0% | 0% |
+| first-pass | 0.93 | [0.91, 0.94] | $2.4846 | $0.0027 | 0.07 | 19% | 81% |
+
+Paired against always-top (same tasks, so the per-task difference is the test with the power this design actually has):
+
+| vs | Δ success | 95% CI | Δ $/task | 95% CI | fp wins | fp loses |
+|---|---|---|---|---|---|---|
+| always-top | -0.015 | [-0.025, -0.006] | -0.00039 | [-0.00059, -0.00021] | 4 | 19 |
+| always-cheap | +0.157 | [+0.133, +0.181] | +0.00121 | [+0.00097, +0.00148] | 153 | 0 |
+
+VERDICT: **TRADEOFF, MEASURED** — first-pass costs 12% less per success and is 1.5 points worse in quality (paired Δ -0.015, 95% CI [-0.025, -0.006], so the gap is real and not noise). It loses 19 tasks to always-top and wins 4. Whether that trade is worth taking is a product decision, not a benchmark one — but it is now a stated price rather than an unmeasured hope.
+
