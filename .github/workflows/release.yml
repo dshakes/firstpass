@@ -19,6 +19,7 @@ on:
 permissions:
   contents: write          # create + push the tag, publish the Release
   pull-requests: write     # open the Homebrew formula-bump PR
+  actions: write           # dispatch the publish workflows (see the fan-out step below)
 
 concurrency:
   group: release
@@ -152,3 +153,39 @@ jobs:
           git commit -aqm "compass $VERSION"
           git push
           echo "synced compass $VERSION into dshakes/homebrew-tap"
+
+      # Fan out to the publish workflows.
+      #
+      # This step exists because the release above does NOT trigger them on its own, and the
+      # failure is silent: v0.3.0 shipped a public GitHub Release while Docker, crates.io and
+      # PyPI all stayed on the previous version, and `latest` kept serving it.
+      #
+      # The cause is GitHub's recursion guard — events created with GITHUB_TOKEN do not start
+      # workflow runs, so the `git push origin refs/tags/vX.Y.Z` above fires no `push: tags`
+      # trigger no matter how those workflows are written. `workflow_dispatch` is one of the two
+      # documented exceptions and always creates a run, which is why the fan-out is explicit here
+      # rather than a trigger over there:
+      # https://github.blog/changelog/2022-09-08-github-actions-use-github_token-with-workflow_dispatch-and-repository_dispatch/
+      #
+      # Dispatched at the TAG so each publish builds the released commit, not whatever main has
+      # moved on to. Best-effort per channel: a workflow that is absent or whose publish is gated
+      # off must not fail the release that already published.
+      - name: Publish to the distribution channels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -uo pipefail
+          for wf in docker.yml crates-io.yml python-wheels.yml; do
+            if gh workflow run "$wf" --ref "$VERSION" 2>/dev/null; then
+              echo "dispatched $wf @ $VERSION"
+            else
+              echo "::warning::could not dispatch $wf @ $VERSION — publish it by hand from the Actions tab"
+            fi
+          done
+          # npm takes the tag as an input rather than running at the tag ref.
+          if gh workflow run npm-publish.yml --ref main -f tag="$VERSION" 2>/dev/null; then
+            echo "dispatched npm-publish.yml for $VERSION"
+          else
+            echo "::warning::could not dispatch npm-publish.yml for $VERSION"
+          fi

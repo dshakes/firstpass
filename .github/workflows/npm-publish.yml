@@ -4,11 +4,20 @@ name: npm-publish
 # asset (npm is in `installers` but NOT `publish-jobs`); this job downloads it and
 # pushes it to npm using the repo's OIDC identity.
 #
-# TRIGGER: `workflow_run` after the "Release" workflow finishes — NOT `release:
-# published`. A release created by GITHUB_TOKEN (which cargo-dist uses) does NOT
-# fire the `release` event — GitHub suppresses token-created events to avoid
-# recursion, so a `release`-triggered job silently never runs. `workflow_run` fires
-# regardless, so npm auto-publishes on every stable release with no manual step.
+# TRIGGER: dispatched by `release.yml` at the end of a release. NOT `release:
+# published` and no longer `workflow_run`.
+#
+# The reasoning that ruled out `release: published` was right: an event created by
+# GITHUB_TOKEN does not start a workflow run, so a `release`-triggered job silently
+# never fires. The `workflow_run` workaround that replaced it never fired either —
+# it waited on `workflows: ["Release"]` while the release workflow is named
+# `release`, and that match is case-sensitive. Dead config that reads as live, which
+# is worse than none: v0.3.0 published with npm untouched and no error anywhere.
+#
+# `workflow_dispatch` is one of the two documented exceptions to the recursion guard
+# and ALWAYS creates a run, even from GITHUB_TOKEN, so `release.yml` now calls this
+# workflow directly with the tag. One path, and it is the one that is guaranteed to
+# work. Still hand-dispatchable from the Actions tab for a re-publish.
 #
 # One-time npm setup (npmjs.com → the package → Trusted Publisher → GitHub Actions):
 #   Organization or user : dshakes
@@ -18,9 +27,6 @@ name: npm-publish
 #   Allowed actions      : npm publish
 # Then the NPM_TOKEN secret can be deleted — OIDC replaces it.
 on:
-  workflow_run:
-    workflows: ["Release"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -37,10 +43,7 @@ jobs:
     # Manual dispatch, or after a SUCCESSFUL Release run on a stable v* tag (skip
     # rc/prereleases, which carry a '-' suffix — mirrors cargo-dist's brew/npm policy).
     if: >-
-      ${{ github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-      startsWith(github.event.workflow_run.head_branch, 'v') &&
-      !contains(github.event.workflow_run.head_branch, '-')) }}
+      ${{ startsWith(inputs.tag, 'v') && !contains(inputs.tag, '-') }}
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -50,10 +53,11 @@ jobs:
       - name: Download the npm package tarball from the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.workflow_run.head_branch || github.event.inputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
-          # workflow_run.head_branch is the tag for a tag-triggered Release; fall back
-          # to the latest release if it isn't a resolvable tag.
+          # The tag comes in as an input; fall back to the latest release if it is empty
+          # or does not resolve, so a hand-dispatch with a typo republishes the newest
+          # release rather than failing halfway through.
           if [ -z "$TAG" ] || ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             TAG="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
           fi
