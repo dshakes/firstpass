@@ -22,6 +22,7 @@ pub mod report;
 pub mod sandbox;
 pub mod sim;
 pub mod stats;
+pub mod swebench;
 
 use firstpass_core::PriceTable;
 use metrics::evaluate;

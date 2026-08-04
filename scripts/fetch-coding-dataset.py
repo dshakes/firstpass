@@ -43,7 +43,24 @@ PAGE = 100  # the datasets-server per-request cap
 SOURCES = {
     "bigcodebench": {"dataset": "bigcode/bigcodebench", "config": "default", "split": "v0.1.4"},
     "mbpp": {"dataset": "Muennighoff/mbpp", "config": "full", "split": "test"},
+    "swebench": {
+        "dataset": "princeton-nlp/SWE-bench_Verified",
+        "config": "default",
+        "split": "test",
+    },
 }
+
+
+def swebench_image(instance_id: str) -> str:
+    """The published eval image for an instance.
+
+    The tag mangles the id: `astropy__astropy-12907` becomes
+    `sweb.eval.x86_64.astropy_1776_astropy-12907`. `1776` is just the separator upstream chose
+    for `__`; getting it wrong yields a 404 at pull time rather than anything diagnosable, so it
+    is derived here once rather than hand-written per instance.
+    """
+    return "swebench/sweb.eval.x86_64." + instance_id.replace("__", "_1776_")
+
 
 
 def fetch_page(src: dict, split: str, offset: int, length: int) -> list[dict]:
@@ -80,7 +97,7 @@ def write_out(path: str, kept: list[dict], src: dict, split: str, filt: str, sca
                 "filter": filt,
                 "scanned": scanned,
                 "kept": len(kept),
-                "task_ids": [t["task_id"] for t in kept],
+                "task_ids": [t.get("task_id", t.get("instance_id")) for t in kept],
             },
             f,
             indent=2,
@@ -113,6 +130,35 @@ def main() -> int:
 
     # MBPP is plain stdlib Python by construction, and its rows carry `test_list` rather than a
     # unittest class, so the lib filter neither applies nor is needed.
+    if args.dataset == "swebench":
+        kept, scanned = [], 0
+        while scanned < args.limit:
+            rows = fetch_page(src, split, scanned, min(PAGE, args.limit - scanned))
+            if not rows:
+                break
+            scanned += len(rows)
+            for r in rows:
+                # FAIL_TO_PASS / PASS_TO_PASS arrive as JSON *strings*, not lists.
+                f2p = r["FAIL_TO_PASS"]
+                p2p = r["PASS_TO_PASS"]
+                kept.append(
+                    {
+                        "instance_id": r["instance_id"],
+                        "repo": r["repo"],
+                        "base_commit": r["base_commit"],
+                        "problem_statement": r["problem_statement"],
+                        "test_patch": r["test_patch"],
+                        "fail_to_pass": json.loads(f2p) if isinstance(f2p, str) else f2p,
+                        "pass_to_pass": json.loads(p2p) if isinstance(p2p, str) else p2p,
+                        "image": swebench_image(r["instance_id"]),
+                        "difficulty": r.get("difficulty", ""),
+                    }
+                )
+        write_out(args.out, kept, src, split, "none (SWE-bench Verified, human-validated)", scanned)
+        print(f"wrote {len(kept)} SWE-bench instances to {args.out}")
+        print("each needs its own multi-GB eval image; pull them BEFORE the run (no network at eval)")
+        return 0 if kept else 1
+
     if args.dataset == "mbpp":
         kept, scanned = [], 0
         while scanned < args.limit:

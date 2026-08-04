@@ -1,6 +1,7 @@
 # ADR 0010 — Running SWE-bench without quietly dismantling the sandbox
 
-- Status: **Accepted** (design; implementation deferred behind BigCodeBench results)
+- Status: **Accepted and implemented** — `crates/firstpass-bench/src/swebench.rs`. D1's mechanism
+  is verified against a real published image (`astropy__astropy-12907`); see *"Verified"* below.
 - Date: 2026-08-03, revised same day — see *"D1, corrected"*: the premise that SWE-bench
   requires a writable rootfs turned out to be false when tested, so no isolation
   invariant is relaxed after all.
@@ -204,10 +205,29 @@ dependency-carrying image), or a genuinely weak rung 0. If the gap between rungs
 stays this narrow, the honest conclusion is that this workload does not need a
 router — and that is worth knowing for a fifth of a dollar.
 
+## Verified (2026-08-03, on `astropy__astropy-12907`)
+
+Not asserted — driven, with the numbers recorded:
+
+- **The tmpfs copy wins the import.** These images install the project *editable, pointing at
+  `/testbed`*, so a patched copy at `/work/repo` could be silently ignored and the run would score
+  the **unpatched** code. A marker appended to the copy is visible to the interpreter with
+  `PYTHONPATH=/work/repo`, and `/testbed` is confirmed unwritable in the same container. This was
+  the single risk that could have made every number meaningless.
+- **The evaluation reproduces the official result.** Before the gold patch, `FAIL_TO_PASS` is
+  `2 failed` and `PASS_TO_PASS` is `13 passed` — the control holds and the bug is real. After it,
+  `2 passed` / `13 passed`. Encoded as an `#[ignore]` test that runs the same two arms in 9.3s.
+- **Emulation is not the obstacle it looked like.** Images are published x86_64-only, but on an
+  arm64 host they run under Rosetta at roughly native speed (0.7s to start and exercise a
+  container), not the QEMU crawl that would have made this impractical.
+- **Disk is the real ceiling**: ~1.1GB per instance, so all 500 of SWE-bench Verified is ~545GB of
+  pulls. A labelled subset is the practical unit, which D5 already required for other reasons.
+
 ## Status of the work
 
-Design accepted; implementation deliberately **not** started, and the pilot above
-is now the reason rather than the sandbox question. SWE-bench scores an agent
+The **harness** is built and verified. What is deliberately still missing is the
+**scaffold** — and that gap is the honest reason there is no SWE-bench number
+here yet, not the sandbox and not the images. SWE-bench scores an agent
 scaffold; what we need answered is narrower — *is the routing policy better?* —
 and `--coding-policy` answers that for cents by holding the scaffold fixed and
 varying only the policy. Paying twenty times as much for a benchmark whose name
