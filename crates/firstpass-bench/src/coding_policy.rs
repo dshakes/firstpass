@@ -219,7 +219,7 @@ pub fn measure_resumable(
                 Some(j) => evaluate_task_judged(sb, rung.solver, j, task, limits)?,
                 None => evaluate_task(sb, rung.solver, task, limits)?,
             };
-            let cost = prices
+            let mut cost = prices
                 .cost_usd(&rung.model, o.in_tokens, o.out_tokens)
                 .map_err(|e| {
                     format!(
@@ -228,6 +228,23 @@ pub fn measure_resumable(
                         rung.model
                     )
                 })?;
+            // The judge is a model call and is billed like one. Folding it into the rung's cost
+            // is what lets the judged arm publish a $/success instead of withholding it: a policy
+            // that looks cheaper only because its verification was left off the invoice is not
+            // cheaper. Priced with the JUDGE's own model, which is usually not a ladder rung.
+            if let Some(j) = judge
+                && (o.judge_in_tokens > 0 || o.judge_out_tokens > 0)
+            {
+                cost += prices
+                    .cost_usd(j.ladder_id(), o.judge_in_tokens, o.judge_out_tokens)
+                    .map_err(|e| {
+                        format!(
+                            "judge model {:?} has no price, so its calls would be free by \
+                             omission and the judged arm would look cheaper than it is: {e}",
+                            j.ladder_id()
+                        )
+                    })?;
+            }
             row.push(RungOutcome {
                 gate_score: o.gate_score,
                 gate_full_pass: o.gate_full_pass,
@@ -317,11 +334,10 @@ pub fn replay(matrix: &[Vec<RungOutcome>], ladder: &[String], runtime_tier: &str
         .iter()
         .any(|row| row.iter().any(|o| o.judge_score.is_some()))
     {
-        let mut judged = eval_policy("first-pass+judge", matrix, |row| {
+        // Metered now: judge tokens are billed into each rung's cost in `measure_judged`.
+        policies.push(eval_policy("first-pass+judge", matrix, |row| {
             serve_first_pass_judged(row, JUDGE_THRESHOLD)
-        });
-        judged.cost_metered = false;
-        policies.push(judged);
+        }));
     }
     let paired_cmps = vec![
         paired("always-top", matrix, |row| serve_fixed(row, top)),
@@ -915,26 +931,203 @@ mod tests {
         );
     }
 
-    /// The judged arm must not publish a $/success while the judge's own calls are unmetered.
-    /// Showing one would make adding a judge look free — the same fabricated-cost failure the
-    /// unpriced-rung validator exists to stop, just moved into the benchmark.
-    #[test]
-    fn the_judged_arm_withholds_a_cost_it_cannot_account_for() {
-        let matrix = vec![vec![oj(true, false, 0.01, 0.2), oj(true, true, 0.10, 0.95)]];
-        let study = replay(&matrix, &ladder(), "test");
-        let judged = study.find("first-pass+judge").expect("judged arm present");
-        assert!(!judged.cost_metered, "judge tokens are not counted yet");
-        for p in study
-            .policies
-            .iter()
-            .filter(|p| p.name != "first-pass+judge")
-        {
-            assert!(p.cost_metered, "{} must report a real cost", p.name);
+    /// A minimal task for the metering tests — one visible case, one hidden case.
+    fn mk_task(id: &str) -> CodingTask {
+        CodingTask {
+            id: id.to_owned(),
+            prompt: "p".to_owned(),
+            entrypoint: "solution.py".to_owned(),
+            visible_cases: vec!["a".to_owned()],
+            hidden_cases: vec!["a".to_owned()],
+            unit_test: None,
         }
-        let out = study.render();
+    }
+
+    /// The judge is a model call and must appear on the invoice. A judged arm that looks cheaper
+    /// only because its verification was left uncounted is not cheaper — the same fabricated-cost
+    /// failure as an unpriced ladder rung, relocated into the benchmark.
+    #[test]
+    fn a_judges_own_calls_are_billed_into_the_cost() {
+        struct FixedSolver;
+        impl CandidateSolver for FixedSolver {
+            fn solve(&self, _: &CodingTask) -> Result<crate::coding::Solution, String> {
+                Ok(crate::coding::Solution {
+                    code: "x".to_owned(),
+                    in_tokens: 1_000_000,
+                    out_tokens: 0,
+                })
+            }
+        }
+        struct CostlyJudge;
+        impl Judge for CostlyJudge {
+            fn ladder_id(&self) -> &str {
+                "judge/model"
+            }
+            fn score(
+                &self,
+                _: &CodingTask,
+                _: &str,
+            ) -> Result<crate::coding::JudgeOpinion, String> {
+                Ok(crate::coding::JudgeOpinion {
+                    score: Some(0.9),
+                    in_tokens: 2_000_000,
+                    out_tokens: 0,
+                })
+            }
+        }
+        struct PassSandbox;
+        impl Sandbox for PassSandbox {
+            fn runtime(&self) -> &str {
+                "pass"
+            }
+            fn run(
+                &self,
+                _: &crate::sandbox::ExecUnit,
+                _: &Limits,
+            ) -> Result<crate::sandbox::ExecOutcome, crate::sandbox::SandboxError> {
+                Ok(crate::sandbox::ExecOutcome::Completed {
+                    exit_code: 0,
+                    stdout: "FP_SCORE 1 1\n".to_owned(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        // $1/Mtok for the rung, $10/Mtok for the judge: 1M solver tokens + 2M judge tokens
+        // ⇒ $1 + $20 = $21 if the judge is billed, $1 if it is silently free.
+        let prices = PriceTable::defaults()
+            .with_override(
+                "rung/model",
+                firstpass_core::cost::ModelPrice {
+                    input_per_mtok: 1.0,
+                    output_per_mtok: 0.0,
+                },
+            )
+            .with_override(
+                "judge/model",
+                firstpass_core::cost::ModelPrice {
+                    input_per_mtok: 10.0,
+                    output_per_mtok: 0.0,
+                },
+            );
+        let solver = FixedSolver;
+        let rungs = vec![Rung {
+            model: "rung/model".to_owned(),
+            solver: &solver,
+        }];
+        let tasks = vec![mk_task("t")];
+
+        let unjudged = measure_judged(
+            &tasks,
+            &rungs,
+            &PassSandbox,
+            &prices,
+            &Limits::default(),
+            None,
+        )
+        .expect("measure");
         assert!(
-            out.contains("cost withheld"),
-            "the table must say why a cost is missing: {out}"
+            (unjudged[0][0].cost_usd - 1.0).abs() < 1e-9,
+            "rung alone is $1"
+        );
+
+        let judged = measure_judged(
+            &tasks,
+            &rungs,
+            &PassSandbox,
+            &prices,
+            &Limits::default(),
+            Some(&CostlyJudge),
+        )
+        .expect("measure");
+        assert!(
+            (judged[0][0].cost_usd - 21.0).abs() < 1e-9,
+            "the judge's 2M tokens at $10/Mtok must be on the invoice; got {}",
+            judged[0][0].cost_usd
+        );
+
+        // And with the judge billed, the arm publishes a real $/success rather than withholding.
+        let study = replay(&judged, &["rung/model".to_owned()], "test");
+        assert!(
+            study
+                .find("first-pass+judge")
+                .is_some_and(|p| p.cost_metered),
+            "a metered judge means the arm can state its cost"
+        );
+    }
+
+    /// An unpriced JUDGE must abort for the same reason an unpriced rung does: its calls would be
+    /// free by omission, and the judged arm would look cheaper than it is.
+    #[test]
+    fn an_unpriced_judge_aborts_rather_than_costing_nothing() {
+        struct S;
+        impl CandidateSolver for S {
+            fn solve(&self, _: &CodingTask) -> Result<crate::coding::Solution, String> {
+                Ok(crate::coding::Solution {
+                    code: "x".to_owned(),
+                    in_tokens: 10,
+                    out_tokens: 0,
+                })
+            }
+        }
+        struct J;
+        impl Judge for J {
+            fn ladder_id(&self) -> &str {
+                "nobody/prices-me"
+            }
+            fn score(
+                &self,
+                _: &CodingTask,
+                _: &str,
+            ) -> Result<crate::coding::JudgeOpinion, String> {
+                Ok(crate::coding::JudgeOpinion {
+                    score: Some(1.0),
+                    in_tokens: 5,
+                    out_tokens: 0,
+                })
+            }
+        }
+        struct Sb;
+        impl Sandbox for Sb {
+            fn runtime(&self) -> &str {
+                "s"
+            }
+            fn run(
+                &self,
+                _: &crate::sandbox::ExecUnit,
+                _: &Limits,
+            ) -> Result<crate::sandbox::ExecOutcome, crate::sandbox::SandboxError> {
+                Ok(crate::sandbox::ExecOutcome::Completed {
+                    exit_code: 0,
+                    stdout: "FP_SCORE 1 1\n".to_owned(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let prices = PriceTable::defaults().with_override(
+            "rung/model",
+            firstpass_core::cost::ModelPrice {
+                input_per_mtok: 1.0,
+                output_per_mtok: 0.0,
+            },
+        );
+        let solver = S;
+        let rungs = vec![Rung {
+            model: "rung/model".to_owned(),
+            solver: &solver,
+        }];
+        let err = measure_judged(
+            &[mk_task("t")],
+            &rungs,
+            &Sb,
+            &prices,
+            &Limits::default(),
+            Some(&J),
+        )
+        .expect_err("an unpriced judge must not be silently free");
+        assert!(
+            err.contains("judge model") && err.contains("free by omission"),
+            "{err}"
         );
     }
 

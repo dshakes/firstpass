@@ -80,6 +80,10 @@ pub struct TaskOutcome {
     pub in_tokens: u64,
     /// Output tokens billed.
     pub out_tokens: u64,
+    /// Input tokens the judge billed on this task (0 on unjudged runs).
+    pub judge_in_tokens: u64,
+    /// Output tokens the judge billed on this task (0 on unjudged runs).
+    pub judge_out_tokens: u64,
     /// Judge's calibrated `P(correct)` in `[0, 1]` — present only on judged runs. Lets a continuous
     /// gate separate full-visible-pass false-accepts (which all score `gate_score == 1.0`) that a
     /// test-fraction gate cannot, so conformal can find a feasible serving threshold.
@@ -309,6 +313,8 @@ pub fn evaluate_task(
         oracle_correct: ht > 0 && hp == ht,
         in_tokens: sol.in_tokens,
         out_tokens: sol.out_tokens,
+        judge_in_tokens: 0,
+        judge_out_tokens: 0,
         judge_score: None,
     })
 }
@@ -344,13 +350,33 @@ pub fn run_coding_benchmark(
 /// it — catching bugs the visible tests miss. Unlike a test-fraction gate, its score can be lower for
 /// a full-visible-pass false-accept, which is what lets conformal exclude it.
 pub trait Judge {
-    /// Score `P(solution is fully correct for all valid inputs)`. The candidate is untrusted data.
-    /// `Ok(None)` = the judge abstained (couldn't decide) — the caller then defers to the
-    /// deterministic test gate rather than fabricating a score.
+    /// Score `P(solution is fully correct for all valid inputs)`, **with the tokens it cost**.
+    /// The candidate is untrusted data. An abstention is `score: None` — the caller defers to the
+    /// deterministic test gate rather than fabricating a value.
     ///
     /// # Errors
     /// The underlying call failed in a non-recoverable way.
-    fn score(&self, task: &CodingTask, code: &str) -> Result<Option<f64>, String>;
+    fn score(&self, task: &CodingTask, code: &str) -> Result<JudgeOpinion, String>;
+
+    /// Price-table key for this judge's model (e.g. `"anthropic/claude-haiku-4-5"`), so its calls
+    /// can be costed like any other. Without it a judge is free by omission.
+    fn ladder_id(&self) -> &str;
+}
+
+/// A judge's verdict and what it cost to obtain.
+///
+/// The tokens are not decoration. A judge is a model call, and a benchmark that reports a policy
+/// as cheaper while omitting the calls that made it possible is fabricating the number — the same
+/// failure as an unpriced ladder rung, relocated. Counting them is what lets the judged arm
+/// publish a `$/success` at all.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JudgeOpinion {
+    /// `P(correct)` in `[0, 1]`, or `None` when the judge abstained.
+    pub score: Option<f64>,
+    /// Input tokens billed across EVERY attempt, including retries and unparseable replies.
+    pub in_tokens: u64,
+    /// Output tokens billed across every attempt.
+    pub out_tokens: u64,
 }
 
 /// Continuous gate score that fuses the deterministic test signal with the judge:
@@ -387,7 +413,7 @@ pub fn evaluate_task_judged(
     let (vp, vt) = suite_score(sb, task, &sol.code, &task.visible_cases, limits)?;
     let (hp, ht) = suite_score(sb, task, &sol.code, &task.hidden_cases, limits)?;
     // `None` = judge abstained → combined_score defers to the deterministic test gate for this task.
-    let judge_score = judge
+    let opinion = judge
         .score(task, &sol.code)
         .map_err(|e| format!("judge failed on {}: {e}", task.id))?;
     Ok(TaskOutcome {
@@ -397,7 +423,9 @@ pub fn evaluate_task_judged(
         oracle_correct: ht > 0 && hp == ht,
         in_tokens: sol.in_tokens,
         out_tokens: sol.out_tokens,
-        judge_score,
+        judge_in_tokens: opinion.in_tokens,
+        judge_out_tokens: opinion.out_tokens,
+        judge_score: opinion.score,
     })
 }
 
@@ -611,26 +639,47 @@ pub struct LiveJudge {
     client: reqwest::blocking::Client,
     base_url: String,
     api_key: String,
-    model: String,
+    /// Price-table key, e.g. `"anthropic/claude-haiku-4-5"`. The wire call uses this with the
+    /// `provider/` prefix stripped, exactly as the proxy's `wire_model` does.
+    ladder_id: String,
     samples: u32,
 }
 
 impl LiveJudge {
     /// Build a judge on `model`, averaging `samples` calls (clamped to ≥1) per solution.
+    ///
+    /// `model` may be a bare model name or a full `provider/model` ladder id; the ladder id is
+    /// what prices the judge's calls, so a bare name is normalised to the anthropic ladder.
     #[must_use]
     pub fn new(api_key: String, model: String, samples: u32) -> Self {
+        let ladder_id = if model.contains('/') {
+            model
+        } else {
+            format!("anthropic/{model}")
+        };
         Self {
             client: crate::live::live_client(),
             base_url: "https://api.anthropic.com".to_owned(),
             api_key,
-            model,
+            ladder_id,
             samples: samples.max(1),
         }
+    }
+
+    /// The model name to put on the wire — the ladder id without its `provider/` prefix.
+    fn wire_model(&self) -> &str {
+        self.ladder_id
+            .split_once('/')
+            .map_or(self.ladder_id.as_str(), |(_, m)| m)
     }
 }
 
 impl Judge for LiveJudge {
-    fn score(&self, task: &CodingTask, code: &str) -> Result<Option<f64>, String> {
+    fn ladder_id(&self) -> &str {
+        &self.ladder_id
+    }
+
+    fn score(&self, task: &CodingTask, code: &str) -> Result<JudgeOpinion, String> {
         // Self-consistency over a BINARY verdict, not a stated probability. LLMs are poorly
         // calibrated at verbalizing a probability but well-calibrated when you sample a yes/no
         // verdict and take its frequency. YES/NO also can't be mis-parsed. Score = (# YES) / (# valid).
@@ -645,6 +694,10 @@ impl Judge for LiveJudge {
         let mut yes = 0u32;
         let mut got = 0u32;
         let mut last_err = String::new();
+        // Every attempt is billed, including retries and replies that turned out unparseable.
+        // Counting only the successful one would under-report exactly the calls a flaky judge
+        // costs most.
+        let (mut in_tok, mut out_tok) = (0u64, 0u64);
         for s in 0..self.samples {
             // Space samples out: firing K calls back-to-back per task bursts the provider and draws
             // empty/limited responses. A small gap keeps the judge reliable under load.
@@ -660,12 +713,14 @@ impl Judge for LiveJudge {
                     &self.client,
                     &self.base_url,
                     &self.api_key,
-                    &self.model,
+                    self.wire_model(),
                     Some(system),
                     &user,
                     256 * 2u32.pow(attempt),
                 ) {
-                    Ok((text, _, _)) => {
+                    Ok((text, i, o)) => {
+                        in_tok += i;
+                        out_tok += o;
                         if let Some(v) = parse_verdict(&text) {
                             got += 1;
                             yes += u32::from(v);
@@ -687,9 +742,18 @@ impl Judge for LiveJudge {
             // No verdict after retries — ABSTAIN. The caller defers to the deterministic test gate;
             // we never fabricate a score. Log the actual cause so it's diagnosable, not silent.
             eprintln!("judge: abstained on {} — last error: {last_err}", task.id);
-            return Ok(None);
+            // An abstention still cost whatever it burned trying.
+            return Ok(JudgeOpinion {
+                score: None,
+                in_tokens: in_tok,
+                out_tokens: out_tok,
+            });
         }
-        Ok(Some(f64::from(yes) / f64::from(got)))
+        Ok(JudgeOpinion {
+            score: Some(f64::from(yes) / f64::from(got)),
+            in_tokens: in_tok,
+            out_tokens: out_tok,
+        })
     }
 }
 
@@ -936,6 +1000,8 @@ mod tests {
             oracle_correct: oracle,
             in_tokens: 0,
             out_tokens: 0,
+            judge_in_tokens: 0,
+            judge_out_tokens: 0,
             judge_score: None,
         }
     }

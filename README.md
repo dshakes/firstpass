@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/hero.svg" alt="Firstpass — cheap until proven otherwise. It routes every request to the cheapest model, gates the real output, escalates only on proof of need, and cuts your AI bill from $$$$ to $ — with a distribution-free guarantee of ≤10% wrong answers served at 95% confidence and a signed receipt every call." width="900">
+<img src="assets/hero.svg" alt="Firstpass — cheap until proven otherwise. It routes every request to the cheapest model, gates the real output, and escalates only on proof of need. Measured on 974 real MBPP coding tasks: 12–57% lower cost per success depending on how expensive your top rung is — with a distribution-free guarantee of ≤10% wrong answers served at 95% confidence and a signed receipt every call." width="900">
 
 # ⚡ Firstpass
 
@@ -54,6 +54,31 @@ The claim no predictive router makes: on **974 real MBPP coding tasks** (fail-cl
 <div align="center"><img src="assets/guarantee.svg" alt="On 974 real MBPP tasks with real test gates: served-failure is 5.5% calibrated risk and 7.7% realized, both under the ≤10% distribution-free target line at 95% confidence; 82% of requests are served from the cheap tier, only 18% escalate. Pre-registered α=0.10, δ=0.05." width="900"></div>
 
 The bound is a Hoeffding upper confidence bound — **valid for any data distribution**, no Gaussian assumptions. It's computed from a real run, not assumed. Your savings depend on your workload, which is why every trace records the always-frontier counterfactual: **you measure your number instead of trusting ours.**
+
+### …and what it costs, against the alternatives
+
+A guarantee is only half the question. The other half is whether routing beats simply picking one
+model, so the same 974 tasks were replayed under each policy on identical measurements
+([sonnet ladder](docs/benchmarks/mbpp-policy-974.txt) · [opus ladder](docs/benchmarks/mbpp-policy-974-opus.txt)):
+
+| | vs **always-cheap** | vs **always-top** |
+|---|---|---|
+| quality | **+15.2 points** (paired, 95% CI [+12.9, +17.5]) | −2.3 points (95% CI [−3.5, −1.1]) |
+| tasks | **~150 recovered, 0 regressed** | 28 lost, 6 won |
+| cost | +$1.71 total | **57% lower per success** |
+
+**The gate never made a task worse.** Not once in 974, on either ladder — it escalates on 19% of
+traffic and 80% of those escalations turn a wrong answer into a right one.
+
+Two honest qualifications, because a number that can't survive scrutiny isn't worth quoting:
+
+- **The saving depends on your ladder, and it is the ladder that moves it.** 57% against an
+  `opus` ceiling, **12% against a `sonnet` one** — 81% of traffic never reaches the top rung, so a
+  pricier ceiling compounds directly.
+- **On MBPP those two ceilings are statistically indistinguishable** (0.9476 vs 0.9456, a 2-task
+  difference; an independent re-run of the shared cheap rung flipped 80 of 974 outcomes). So part
+  of the 57% is `opus` being the wrong ceiling for this workload rather than routing beating a
+  well-chosen baseline. The artifacts say so in their headers.
 
 <details>
 <summary><b>Reproduce it</b> — each command labels itself and states what it costs</summary>
