@@ -30,12 +30,43 @@ pub struct LiveBackend {
     errors: RefCell<Vec<String>>,
 }
 
+/// The HTTP client every live caller in the bench shares.
+///
+/// `Client::new()` keeps idle connections for 90s and sets no timeouts, which is wrong for this
+/// workload in a specific way: a policy run spends 10-20 SECONDS running Docker between calls, so
+/// a pooled connection sits idle long enough for the server to close it, and the next request is
+/// handed a dead socket — surfacing as `error sending request for url`. Retries do not help,
+/// because they draw from the same pool. Three 974-task runs died this way at ~30 tasks.
+///
+/// So: retire idle connections before the far end does, and bound every request. The proxy already
+/// runs its providers with connect(10s)/total(120s) for the same reasons.
+/// Flatten an error's `source()` chain, which is where the actual cause lives.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = String::new();
+    let mut src = e.source();
+    while let Some(c) = src {
+        out.push_str(&format!(" <- {c}"));
+        src = c.source();
+    }
+    out
+}
+
+#[must_use]
+pub fn live_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 impl LiveBackend {
     /// Construct a backend from a provider API key. Honors `ANTHROPIC_BASE_URL` for proxies/tests.
     #[must_use]
     pub fn new(api_key: String) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: live_client(),
             api_key,
             base_url: std::env::var("ANTHROPIC_BASE_URL")
                 .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
@@ -111,7 +142,11 @@ pub(crate) fn anthropic_call(
         {
             Ok(r) => r,
             Err(e) => {
-                last = format!("request failed: {e}"); // transient → retry
+                // reqwest's Display stops at "error sending request for url (...)"; the reason
+                // (connection closed, dns, tls, timeout) is only in the source chain. Without it
+                // a transport failure is undiagnosable, which is how the stale-pool bug above
+                // survived three runs.
+                last = format!("request failed: {e}{}", error_chain(&e)); // transient → retry
                 continue;
             }
         };
@@ -226,7 +261,7 @@ impl LiveJudgeGate {
     #[must_use]
     pub fn new(api_key: String, judge_model: String) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: live_client(),
             api_key,
             base_url: std::env::var("ANTHROPIC_BASE_URL")
                 .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),

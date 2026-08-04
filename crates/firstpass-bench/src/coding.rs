@@ -539,7 +539,7 @@ impl LiveSolver {
     #[must_use]
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: crate::live::live_client(),
             base_url: "https://api.anthropic.com".to_owned(),
             api_key,
             model,
@@ -551,19 +551,53 @@ impl CandidateSolver for LiveSolver {
     fn solve(&self, task: &CodingTask) -> Result<Solution, String> {
         let system = "You are a Python coding assistant. Output ONLY the full contents of the \
                       requested file — no explanation, no markdown code fences.";
-        let (text, in_tokens, out_tokens) = crate::live::anthropic_call(
-            &self.client,
-            &self.base_url,
-            &self.api_key,
-            &self.model,
-            Some(system),
-            &task.prompt,
-            1024,
-        )?;
+        // Escalating token budget, exactly as `LiveJudge` already does and for the same reason:
+        // an empty reply ("no text content") means the response budget was exhausted before any
+        // text was emitted, and retrying at the SAME budget just reproduces it. A fixed 1024 here
+        // aborted a 200-task run partway — every candidate call is a paid call, so one starved
+        // response must not be able to discard the ones already bought.
+        let mut last = String::new();
+        for max_tokens in [1024u32, 2048, 4096] {
+            match crate::live::anthropic_call(
+                &self.client,
+                &self.base_url,
+                &self.api_key,
+                &self.model,
+                Some(system),
+                &task.prompt,
+                max_tokens,
+            ) {
+                Ok((text, in_tokens, out_tokens)) => {
+                    return Ok(Solution {
+                        code: strip_fences(&text),
+                        in_tokens,
+                        out_tokens,
+                    });
+                }
+                // Only an empty response is worth more budget. Anything else (auth, 4xx, decode)
+                // will not improve by asking for more room, so it aborts as before.
+                Err(e) if e.contains("no text content") => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        // Out of budgets. This is NOT a harness failure — it is the candidate failing to produce
+        // a solution, which is an ordinary benchmark outcome and must be scored, not escalated
+        // into an abort. Treating it as fatal is what killed this run on task 31 of 974, throwing
+        // away 30 tasks' worth of paid calls over one model that would not answer.
+        //
+        // Empty code scores 0 on both the visible and hidden suites, so it lands as the wrong
+        // answer it is. The warning is what stops that being silent: a handful of these is the
+        // model having a bad day, a hundred is an API problem, and the log has to let you tell
+        // the difference.
+        eprintln!(
+            "WARNING: {:?} produced no text at any budget ({last}) — scoring it as a failed \
+             candidate. Many of these in one run means an API problem, not a model one.",
+            task.id
+        );
         Ok(Solution {
-            code: strip_fences(&text),
-            in_tokens,
-            out_tokens,
+            code: String::new(),
+            in_tokens: 0,
+            out_tokens: 0,
         })
     }
 }
@@ -586,7 +620,7 @@ impl LiveJudge {
     #[must_use]
     pub fn new(api_key: String, model: String, samples: u32) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: crate::live::live_client(),
             base_url: "https://api.anthropic.com".to_owned(),
             api_key,
             model,
@@ -1126,6 +1160,80 @@ mod tests {
         assert!(
             runner.contains("test_a") && !runner.contains("test_b"),
             "the runner must select only the visible methods"
+        );
+    }
+
+    /// An empty candidate is a WRONG ANSWER, not a broken harness. Scored against any real suite
+    /// it fails every case, which is exactly what "the model produced no solution" means. The
+    /// first version aborted instead, and one such task (mbpp-31 of 974) discarded thirty tasks
+    /// of paid calls.
+    #[test]
+    fn an_empty_candidate_scores_zero_rather_than_stopping_the_run() {
+        struct EmptyEcho;
+        impl Sandbox for EmptyEcho {
+            fn runtime(&self) -> &str {
+                "empty"
+            }
+            fn run(
+                &self,
+                u: &ExecUnit,
+                _: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                // Stand in for real Python: empty solution ⇒ nothing importable ⇒ no case passes.
+                let code = &u.files.first().expect("a file").1;
+                let n = if code.trim().is_empty() { 0 } else { 2 };
+                Ok(ExecOutcome::Completed {
+                    exit_code: 0,
+                    stdout: format!("FP_SCORE {n} 2\n"),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let t = task("t", "p", &["a", "b"], &["a", "b"]);
+        let empty = MockSolver::new(vec![(t.id.as_str(), "")]);
+        let o = evaluate_task(&EmptyEcho, &empty, &t, &Limits::default())
+            .expect("an empty candidate must be scored, not aborted");
+        assert!(
+            (o.gate_score - 0.0).abs() < 1e-9 && !o.gate_full_pass && !o.oracle_correct,
+            "an empty candidate is simply wrong: {o:?}"
+        );
+    }
+
+    /// An empty response must escalate the token budget, not abort. Retrying at the same budget
+    /// reproduces the same starved reply, and a fixed budget already killed a 200-task paid run
+    /// partway — the calls bought before the anomaly are gone with it.
+    #[test]
+    fn an_empty_response_retries_with_more_room_and_only_then_gives_up() {
+        // A stand-in for the real HTTP path: fails with "no text content" below `needs`, then
+        // succeeds — the exact shape of a budget-starved response.
+        fn attempt(max_tokens: u32, needs: u32) -> Result<String, String> {
+            if max_tokens < needs {
+                Err("no text content in response".to_owned())
+            } else {
+                Ok("def task_func(): pass".to_owned())
+            }
+        }
+        let budgets = [1024u32, 2048, 4096];
+
+        // Needs 2048: the first budget starves, the second succeeds.
+        let got = budgets.iter().find_map(|&b| attempt(b, 2048).ok());
+        assert!(got.is_some(), "escalating the budget must recover the call");
+
+        // Needs more than any budget: it gives up rather than looping.
+        assert!(
+            budgets
+                .iter()
+                .find_map(|&b| attempt(b, 8192).ok())
+                .is_none(),
+            "an unrecoverable empty response must still terminate"
+        );
+
+        // The real solver only escalates on THIS error; anything else aborts immediately, since
+        // more room cannot fix an auth failure or a decode error.
+        let src = include_str!("coding.rs");
+        assert!(
+            src.contains(r#"Err(e) if e.contains("no text content") => last = e"#),
+            "only an empty response should buy another attempt"
         );
     }
 

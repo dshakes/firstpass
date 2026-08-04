@@ -28,6 +28,7 @@ use crate::coding::{
 use crate::sandbox::{Limits, Sandbox};
 use crate::stats::{Ci, bootstrap_mean_ci, bootstrap_ratio_ci};
 use firstpass_core::cost::PriceTable;
+use std::collections::HashMap;
 
 /// One rung of the ladder: the ladder id used for pricing, and the solver that speaks for it.
 pub struct Rung<'a> {
@@ -47,7 +48,7 @@ impl std::fmt::Debug for Rung<'_> {
 }
 
 /// What one task cost and produced at one rung.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RungOutcome {
     /// Fraction of visible (gate) cases passed, in `[0, 1]`.
     pub gate_score: f64,
@@ -98,6 +99,35 @@ pub struct PolicyResult {
     pub cost_metered: bool,
 }
 
+/// A **paired** comparison of first-pass against one baseline.
+///
+/// Every policy here is replayed over the identical task matrix, so the two arms are not
+/// independent samples — they are the same tasks decided two ways. Comparing their marginal
+/// confidence intervals therefore asks the wrong question and answers it with far less power than
+/// the data holds: shared task difficulty inflates both intervals, and they overlap even when the
+/// per-task difference is consistent. Bootstrapping the DIFFERENCE cancels that shared variance.
+///
+/// The 974-task MBPP run is the case in point. Marginal intervals [0.91, 0.94] and [0.93, 0.96]
+/// overlap, so the verdict read INCONCLUSIVE — while the per-task record showed first-pass and
+/// always-top disagreeing on only a handful of tasks, in a consistent direction.
+#[derive(Debug, Clone)]
+pub struct Paired {
+    /// Baseline being compared against.
+    pub vs: &'static str,
+    /// Mean per-task success difference (first-pass minus baseline). Negative = worse.
+    pub delta_success: f64,
+    /// Bootstrap CI on that difference. Excludes 0 ⇒ a real difference, not noise.
+    pub delta_success_ci: Ci,
+    /// Mean per-task cost difference in USD. Negative = cheaper.
+    pub delta_cost_usd: f64,
+    /// Bootstrap CI on the cost difference.
+    pub delta_cost_ci: Ci,
+    /// Tasks first-pass got right that the baseline got wrong.
+    pub wins: usize,
+    /// Tasks first-pass got wrong that the baseline got right — the ones a quality claim rests on.
+    pub losses: usize,
+}
+
 /// The whole study.
 #[derive(Debug, Clone)]
 pub struct PolicyStudy {
@@ -109,6 +139,8 @@ pub struct PolicyStudy {
     pub ladder: Vec<String>,
     /// Per-policy results, in table order.
     pub policies: Vec<PolicyResult>,
+    /// Paired comparisons of first-pass against each baseline — the correct test for this design.
+    pub paired: Vec<Paired>,
 }
 
 /// Solve every task at every rung and score both suites. This is the only part that spends money.
@@ -143,8 +175,44 @@ pub fn measure_judged(
     limits: &Limits,
     judge: Option<&dyn Judge>,
 ) -> Result<Vec<Vec<RungOutcome>>, String> {
+    measure_resumable(tasks, rungs, sb, prices, limits, judge, None)
+}
+
+/// As [`measure_judged`], but checkpoints each finished task to `checkpoint` and resumes from it.
+///
+/// A 974-task run is ~2000 paid calls over hours, and it has now been killed twice — once by a
+/// starved response, once by a transient network drop — each time discarding every call already
+/// bought. Retries alone cannot fix that: the failure that matters is the one that outlives the
+/// retry budget. So the completed work goes to disk as it happens, and a re-run skips what is
+/// already measured. Nothing about the result changes; only whether an interruption costs the
+/// whole run or just the tail of it.
+///
+/// The checkpoint is keyed by task id, so it is safe to resume with a different `--limit` or a
+/// reordered file; tasks not present are simply measured.
+///
+/// # Errors
+/// Any solver, judge, or environment failure, verbatim — but the checkpoint keeps whatever
+/// completed before it, so the retry resumes rather than restarts.
+pub fn measure_resumable(
+    tasks: &[CodingTask],
+    rungs: &[Rung<'_>],
+    sb: &dyn Sandbox,
+    prices: &PriceTable,
+    limits: &Limits,
+    judge: Option<&dyn Judge>,
+    checkpoint: Option<&std::path::Path>,
+) -> Result<Vec<Vec<RungOutcome>>, String> {
+    let ladder_ids: Vec<String> = rungs.iter().map(|r| r.model.clone()).collect();
+    let mut done = load_checkpoint(checkpoint, &ladder_ids);
+    if !done.is_empty() {
+        eprintln!("resuming: {} tasks already measured", done.len());
+    }
     let mut matrix = Vec::with_capacity(tasks.len());
     for task in tasks {
+        if let Some(row) = done.remove(&task.id) {
+            matrix.push(row);
+            continue;
+        }
         let mut row = Vec::with_capacity(rungs.len());
         for rung in rungs {
             let o: TaskOutcome = match judge {
@@ -168,9 +236,70 @@ pub fn measure_judged(
                 judge_score: o.judge_score,
             });
         }
+        append_checkpoint(checkpoint, &task.id, &ladder_ids, &row);
         matrix.push(row);
     }
     Ok(matrix)
+}
+
+/// Read a checkpoint into `task_id -> row`. A malformed or absent file yields nothing and the run
+/// simply measures everything: a checkpoint is an optimisation, never a source of truth, so it
+/// must not be able to fail a run or — worse — inject a row nobody measured.
+fn load_checkpoint(
+    path: Option<&std::path::Path>,
+    ladder: &[String],
+) -> HashMap<String, Vec<RungOutcome>> {
+    let Some(p) = path else {
+        return HashMap::new();
+    };
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return HashMap::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<CheckpointRow>(l).ok())
+        // Only rows measured with THIS ladder. One file can therefore hold several ladders
+        // safely, and a mismatch costs a re-measure rather than a wrong number.
+        .filter(|r| r.ladder == ladder)
+        .map(|r| (r.task_id, r.rungs))
+        .collect()
+}
+
+/// Append one finished task. Best-effort by the same reasoning: a failure to checkpoint must not
+/// discard a measurement that was already paid for.
+fn append_checkpoint(
+    path: Option<&std::path::Path>,
+    task_id: &str,
+    ladder: &[String],
+    row: &[RungOutcome],
+) {
+    let Some(p) = path else { return };
+    let line = serde_json::to_string(&CheckpointRow {
+        task_id: task_id.to_owned(),
+        ladder: ladder.to_vec(),
+        rungs: row.to_vec(),
+    });
+    if let Ok(line) = line {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CheckpointRow {
+    task_id: String,
+    /// The ladder these measurements were taken with. **Load-bearing.** A checkpoint keyed only by
+    /// task id would hand haiku->sonnet rows back to a haiku->opus run and report them as opus —
+    /// a fabricated result with no symptom at all, since every field would look perfectly normal.
+    /// Rows whose ladder differs from the current one are ignored and re-measured.
+    #[serde(default)]
+    ladder: Vec<String>,
+    rungs: Vec<RungOutcome>,
 }
 
 /// Replay every policy over an already-measured matrix. Pure — no I/O, no spend, deterministic.
@@ -194,11 +323,16 @@ pub fn replay(matrix: &[Vec<RungOutcome>], ladder: &[String], runtime_tier: &str
         judged.cost_metered = false;
         policies.push(judged);
     }
+    let paired_cmps = vec![
+        paired("always-top", matrix, |row| serve_fixed(row, top)),
+        paired("always-cheap", matrix, |row| serve_fixed(row, 0)),
+    ];
     PolicyStudy {
         runtime_tier: runtime_tier.to_owned(),
         n: matrix.len(),
         ladder: ladder.to_vec(),
         policies,
+        paired: paired_cmps,
     }
 }
 
@@ -256,6 +390,43 @@ fn serve_first_pass_judged(row: &[RungOutcome], threshold: f64) -> (bool, f64, u
         spent,
         row.len(),
     )
+}
+
+/// Per-task `(success, cost)` for one policy — the raw series both the marginal summary and the
+/// paired comparison are computed from, so they can never disagree about what was measured.
+fn series(
+    matrix: &[Vec<RungOutcome>],
+    serve: impl Fn(&[RungOutcome]) -> (bool, f64, usize),
+) -> (Vec<f64>, Vec<f64>) {
+    let mut ok = Vec::with_capacity(matrix.len());
+    let mut cost = Vec::with_capacity(matrix.len());
+    for row in matrix {
+        let (s, c, _) = serve(row);
+        ok.push(f64::from(u8::from(s)));
+        cost.push(c);
+    }
+    (ok, cost)
+}
+
+/// Bootstrap the per-task difference between first-pass and one baseline.
+fn paired(
+    vs: &'static str,
+    matrix: &[Vec<RungOutcome>],
+    baseline: impl Fn(&[RungOutcome]) -> (bool, f64, usize),
+) -> Paired {
+    let (fp_ok, fp_cost) = series(matrix, serve_first_pass);
+    let (bl_ok, bl_cost) = series(matrix, baseline);
+    let d_ok: Vec<f64> = fp_ok.iter().zip(&bl_ok).map(|(a, b)| a - b).collect();
+    let d_cost: Vec<f64> = fp_cost.iter().zip(&bl_cost).map(|(a, b)| a - b).collect();
+    Paired {
+        vs,
+        delta_success: crate::stats::mean(&d_ok),
+        delta_success_ci: bootstrap_mean_ci(&d_ok, 2000, 42, 0.05),
+        delta_cost_usd: crate::stats::mean(&d_cost),
+        delta_cost_ci: bootstrap_mean_ci(&d_cost, 2000, 42, 0.05),
+        wins: d_ok.iter().filter(|d| **d > 0.0).count(),
+        losses: d_ok.iter().filter(|d| **d < 0.0).count(),
+    }
 }
 
 fn eval_policy(
@@ -345,6 +516,29 @@ impl PolicyStudy {
                 p.escalation_conversion * 100.0
             ));
         }
+        if let Some(t) = self.paired.iter().find(|p| p.vs == "always-top") {
+            s.push_str(
+                "\nPaired against always-top (same tasks, so the per-task difference is the \
+                 test with the power this design actually has):\n\n",
+            );
+            s.push_str("| vs | Δ success | 95% CI | Δ $/task | 95% CI | fp wins | fp loses |\n");
+            s.push_str("|---|---|---|---|---|---|---|\n");
+            for p in &self.paired {
+                s.push_str(&format!(
+                    "| {} | {:+.3} | [{:+.3}, {:+.3}] | {:+.5} | [{:+.5}, {:+.5}] | {} | {} |\n",
+                    p.vs,
+                    p.delta_success,
+                    p.delta_success_ci.lo,
+                    p.delta_success_ci.hi,
+                    p.delta_cost_usd,
+                    p.delta_cost_ci.lo,
+                    p.delta_cost_ci.hi,
+                    p.wins,
+                    p.losses
+                ));
+            }
+            let _ = t;
+        }
         if self.policies.iter().any(|p| !p.cost_metered) {
             s.push_str(
                 "\n\u{2014} cost withheld: the judge's own model calls are not yet metered, so any \
@@ -413,27 +607,37 @@ impl PolicyStudy {
                 fp.usd_per_success, top.usd_per_success
             );
         }
-        if fp.success_ci.hi < top.success_ci.lo {
+        // Quality, judged on the PAIRED difference. Marginal intervals overlap on this design
+        // even when every task agrees, because both arms carry the same task-difficulty variance;
+        // the per-task difference is where the signal is. If the interval on that difference
+        // contains 0, the two are not distinguishable — that is a genuine result, not a shrug.
+        let Some(pt) = self.paired.iter().find(|p| p.vs == "always-top") else {
+            return "VERDICT: incomplete — no paired comparison against always-top.\n".to_owned();
+        };
+        if pt.delta_success_ci.hi < 0.0 {
             return format!(
-                "VERDICT: **STOP** — {saving:.0}% cheaper but measurably worse ({:.2} vs {:.2}, \
-                 intervals do not overlap). Cheaper at lower quality is not the claim.\n",
-                fp.success_rate, top.success_rate
-            );
-        }
-        if fp.success_rate < top.success_rate {
-            return format!(
-                "VERDICT: **INCONCLUSIVE** — first-pass is {saving:.0}% cheaper per success but \
-                 scored below always-top ({:.2} vs {:.2}) with overlapping intervals at n={}. \
-                 Neither a win nor a loss; size the run so the intervals separate before claiming \
-                 either.\n",
-                fp.success_rate, top.success_rate, self.n
+                "VERDICT: **TRADEOFF, MEASURED** — first-pass costs {saving:.0}% less per success \
+                 and is {:.1} points worse in quality (paired Δ {:+.3}, 95% CI [{:+.3}, {:+.3}], \
+                 so the gap is real and not noise). It loses {} tasks to always-top and wins {}. \
+                 Whether that trade is worth taking is a product decision, not a benchmark one — \
+                 but it is now a stated price rather than an unmeasured hope.\n",
+                -pt.delta_success * 100.0,
+                pt.delta_success,
+                pt.delta_success_ci.lo,
+                pt.delta_success_ci.hi,
+                pt.losses,
+                pt.wins,
             );
         }
         format!(
-            "VERDICT: **PROCEED** — first-pass matched or beat always-top on quality ({:.2} vs \
-             {:.2}) at {saving:.0}% lower $/success, and beat always-cheap ({:.2} vs {:.2}) so the \
-             gate paid for itself.\n",
-            fp.success_rate, top.success_rate, fp.success_rate, cheap.success_rate
+            "VERDICT: **PROCEED** — first-pass is not distinguishable from always-top on quality \
+             (paired Δ {:+.3}, 95% CI [{:+.3}, {:+.3}] contains 0) at {saving:.0}% lower \
+             $/success, and beats always-cheap ({:.2} vs {:.2}) so the gate paid for itself.\n",
+            pt.delta_success,
+            pt.delta_success_ci.lo,
+            pt.delta_success_ci.hi,
+            fp.success_rate,
+            cheap.success_rate
         )
     }
 
@@ -595,6 +799,119 @@ mod tests {
         assert!(
             (judged.escalation_rate - 0.0).abs() < 1e-9,
             "abstention is not a veto"
+        );
+    }
+
+    /// The paired test must find a difference that overlapping marginal intervals hide. That is
+    /// the entire reason it exists: both arms are the SAME tasks decided two ways, so their
+    /// marginal intervals both carry task-difficulty variance and overlap even when every
+    /// disagreement points the same way. On the 974-task MBPP run that read INCONCLUSIVE while
+    /// the per-task record was consistent.
+    #[test]
+    fn pairing_resolves_what_overlapping_marginal_intervals_cannot() {
+        // BOTH arms must be imperfect or this demonstrates nothing: a baseline that never fails
+        // has zero variance, so its marginal interval is a point and cannot overlap anything.
+        // Real data is not like that, and neither is this fixture.
+        let mut matrix = Vec::new();
+        for i in 0..200 {
+            let spread = f64::from(i % 20) * 0.01; // per-task cost variance, identical in both arms
+            if i < 10 {
+                // Gate wrongly PASSES a bad cheap answer; the top rung would have been right.
+                // These 10 tasks are the entire quality difference, and they all point one way.
+                matrix.push(vec![
+                    o(true, false, 0.01 + spread),
+                    o(true, true, 0.10 + spread),
+                ]);
+            } else if i < 30 {
+                // Both rungs wrong: adds variance to BOTH marginals, contributes 0 to the paired
+                // difference. This is what makes the marginal intervals overlap.
+                matrix.push(vec![
+                    o(true, false, 0.01 + spread),
+                    o(true, false, 0.10 + spread),
+                ]);
+            } else {
+                matrix.push(vec![
+                    o(true, true, 0.01 + spread),
+                    o(true, true, 0.10 + spread),
+                ]);
+            }
+        }
+        let study = replay(&matrix, &ladder(), "test");
+        let fp = study.find("first-pass").unwrap();
+        let top = study.find("always-top").unwrap();
+        let pt = study.paired.iter().find(|p| p.vs == "always-top").unwrap();
+
+        // Every disagreement points one way: 10 losses, no wins.
+        assert_eq!((pt.wins, pt.losses), (0, 10));
+        // Both arms genuinely imperfect, so both marginals carry real width.
+        assert!(fp.success_rate < 0.9 && top.success_rate < 0.95);
+        // The paired interval excludes 0 — a real difference…
+        assert!(
+            pt.delta_success_ci.hi < 0.0,
+            "paired CI must exclude 0: [{:+.4}, {:+.4}]",
+            pt.delta_success_ci.lo,
+            pt.delta_success_ci.hi
+        );
+        // …and it is far tighter than the gap between the two marginal intervals suggests.
+        let marginal_overlap = fp.success_ci.hi >= top.success_ci.lo;
+        assert!(
+            marginal_overlap,
+            "this fixture is only interesting while the marginal intervals overlap"
+        );
+        assert!(
+            study.verdict().contains("TRADEOFF, MEASURED"),
+            "a consistent, real quality gap must be stated as a measured trade: {}",
+            study.verdict()
+        );
+    }
+
+    /// A checkpoint must resume real work and never invent it. Two failure modes matter and they
+    /// pull in opposite directions: losing finished tasks wastes money, and *trusting* a bad file
+    /// would put rows into a published result that nobody measured. So a valid entry is reused
+    /// verbatim, and anything unreadable is ignored rather than allowed to fail — or fake — a run.
+    #[test]
+    fn a_checkpoint_resumes_real_work_and_ignores_a_corrupt_file() {
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("fp-ckpt-{}.jsonl", std::process::id()));
+
+        let row = vec![o(true, true, 0.01), o(true, true, 0.10)];
+        append_checkpoint(Some(&p), "mbpp-1", &ladder(), &row);
+        append_checkpoint(Some(&p), "mbpp-2", &ladder(), &row);
+        let loaded = load_checkpoint(Some(&p), &ladder());
+        assert_eq!(loaded.len(), 2);
+        let back = &loaded["mbpp-1"];
+        assert_eq!(back.len(), 2);
+        assert!(
+            (back[0].cost_usd - 0.01).abs() < 1e-12 && back[0].oracle_correct,
+            "a resumed row must be the measurement, not a default"
+        );
+
+        // A truncated final line — exactly what an interrupted write leaves behind — must cost
+        // only that row, not the whole file.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        writeln!(f, "{{\"task_id\": \"mbpp-3\", \"rungs\": [{{\"gate_sc").unwrap();
+        drop(f);
+        assert_eq!(
+            load_checkpoint(Some(&p), &ladder()).len(),
+            2,
+            "a torn line is skipped; the intact rows survive"
+        );
+
+        // A DIFFERENT ladder must not reuse these rows. Without this, measuring haiku->opus
+        // would silently return the haiku->sonnet numbers and label them opus — a fabricated
+        // result with no symptom, because every field would look entirely normal.
+        let other = vec!["cheap".to_owned(), "different-top".to_owned()];
+        assert!(
+            load_checkpoint(Some(&p), &other).is_empty(),
+            "rows measured with another ladder must be re-measured, never reused"
+        );
+
+        std::fs::remove_file(&p).ok();
+        assert!(
+            load_checkpoint(Some(&p), &ladder()).is_empty()
+                && load_checkpoint(None, &ladder()).is_empty(),
+            "a missing checkpoint just means measure everything"
         );
     }
 
