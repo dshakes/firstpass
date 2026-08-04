@@ -58,7 +58,7 @@
 <h1>Benchmarks</h1>
 <p class="page-sub">Every number Firstpass publishes regenerates from a committed command. This page is the index of those artifacts, the provenance rules that keep them honest, and the exact commands to reproduce them on your own account.</p>
 
-<div class="tldr">On <b>974 real coding tasks</b> with real unit-test gates, Firstpass served <b>82% of requests from the cheap rung</b> at a <b>7.7% served-failure rate</b> — below the pre-registered 10% target at 95% confidence. Every published number here traces to a committed, reproducible artifact; if the artifact isn't in <code>docs/benchmarks/</code>, the number is stale.</div>
+<div class="tldr">On <b>974 real coding tasks</b> with real unit-test gates: gating recovered <b>+15.2 points</b> of quality over the cheap model alone and made <b>zero of those 974 tasks worse</b>, while holding a <b>7.7% served-failure rate</b> below the pre-registered 10% target at 95% confidence. Every published number here traces to a committed, reproducible artifact; if the artifact isn't in <code>docs/benchmarks/</code>, the number is stale.</div>
 
 <h2 id="rule">The provenance rule<a class="anchor" href="#rule" aria-label="Link to this section">#</a></h2>
 <div class="tldr">Every public number Firstpass cites must have a <b>committed artifact</b> — the harness's raw stdout, unedited. No artifact means the number is stale; the missing artifact is the bug to file, not the number to debate.</div>
@@ -118,6 +118,28 @@
 <div class="note"><span class="nt">Key idea</span> The <b>82% figure</b> is the efficiency number: four out of five requests never needed a strong-model call. The <b>7.7% served-failure rate</b> is the safety number: of the cheap-tier serves, how often does the unit test disagree? Both hold simultaneously — that is the point of the conformal bound.</div>
 <div class="recap">82% cheap-tier, 7.7% served-failure, 974 live tasks, real unit-test gates — one committed artifact, one command to reproduce.</div>
 
+<h2 id="policy">Does routing beat picking one model?<a class="anchor" href="#policy" aria-label="Link to this section">#</a></h2>
+<div class="tldr">A guarantee is half the question; the other half is whether any of this beats picking one model and living with it. On the same 974 tasks: gating recovered <b>+15.2 points</b> of quality over the cheap model alone and made <b>zero of the 974 tasks worse</b>, at 12&ndash;57% lower cost per success depending on the ladder. Artifacts: <code>docs/benchmarks/mbpp-policy-974.txt</code> and <code>mbpp-policy-974-opus.txt</code>.</div>
+<p>Each task is solved <b>once per rung</b> and every policy is then replayed over that one shared matrix of measurements. So the policies are judged on <b>identical outcomes</b> &mdash; the gap between them cannot be an artifact of which samples each one happened to draw &mdash; and comparing more policies costs no extra calls.</p>
+<div class="chips">
+  <div class="chip good"><div class="cn">0</div><div class="cl">of 974 tasks regressed</div></div>
+  <div class="chip good"><div class="cn">+15.2</div><div class="cl">points vs always-cheap</div></div>
+  <div class="chip"><div class="cn">19<span class="u">%</span></div><div class="cl">escalated</div></div>
+  <div class="chip"><div class="cn">80<span class="u">%</span></div><div class="cl">of escalations converted</div></div>
+</div>
+<div class="tblwrap"><table>
+  <thead><tr><th>Policy</th><th>Success</th><th>$/success</th><th>Escalated</th><th>Converted</th></tr></thead>
+  <tbody>
+    <tr><td>always-cheap</td><td>0.77</td><td>$0.0018</td><td>0%</td><td>&mdash;</td></tr>
+    <tr><td>always-top (opus)</td><td>0.95</td><td>$0.0079</td><td>0%</td><td>&mdash;</td></tr>
+    <tr><td><b>first-pass</b></td><td><b>0.93</b></td><td><b>$0.0034</b></td><td>19%</td><td>80%</td></tr>
+  </tbody>
+</table></div>
+<p><b>Paired</b>, which is the correct test here because both arms are the same tasks decided two ways: <b>+0.152</b> vs always-cheap (95% CI [+0.129, +0.175], ~150 tasks recovered, none lost) and <b>&minus;0.023</b> vs always-top (95% CI [&minus;0.035, &minus;0.011], 28 lost, 6 won). Marginal intervals overlap on this design even when every disagreement points one way, because they carry the same task-difficulty variance twice.</p>
+<div class="note"><span class="nt">When this could regress</span> Escalation makes things worse in exactly one way: the gate rejects a cheap answer that was actually correct, and the rung above then gets it wrong. On these 974 tasks the first half never happened &mdash; <b>zero correct cheap answers were rejected</b>, matching the 0.0% false-reject rate in the guarantee artifact &mdash; so the regression path was never entered. A gate that rejects sloppily on your traffic can regress; <code>firstpass ope</code> rehearses a policy against your own logs before it enforces anything.</div>
+<div class="note"><span class="nt">Read the 57% with its ladder</span> The two artifacts run the same policy on the same tasks and differ only in the top rung: <b>12%</b> cheaper against a <code>sonnet</code> ceiling, <b>57%</b> against an <code>opus</code> one. On MBPP those two ceilings are statistically indistinguishable (0.9476 vs 0.9456, a 2-task difference against an 8% per-task flip rate on re-run), so part of the 57% is <code>opus</code> being the wrong ceiling for this workload rather than routing beating a well-chosen baseline. Quote either number with its ladder, or it says nothing.</div>
+<div class="recap">The gate <b>never made a task worse</b> &mdash; and the saving is a property of your ladder, not of the router alone.</div>
+
 <h2 id="probe">Probe study<a class="anchor" href="#probe" aria-label="Link to this section">#</a></h2>
 <div class="tldr">The go/no-go for elastic verification: the <b>pass-count regime signal works</b> — 77% of traffic is decidable at ~99% safety with k=5 cheap probes. The entropy AUC signal does not (0.431, near chance). Verdict: <b>GO</b> on elastic verification, using pass-count only.</div>
 <p>The elastic-verification go/no-go: <code>docs/benchmarks/probe-study-mbpp.txt</code>. <code>k=5</code>, <code>n=150</code> MBPP tasks, cheap-model probe. Verdict: GO with a corrected signal — the entropy AUC failed (0.431), the pass-count regime signal succeeded (77% of traffic decidable at ~99% safety).</p>
@@ -154,17 +176,19 @@
 <div class="recap">Pass-count wins, entropy loses — 77% of traffic is decidable by the cheap probe alone at ~99% safety.</div>
 
 <h2 id="artifacts">Artifact index<a class="anchor" href="#artifacts" aria-label="Link to this section">#</a></h2>
-<div class="tldr">Four artifacts back the published numbers; <b>two are committed</b> today. If a row has no <span class="badge ok">committed</span> badge, it hasn't been run on a live key — treat it as a runnable template, not an evidence record.</div>
+<div class="tldr">Six artifacts back the published numbers; <b>four are committed</b> today. If a row has no <span class="badge ok">committed</span> badge, it hasn't been run on a live key — treat it as a runnable template, not an evidence record.</div>
 <div class="tblwrap"><table>
   <thead><tr><th>Artifact</th><th>Backs</th><th>Command</th><th>Cost</th></tr></thead>
   <tbody>
     <tr><td><code>mbpp-live-base.txt</code> <span class="badge ok">committed</span></td><td>MBPP served-failure bound, base (test) gate</td><td><code>--coding-live</code></td><td>key + Docker, ~$5</td></tr>
     <tr><td><code>probe-study-mbpp.txt</code> <span class="badge ok">committed</span></td><td>Elastic-verification go/no-go (ADR 0008)</td><td><code>--probe-study</code></td><td>key + Docker</td></tr>
+    <tr><td><code>mbpp-policy-974.txt</code> <span class="badge ok">committed</span></td><td>Routing policy vs always-cheap / always-top, haiku&rarr;sonnet</td><td><code>--coding-policy</code></td><td>key + Docker, ~$3</td></tr>
+    <tr><td><code>mbpp-policy-974-opus.txt</code> <span class="badge ok">committed</span></td><td>Same comparison on a ~15&times; ladder, haiku&rarr;opus</td><td><code>--coding-policy</code> + <code>FIRSTPASS_CODING_LADDER</code></td><td>key + Docker, ~$9</td></tr>
     <tr><td><code>mbpp-live-judged.txt</code></td><td>MBPP bound with an LLM judge on the gate</td><td><code>--coding-live</code> + judge</td><td>key + Docker, ~$10</td></tr>
     <tr><td><code>live-200.txt</code></td><td>200-task live cost/success table</td><td><code>--live</code></td><td>key, ~a few $</td></tr>
   </tbody>
 </table></div>
-<div class="recap">Two artifacts committed, two still unrun — <b>the badge is the evidence</b>.</div>
+<div class="recap">Four artifacts committed, two still unrun &mdash; <b>the badge is the evidence</b>.</div>
 
 <h2 id="repro">Reproduce<a class="anchor" href="#repro" aria-label="Link to this section">#</a></h2>
 <div class="tldr">One command per artifact. The <b>bound machinery reproduces exactly</b> — give it your own run's gate/oracle outcomes and it recomputes the same certified threshold. The raw pass/fail counts will differ (model updates, sampling); cross-run dollar comparisons are not meaningful.</div>
@@ -184,7 +208,7 @@ FIRSTPASS_CODING_DATASET=./mbpp.jsonl FIRSTPASS_PROBE_K=5 \
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="elastic-verification.html"><span class="dir">← Previous</span><span class="t">Elastic verification</span></a><span></span></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#rule" class="">The provenance rule</a><a href="#live" class="">MBPP live bound</a><a href="#probe" class="">Probe study</a><a href="#artifacts" class="">Artifact index</a><a href="#repro" class="">Reproduce</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#rule" class="">The provenance rule</a><a href="#live" class="">MBPP live bound</a><a href="#policy" class="">Does routing beat picking one model?</a><a href="#probe" class="">Probe study</a><a href="#artifacts" class="">Artifact index</a><a href="#repro" class="">Reproduce</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">
