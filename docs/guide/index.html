@@ -14,7 +14,7 @@
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <header class="topnav"><div class="bar">
-  <a class="brand" href="../index.html"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass <span class="ver">v0.2.7</span></a>
+  <a class="brand" href="../index.html"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass <span class="ver">v0.3.0</span></a>
   <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
   <span class="nav-sp"></span>
   <div class="nav-right">
@@ -58,13 +58,13 @@
 <h1>Overview</h1>
 <p class="page-sub">Firstpass is an open-source adaptive LLM router. Every request opens on the cheapest model in a ladder; a gate checks the actual output; it serves the first output that passes and escalates one rung only on gate failure. Every decision gets a tamper-evident, hash-chained receipt.</p>
 
-<div class="tldr">Firstpass is an <b>open-source verification-gated LLM cascade router</b>, v0.2.7, pre-GA. Every request opens on the cheapest model; a gate <b>proves the real output</b> before serving it; on gate failure, it escalates exactly one rung. On 974 real coding tasks that recovered <b>+15.2 points</b> of quality over the cheap model alone and made <b>zero of those tasks worse</b> (<a href="benchmarks.html">artifacts</a>). Four moves — <b>Route → Prove → Escalate → Learn</b> — on every request. It sits as an HTTP reverse proxy between your agent and any provider; your agent code doesn't change.</div>
+<div class="tldr">Firstpass is an <b>open-source verification-gated LLM cascade router</b>, v0.3.0, pre-GA. Every request opens on the cheapest model; a gate <b>proves the real output</b> before serving it; on gate failure, it escalates exactly one rung. On 974 real coding tasks that recovered <b>+15.2 points</b> of quality over the cheap model alone and made <b>zero of those tasks worse</b> (<a href="benchmarks.html">artifacts</a>). Four moves — <b>Route → Prove → Escalate → Learn</b> — on every request. It sits as an HTTP reverse proxy between your agent and any provider; your agent code doesn't change.</div>
 
 <div class="chips">
   <div class="chip good"><div class="cn">≤10<span class="u">%</span></div><div class="cl">served-failure, 95% conf.</div></div>
   <div class="chip"><div class="cn">82<span class="u">%</span></div><div class="cl">served from cheap tier</div></div>
   <div class="chip"><div class="cn">974</div><div class="cl">real tasks in the live bound</div></div>
-  <div class="chip"><div class="cn">v0.2.7</div><div class="cl">pre-GA, open source</div></div>
+  <div class="chip"><div class="cn">v0.3.0</div><div class="cl">pre-GA, open source</div></div>
 </div>
 
 <h2 id="what">What Firstpass is<a class="anchor" href="#what" aria-label="Link to this section">#</a></h2>
@@ -155,8 +155,8 @@
 <div class="recap">Firstpass fits best when you have a definition of "good" you can run, and a cost problem you can see in the bill.</div>
 
 <h2 id="status">Status<a class="anchor" href="#status" aria-label="Link to this section">#</a></h2>
-<div class="tldr">v0.2.7 is <b>shipped and running</b>. The "Shipped &amp; verified" column is available and on by default. The "Next / research" column is gated on further validation — nothing there ships as a default, and every feature is <b>opt-in only</b>.</div>
-<p>Firstpass is <strong>v0.2.7, pre-GA</strong>, and honest about the line between shipped and researched.</p>
+<div class="tldr">v0.3.0 is <b>shipped and running</b>. The "Shipped &amp; verified" column is available and on by default. The "Next / research" column is gated on further validation — nothing there ships as a default, and every feature is <b>opt-in only</b>.</div>
+<p>Firstpass is <strong>v0.3.0, pre-GA</strong>, and honest about the line between shipped and researched.</p>
 <p class="subh">Shipped vs. in progress</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Shipped &amp; verified</th><th>Next / research</th></tr></thead>
@@ -194,7 +194,7 @@
     <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
     <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
   </div>
-  <div class="legal"><span>Firstpass v0.2.7 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+  <div class="legal"><span>Firstpass v0.3.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
 <script src="../assets/docs.js?v=5"></script>
 </body></html>
