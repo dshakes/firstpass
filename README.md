@@ -1,10 +1,12 @@
 <div align="center">
 
-<img src="assets/hero.svg" alt="Firstpass — cheap until proven otherwise. It routes every request to the cheapest model, gates the real output, and escalates only on proof of need. Measured on 974 real MBPP coding tasks: 12–57% lower cost per success depending on how expensive your top rung is — with a distribution-free guarantee of ≤10% wrong answers served at 95% confidence and a signed receipt every call." width="900">
+<img src="assets/hero.svg" alt="Firstpass — cheap until proven otherwise. It routes every request to the cheapest model, gates the real output, and escalates only on proof of need. Measured on 974 real MBPP coding tasks: it recovered 15 points of quality over the cheap model alone and made zero of those 974 tasks worse, at 12–57% lower cost per success depending on how expensive your top rung is — with a distribution-free guarantee of ≤10% wrong answers served at 95% confidence and a signed receipt every call." width="900">
 
 # ⚡ Firstpass
 
 ### The adaptive LLM router that proves the answer instead of guessing the model.
+
+**On 974 real coding tasks it recovered +15.2 points of quality over the cheap model alone — and made _zero_ of those 974 tasks worse.** At 12–57% lower cost per success, depending on how expensive your top rung is.
 
 Open every request on the **cheapest** model, **gate the real output** with your own test / schema / judge, escalate **only on proof of need**, and seal a **hash-chained receipt** every time. Wrong answers are capped by a **distribution-free guarantee**, not a promise.
 
@@ -29,6 +31,12 @@ Most routers decide by **prediction**: a classifier reads your prompt and *guess
 Firstpass decides by **proof**. It opens on the cheapest model in your ladder, then **gates the actual output** — runs your tests, checks a schema, asks a judge, or measures self-consistency. Pass → it serves. Fail → it escalates exactly one rung and gates again. The cheap model handles most traffic; the frontier model is spent **only when the cheap one is provably not enough**. Every decision is a tamper-evident, hash-chained receipt you (or an auditor) can re-derive independently — and a **distribution-free bound caps how often a wrong answer is served**.
 
 > **Cheap until proven otherwise.** You pay frontier prices only when a real check proves you must.
+
+The measured consequence, on 974 real coding tasks: gating lifted quality **+15.2 points** over serving
+the cheap model alone (95% CI [+12.9, +17.5]) and **regressed not one of the 974** — because a rung is
+only ever spent after a check says the cheap answer is not good enough, and on this workload the gate
+never once rejected an answer that was already right. [See the numbers](#the-proof), including the
+ones that qualify them.
 
 ---
 
@@ -55,11 +63,15 @@ The claim no predictive router makes: on **974 real MBPP coding tasks** (fail-cl
 
 The bound is a Hoeffding upper confidence bound — **valid for any data distribution**, no Gaussian assumptions. It's computed from a real run, not assumed. Your savings depend on your workload, which is why every trace records the always-frontier counterfactual: **you measure your number instead of trusting ours.**
 
-### …and what it costs, against the alternatives
+### …and whether routing beat simply picking one model
 
-A guarantee is only half the question. The other half is whether routing beats simply picking one
-model, so the same 974 tasks were replayed under each policy on identical measurements
-([sonnet ladder](docs/benchmarks/mbpp-policy-974.txt) · [opus ladder](docs/benchmarks/mbpp-policy-974-opus.txt)):
+A guarantee is only half the question. The other half is whether any of this beats picking one model
+and living with it, so the same 974 tasks were replayed under each policy on identical measurements
+([sonnet ladder](docs/benchmarks/mbpp-policy-974.txt) · [opus ladder](docs/benchmarks/mbpp-policy-974-opus.txt)).
+
+**The headline: the gate never made a task worse.** Not one of 974, on either ladder. It escalates on
+19% of traffic, 80% of those escalations turn a wrong answer into a right one, and nothing it did cost
+a task that the cheap model had already got right.
 
 | | vs **always-cheap** | vs **always-top** |
 |---|---|---|
@@ -67,8 +79,13 @@ model, so the same 974 tasks were replayed under each policy on identical measur
 | tasks | **~150 recovered, 0 regressed** | 28 lost, 6 won |
 | cost | +$1.71 total | **57% lower per success** |
 
-**The gate never made a task worse.** Not once in 974, on either ladder — it escalates on 19% of
-traffic and 80% of those escalations turn a wrong answer into a right one.
+That asymmetry is worth being precise about, because it is a property of *this workload* and not a
+law. Escalation can only make things worse in one specific way: the gate rejects a cheap answer that
+was actually correct, and the rung above then gets it wrong. On these 974 tasks the first half never
+happened — **zero correct cheap answers were rejected**, matching the 0.0% false-reject rate in the
+guarantee artifact — so the regression path was never entered. A gate that rejects sloppily on your
+traffic can regress, which is exactly why the receipts record every verdict and `firstpass ope`
+rehearses a policy against your own logs before it enforces anything.
 
 Two honest qualifications, because a number that can't survive scrutiny isn't worth quoting:
 
