@@ -29,14 +29,14 @@ config surface — two items on the first pass turned out to already exist and w
 |---|---|---|---|---|
 | 1 | `/v1/responses` (OpenAI Responses API) | Newer OpenAI agents speak Responses, not Chat Completions; without it they cannot point at us at all | M | planned |
 | 2 | `/v1/models` catalog | Agent CLIs call it to populate a model picker; its absence shows an empty list | S | **done** |
-| 3 | Session affinity | A multi-turn session that escalated re-pays the gate cycle from rung 0 every turn | M | planned |
+| 3 | Session affinity | A multi-turn session that escalated re-pays the gate cycle from rung 0 every turn | M | **done** |
 | 4 | Agent launchers (`firstpass launch …`) | One command beats a page of env-var instructions | S | **done** |
 | 5 | Reasoning-effort normalization | Providers spell effort differently; agents should not care which is behind us | S | **done** |
 | 6 | Prompt-cache breakpoints | Real money on long agent conversations against Anthropic | S | planned |
 | 7 | Message condensing | Long conversations blow the cheap rung's context and force escalation for the wrong reason | M | planned |
 | 8 | RL / training-trace export | Traces are already recorded; the gap is an export shape a trainer can consume | S | planned |
 
-Two of the three shipped items turned out to be fixing a bug rather than adding a feature,
+Three of the four shipped items turned out to be fixing a bug rather than adding a feature,
 which is the usual shape of parity work:
 
 - **Reasoning effort** was a live **400**. A ladder is routinely cross-vendor, so an OpenAI client
@@ -46,6 +46,9 @@ which is the usual shape of parity work:
   any other service holding the port. The first version of the launcher pointed an agent at an
   unrelated dev server on :8080 that answered 200. Every request would have bypassed the gate and
   reached something that replies — a failure that looks like success.
+- **Session affinity** was already in the config schema as `[escalation.session_promotion]`,
+  parsing cleanly and doing **nothing** — no code read it. Implementing it was the work; the
+  feature had been advertised to operators for releases.
 
 ### Struck on re-check — already present
 

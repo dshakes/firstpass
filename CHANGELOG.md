@@ -1,5 +1,57 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed: `[escalation.session_promotion]` parsed and did nothing
+
+The block has been in the config schema — and exported from `firstpass-core` — since before this
+release, and **nothing ever read it**. An operator could set `after_failures` and `window`, get no
+parse error, and receive none of the behaviour. A config that parses and no-ops is the same class
+of defect as a receipt that records `$0.00`: the file states one thing and the system does another,
+with nothing to notice it by.
+
+It is now implemented. A session that had to escalate starts its next turn on the rung it actually
+needed, instead of re-paying for the rung that already failed it — aimed at the escalation tax
+measured at 18% of first-pass spend.
+
+Two additions keep it from becoming a cost regression:
+
+- **`probe_every` (default 5)** — every 5th turn deliberately starts one rung *lower* to test
+  whether the promotion is still earned. Without it, promotion is a ratchet: a conversation that
+  escalates once stays expensive forever, including the trivial turns at the end. `probe_every = 0`
+  is **rejected at parse** rather than silently pinning a session permanently.
+- **`max_sessions` (default 10000)** — hard cap, oldest evicted first. A routing optimisation must
+  not be able to exhaust memory on a proxy under load.
+
+Promotion is per `(tenant, session)` and never crosses a tenant boundary. It chooses only where the
+ladder starts; the gate still verifies whatever is served, so a wrong promotion costs money, never
+correctness.
+
+### Added
+
+- **`GET /v1/models`** — OpenAI-shaped discovery so agent CLIs can populate a model picker.
+  Reports distinct ladder rungs in ladder order (that order is the cost gradient) with the real
+  per-1M prices from the table that bills the receipt.
+- **`firstpass launch claude|codex|openai -- <cmd>`** — start a coding agent already pointed at the
+  proxy. Refuses when nothing is listening, and refuses when something that is *not* Firstpass is.
+- **`docs/parity.md`** — feature-parity audit against comparable routing proxies, and the order the
+  remaining gaps get closed.
+
+### Fixed
+
+- **Cross-vendor reasoning effort.** A ladder is routinely cross-vendor, so an OpenAI client that
+  set `reasoning_effort` got a **400 from Anthropic** the moment the router escalated it onto an
+  Anthropic rung — a correct request broken by the ladder moving underneath it. The caller's
+  request is now translated between `reasoning_effort`, `thinking.budget_tokens`, and
+  `thinkingConfig.thinkingBudget`, honouring Anthropic's constraints (a budget `max_tokens` cannot
+  fit is dropped rather than sent invalid; enabling thinking clears a now-invalid `temperature`).
+  Same-dialect bodies are never rewritten — ADR 0005 promises verbatim passthrough, and that covers
+  the caller's own mistakes.
+- **`GET /healthz` now reports `service` and `version`.** A bare `{"status":"ok"}` cannot
+  distinguish this proxy from anything else holding the port, which made it useless for the one
+  check that needs it — `firstpass launch` pointed an agent at an unrelated dev server that answered
+  200, which would have routed every request past the gate to a stranger that replies.
+
 ## [0.3.0]
 
 **Breaking.** Two config changes can stop an existing deployment from starting. Both are cases
