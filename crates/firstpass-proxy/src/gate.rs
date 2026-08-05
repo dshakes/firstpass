@@ -457,6 +457,7 @@ mod tests {
             max_tokens: 16,
             tools: Value::Null,
             raw: Value::Null,
+            cache_prefix: false,
         }
     }
 

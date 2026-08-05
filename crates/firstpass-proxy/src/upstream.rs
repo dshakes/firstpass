@@ -103,7 +103,27 @@ pub async fn forward_openai(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
-    let response = build_request(client, base, "/v1/chat/completions", headers, body)
+    forward_openai_path(client, base, OPENAI_CHAT_PATH, headers, body).await
+}
+
+/// The OpenAI-compatible inbound paths this proxy relays for.
+pub const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
+/// The Responses API path. A Responses-shaped body relayed to [`OPENAI_CHAT_PATH`] is rejected by
+/// the upstream, so the passthrough has to preserve which endpoint the client actually called.
+pub const OPENAI_RESPONSES_PATH: &str = "/v1/responses";
+
+/// As [`forward_openai`], but to an explicit upstream path.
+///
+/// # Errors
+/// Returns [`ProxyError::Upstream`] on a transport-level failure.
+pub async fn forward_openai_path(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
+    let response = build_request(client, base, path, headers, body)
         .send()
         .await?;
     let status = response.status();
@@ -122,7 +142,21 @@ pub async fn forward_openai_streaming(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, reqwest::Response), ProxyError> {
-    let response = build_request(client, base, "/v1/chat/completions", headers, body)
+    forward_openai_streaming_path(client, base, OPENAI_CHAT_PATH, headers, body).await
+}
+
+/// As [`forward_openai_streaming`], but to an explicit upstream path.
+///
+/// # Errors
+/// Returns [`ProxyError::Upstream`] on a transport-level failure.
+pub async fn forward_openai_streaming_path(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, reqwest::Response), ProxyError> {
+    let response = build_request(client, base, path, headers, body)
         .send()
         .await?;
     let status = response.status();

@@ -77,6 +77,11 @@ pub struct ModelRequest {
     /// synthesized requests (judge / consistency samples), which use the normalized fields.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub raw: Value,
+    /// Whether to insert prompt-cache breakpoints on the stable prefix — see
+    /// [`add_cache_breakpoints`]. Set from `[escalation] prompt_cache`; `false` everywhere else,
+    /// including synthesized judge/consistency requests, so nothing changes unless asked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_prefix: bool,
 }
 
 /// A provider-agnostic model response.
@@ -243,6 +248,9 @@ pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
         );
         body.remove("stream");
         normalize_reasoning(&mut body, Wire::Anthropic);
+        if req.cache_prefix {
+            add_cache_breakpoints(&mut body);
+        }
         return Value::Object(body);
     }
     let messages: Vec<Value> = req
@@ -260,6 +268,15 @@ pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
     }
     if !req.tools.is_null() {
         body["tools"] = req.tools.clone();
+    }
+    // This branch is not a rare fallback: it is the path every translated request takes, and
+    // every CONDENSED one — condensing clears `raw` precisely so the smaller message list is what
+    // gets sent. Applying breakpoints only in the raw branch above would mean `prompt_cache`
+    // silently did nothing for exactly the long conversations it exists to pay for.
+    if req.cache_prefix
+        && let Some(map) = body.as_object_mut()
+    {
+        add_cache_breakpoints(map);
     }
     body
 }
@@ -627,6 +644,73 @@ pub fn normalize_reasoning(body: &mut serde_json::Map<String, Value>, target: Wi
                 });
         }
     }
+}
+
+/// Insert Anthropic prompt-cache breakpoints on the stable prefix of a request.
+///
+/// Marks the end of the system prompt and the end of the tool definitions — the part of an agent's
+/// request that is byte-identical turn after turn. Everything after the last breakpoint (the
+/// conversation itself) is not cached.
+///
+/// **This is opt-in, and it is not free money.** A cache *write* costs
+/// [`CACHE_WRITE_MULTIPLIER`](firstpass_core::cost::CACHE_WRITE_MULTIPLIER) (1.25×) of base input,
+/// and only pays back once the same prefix is read again — [`CACHE_READ_MULTIPLIER`] is 0.1×, so
+/// roughly one reuse covers the premium and everything after is a large saving. On a long agent
+/// session with a fixed system prompt and tool set that is a clear win; on single-shot traffic it
+/// is a 25% surcharge on the prefix for nothing. Which one an operator has is a question about
+/// their traffic, not about this code, so it is configured rather than assumed.
+///
+/// Idempotent: a caller already using `cache_control` keeps their own breakpoints and gets none
+/// added, since they have placed them with knowledge this code does not have.
+pub fn add_cache_breakpoints(body: &mut serde_json::Map<String, Value>) {
+    if body_has_cache_control(body) {
+        return;
+    }
+    let marker = serde_json::json!({ "type": "ephemeral" });
+
+    // `system` may be a bare string; caching requires the block form.
+    match body.get("system") {
+        Some(Value::String(text)) if !text.is_empty() => {
+            body.insert(
+                "system".to_owned(),
+                serde_json::json!([{
+                    "type": "text", "text": text, "cache_control": marker,
+                }]),
+            );
+        }
+        Some(Value::Array(blocks)) if !blocks.is_empty() => {
+            let mut blocks = blocks.clone();
+            if let Some(last) = blocks.last_mut().and_then(Value::as_object_mut) {
+                last.insert("cache_control".to_owned(), marker.clone());
+            }
+            body.insert("system".to_owned(), Value::Array(blocks));
+        }
+        _ => {}
+    }
+
+    // Tool definitions are the other half of the stable prefix, and on an agent request usually
+    // the larger half.
+    if let Some(Value::Array(tools)) = body.get("tools")
+        && !tools.is_empty()
+    {
+        let mut tools = tools.clone();
+        if let Some(last) = tools.last_mut().and_then(Value::as_object_mut) {
+            last.insert("cache_control".to_owned(), marker);
+        }
+        body.insert("tools".to_owned(), Value::Array(tools));
+    }
+}
+
+/// Whether the caller already placed cache breakpoints of their own.
+fn body_has_cache_control(body: &serde_json::Map<String, Value>) -> bool {
+    fn any_in(v: &Value) -> bool {
+        match v {
+            Value::Array(items) => items.iter().any(any_in),
+            Value::Object(o) => o.contains_key("cache_control") || o.values().any(any_in),
+            _ => false,
+        }
+    }
+    body.values().any(any_in)
 }
 
 /// Speaks `POST {base}/v1/chat/completions` (OpenAI Chat Completions API).
@@ -1527,6 +1611,111 @@ mod tests {
     }
 
     #[test]
+    fn cache_breakpoints_land_on_the_stable_prefix_only() {
+        // System prompt and tool definitions are what repeat byte-for-byte across an agent's
+        // turns. The conversation after them is not cached, and must not be marked.
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "system": "you are a careful assistant",
+            "tools": [{ "name": "a" }, { "name": "b" }],
+            "messages": [{ "role": "user", "content": "hi" }],
+        }));
+
+        add_cache_breakpoints(&mut body);
+
+        // A bare string system cannot carry cache_control — it must become the block form.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["system"][0]["text"], "you are a careful assistant");
+        // Only the LAST tool: a breakpoint marks the end of a prefix, and one per tool would
+        // spend the write premium several times over for the same prefix.
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert!(
+            body["messages"][0].get("cache_control").is_none(),
+            "the conversation is not the stable prefix"
+        );
+    }
+
+    #[test]
+    fn a_caller_that_placed_its_own_breakpoints_is_left_alone() {
+        // They have knowledge of their own prefix that this code does not; adding more would
+        // exceed Anthropic's breakpoint limit and re-bill the write premium.
+        let before = serde_json::json!({
+            "system": [{ "type": "text", "text": "s", "cache_control": { "type": "ephemeral" } }],
+            "tools": [{ "name": "a" }],
+        });
+        let mut body = obj(before.clone());
+
+        add_cache_breakpoints(&mut body);
+
+        assert_eq!(Value::Object(body), before);
+    }
+
+    #[test]
+    fn nothing_is_marked_when_there_is_no_stable_prefix() {
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{ "role": "user", "content": "one shot" }],
+        }));
+        let before = body.clone();
+
+        add_cache_breakpoints(&mut body);
+
+        assert_eq!(body, before, "no system, no tools — nothing to cache");
+    }
+
+    #[test]
+    fn breakpoints_are_off_unless_the_request_asks_for_them() {
+        // The default path must be byte-identical to before this existed.
+        let raw = serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 64,
+            "system": "s", "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let req = ModelRequest {
+            model: "anthropic/claude-sonnet-5".to_owned(),
+            system: Some("s".to_owned()),
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 64,
+            tools: Value::Null,
+            raw: raw.clone(),
+            cache_prefix: false,
+        };
+
+        let body = anthropic_wire_body(&req);
+        assert_eq!(body["system"], "s", "unchanged when opted out");
+
+        let opted = ModelRequest {
+            cache_prefix: true,
+            ..req
+        };
+        let body = anthropic_wire_body(&opted);
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn breakpoints_apply_on_the_normalized_path_too() {
+        // Found in review. The normalized branch is not a rare fallback — it is what every
+        // translated request uses, and every CONDENSED one, since condensing clears `raw` on
+        // purpose. Marking only the raw branch meant `prompt_cache` did nothing for exactly the
+        // long conversations it exists to pay for.
+        let req = ModelRequest {
+            model: "anthropic/claude-sonnet-5".to_owned(),
+            system: Some("stable prefix".to_owned()),
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 64,
+            tools: serde_json::json!([{ "name": "a" }]),
+            raw: Value::Null, // no raw body → normalized build path
+            cache_prefix: true,
+        };
+
+        let body = anthropic_wire_body(&req);
+
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
     fn wire_model_strips_the_provider_prefix() {
         // Regression: sending "anthropic/claude-haiku-4-5" verbatim 404s at the provider.
         assert_eq!(wire_model("anthropic/claude-haiku-4-5"), "claude-haiku-4-5");
@@ -1546,6 +1735,7 @@ mod tests {
             max_tokens: 256,
             tools: Value::Null,
             raw: Value::Null,
+            cache_prefix: false,
         };
         let body = gemini_request_body(&req);
         // System prompt goes in system_instruction, not contents.
@@ -1643,6 +1833,7 @@ mod tests {
             max_tokens: 128,
             tools: Value::Null,
             raw: Value::Null,
+            cache_prefix: false,
         };
         let body = anthropic_messages_body(&req, "bedrock-2023-05-31");
         // Model goes in the URL for Bedrock/Vertex, never the body.
@@ -1688,6 +1879,7 @@ mod tests {
             max_tokens: 16,
             tools: Value::Null,
             raw: Value::Null,
+            cache_prefix: false,
         };
         let err = provider.complete(&req, &Auth::default()).await.unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
@@ -1744,6 +1936,7 @@ mod tests {
             max_tokens: 16,
             tools: Value::Null,
             raw: Value::Null,
+            cache_prefix: false,
         };
         let err = provider.complete(&req, &Auth::default()).await.unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
@@ -1825,6 +2018,7 @@ mod tests {
             max_tokens: 64,
             tools: Value::Null,
             raw: Value::Null,
+            cache_prefix: false,
         });
         assert_eq!(wire["messages"][0]["content"], serde_json::json!("hi"));
         assert_eq!(
@@ -1901,6 +2095,7 @@ mod tests {
             max_tokens: 100,
             tools: Value::Null,
             raw: Value::Null,
+            cache_prefix: false,
         };
         let out = provider.complete(&req, &Auth::default()).await.unwrap();
         assert_eq!(out.text, "hello");
@@ -1928,6 +2123,7 @@ mod tests {
             max_tokens: 512,
             tools: raw["tools"].clone(),
             raw: raw.clone(),
+            cache_prefix: false,
         };
         let wire = anthropic_wire_body(&req);
         assert_eq!(wire["model"], "claude-haiku-4-5", "rung model swapped in");
@@ -1963,6 +2159,7 @@ mod tests {
             max_tokens: 64,
             tools: raw["tools"].clone(),
             raw: raw.clone(),
+            cache_prefix: false,
         };
         let body = anthropic_messages_body(&req, "bedrock-2023-05-31");
         assert!(body.get("model").is_none(), "model lives in the URL");
@@ -2020,6 +2217,7 @@ mod tests {
             max_tokens: 256,
             tools: Value::Null,
             raw: raw.clone(),
+            cache_prefix: false,
         };
         let wire = openai_wire_body(&req);
         assert_eq!(wire["model"], "gpt-4.1-mini", "rung model swapped in");
@@ -2052,6 +2250,7 @@ mod tests {
             max_tokens: 128,
             tools: Value::Null,
             raw: Value::Null,
+            cache_prefix: false,
         };
         let wire = openai_wire_body(&req);
         assert_eq!(wire["model"], "gpt-4.1-mini");

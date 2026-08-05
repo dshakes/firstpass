@@ -65,6 +65,33 @@ correctness.
 
 ### Added
 
+- **`POST /v1/responses`** — the OpenAI Responses API. Newer OpenAI-family agents speak Responses
+  rather than Chat Completions, and without this they could not point at Firstpass at all. Served
+  by translating to and from the Chat Completions path, so the gate, ladder, budget, and receipt are
+  the **same** ones — not a parallel implementation that could drift on the parts that matter.
+  Buffered only: `enforce` cannot stream, because the gate must see the whole candidate before it
+  can judge it, so a streaming Responses request takes the same observe passthrough that Chat
+  Completions already uses for a request it cannot gate faithfully.
+- **`[escalation] prompt_cache`** — insert Anthropic prompt-cache breakpoints on the stable prefix
+  (system prompt + tool definitions), the part of an agent request that repeats byte-for-byte every
+  turn. **Off by default, and deliberately so**: a cache write costs 1.25× base input and a read
+  0.1×, so roughly one reuse of the prefix covers the premium and everything after saves heavily —
+  but single-shot traffic never reuses and would pay a 25% surcharge for nothing. Whether that
+  trade pays is a fact about your traffic, not something this code can infer. A caller that already
+  places its own `cache_control` is left untouched.
+- **`[escalation.condense]`** — last-resort context condensing. When a conversation has overflowed
+  the context window of *every* rung, the middle of the history is dropped (head and tail kept, with
+  a marker turn telling the model its history is incomplete) and the top rung is retried **once**.
+  Deliberately not a general trimming knob: condensing routinely would mean gating an answer
+  produced from a prompt the client never sent. It fires only where the alternative is no answer at
+  all, and the overflow attempts stay on the receipt so the elision is visible. Absent by default.
+- **Context overflow now escalates instead of failing the request.** A prompt too large for a rung
+  is a 400, and every 400 aborted the ladder — so a long agent conversation that outgrew the
+  *cheapest* rung's context window failed outright, even with a larger rung configured directly
+  above it. It now climbs, and records the attempt as `context_overflow` rather than a gate
+  failure, so capacity-forced escalations are not pooled with quality ones in the statistics. An
+  unrecognised 400 still aborts: escalating a genuinely malformed request only buys the same
+  rejection at a higher price.
 - **`GET /v1/models`** — OpenAI-shaped discovery so agent CLIs can populate a model picker.
   Reports distinct ladder rungs in ladder order (that order is the cost gradient) with the real
   per-1M prices from the table that bills the receipt.

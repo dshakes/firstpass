@@ -33,6 +33,7 @@ async fn spawn_upstream() -> String {
     let router = Router::new()
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/chat/completions", post(openai_chat))
+        .route("/v1/responses", post(openai_responses))
         // Gemini's `{model}:generateContent` is a single path segment.
         .route("/v1beta/models/{model_action}", post(gemini_generate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -81,6 +82,26 @@ async fn openai_chat(body: Bytes) -> Response {
         "model": model,
         "choices": [{ "index": 0, "message": { "role": "assistant", "content": "answer via openai" }, "finish_reason": "stop" }],
         "usage": { "prompt_tokens": 1000, "completion_tokens": 200 },
+    }))
+    .into_response()
+}
+
+/// Responses-API wire response. Exists so a relay that targets the WRONG upstream path is
+/// observable: a Responses-shaped body sent to /v1/chat/completions would land in `openai_chat`
+/// and come back Chat-shaped, which is exactly the bug this endpoint had.
+async fn openai_responses(body: Bytes) -> Response {
+    let model = requested_model(&body);
+    Json(json!({
+        "id": "resp_e2e",
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": [{
+            "type": "message", "id": "msg_e2e", "status": "completed", "role": "assistant",
+            "content": [{ "type": "output_text", "text": "streamed via responses", "annotations": [] }],
+        }],
+        "output_text": "streamed via responses",
+        "usage": { "input_tokens": 7, "output_tokens": 3, "total_tokens": 10 },
     }))
     .into_response()
 }
@@ -444,5 +465,124 @@ async fn session_promotion_skips_the_rung_that_already_failed() {
         other.attempts.len(),
         2,
         "an unrelated session starts cold and climbs on its own"
+    );
+}
+
+/// The Responses API served through the real gated ladder over real HTTP.
+///
+/// The point is not the translation — that is unit-tested. It is that a Responses client gets the
+/// *same* engine: the cheap rung is tried, its empty answer fails the gate, the ladder escalates,
+/// and the receipt records both attempts. A parallel implementation would be the easy mistake here,
+/// and it would drift on exactly the parts that matter.
+#[tokio::test]
+async fn responses_api_is_gated_by_the_same_ladder() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy(
+        &upstream,
+        &["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"],
+        "",
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/responses"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({
+            "model": "claude-haiku-4-5",
+            "instructions": "be terse",
+            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "write a hello world" }] }],
+            "max_output_tokens": 256,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    // Responses shape, not Chat shape leaking through.
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(
+        body["output"][0]["content"][0]["text"],
+        "fn main() {} // compiles"
+    );
+    assert_eq!(body["output_text"], "fn main() {} // compiles");
+    // Responses spells usage differently; Chat's spelling here would read as a free call.
+    assert!(
+        body["usage"]["input_tokens"].as_u64().unwrap() > 0,
+        "{}",
+        body["usage"]
+    );
+    assert!(body["usage"]["output_tokens"].as_u64().unwrap() > 0);
+
+    // And it went through the real ladder: haiku failed the gate, sonnet served.
+    let traces = wait_for_traces(&db, 1).await;
+    assert_eq!(traces[0].attempts.len(), 2, "same gate, same escalation");
+    assert_eq!(traces[0].attempts[0].verdict, Verdict::Fail);
+    assert_eq!(traces[0].final_.served_rung, Some(1));
+    assert!(
+        verify_chain(&traces, GENESIS_HASH).is_ok(),
+        "receipt chain intact"
+    );
+}
+
+/// A Responses request that cannot be gated must still reach the **Responses** upstream endpoint.
+///
+/// Caught in review: the fallback relayed a Responses-shaped body to `/v1/chat/completions`, which
+/// the upstream rejects — breaking the exact client class the endpoint exists to serve. Observe
+/// mode is the reachable fallback here; streaming takes the same path.
+#[tokio::test]
+async fn a_responses_request_that_cannot_be_gated_still_reaches_the_responses_endpoint() {
+    let upstream = spawn_upstream().await;
+    // No enforce route → every request falls through to observe passthrough.
+    let (proxy, _db) = spawn_proxy_with(&upstream, &["anthropic/claude-haiku-4-5"], "", "").await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/responses"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({ "model": "gpt-5.5", "input": "hi", "stream": true }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("streamed via responses"),
+        "relay must hit /v1/responses upstream, not /v1/chat/completions: {text}"
+    );
+    assert!(
+        !text.contains("answer via openai"),
+        "landing in the chat handler means the wrong upstream path: {text}"
+    );
+}
+
+/// The receipt must describe the request the CLIENT made, not the translated one it was routed as.
+#[tokio::test]
+async fn a_responses_receipt_names_the_api_the_client_actually_called() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy(
+        &upstream,
+        &["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"],
+        "",
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/responses"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({ "model": "claude-haiku-4-5", "input": "write a hello world" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let traces = wait_for_traces(&db, 1).await;
+    assert_eq!(
+        traces[0].request.api, "openai.responses",
+        "an audit record that misnames the API cannot be reconciled against the client's logs"
     );
 }
