@@ -24,7 +24,42 @@ impl ModelPrice {
     pub fn cost(&self, input: u64, output: u64) -> f64 {
         (input as f64 / 1e6) * self.input_per_mtok + (output as f64 / 1e6) * self.output_per_mtok
     }
+
+    /// Cost in USD including prompt-cache traffic, which bills at different rates than plain input.
+    ///
+    /// Cached prompt tokens are **not** free and **not** priced like ordinary input:
+    /// - writing to the cache costs a premium ([`CACHE_WRITE_MULTIPLIER`]), because the provider
+    ///   stores the prefix;
+    /// - reading from it is heavily discounted ([`CACHE_READ_MULTIPLIER`]).
+    ///
+    /// Ignoring both — which is what counting `input_tokens` alone does — understates a cached
+    /// request by orders of magnitude. A 190k-token cached prefix reports an `input_tokens` of
+    /// about 20, so the receipt reads a fraction of a cent for a call that cost most of a dollar,
+    /// and `[budget]` caps fed by that total never trip.
+    #[must_use]
+    pub fn cost_with_cache(
+        &self,
+        input: u64,
+        cache_write: u64,
+        cache_read: u64,
+        output: u64,
+    ) -> f64 {
+        self.cost(input, output)
+            + (cache_write as f64 / 1e6) * self.input_per_mtok * CACHE_WRITE_MULTIPLIER
+            + (cache_read as f64 / 1e6) * self.input_per_mtok * CACHE_READ_MULTIPLIER
+    }
 }
+
+/// Premium on input rate for tokens written to the provider's prompt cache.
+///
+/// Anthropic's published 5-minute-TTL rate. ponytail: one constant rather than a per-model column —
+/// every provider that offers prompt caching currently prices it as a fixed multiple of its own
+/// input rate, so a column would be the same number repeated. Move it into [`ModelPrice`] the day
+/// one of them diverges.
+pub const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
+
+/// Discount on input rate for tokens served from the provider's prompt cache (Anthropic: 0.1×).
+pub const CACHE_READ_MULTIPLIER: f64 = 0.1;
 
 /// A lookup from `provider/model` to [`ModelPrice`].
 ///
@@ -91,11 +126,33 @@ impl PriceTable {
 
     /// Cost in USD of a call to `model` with the given token counts.
     ///
+    /// **Only correct for a response with no prompt-cache traffic.** Any path pricing a real
+    /// provider response should call [`PriceTable::cost_usd_with_cache`] instead and pass the
+    /// cache counters — this one silently prices a cached call at a small fraction of what it
+    /// cost, which is how a ~$0.72 request once banked a $0.0001 receipt. Reserved for
+    /// counterfactuals and synthetic token counts, where there is no cache traffic by
+    /// construction.
+    ///
     /// # Errors
     /// Returns [`Error::UnknownModel`] if the model has no price entry.
     pub fn cost_usd(&self, model: &str, input: u64, output: u64) -> Result<f64> {
+        self.cost_usd_with_cache(model, input, 0, 0, output)
+    }
+
+    /// As [`PriceTable::cost_usd`], including prompt-cache traffic at its own rates.
+    ///
+    /// # Errors
+    /// Returns [`Error::UnknownModel`] if the model has no price entry.
+    pub fn cost_usd_with_cache(
+        &self,
+        model: &str,
+        input: u64,
+        cache_write: u64,
+        cache_read: u64,
+        output: u64,
+    ) -> Result<f64> {
         self.get(model)
-            .map(|p| p.cost(input, output))
+            .map(|p| p.cost_with_cache(input, cache_write, cache_read, output))
             .ok_or_else(|| Error::UnknownModel(model.to_owned()))
     }
 
@@ -114,6 +171,57 @@ impl PriceTable {
 
 #[cfg(test)]
 mod tests {
+    /// A cached request must not be billed as if the cached prompt were free.
+    ///
+    /// This is the regression that mattered: usage was read as `input_tokens` alone, and a caller
+    /// using prompt caching reports the bulk of its prompt in the cache counters. A 190k-token
+    /// cached prefix arrives as an `input_tokens` of ~20, so the receipt recorded a fraction of a
+    /// cent for a call that cost most of a dollar — in a product whose claim is a tamper-evident
+    /// cost record, and with `[budget]` caps fed by that same total.
+    #[test]
+    fn a_cached_prompt_is_billed_not_ignored() {
+        // sonnet-5: $3/1M input, $15/1M output.
+        let p = super::ModelPrice {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+        };
+
+        // What a real cached Claude Code turn looks like: tiny uncached remainder, huge cache write.
+        let naive = p.cost(20, 400);
+        let real = p.cost_with_cache(20, 190_000, 0, 400);
+
+        assert!(
+            real > naive * 50.0,
+            "cache-aware cost {real} must dwarf the naive {naive}; that gap is the bug"
+        );
+        // 20 in + 400 out + 190k written at 1.25x: 0.00006 + 0.006 + 0.7125
+        assert!((real - 0.71856).abs() < 1e-5, "got {real}");
+    }
+
+    #[test]
+    fn a_cache_read_is_cheap_but_never_free() {
+        let p = super::ModelPrice {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+        };
+        // 190k read from cache at 0.1x = $0.057, versus $0.57 had it been uncached input.
+        let read = p.cost_with_cache(0, 0, 190_000, 0);
+        assert!((read - 0.057).abs() < 1e-6, "got {read}");
+        assert!(read > 0.0, "a cache read is discounted, not free");
+        let uncached = p.cost(190_000, 0);
+        assert!(read < uncached, "{read} should undercut {uncached}");
+    }
+
+    #[test]
+    fn zero_cache_traffic_bills_exactly_as_before() {
+        // Every existing receipt and test must be unaffected: no cache traffic, no change.
+        let p = super::ModelPrice {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+        };
+        assert!((p.cost_with_cache(1000, 0, 0, 500) - p.cost(1000, 500)).abs() < f64::EPSILON);
+    }
+
     use super::*;
 
     #[test]

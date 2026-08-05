@@ -95,9 +95,17 @@ impl Gate for JudgeGate {
                     parse_judgment(&self.id, &judgment.text, self.threshold, elapsed_ms(start));
                 // The judge's own model call is real spend — price it onto the receipt so the
                 // router's budget/savings math sees the true cost of measured quality.
+                // Cache-aware — a judge prompt carries the candidate plus a fixed rubric, so it
+                // caches well and would otherwise be priced at a fraction of what it cost.
                 r.cost_usd = self
                     .prices
-                    .cost_usd(&self.judge_model, judgment.in_tokens, judgment.out_tokens)
+                    .cost_usd_with_cache(
+                        &self.judge_model,
+                        judgment.in_tokens,
+                        judgment.cache_write_tokens,
+                        judgment.cache_read_tokens,
+                        judgment.out_tokens,
+                    )
                     .unwrap_or(0.0);
                 r
             }
@@ -192,6 +200,8 @@ mod tests {
             model: model.to_owned(),
             text: text.to_owned(),
             in_tokens: 10,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 10,
             raw: Value::Null,
         }

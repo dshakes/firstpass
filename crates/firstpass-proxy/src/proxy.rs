@@ -1535,12 +1535,16 @@ async fn enforce_pipeline_inner(
                     let Ok(Ok(probe_resp)) = task_result else {
                         continue; // provider error on a sample = not-passed; count honestly
                     };
+                    // Cache-aware: k shadow samples of one prompt cache the same way consistency
+                    // does, and probe cost is reported separately precisely so it can be trusted.
                     probe_cost_usd += state
                         .config
                         .prices
-                        .cost_usd(
+                        .cost_usd_with_cache(
                             &probe_model_str,
                             probe_resp.in_tokens,
+                            probe_resp.cache_write_tokens,
+                            probe_resp.cache_read_tokens,
                             probe_resp.out_tokens,
                         )
                         .unwrap_or(0.0);
@@ -2132,22 +2136,35 @@ fn message_has_image(message: &Value) -> bool {
         })
 }
 
-/// Response-side usage extraction: model name and token counts, defaulting to `0` when the
-/// upstream response doesn't carry them (e.g. an error body).
-fn response_usage(body: &[u8]) -> (Option<String>, u64, u64) {
+/// Model and token split read off a response body.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ResponseUsage {
+    model: Option<String>,
+    in_tokens: u64,
+    cache_write_tokens: u64,
+    cache_read_tokens: u64,
+    out_tokens: u64,
+}
+
+/// Response-side usage: model name and the full token split, defaulting to `0` when the upstream
+/// response doesn't carry them (e.g. an error body).
+///
+/// Observe mode reads usage straight off the passthrough body, so it needs the prompt-cache
+/// counters for the same reason the enforce path does — a caller using prompt caching reports the
+/// bulk of its prompt in `cache_*_input_tokens`, and reading `input_tokens` alone records a
+/// near-zero cost for a call that was not near-zero.
+fn response_usage(body: &[u8]) -> ResponseUsage {
     let Ok(json) = serde_json::from_slice::<Value>(body) else {
-        return (None, 0, 0);
+        return ResponseUsage::default();
     };
-    let model = json.get("model").and_then(Value::as_str).map(str::to_owned);
-    let in_tokens = json
-        .pointer("/usage/input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let out_tokens = json
-        .pointer("/usage/output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    (model, in_tokens, out_tokens)
+    let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
+    ResponseUsage {
+        model: json.get("model").and_then(Value::as_str).map(str::to_owned),
+        in_tokens: u("/usage/input_tokens"),
+        cache_write_tokens: u("/usage/cache_creation_input_tokens"),
+        cache_read_tokens: u("/usage/cache_read_input_tokens"),
+        out_tokens: u("/usage/output_tokens"),
+    }
 }
 
 /// Build the observe-mode trace for a request that was successfully forwarded and answered.
@@ -2159,14 +2176,23 @@ fn build_trace(
     session_header: Option<&str>,
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
-    let (resp_model, in_tokens, out_tokens) = response_usage(resp_body);
+    let usage = response_usage(resp_body);
+    let (resp_model, in_tokens, out_tokens) = (usage.model, usage.in_tokens, usage.out_tokens);
+    let (cache_write_tokens, cache_read_tokens) =
+        (usage.cache_write_tokens, usage.cache_read_tokens);
     let model = resp_model
         .or(req_model)
         .unwrap_or_else(|| "unknown".to_owned());
 
     let cost_usd = config
         .prices
-        .cost_usd(&format!("anthropic/{model}"), in_tokens, out_tokens)
+        .cost_usd_with_cache(
+            &format!("anthropic/{model}"),
+            in_tokens,
+            cache_write_tokens,
+            cache_read_tokens,
+            out_tokens,
+        )
         .unwrap_or(0.0);
 
     let attempt = Attempt {
@@ -2174,6 +2200,8 @@ fn build_trace(
         model,
         provider: "anthropic".to_owned(),
         in_tokens,
+        cache_write_tokens,
+        cache_read_tokens,
         out_tokens,
         cost_usd,
         latency_ms,
@@ -2217,6 +2245,9 @@ fn build_stream_trace(
         model,
         provider: "anthropic".to_owned(),
         in_tokens: 0,
+        // Nothing was served, so there is no cache traffic to account for.
+        cache_write_tokens: 0,
+        cache_read_tokens: 0,
         out_tokens: 0,
         cost_usd: 0.0,
         latency_ms,
@@ -3167,6 +3198,8 @@ mod tests {
             model: model.to_owned(),
             text: text.to_owned(),
             in_tokens: 1000,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 400,
             raw: serde_json::Value::Null,
         }
@@ -3735,6 +3768,8 @@ mod tests {
             model: "anthropic/claude-haiku-4-5".to_owned(),
             text: "let me check".to_owned(),
             in_tokens: 5,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 7,
             raw: serde_json::json!({
                 "content": [
@@ -3992,6 +4027,8 @@ mod tests {
             model: "anthropic/claude-haiku-4-5".into(),
             provider: "anthropic".into(),
             in_tokens: 10,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 5,
             cost_usd: 0.001,
             latency_ms: 5,
@@ -4797,6 +4834,8 @@ mod tests {
             model: "gpt-4o".to_owned(),
             text: "Hello!".to_owned(),
             in_tokens: 10,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 5,
             raw: serde_json::json!({
                 "content": [{ "type": "text", "text": "Hello!" }]
@@ -4818,6 +4857,8 @@ mod tests {
             model: "gpt-4o".to_owned(),
             text: String::new(),
             in_tokens: 20,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 15,
             raw: serde_json::json!({
                 "content": [{
@@ -4844,6 +4885,8 @@ mod tests {
             model: "gpt-4o".to_owned(),
             text: "Hi there!".to_owned(),
             in_tokens: 5,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 3,
             raw: serde_json::json!({
                 "content": [{ "type": "text", "text": "Hi there!" }]

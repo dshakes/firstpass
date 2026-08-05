@@ -32,9 +32,9 @@ config surface — two items on the first pass turned out to already exist and w
 | 3 | Session affinity | A multi-turn session that escalated re-pays the gate cycle from rung 0 every turn | M | **done** |
 | 4 | Agent launchers (`firstpass launch …`) | One command beats a page of env-var instructions | S | **done** |
 | 5 | Reasoning-effort normalization | Providers spell effort differently; agents should not care which is behind us | S | **done** |
-| 6 | Prompt-cache breakpoints | Real money on long agent conversations against Anthropic | S | planned |
+| 6 | Prompt-cache breakpoints | Real money on long agent conversations against Anthropic | S | accounting fixed; write-side pending |
 | 7 | Message condensing | Long conversations blow the cheap rung's context and force escalation for the wrong reason | M | planned |
-| 8 | RL / training-trace export | Traces are already recorded; the gap is an export shape a trainer can consume | S | planned |
+| 8 | RL / training-trace export | Traces are already recorded; the gap is an export shape a trainer can consume | S | **done** |
 
 Three of the four shipped items turned out to be fixing a bug rather than adding a feature,
 which is the usual shape of parity work:

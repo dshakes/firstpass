@@ -246,8 +246,23 @@ pub struct Attempt {
     pub model: String,
     /// Provider segment (denormalized for cheap querying).
     pub provider: String,
-    /// Input tokens consumed.
+    /// Input tokens consumed, **uncached only**.
+    ///
+    /// When the caller uses prompt caching this is the small remainder; the bulk of the prompt is
+    /// reported separately below and billed at different rates. Read `billable_input()` rather
+    /// than this field for anything cost-shaped.
     pub in_tokens: u64,
+    /// Prompt tokens written to the provider's cache on this call, billed at a **premium**
+    /// (Anthropic: 1.25× base input).
+    ///
+    /// Defaults to 0, so a receipt written before this field existed still deserializes and still
+    /// re-derives the same hash — the field is skipped when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+    /// Prompt tokens served from the provider's cache, billed at a **discount** (Anthropic: 0.1×
+    /// base input). Same zero-default reasoning as `cache_write_tokens`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_tokens: u64,
     /// Output tokens produced.
     pub out_tokens: u64,
     /// USD cost of this model call (excludes gate cost).
@@ -258,6 +273,27 @@ pub struct Attempt {
     pub gates: Vec<GateResult>,
     /// The attempt's overall verdict (the aggregate that drove escalate-or-serve).
     pub verdict: Verdict,
+}
+
+/// `skip_serializing_if` helper: keeps zero-valued cache fields out of the canonical JSON, so a
+/// receipt written before those fields existed hashes identically to one written after.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde requires the &-taking shape
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl Attempt {
+    /// Total prompt tokens this call actually consumed, cached or not.
+    ///
+    /// `in_tokens` alone is **not** the prompt size when the caller uses prompt caching: providers
+    /// report the cached portion in separate fields, and a 190k-token cached prefix shows up as an
+    /// `in_tokens` of about 20. Anything reporting prompt volume wants this, not the raw field.
+    #[must_use]
+    pub const fn billable_input(&self) -> u64 {
+        self.in_tokens
+            .saturating_add(self.cache_write_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
 }
 
 /// A verdict that arrived after the response was served (deferred gate or downstream feedback).
@@ -381,6 +417,8 @@ mod tests {
                     model: "anthropic/claude-haiku-4-5".into(),
                     provider: "anthropic".into(),
                     in_tokens: 2000,
+                    cache_write_tokens: 0,
+                    cache_read_tokens: 0,
                     out_tokens: 700,
                     cost_usd: 0.0007,
                     latency_ms: 900,
@@ -392,6 +430,8 @@ mod tests {
                     model: "anthropic/claude-sonnet-5".into(),
                     provider: "anthropic".into(),
                     in_tokens: 2000,
+                    cache_write_tokens: 0,
+                    cache_read_tokens: 0,
                     out_tokens: 800,
                     cost_usd: 0.0121,
                     latency_ms: 1200,

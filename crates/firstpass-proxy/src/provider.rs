@@ -86,8 +86,13 @@ pub struct ModelResponse {
     pub model: String,
     /// Concatenated text output.
     pub text: String,
-    /// Input tokens billed.
+    /// Input tokens billed, **uncached only** — see `cache_write_tokens` for the rest.
     pub in_tokens: u64,
+    /// Prompt tokens written to the provider's cache (billed at a premium). 0 when the caller did
+    /// not use prompt caching, or the provider does not report it.
+    pub cache_write_tokens: u64,
+    /// Prompt tokens served from the provider's cache (billed at a discount).
+    pub cache_read_tokens: u64,
     /// Output tokens billed.
     pub out_tokens: u64,
     /// The raw wire response, kept for debugging/audit — never logged wholesale.
@@ -321,9 +326,13 @@ impl Provider for AnthropicProvider {
 
         let json: Value =
             serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
-        let (text, in_tokens, out_tokens) = anthropic_parse_response(&json)?;
+        let u = anthropic_parse_response(&json)?;
+        let (text, in_tokens, out_tokens) = (u.text, u.in_tokens, u.out_tokens);
+        let (cache_write_tokens, cache_read_tokens) = (u.cache_write_tokens, u.cache_read_tokens);
 
         Ok(ModelResponse {
+            cache_write_tokens,
+            cache_read_tokens,
             model: req.model.clone(),
             text,
             in_tokens,
@@ -336,7 +345,7 @@ impl Provider for AnthropicProvider {
 /// Extract `(text, in_tokens, out_tokens)` from an Anthropic Messages API response. Shared by
 /// [`AnthropicProvider`] and every auth scheme that wraps the Anthropic body shape (Bedrock,
 /// Vertex — ADR 0006): they all get the same response back, only the request's auth/URL differ.
-fn anthropic_parse_response(json: &Value) -> Result<(String, u64, u64), ProviderError> {
+fn anthropic_parse_response(json: &Value) -> Result<AnthropicUsage, ProviderError> {
     let text = json
         .get("content")
         .and_then(Value::as_array)
@@ -357,8 +366,35 @@ fn anthropic_parse_response(json: &Value) -> Result<(String, u64, u64), Provider
         .pointer("/usage/output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // Prompt caching splits the prompt across three counters. Reading only `input_tokens` — which
+    // this did until now — reports about 20 tokens for a 190k-token cached prefix, so the receipt
+    // records a fraction of a cent for a call that cost most of a dollar, and `[budget]` caps fed
+    // by that total never trip.
+    let cache_write_tokens = json
+        .pointer("/usage/cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_tokens = json
+        .pointer("/usage/cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
 
-    Ok((text, in_tokens, out_tokens))
+    Ok(AnthropicUsage {
+        text,
+        in_tokens,
+        cache_write_tokens,
+        cache_read_tokens,
+        out_tokens,
+    })
+}
+
+/// Text plus the full token split from an Anthropic response.
+struct AnthropicUsage {
+    text: String,
+    in_tokens: u64,
+    cache_write_tokens: u64,
+    cache_read_tokens: u64,
+    out_tokens: u64,
 }
 
 /// Build an Anthropic Messages-shaped request body with the model **omitted** — Bedrock and Vertex
@@ -676,6 +712,9 @@ impl Provider for OpenAiProvider {
             .unwrap_or(0);
 
         Ok(ModelResponse {
+            // This provider reports no prompt-cache split.
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             model: req.model.clone(),
             text,
             in_tokens,
@@ -817,6 +856,9 @@ impl Provider for GeminiProvider {
             serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
         let (text, in_tokens, out_tokens) = gemini_parse_response(&json)?;
         Ok(ModelResponse {
+            // This provider reports no prompt-cache split.
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             model: req.model.clone(),
             text,
             in_tokens,
@@ -993,8 +1035,12 @@ impl Provider for BedrockProvider {
 
         let json: Value =
             serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
-        let (text, in_tokens, out_tokens) = anthropic_parse_response(&json)?;
+        let u = anthropic_parse_response(&json)?;
+        let (text, in_tokens, out_tokens) = (u.text, u.in_tokens, u.out_tokens);
+        let (cache_write_tokens, cache_read_tokens) = (u.cache_write_tokens, u.cache_read_tokens);
         Ok(ModelResponse {
+            cache_write_tokens,
+            cache_read_tokens,
             model: req.model.clone(),
             text,
             in_tokens,
@@ -1093,8 +1139,12 @@ impl Provider for VertexProvider {
 
         let json: Value =
             serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
-        let (text, in_tokens, out_tokens) = anthropic_parse_response(&json)?;
+        let u = anthropic_parse_response(&json)?;
+        let (text, in_tokens, out_tokens) = (u.text, u.in_tokens, u.out_tokens);
+        let (cache_write_tokens, cache_read_tokens) = (u.cache_write_tokens, u.cache_read_tokens);
         Ok(ModelResponse {
+            cache_write_tokens,
+            cache_read_tokens,
             model: req.model.clone(),
             text,
             in_tokens,
@@ -1439,6 +1489,44 @@ mod tests {
     }
 
     #[test]
+    fn a_cached_response_reports_its_cache_tokens_not_just_the_remainder() {
+        // A real cached Claude Code turn: the prompt is in the cache counters, and `input_tokens`
+        // is the small uncached remainder. Reading only `input_tokens` — which this did — is how a
+        // ~$0.70 call banked a receipt reading a fraction of a cent.
+        let json = serde_json::json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "usage": {
+                "input_tokens": 20,
+                "cache_creation_input_tokens": 190_000,
+                "cache_read_input_tokens": 1_234,
+                "output_tokens": 400,
+            },
+        });
+
+        let u = anthropic_parse_response(&json).expect("parses");
+
+        assert_eq!(u.in_tokens, 20);
+        assert_eq!(u.cache_write_tokens, 190_000);
+        assert_eq!(u.cache_read_tokens, 1_234);
+        assert_eq!(u.out_tokens, 400);
+    }
+
+    #[test]
+    fn an_uncached_response_reports_zero_cache_traffic() {
+        // The overwhelmingly common case must be untouched.
+        let json = serde_json::json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "usage": { "input_tokens": 1000, "output_tokens": 200 },
+        });
+
+        let u = anthropic_parse_response(&json).expect("parses");
+
+        assert_eq!(u.in_tokens, 1000);
+        assert_eq!(u.cache_write_tokens, 0);
+        assert_eq!(u.cache_read_tokens, 0);
+    }
+
+    #[test]
     fn wire_model_strips_the_provider_prefix() {
         // Regression: sending "anthropic/claude-haiku-4-5" verbatim 404s at the provider.
         assert_eq!(wire_model("anthropic/claude-haiku-4-5"), "claude-haiku-4-5");
@@ -1757,6 +1845,8 @@ mod tests {
             model: model.to_owned(),
             text: text.to_owned(),
             in_tokens: 10,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 5,
             raw: Value::Null,
         }

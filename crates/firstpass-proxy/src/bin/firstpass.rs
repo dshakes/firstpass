@@ -39,7 +39,10 @@ USAGE:
     firstpass predictor-eval [--json] [--lr L] [--l2 R]
                                    prequential AUC/Brier of the per-query P(pass) predictor
     firstpass explain <trace-id>  [--json]  why one routing decision went the way it did
-    firstpass export [--out F]    write the sealed receipt log as JSONL (hand to an auditor)
+    firstpass export [--out F] [--format rl]
+                                  write the sealed receipt log as JSONL (hand to an auditor), or
+                                  with --format rl, flat training rows carrying the logged
+                                  propensity that offline RL needs
     firstpass verify [--file F] [--json]
                                    independently re-derive the receipt hash chain; exit 1 if broken
     firstpass calibrate [--alpha A] [--delta D] [--min-n N] [--method conformal|ltt]
@@ -541,7 +544,18 @@ fn cmd_export(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let config = ProxyConfig::from_env()?;
     // Operator-wide (the chain spans all tenants — a per-tenant view can't be chain-verified).
     let traces = store::load_all_traces(std::path::Path::new(&config.db_path)).unwrap_or_default();
-    let jsonl = cli::export_receipts_jsonl(&traces);
+    // `--format rl` reshapes receipts into flat training rows. Default stays the receipt itself,
+    // which is what an auditor wants.
+    let rl = args
+        .iter()
+        .position(|a| a == "--format")
+        .and_then(|i| args.get(i + 1))
+        .is_some_and(|f| f == "rl");
+    let jsonl = if rl {
+        cli::export_training_jsonl(&traces)
+    } else {
+        cli::export_receipts_jsonl(&traces)
+    };
     match args
         .iter()
         .position(|a| a == "--out")

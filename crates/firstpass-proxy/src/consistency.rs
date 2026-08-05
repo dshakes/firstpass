@@ -106,9 +106,18 @@ impl Gate for ConsistencyGate {
             if let Ok(Ok(sample)) = res {
                 // Each sample is a real model call — price it onto the receipt so the router's
                 // budget/savings math sees the true cost of measured confidence.
+                // Cache-aware: consistency re-sends one prompt k times, which is precisely the
+                // shape prompt caching is built for — so on a cached prompt nearly all of this
+                // spend lands in the cache counters and `in_tokens` alone reports close to zero.
                 sample_cost += self
                     .prices
-                    .cost_usd(&self.sample_model, sample.in_tokens, sample.out_tokens)
+                    .cost_usd_with_cache(
+                        &self.sample_model,
+                        sample.in_tokens,
+                        sample.cache_write_tokens,
+                        sample.cache_read_tokens,
+                        sample.out_tokens,
+                    )
                     .unwrap_or(0.0);
                 samples.push(sample.text);
             }
@@ -237,6 +246,8 @@ mod tests {
             model: model.to_owned(),
             text: text.to_owned(),
             in_tokens: 10,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 10,
             raw: Value::Null,
         }

@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Fixed: cached prompts were billed as if they were free
+
+Token usage was read as `usage.input_tokens` alone. Providers that support prompt caching do not
+report the prompt there — they split it:
+
+| field | what it is | billed at |
+| --- | --- | --- |
+| `input_tokens` | the uncached remainder | 1× |
+| `cache_creation_input_tokens` | prompt written to cache | **1.25×** |
+| `cache_read_input_tokens` | prompt served from cache | **0.1×** |
+
+Firstpass counted only the first. A caller using prompt caching — which coding agents do by
+default — sends a large stable prefix, so a turn with a 190k-token cached prompt arrives as an
+`input_tokens` of about **20**. The receipt recorded roughly **$0.0001 for a call that cost about
+$0.72**, and `[budget]` caps, which are fed by that same total, could not trip on it.
+
+This is the same defect class as the unpriced-rung bug fixed in 0.3.0: not a missing number, a
+**fabricated** one, in the record whose whole purpose is being auditable.
+
+Cache traffic is now parsed, priced at its own multipliers, and recorded on the receipt as
+`cache_write_tokens` / `cache_read_tokens`. Both the enforce path and observe-mode passthrough are
+fixed — observe reads usage off the same response body and had the same gap.
+
+**The hash chain is unaffected.** Both fields are omitted from canonical JSON when zero, so every
+receipt written before this change serializes byte-identically and re-derives the same hash, and
+older receipts still deserialize. Verified directly, not assumed.
+
+`Attempt::billable_input()` returns the true prompt size (uncached + written + read); prefer it
+over `in_tokens` for anything cost- or volume-shaped.
+
+Every path that prices a real provider response is fixed, not only the gated ladder: speculative
+calls that completed before cancellation, consistency samples, judge calls, and shadow probes.
+Consistency and probes matter most — both re-send one prompt k times, which is exactly the shape
+prompt caching is built for, so on a cached prompt nearly all of their spend lands in the cache
+counters. `PriceTable::cost_usd` now documents that it is only correct with no cache traffic.
+
 ### Fixed: `[escalation.session_promotion]` parsed and did nothing
 
 The block has been in the config schema — and exported from `firstpass-core` — since before this
@@ -34,6 +70,11 @@ correctness.
   per-1M prices from the table that bills the receipt.
 - **`firstpass launch claude|codex|openai -- <cmd>`** — start a coding agent already pointed at the
   proxy. Refuses when nothing is listening, and refuses when something that is *not* Firstpass is.
+- **`firstpass export --format rl`** — receipts reshaped as flat training rows (context, action,
+  reward, propensity) for offline learning. The propensity is the part that matters: it is already
+  logged for IPS/SNIPS/DR off-policy evaluation and is exactly what a routing log normally lacks.
+  A deterministic decision exports `null` rather than a defaulted `1.0`, which would look like a
+  uniformly-sampled row and quietly bias anything built on it.
 - **`docs/parity.md`** — feature-parity audit against comparable routing proxies, and the order the
   remaining gaps get closed.
 
