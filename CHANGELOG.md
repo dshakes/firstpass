@@ -32,6 +32,12 @@ older receipts still deserialize. Verified directly, not assumed.
 `Attempt::billable_input()` returns the true prompt size (uncached + written + read); prefer it
 over `in_tokens` for anything cost- or volume-shaped.
 
+Every path that prices a real provider response is fixed, not only the gated ladder: speculative
+calls that completed before cancellation, consistency samples, judge calls, and shadow probes.
+Consistency and probes matter most — both re-send one prompt k times, which is exactly the shape
+prompt caching is built for, so on a cached prompt nearly all of their spend lands in the cache
+counters. `PriceTable::cost_usd` now documents that it is only correct with no cache traffic.
+
 ### Fixed: `[escalation.session_promotion]` parsed and did nothing
 
 The block has been in the config schema — and exported from `firstpass-core` — since before this
@@ -64,6 +70,11 @@ correctness.
   per-1M prices from the table that bills the receipt.
 - **`firstpass launch claude|codex|openai -- <cmd>`** — start a coding agent already pointed at the
   proxy. Refuses when nothing is listening, and refuses when something that is *not* Firstpass is.
+- **`firstpass export --format rl`** — receipts reshaped as flat training rows (context, action,
+  reward, propensity) for offline learning. The propensity is the part that matters: it is already
+  logged for IPS/SNIPS/DR off-policy evaluation and is exactly what a routing log normally lacks.
+  A deterministic decision exports `null` rather than a defaulted `1.0`, which would look like a
+  uniformly-sampled row and quietly bias anything built on it.
 - **`docs/parity.md`** — feature-parity audit against comparable routing proxies, and the order the
   remaining gaps get closed.
 
