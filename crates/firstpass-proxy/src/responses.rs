@@ -67,6 +67,22 @@ pub fn request_to_chat(body: &Value) -> Value {
             out.insert("tools".to_owned(), Value::Array(converted));
         }
     }
+    // `tool_choice` naming a specific function differs in shape between the two APIs. Passing the
+    // Responses spelling through unchanged does not error — Chat simply does not recognise it, so
+    // the model is free to ignore a tool the caller demanded. Silent, and exactly the failure this
+    // file keeps having to design against.
+    if let Some(tc) = obj.get("tool_choice") {
+        match tool_choice_to_chat(tc) {
+            Some(v) => {
+                out.insert("tool_choice".to_owned(), v);
+            }
+            // Unrepresentable (a hosted-tool choice). `has_untranslatable_content` routes these to
+            // passthrough, so dropping here is belt-and-braces rather than the real guard.
+            None => {
+                out.remove("tool_choice");
+            }
+        }
+    }
     // A caller that sent `messages` directly (some SDKs accept both) keeps them.
     if !messages.is_empty() {
         out.insert("messages".to_owned(), Value::Array(messages));
@@ -160,6 +176,29 @@ fn tool_to_chat(tool: &Value) -> Option<Value> {
     Some(serde_json::json!({ "type": "function", "function": Value::Object(f) }))
 }
 
+/// A Responses `tool_choice` → its Chat spelling.
+///
+/// The string forms (`auto` / `none` / `required`) are identical. Naming a specific function is
+/// not: Responses says `{type: "function", name: "f"}`, Chat says
+/// `{type: "function", function: {name: "f"}}`.
+fn tool_choice_to_chat(tc: &Value) -> Option<Value> {
+    match tc {
+        Value::String(_) => Some(tc.clone()),
+        Value::Object(o) => {
+            if o.contains_key("function") {
+                return Some(tc.clone()); // already Chat-shaped
+            }
+            if o.get("type").and_then(Value::as_str) != Some("function") {
+                return None; // hosted-tool choice — no Chat equivalent
+            }
+            Some(serde_json::json!({
+                "type": "function", "function": { "name": o.get("name")?.clone() }
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// A Responses tool-call item → the Chat `assistant` message that carries it.
 fn function_call_to_chat(item: &serde_json::Map<String, Value>) -> Option<Value> {
     Some(serde_json::json!({
@@ -239,6 +278,12 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
     // missing one of its tools produces a confidently wrong plan.
     if let Some(Value::Array(tools)) = body.get("tools")
         && tools.iter().any(|t| tool_to_chat(t).is_none())
+    {
+        return true;
+    }
+    // A `tool_choice` we cannot express would let the model ignore a tool the caller demanded.
+    if let Some(tc) = body.get("tool_choice")
+        && tool_choice_to_chat(tc).is_none()
     {
         return true;
     }
@@ -351,20 +396,27 @@ pub fn response_from_chat(chat: &Value) -> Value {
             "content": [{ "type": "output_text", "text": "", "annotations": [] }],
         }));
     }
-    // Responses reports a tool-call turn as `incomplete`, not `completed`: the model is waiting
-    // for the caller to run the tool. Reporting `completed` would tell an agent the turn is over.
-    let awaiting_tool = tool_calls.is_some_and(|c| !c.is_empty());
-    resp.insert(
-        "status".to_owned(),
-        Value::String(
-            if awaiting_tool {
-                "incomplete"
-            } else {
-                "completed"
-            }
-            .to_owned(),
-        ),
-    );
+    // `completed` means GENERATION finished, not that the agent loop is done — a response is
+    // `completed` even when `output` carries a `function_call` the caller still has to run. The
+    // Responses API reserves `incomplete` for a TRUNCATED response, with `incomplete_details`
+    // naming the reason.
+    //
+    // An earlier version of this reported a tool-call turn as `incomplete` by analogy: the model
+    // is waiting, so surely it is not complete. That is wrong against the spec and would stall any
+    // client that checks `status == "completed"` before reading `output`.
+    let truncated = chat
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        == Some("length");
+    if truncated {
+        resp.insert("status".to_owned(), Value::String("incomplete".to_owned()));
+        resp.insert(
+            "incomplete_details".to_owned(),
+            serde_json::json!({ "reason": "max_output_tokens" }),
+        );
+    } else {
+        resp.insert("status".to_owned(), Value::String("completed".to_owned()));
+    }
     resp.insert("output".to_owned(), Value::Array(output));
     // The SDK convenience accessor. Populating it means `response.output_text` works rather than
     // returning nothing on a response this proxy produced.
@@ -519,9 +571,10 @@ mod tests {
         assert_eq!(item["call_id"], "call_9");
         assert_eq!(item["name"], "get_weather");
         assert_eq!(item["arguments"], "{\"city\":\"Paris\"}");
-        // A turn awaiting a tool result is NOT complete — reporting `completed` would tell an
-        // agent the turn is over when the model is waiting on it.
-        assert_eq!(out["status"], "incomplete");
+        // `completed` is correct even with a tool call pending: it means GENERATION finished, not
+        // that the agent loop is done. An earlier version reported `incomplete` here by analogy,
+        // which is wrong against the spec and stalls any client that gates on `completed`.
+        assert_eq!(out["status"], "completed");
     }
 
     #[test]
@@ -539,6 +592,56 @@ mod tests {
         assert_eq!(out["output"][0]["type"], "message");
         assert_eq!(out["output"][0]["content"][0]["text"], "let me check");
         assert_eq!(out["output"][1]["type"], "function_call");
+    }
+
+    #[test]
+    fn a_truncated_reply_is_the_only_incomplete_one() {
+        // The Responses API reserves `incomplete` for truncation, with `incomplete_details` naming
+        // the reason — which is what `finish_reason: "length"` means on the Chat side.
+        let chat = serde_json::json!({
+            "id": "c", "model": "m",
+            "choices": [{ "finish_reason": "length", "message": { "content": "cut off mid-" } }],
+        });
+
+        let out = response_from_chat(&chat);
+
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    #[test]
+    fn tool_choice_is_translated_not_passed_through_in_the_wrong_shape() {
+        // Responses: {type, name}. Chat: {type, function: {name}}. Forwarded unchanged this does
+        // not error — Chat just does not recognise it, so the model is free to ignore a tool the
+        // caller demanded. Silent, which is the whole problem.
+        let out = request_to_chat(&serde_json::json!({
+            "input": "hi",
+            "tools": [{ "type": "function", "name": "f" }],
+            "tool_choice": { "type": "function", "name": "f" },
+        }));
+        assert_eq!(out["tool_choice"]["type"], "function");
+        assert_eq!(out["tool_choice"]["function"]["name"], "f");
+
+        // The string forms are identical in both APIs.
+        for word in ["auto", "none", "required"] {
+            let out = request_to_chat(&serde_json::json!({
+                "input": "hi", "tool_choice": word,
+            }));
+            assert_eq!(out["tool_choice"], word);
+        }
+    }
+
+    #[test]
+    fn a_tool_choice_we_cannot_express_routes_to_passthrough() {
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "input": "hi",
+            "tool_choice": { "type": "file_search" },
+        })));
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "input": "hi",
+            "tools": [{ "type": "function", "name": "f" }],
+            "tool_choice": { "type": "function", "name": "f" },
+        })));
     }
 
     #[test]
