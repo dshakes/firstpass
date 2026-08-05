@@ -254,12 +254,12 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
         let Some(obj) = turn.as_object() else {
             return true;
         };
-        // Typed items: the tool round trip translates; anything else (reasoning items, hosted-tool
-        // calls) does not.
-        if let Some(kind) = obj.get("type").and_then(Value::as_str)
-            && !obj.contains_key("role")
-        {
-            return !matches!(kind, "function_call" | "function_call_output");
+        // Typed items: ask the translator itself rather than restating its rules here. A
+        // `function_call` missing its `call_id` translates to nothing, and a check that only
+        // looked at `type` would wave it through and let the turn vanish — the exact silent drop
+        // this allow-list exists to prevent. One source of truth cannot drift from itself.
+        if obj.contains_key("type") && !obj.contains_key("role") {
+            return turn_to_message(turn).is_none();
         }
         if !matches!(
             obj.get("role").and_then(Value::as_str),
@@ -564,6 +564,59 @@ mod tests {
             ],
             "tools": [{ "type": "function", "name": "f" }],
         })));
+    }
+
+    #[test]
+    fn a_malformed_tool_item_routes_to_passthrough_rather_than_vanishing() {
+        // Found in review: the gate said `function_call` translates while the translator returned
+        // None for one missing its `call_id`, so the turn was silently dropped. The gate now asks
+        // the translator, so the two cannot disagree.
+        let no_call_id = serde_json::json!({
+            "input": [{ "type": "function_call", "name": "f", "arguments": "{}" }],
+        });
+        assert!(has_untranslatable_content(&no_call_id));
+
+        let no_name = serde_json::json!({
+            "input": [{ "type": "function_call", "call_id": "c1", "arguments": "{}" }],
+        });
+        assert!(has_untranslatable_content(&no_name));
+
+        let no_output = serde_json::json!({
+            "input": [{ "type": "function_call_output", "call_id": "c1" }],
+        });
+        assert!(has_untranslatable_content(&no_output));
+
+        // The well-formed pair still translates and is still gated.
+        let ok = serde_json::json!({
+            "input": [
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "42" },
+            ],
+        });
+        assert!(!has_untranslatable_content(&ok));
+    }
+
+    #[test]
+    fn every_allowed_turn_actually_produces_a_message() {
+        // The invariant behind the fix, stated directly: anything the gate allows must translate
+        // to something. If these two ever disagree again, a turn goes missing with no error.
+        let body = serde_json::json!({
+            "input": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [{ "type": "output_text", "text": "yes" }] },
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "42" },
+            ],
+        });
+        assert!(!has_untranslatable_content(&body));
+
+        let turns = body["input"].as_array().expect("array");
+        let out = request_to_chat(&body);
+        assert_eq!(
+            out["messages"].as_array().expect("messages").len(),
+            turns.len(),
+            "every allowed turn must survive translation"
+        );
     }
 
     #[test]

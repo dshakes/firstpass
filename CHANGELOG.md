@@ -1,6 +1,16 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0]
+
+Feature parity with the rest of the proxy-router category, reached mostly by **fixing silent wrong
+numbers** rather than adding features. Three of the items below were bugs that produced a confident
+wrong answer or a fabricated figure with no error to notice: a config block that parsed and did
+nothing, cached prompts billed as free, and a long conversation failing outright when the rung above
+would have served it.
+
+Not breaking: every new config field is optional and every new receipt field is omitted when zero,
+so existing receipts re-derive the same hash. **Reported costs will go up** on cached traffic —
+that is the fix, not a regression.
 
 ### Fixed: cached prompts were billed as if they were free
 

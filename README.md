@@ -206,6 +206,16 @@ cp firstpass.example.toml firstpass.toml
 FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy
 ```
 
+Or skip the env var entirely and let Firstpass start the agent already pointed at it:
+
+```bash
+firstpass launch claude          # also: codex, or `openai -- <any OpenAI-compatible command>`
+```
+
+It refuses to start if no proxy is listening — or if something that *isn't* Firstpass is holding the
+port — because an agent launched at the wrong address fails in a way that reads like the agent is
+broken.
+
 Leaving is `unset ANTHROPIC_BASE_URL`. That's the whole offboarding story.
 
 ### 🤖 …or let an agent do it — one command does everything
@@ -254,6 +264,22 @@ Firstpass is a proxy in front of your provider calls. Your agent keeps its exist
 
 <div align="center"><img src="assets/architecture.svg" alt="Architecture: your agent calls the proxy on POST /v1/messages (Anthropic dialect) or POST /v1/chat/completions (OpenAI dialect). Inside, the request flows Route → Gate → Escalate → Serve. Rungs call providers with your own keys — anthropic, openai, or any OpenAI-compatible endpoint — with failover on 5xx. Every decision writes a SHA-256 hash-chained receipt; deferred outcomes on /v1/feedback tune the serve threshold." width="900"></div>
 
+### Wire APIs
+
+Point anything at it. Firstpass speaks three inbound dialects and translates across vendors, so a
+cascade can cross providers without the caller knowing:
+
+| Endpoint | For |
+| --- | --- |
+| `POST /v1/messages` | Anthropic Messages — Claude Code and anything Anthropic-native |
+| `POST /v1/chat/completions` | OpenAI Chat Completions, and every OpenAI-compatible client |
+| `POST /v1/responses` | OpenAI Responses — newer OpenAI-family agents, including tool calls |
+| `GET /v1/models` | Model discovery, so an agent CLI can populate its picker |
+
+Crossing vendors is handled, not assumed: a caller that sets `reasoning_effort` keeps it when the
+ladder escalates onto an Anthropic rung (as `thinking`), and a tool call survives the round trip
+through `/v1/responses` in both directions rather than being quietly dropped.
+
 ### Every provider, including open-source
 
 A ladder rung is `<id>/<model>` — open on a free local model, escalate to a frontier model only on proven need:
@@ -288,6 +314,25 @@ No. Meet it where you are:
 | **Your existing tests** | The strongest gate: generated code ships only if your suite actually passes. |
 
 Flaky gates auto-disable on an error budget — one bad check can't take down a route.
+
+### Long conversations
+
+Agent sessions get long, and that breaks routers in ways that are invisible until you read a bill:
+
+- **A prompt too large for the cheap rung escalates** instead of failing the request. It is a 400
+  from the provider, and treating every 400 as fatal kills a request the next rung up would have
+  served. The receipt records it as `context_overflow`, so capacity-forced escalations are not
+  pooled with quality failures in your statistics.
+- **A session that had to escalate starts there next turn** (`[escalation.session_promotion]`),
+  instead of re-paying for the rung that already failed it — with a periodic downward probe so a
+  promotion is never a one-way ratchet.
+- **Cached prompts are billed as cached.** Prompt caching splits the prompt across three counters
+  at three different rates; counting only `input_tokens` reports a 190k-token cached prompt as
+  about 20 tokens. Firstpass prices all three, so the receipt and your `[budget]` caps see what the
+  call actually cost.
+- **A conversation that fits nowhere is condensed rather than refused**
+  (`[escalation.condense]`, off by default) — but only once *every* rung has overflowed, where the
+  choice is a degraded answer versus none at all.
 
 ### Modes
 
