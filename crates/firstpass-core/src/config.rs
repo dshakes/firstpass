@@ -551,6 +551,15 @@ pub struct Escalation {
     /// choose where the ladder STARTS; gating, escalation, and serving are untouched.
     #[serde(default)]
     pub bandit: Option<BanditConfig>,
+    /// Last-resort context condensing. `None` (default) = a conversation that overflows every
+    /// rung's context window fails, which is today's behaviour.
+    ///
+    /// Deliberately not a general trimming knob: condensing routinely would mean the gate verifies
+    /// an answer produced from a prompt the client never sent, and the receipt would attest to a
+    /// decision about a different question than the one asked. This fires only once the ladder is
+    /// exhausted, where the choice is no longer "faithful vs degraded" but "degraded vs failed".
+    #[serde(default)]
+    pub condense: Option<CondenseConfig>,
     /// Speculative-deferral band: when set (and the bandit has a warm gate-pass estimate for
     /// the chosen start rung), speculative prefetch fires **only** when that estimate falls
     /// inside `[low, high]` — the marginal zone where the next rung is *probably but not
@@ -700,6 +709,26 @@ pub struct ElasticConfig {
     pub calibration_id: Option<String>,
 }
 
+/// Last-resort context condensing (§8.4). See [`Escalation::condense`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CondenseConfig {
+    /// Opening turns to keep — usually where the task definition lives.
+    #[serde(default = "default_condense_keep_head")]
+    pub keep_head: usize,
+    /// Closing turns to keep — the live thread.
+    #[serde(default = "default_condense_keep_tail")]
+    pub keep_tail: usize,
+}
+
+const fn default_condense_keep_head() -> usize {
+    2
+}
+
+const fn default_condense_keep_tail() -> usize {
+    6
+}
+
 /// Config for the UCB1 start-rung bandit (`firstpass_proxy::bandit::StartRungBandit`).
 ///
 /// Absent (`None`) → start every request at rung 0 (byte-identical to today).
@@ -771,6 +800,7 @@ impl Default for Escalation {
             enforce_structured: default_enforce_structured(),
             speculation_band: None,
             bandit: None,
+            condense: None,
             exploration: None,
             probe: None,
             predictor: None,

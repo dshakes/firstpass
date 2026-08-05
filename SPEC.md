@@ -461,6 +461,21 @@ probe_every    = 5        # every 5th turn, start one rung LOWER to test whether
 max_sessions   = 10000    # hard cap on tracked sessions; oldest evicted first
 ```
 
+```toml
+# Last resort only: condense a conversation that overflowed EVERY rung's context window.
+# Absent (the default) = such a request fails, which is today's behaviour.
+[escalation.condense]
+keep_head = 2   # opening turns to keep (usually the task definition)
+keep_tail = 6   # closing turns to keep (the live thread)
+```
+
+Condensing is deliberately **not** a general trimming knob. Trimming routinely would mean the gate
+verifies an answer produced from a prompt the client never sent, and the receipt would attest to a
+decision about a different question than the one asked. It fires only once the ladder is exhausted,
+where the choice is no longer "faithful answer vs degraded answer" but "degraded answer vs none" —
+and the dropped turns stay on the receipt as `context_overflow` attempts, so the elision is visible
+rather than inferred.
+
 `probe_every` is not optional tuning. Promotion on its own is one-way: a session that escalates
 once would stay on the expensive rung for the rest of its life, including the trivial turns at the
 end. The periodic downward probe is the only way a promotion is ever released, so `probe_every = 0`

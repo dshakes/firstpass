@@ -100,6 +100,17 @@ pub struct AppState {
 /// # Errors
 /// [`firstpass_core::Error::BadDuration`] when `window` does not parse. `Config::parse` already
 /// rejects that, so reaching this is a config built in code rather than read from a file.
+/// The condense config, if any. `None` (the default) leaves a prompt that overflows every rung's
+/// window failing, which is today's behaviour.
+#[must_use]
+fn routing_cfg_condense(state: &AppState) -> Option<&firstpass_core::config::CondenseConfig> {
+    state
+        .config
+        .routing
+        .as_ref()
+        .and_then(|r| r.escalation.condense.as_ref())
+}
+
 pub fn build_promoter(
     config: &ProxyConfig,
 ) -> firstpass_core::Result<Option<Arc<crate::affinity::SessionPromoter>>> {
@@ -814,6 +825,7 @@ async fn evaluate_shadow(
         });
 
     let ctx = EnforceCtx {
+        condense: routing_cfg_condense(state),
         ladder: &route.ladder,
         gates: &gates,
         health: &state.gate_health,
@@ -1399,6 +1411,7 @@ async fn enforce_pipeline_inner(
     }
 
     let ctx = EnforceCtx {
+        condense: routing_cfg_condense(state),
         ladder: &route.ladder,
         gates: &gates,
         health: &state.gate_health,

@@ -27,6 +27,7 @@ pub mod affinity;
 pub mod bandit;
 pub mod calibrate;
 pub mod cli;
+pub mod condense;
 pub mod config;
 pub mod consistency;
 pub mod demo;

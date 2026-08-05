@@ -34,6 +34,9 @@ pub enum EngineOutcome {
 /// per call; owned trace-context strings so the resulting [`Trace`] is self-contained.
 #[derive(Debug)]
 pub struct EnforceCtx<'a> {
+    /// Last-resort context condensing. `None` (default) = a prompt that overflows every rung's
+    /// window fails, which is today's behaviour. Never fires while a taller rung remains.
+    pub condense: Option<&'a firstpass_core::config::CondenseConfig>,
     /// Model ladder, cheapest first, as `provider/model` strings.
     pub ladder: &'a [String],
     /// Gates run against each attempt's output (already resolved).
@@ -430,6 +433,65 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                 }
             }
         }
+    }
+
+    // Every rung overflowed and nothing was served. The ladder is exhausted, so the choice is no
+    // longer "faithful answer vs degraded answer" — it is "degraded answer vs no answer". Condense
+    // once and re-run.
+    //
+    // Re-running with `condense: None` is what makes this provably terminate: the retry cannot
+    // condense again, so at most one extra pass happens no matter what the provider says.
+    if served_rung.is_none()
+        && let Some(cfg) = ctx.condense
+        && !attempts.is_empty()
+        && attempts.iter().all(|a| {
+            a.gates
+                .iter()
+                .any(|g| g.reason.as_deref() == Some(reason::CONTEXT_OVERFLOW))
+        })
+        && let Some(c) = crate::condense::condense(ctx.base_request, cfg.keep_head, cfg.keep_tail)
+    {
+        tracing::info!(
+            dropped = c.dropped,
+            "context overflowed every rung; retrying once with the middle condensed"
+        );
+        let retry_ctx = EnforceCtx {
+            condense: None,
+            base_request: &c.request,
+            features: ctx.features.clone(),
+            tenant_id: ctx.tenant_id.clone(),
+            session_id: ctx.session_id.clone(),
+            prompt_hash: ctx.prompt_hash.clone(),
+            api: ctx.api.clone(),
+            policy_id: ctx.policy_id.clone(),
+            ladder: ctx.ladder,
+            gates: ctx.gates,
+            health: ctx.health,
+            providers: ctx.providers,
+            auth: ctx.auth,
+            prices: ctx.prices,
+            budget_per_request_usd: ctx.budget_per_request_usd,
+            max_rungs: ctx.max_rungs,
+            speculation: ctx.speculation,
+            serve_threshold: ctx.serve_threshold,
+            elastic: ctx.elastic,
+            // Retry the rung that actually has the largest window.
+            start_rung: (ctx.ladder.len().saturating_sub(1)) as u32,
+        };
+        let mut run = Box::pin(run_serial(&retry_ctx)).await;
+        // Keep the overflow attempts on the receipt. They are why the answer is condensed, and a
+        // record that hid them would show a served response with no explanation for the elision.
+        let mut merged = attempts;
+        merged.append(&mut run.attempts);
+        return LadderRun {
+            attempts: merged,
+            spent: spent + run.spent,
+            gate_cost_total: gate_cost_total + run.gate_cost_total,
+            best: run.best,
+            served_rung: run.served_rung,
+            hard_error: run.hard_error,
+            elastic: run.elastic,
+        };
     }
 
     LadderRun {
@@ -880,6 +942,7 @@ mod tests {
         health: &'a GateHealthRegistry,
     ) -> EnforceCtx<'a> {
         EnforceCtx {
+            condense: None,
             ladder,
             gates,
             health,
@@ -1213,6 +1276,151 @@ mod tests {
             "{:?}",
             trace.attempts[0].gates
         );
+    }
+
+    /// A provider that overflows on a long conversation and answers a short one — which is what a
+    /// real context window does, and what a fixed-outcome mock cannot express. Without this the
+    /// condensed retry would hit the same canned error and the test would prove nothing.
+    #[derive(Debug)]
+    struct CondenseAwareProvider {
+        outcomes: HashMap<String, Result<ModelResponse, ProviderError>>,
+        max_messages: usize,
+    }
+
+    impl CondenseAwareProvider {
+        fn new(
+            outcomes: HashMap<String, Result<ModelResponse, ProviderError>>,
+            max_messages: usize,
+        ) -> Self {
+            Self {
+                outcomes,
+                max_messages,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CondenseAwareProvider {
+        fn id(&self) -> &str {
+            "anthropic"
+        }
+
+        fn carries_structured_verbatim(&self, _inbound: firstpass_core::Dialect) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            req: &ModelRequest,
+            _auth: &Auth,
+        ) -> Result<ModelResponse, ProviderError> {
+            if req.messages.len() > self.max_messages {
+                return Err(http(
+                    400,
+                    "prompt is too long: 900000 tokens > 200000 maximum",
+                ));
+            }
+            match self.outcomes.get(&req.model) {
+                Some(Ok(r)) => Ok(r.clone()),
+                _ => Ok(resp(&req.model, "served after condensing")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn condensing_is_a_last_resort_and_never_fires_while_a_taller_rung_remains() {
+        // Rung 0 overflows, rung 1 serves. Condensing must NOT happen: climbing costs the client
+        // nothing in fidelity, so it is strictly better than dropping their history.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let mut req = base_request();
+        req.messages = (0..40)
+            .map(|i| crate::provider::ChatMessage::text("user", format!("turn {i}")))
+            .collect();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let cfg = firstpass_core::config::CondenseConfig {
+            keep_head: 2,
+            keep_tail: 3,
+        };
+        let (providers, _log) = counted_registry(vec![
+            (HAIKU, Err(http(400, "prompt is too long"))),
+            (SONNET, Ok(resp(SONNET, "served whole"))),
+        ]);
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.condense = Some(&cfg);
+
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(matches!(out, EngineOutcome::Served(_)), "{out:?}");
+        assert_eq!(
+            trace.attempts.len(),
+            2,
+            "overflow then serve — no condensed retry"
+        );
+        assert_eq!(trace.final_.served_rung, Some(1));
+    }
+
+    #[tokio::test]
+    async fn condensing_rescues_a_request_that_overflowed_every_rung() {
+        // Both rungs overflow. Without condensing this request simply fails; the trade here is not
+        // a faithful answer versus a degraded one, it is a degraded answer versus none.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let mut req = base_request();
+        req.messages = (0..40)
+            .map(|i| crate::provider::ChatMessage::text("user", format!("turn {i}")))
+            .collect();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let cfg = firstpass_core::config::CondenseConfig {
+            keep_head: 2,
+            keep_tail: 3,
+        };
+        let health = GateHealthRegistry::new();
+
+        // Without condense configured: the request fails.
+        let (providers, _l) = counted_registry(vec![
+            (HAIKU, Err(http(400, "prompt is too long"))),
+            (SONNET, Err(http(400, "prompt is too long"))),
+        ]);
+        let (bare_out, _t) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+        assert!(
+            !matches!(bare_out, EngineOutcome::Served(_)),
+            "{bare_out:?}"
+        );
+
+        // With condense: the retry is a DIFFERENT (smaller) request, so the mock's overflow no
+        // longer applies — the provider answers and the ladder serves it.
+        let mut outs: HashMap<String, Result<ModelResponse, ProviderError>> = HashMap::new();
+        outs.insert(HAIKU.to_owned(), Err(http(400, "prompt is too long")));
+        outs.insert(SONNET.to_owned(), Err(http(400, "prompt is too long")));
+        let overflow_until_small = CondenseAwareProvider::new(outs, 10);
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert("anthropic".to_owned(), Arc::new(overflow_until_small));
+        let providers = ProviderRegistry::from_map(map);
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.condense = Some(&cfg);
+
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(
+            matches!(out, EngineOutcome::Served(_)),
+            "condensing must rescue a request that fits nowhere: {out:?}"
+        );
+        // The overflow attempts stay on the receipt — they are WHY the answer is condensed.
+        assert!(
+            trace.attempts.len() >= 3,
+            "the overflows must remain visible: {:?}",
+            trace.attempts.iter().map(|a| a.rung).collect::<Vec<_>>()
+        );
+        assert!(trace.attempts[0].gates[0].reason.as_deref() == Some(reason::CONTEXT_OVERFLOW));
     }
 
     #[tokio::test]

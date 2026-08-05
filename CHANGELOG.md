@@ -72,6 +72,12 @@ correctness.
   Buffered only: `enforce` cannot stream, because the gate must see the whole candidate before it
   can judge it, so a streaming Responses request takes the same observe passthrough that Chat
   Completions already uses for a request it cannot gate faithfully.
+- **`[escalation.condense]`** — last-resort context condensing. When a conversation has overflowed
+  the context window of *every* rung, the middle of the history is dropped (head and tail kept, with
+  a marker turn telling the model its history is incomplete) and the top rung is retried **once**.
+  Deliberately not a general trimming knob: condensing routinely would mean gating an answer
+  produced from a prompt the client never sent. It fires only where the alternative is no answer at
+  all, and the overflow attempts stay on the receipt so the elision is visible. Absent by default.
 - **Context overflow now escalates instead of failing the request.** A prompt too large for a rung
   is a 400, and every 400 aborted the ladder — so a long agent conversation that outgrew the
   *cheapest* rung's context window failed outright, even with a larger rung configured directly

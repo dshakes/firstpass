@@ -137,28 +137,68 @@ fn part_to_chat(part: &Value) -> Option<Value> {
     }
 }
 
-/// Whether this request contains content the translation cannot faithfully represent.
+/// Whether this request contains anything the translation cannot faithfully round-trip.
 ///
-/// Files, audio, and any part type added after this code was written have no Chat Completions
-/// equivalent here. A request carrying one must take the passthrough path rather than be silently
-/// translated into something smaller than what the client sent — being un-gated is a limitation,
-/// being answered about content that was thrown away is a wrong answer.
+/// **Allow-list, not deny-list, and deliberately so.** Three separate content types were found to
+/// be silently dropped by an earlier deny-list version of this check — images, files, and tool
+/// calls — each producing a confidently wrong answer rather than an error. Enumerating what breaks
+/// loses that game every time a provider adds a field; enumerating what provably round-trips does
+/// not. Anything outside the list takes the passthrough path un-gated.
+///
+/// Un-gated is a real limitation. Being answered about content that was thrown away is a wrong
+/// answer, and between the two this proxy takes the limitation.
+///
+/// Currently translatable: plain `user`/`assistant`/`system`/`developer` turns whose content is
+/// text, or text-and-image parts, in a request that defines **no tools**.
+///
+/// Tools are excluded on the *request* side even though a tool definition itself translates fine,
+/// because a model given tools may answer with a tool call — and a tool call has no representation
+/// on the way back through [`response_from_chat`]. Routing a request whose reply cannot be
+/// represented is the same defect one step later.
 #[must_use]
 pub fn has_untranslatable_content(body: &Value) -> bool {
+    // A tools-bearing request may produce a tool call we cannot translate back.
+    if body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|t| !t.is_empty())
+        || body.get("tool_choice").is_some()
+    {
+        return true;
+    }
+    // Stateful threading: the upstream holds history we do not have, so a translated request is
+    // not the conversation the client is actually continuing.
+    if body.get("previous_response_id").is_some() {
+        return true;
+    }
     let Some(Value::Array(turns)) = body.get("input") else {
         return false;
     };
     turns.iter().any(|turn| {
-        turn.get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|parts| {
-                parts.iter().any(|p| {
-                    !matches!(
-                        p.get("type").and_then(Value::as_str),
-                        Some("input_text" | "output_text" | "text" | "input_image")
-                    )
-                })
-            })
+        let Some(obj) = turn.as_object() else {
+            return true;
+        };
+        // A turn with no `role`/`content` pair is a typed item — a function_call, a
+        // function_call_output, a reasoning item. None of those survive this translation.
+        if !obj.contains_key("role") || !obj.contains_key("content") {
+            return true;
+        }
+        if !matches!(
+            obj.get("role").and_then(Value::as_str),
+            Some("user" | "assistant" | "system" | "developer")
+        ) {
+            return true;
+        }
+        match obj.get("content") {
+            Some(Value::String(_)) => false,
+            Some(Value::Array(parts)) => parts.iter().any(|p| {
+                !matches!(
+                    p.get("type").and_then(Value::as_str),
+                    Some("input_text" | "output_text" | "text" | "input_image")
+                )
+            }),
+            _ => true,
+        }
     })
 }
 
@@ -295,6 +335,64 @@ mod tests {
         assert!(!has_untranslatable_content(
             &serde_json::json!({ "input": "plain" })
         ));
+    }
+
+    #[test]
+    fn a_tool_using_request_is_not_translated() {
+        // Found in review, and the fourth silently-dropped content type on this endpoint. A model
+        // given tools may answer with a tool call, and a tool call has no representation on the way
+        // back — so routing it at all is the same defect one step later. Agentic clients are the
+        // exact target here, which is why this is passthrough rather than a partial translation.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "input": "hi",
+            "tools": [{ "type": "function", "name": "get_weather" }],
+        })));
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "input": "hi", "tool_choice": "auto",
+        })));
+    }
+
+    #[test]
+    fn typed_item_turns_are_not_translated() {
+        // function_call / function_call_output / reasoning items carry no role+content pair.
+        // The earlier deny-list version returned None for these and dropped the turn entirely.
+        for item in [
+            serde_json::json!({ "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" }),
+            serde_json::json!({ "type": "function_call_output", "call_id": "c1", "output": "42" }),
+            serde_json::json!({ "type": "reasoning", "summary": [] }),
+        ] {
+            assert!(
+                has_untranslatable_content(&serde_json::json!({ "input": [item.clone()] })),
+                "must not translate {item}"
+            );
+        }
+    }
+
+    #[test]
+    fn stateful_threading_is_not_translated() {
+        // The upstream holds history we do not have, so a translated request is not the
+        // conversation the client is actually continuing.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "input": "and then?", "previous_response_id": "resp_abc",
+        })));
+    }
+
+    #[test]
+    fn plain_conversations_are_still_translated_and_gated() {
+        // The allow-list must not be so tight that nothing gets verified.
+        assert!(!has_untranslatable_content(
+            &serde_json::json!({ "input": "hi" })
+        ));
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "input": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "hello" },
+                { "role": "user", "content": [
+                    { "type": "input_text", "text": "and this?" },
+                    { "type": "input_image", "image_url": "data:..." },
+                ]},
+            ],
+        })));
     }
 
     #[test]
