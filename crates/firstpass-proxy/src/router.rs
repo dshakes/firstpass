@@ -611,9 +611,20 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
     for (j, handle) in inflight.drain() {
         if handle.is_finished() {
             if let Ok(Ok(resp)) = handle.await {
+                // Cache-aware for the same reason the gated path is: this is real, already-billed
+                // spend feeding `spent`, which the budget cap reads. A speculative call against a
+                // cached prompt bills mostly through the cache counters, so pricing it on
+                // `in_tokens` alone would undercount the waste this loop exists to record
+                // honestly.
                 spent += ctx
                     .prices
-                    .cost_usd(&ctx.ladder[j], resp.in_tokens, resp.out_tokens)
+                    .cost_usd_with_cache(
+                        &ctx.ladder[j],
+                        resp.in_tokens,
+                        resp.cache_write_tokens,
+                        resp.cache_read_tokens,
+                        resp.out_tokens,
+                    )
                     .unwrap_or(0.0);
             }
         } else {

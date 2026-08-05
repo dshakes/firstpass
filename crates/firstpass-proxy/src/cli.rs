@@ -606,6 +606,77 @@ pub fn parse_receipt_jsonl(text: &str) -> Result<Vec<Trace>, String> {
 /// This is the artifact an operator hands an auditor; the deferred-verdict side table is never
 /// included (it is not part of the hashed body).
 #[must_use]
+/// One decision, reshaped as a training example: context, action, reward, propensity.
+///
+/// A receipt is an audit record — nested, provenance-heavy, and shaped for a human or an auditor.
+/// A learner wants a flat row. The conversion is trivial except for one thing that is not, and is
+/// the reason this is worth shipping rather than leaving to a downstream script:
+///
+/// **The propensity is already logged.** Firstpass records the probability its logging policy
+/// assigned to the rung it chose, because it needs that denominator for IPS/SNIPS/DR off-policy
+/// evaluation. That is exactly the field offline RL needs and exactly the field a routing log
+/// normally lacks — without it, a learner trained on this data inherits the logging policy's bias
+/// with no way to correct for it. Rows where it is absent are marked, not silently defaulted to 1.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrainingRow {
+    /// Decision id, so a row can be traced back to the receipt it came from.
+    pub trace_id: String,
+    /// Context the decision was made in.
+    pub features: firstpass_core::Features,
+    /// The action taken: which rung the ladder started on.
+    pub start_rung: u32,
+    /// Which rung actually served, if any.
+    pub served_rung: Option<u32>,
+    /// Whether the served output passed its gate — the reward signal, and the honest one, because
+    /// it is a verified outcome rather than a predicted score.
+    pub served_passed: bool,
+    /// Total USD spent on the decision. Cost-aware objectives need this alongside the reward.
+    pub cost_usd: f64,
+    /// Probability the logging policy gave the chosen action. `None` for a deterministic policy —
+    /// an un-corrected row, which a learner must handle rather than assume away.
+    pub propensity: Option<f64>,
+    /// Whether this was a deliberate exploration draw.
+    pub explore: bool,
+    /// Logging policy identity, so rows from different policies can be separated.
+    pub policy_id: String,
+}
+
+impl TrainingRow {
+    /// Reshape one receipt.
+    pub fn from_trace(t: &Trace) -> Self {
+        let served_rung = t.final_.served_rung;
+        Self {
+            trace_id: t.trace_id.to_string(),
+            features: t.request.features.clone(),
+            // The first attempt is where the ladder started; absent attempts means nothing ran.
+            start_rung: t.attempts.first().map_or(0, |a| a.rung),
+            served_rung,
+            served_passed: served_rung.is_some_and(|r| {
+                t.attempts
+                    .iter()
+                    .any(|a| a.rung == r && a.verdict == firstpass_core::Verdict::Pass)
+            }),
+            cost_usd: t.final_.total_cost_usd,
+            propensity: t.policy.propensity,
+            explore: t.policy.explore,
+            policy_id: t.policy.id.clone(),
+        }
+    }
+}
+
+/// Reshape receipts into JSONL training rows (`firstpass export --format rl`).
+#[must_use]
+pub fn export_training_jsonl(traces: &[Trace]) -> String {
+    let mut out = String::new();
+    for t in traces {
+        if let Ok(line) = serde_json::to_string(&TrainingRow::from_trace(t)) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 pub fn export_receipts_jsonl(traces: &[Trace]) -> String {
     let mut out = String::new();
     for t in traces {
@@ -892,6 +963,82 @@ mod tests {
             parse_receipt_jsonl("\n\n").unwrap().is_empty(),
             "blank lines skipped"
         );
+    }
+
+    #[test]
+    fn training_rows_carry_the_logged_propensity() {
+        use firstpass_core::{
+            Attempt, Features, FinalOutcome, GENESIS_HASH, GateResult, PolicyRef, RequestInfo,
+            ServedFrom, TaskKind, Verdict,
+        };
+        let mk = |propensity: Option<f64>, explore: bool| Trace {
+            trace_id: uuid::Uuid::now_v7(),
+            prev_hash: GENESIS_HASH.to_owned(),
+            tenant_id: "default".to_owned(),
+            session_id: "s".to_owned(),
+            ts: jiff::Timestamp::UNIX_EPOCH,
+            mode: Mode::Enforce,
+            policy: PolicyRef {
+                id: "bandit@v1+eps".to_owned(),
+                explore,
+                propensity,
+                mode_profile: None,
+            },
+            request: RequestInfo {
+                api: "anthropic.messages".to_owned(),
+                prompt_hash: "x".to_owned(),
+                features: Features::new(TaskKind::CodeEdit),
+            },
+            attempts: vec![Attempt {
+                rung: 1,
+                model: "anthropic/claude-sonnet-5".to_owned(),
+                provider: "anthropic".to_owned(),
+                in_tokens: 10,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+                out_tokens: 5,
+                cost_usd: 0.004,
+                latency_ms: 7,
+                gates: vec![GateResult::deterministic("non-empty", Verdict::Pass, 0)],
+                verdict: Verdict::Pass,
+            }],
+            final_: FinalOutcome {
+                served_rung: Some(1),
+                served_from: ServedFrom::Attempt,
+                total_cost_usd: 0.004,
+                gate_cost_usd: 0.0,
+                total_latency_ms: 7,
+                escalations: 0,
+                counterfactual_baseline_usd: 0.02,
+                savings_usd: 0.016,
+            },
+            deferred: vec![],
+            predicted_pass: None,
+            probe: None,
+            elastic: None,
+            rollout: None,
+            shadow: None,
+            route_ix: None,
+        };
+
+        let rows = export_training_jsonl(&[mk(Some(0.25), true), mk(None, false)]);
+        let lines: Vec<&str> = rows.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let a: serde_json::Value = serde_json::from_str(lines[0]).expect("row is json");
+        // The whole point: the propensity survives into the training row. Without it a learner
+        // inherits the logging policy's bias with no way to correct for it.
+        assert_eq!(a["propensity"], 0.25);
+        assert_eq!(a["explore"], true);
+        assert_eq!(a["start_rung"], 1);
+        assert_eq!(a["served_rung"], 1);
+        assert_eq!(a["served_passed"], true);
+        assert_eq!(a["policy_id"], "bandit@v1+eps");
+
+        // A deterministic decision must be marked un-corrected, NOT silently defaulted to 1.0 —
+        // that would look like a uniformly-sampled row and quietly bias any estimate built on it.
+        let b: serde_json::Value = serde_json::from_str(lines[1]).expect("row is json");
+        assert!(b["propensity"].is_null(), "got {}", b["propensity"]);
     }
 
     #[test]

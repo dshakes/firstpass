@@ -126,6 +126,13 @@ impl PriceTable {
 
     /// Cost in USD of a call to `model` with the given token counts.
     ///
+    /// **Only correct for a response with no prompt-cache traffic.** Any path pricing a real
+    /// provider response should call [`PriceTable::cost_usd_with_cache`] instead and pass the
+    /// cache counters — this one silently prices a cached call at a small fraction of what it
+    /// cost, which is how a ~$0.72 request once banked a $0.0001 receipt. Reserved for
+    /// counterfactuals and synthetic token counts, where there is no cache traffic by
+    /// construction.
+    ///
     /// # Errors
     /// Returns [`Error::UnknownModel`] if the model has no price entry.
     pub fn cost_usd(&self, model: &str, input: u64, output: u64) -> Result<f64> {

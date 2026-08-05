@@ -1535,12 +1535,16 @@ async fn enforce_pipeline_inner(
                     let Ok(Ok(probe_resp)) = task_result else {
                         continue; // provider error on a sample = not-passed; count honestly
                     };
+                    // Cache-aware: k shadow samples of one prompt cache the same way consistency
+                    // does, and probe cost is reported separately precisely so it can be trusted.
                     probe_cost_usd += state
                         .config
                         .prices
-                        .cost_usd(
+                        .cost_usd_with_cache(
                             &probe_model_str,
                             probe_resp.in_tokens,
+                            probe_resp.cache_write_tokens,
+                            probe_resp.cache_read_tokens,
                             probe_resp.out_tokens,
                         )
                         .unwrap_or(0.0);
