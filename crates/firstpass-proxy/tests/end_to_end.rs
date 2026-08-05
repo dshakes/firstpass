@@ -33,6 +33,7 @@ async fn spawn_upstream() -> String {
     let router = Router::new()
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/chat/completions", post(openai_chat))
+        .route("/v1/responses", post(openai_responses))
         // Gemini's `{model}:generateContent` is a single path segment.
         .route("/v1beta/models/{model_action}", post(gemini_generate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -81,6 +82,26 @@ async fn openai_chat(body: Bytes) -> Response {
         "model": model,
         "choices": [{ "index": 0, "message": { "role": "assistant", "content": "answer via openai" }, "finish_reason": "stop" }],
         "usage": { "prompt_tokens": 1000, "completion_tokens": 200 },
+    }))
+    .into_response()
+}
+
+/// Responses-API wire response. Exists so a relay that targets the WRONG upstream path is
+/// observable: a Responses-shaped body sent to /v1/chat/completions would land in `openai_chat`
+/// and come back Chat-shaped, which is exactly the bug this endpoint had.
+async fn openai_responses(body: Bytes) -> Response {
+    let model = requested_model(&body);
+    Json(json!({
+        "id": "resp_e2e",
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": [{
+            "type": "message", "id": "msg_e2e", "status": "completed", "role": "assistant",
+            "content": [{ "type": "output_text", "text": "streamed via responses", "annotations": [] }],
+        }],
+        "output_text": "streamed via responses",
+        "usage": { "input_tokens": 7, "output_tokens": 3, "total_tokens": 10 },
     }))
     .into_response()
 }
@@ -505,5 +526,63 @@ async fn responses_api_is_gated_by_the_same_ladder() {
     assert!(
         verify_chain(&traces, GENESIS_HASH).is_ok(),
         "receipt chain intact"
+    );
+}
+
+/// A Responses request that cannot be gated must still reach the **Responses** upstream endpoint.
+///
+/// Caught in review: the fallback relayed a Responses-shaped body to `/v1/chat/completions`, which
+/// the upstream rejects — breaking the exact client class the endpoint exists to serve. Observe
+/// mode is the reachable fallback here; streaming takes the same path.
+#[tokio::test]
+async fn a_responses_request_that_cannot_be_gated_still_reaches_the_responses_endpoint() {
+    let upstream = spawn_upstream().await;
+    // No enforce route → every request falls through to observe passthrough.
+    let (proxy, _db) = spawn_proxy_with(&upstream, &["anthropic/claude-haiku-4-5"], "", "").await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/responses"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({ "model": "gpt-5.5", "input": "hi", "stream": true }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("streamed via responses"),
+        "relay must hit /v1/responses upstream, not /v1/chat/completions: {text}"
+    );
+    assert!(
+        !text.contains("answer via openai"),
+        "landing in the chat handler means the wrong upstream path: {text}"
+    );
+}
+
+/// The receipt must describe the request the CLIENT made, not the translated one it was routed as.
+#[tokio::test]
+async fn a_responses_receipt_names_the_api_the_client_actually_called() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy(
+        &upstream,
+        &["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"],
+        "",
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/responses"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({ "model": "claude-haiku-4-5", "input": "write a hello world" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let traces = wait_for_traces(&db, 1).await;
+    assert_eq!(
+        traces[0].request.api, "openai.responses",
+        "an audit record that misnames the API cannot be reconciled against the client's logs"
     );
 }

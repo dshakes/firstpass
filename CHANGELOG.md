@@ -72,6 +72,13 @@ correctness.
   Buffered only: `enforce` cannot stream, because the gate must see the whole candidate before it
   can judge it, so a streaming Responses request takes the same observe passthrough that Chat
   Completions already uses for a request it cannot gate faithfully.
+- **Context overflow now escalates instead of failing the request.** A prompt too large for a rung
+  is a 400, and every 400 aborted the ladder — so a long agent conversation that outgrew the
+  *cheapest* rung's context window failed outright, even with a larger rung configured directly
+  above it. It now climbs, and records the attempt as `context_overflow` rather than a gate
+  failure, so capacity-forced escalations are not pooled with quality ones in the statistics. An
+  unrecognised 400 still aborts: escalating a genuinely malformed request only buys the same
+  rejection at a higher price.
 - **`GET /v1/models`** — OpenAI-shaped discovery so agent CLIs can populate a model picker.
   Reports distinct ladder rungs in ladder order (that order is the cost gradient) with the real
   per-1M prices from the table that bills the receipt.

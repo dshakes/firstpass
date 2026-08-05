@@ -301,8 +301,21 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                 continue;
             }
             Err(err) => {
-                // Hard error (4xx / decode): do not escalate — the request itself is the problem.
                 let ms = elapsed_ms(start);
+                // A prompt that does not fit THIS rung is not a broken request — the rung above
+                // may have a window twice the size. Climb instead of aborting, and record the
+                // reason as capacity so it is not pooled with quality failures in the statistics.
+                if is_context_overflow(&err) {
+                    attempts.push(abstain_attempt(
+                        idx,
+                        model_str,
+                        provider.id(),
+                        reason::CONTEXT_OVERFLOW,
+                        ms,
+                    ));
+                    continue;
+                }
+                // Hard error (4xx / decode): do not escalate — the request itself is the problem.
                 let (r, msg) = hard_reason(&err);
                 attempts.push(abstain_attempt(idx, model_str, provider.id(), r, ms));
                 hard_error = Some(msg);
@@ -528,11 +541,24 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                 idx += 1;
             }
             Ok(Err(err)) => {
-                // Hard error (4xx / decode): do not escalate — the request itself is the problem.
-                let (r, msg) = hard_reason(&err);
-                attempts.push(abstain_attempt(idx as u32, model_str, provider.id(), r, ms));
-                hard_error = Some(msg);
-                done = true;
+                // Same rule as the serial path: a prompt too large for THIS rung is a capacity
+                // fact about the rung, not a broken request, so the ladder climbs.
+                if is_context_overflow(&err) {
+                    attempts.push(abstain_attempt(
+                        idx as u32,
+                        model_str,
+                        provider.id(),
+                        reason::CONTEXT_OVERFLOW,
+                        ms,
+                    ));
+                    idx += 1;
+                } else {
+                    // Hard error (4xx / decode): do not escalate — the request is the problem.
+                    let (r, msg) = hard_reason(&err);
+                    attempts.push(abstain_attempt(idx as u32, model_str, provider.id(), r, ms));
+                    hard_error = Some(msg);
+                    done = true;
+                }
             }
             Ok(Ok(resp)) => {
                 // Cache-aware: prompt-cache traffic bills at its own rates, and counting only
@@ -692,6 +718,37 @@ fn abstain_attempt(rung: u32, model: &str, provider: &str, reason: &str, ms: u64
 /// content), but the body is logged server-side first: it is the only thing that says *why*.
 /// A bare "upstream http 404" hid a broken provider for weeks — the body it dropped named the
 /// exact model id that did not exist.
+/// Whether a provider rejection means "this prompt does not fit **this rung**" rather than "this
+/// request is broken".
+///
+/// The distinction decides whether the ladder aborts or climbs, and getting it wrong is expensive
+/// in the exact workload Firstpass targets. A long agent conversation eventually outgrows the
+/// cheapest rung's context window; the provider answers 400, and treating every 400 as fatal fails
+/// the whole request even when the next rung up has a window twice the size and would have served
+/// it. The request was never the problem.
+///
+/// Matched on the message text because that is what providers give us — none of them expose a
+/// distinct status for it. Deliberately narrow: an unrecognised 400 stays fatal, because escalating
+/// a genuinely malformed request just spends money on the same rejection at a higher price.
+fn is_context_overflow(err: &ProviderError) -> bool {
+    let ProviderError::Http { status, body } = err else {
+        return false;
+    };
+    if *status != 400 && *status != 413 {
+        return false;
+    }
+    let b = body.to_ascii_lowercase();
+    // Anthropic: "prompt is too long: 250000 tokens > 200000 maximum"
+    // OpenAI:    "This model's maximum context length is 128000 tokens" / context_length_exceeded
+    // Gemini:    "input token count exceeds the maximum"
+    b.contains("prompt is too long")
+        || b.contains("context_length_exceeded")
+        || b.contains("maximum context length")
+        || b.contains("context window")
+        || (b.contains("token count") && b.contains("exceed"))
+        || (b.contains("too many tokens"))
+}
+
 fn hard_reason(err: &ProviderError) -> (&'static str, String) {
     match err {
         ProviderError::Http { status, body } => {
@@ -713,6 +770,46 @@ fn hard_reason(err: &ProviderError) -> (&'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn http(status: u16, body: &str) -> ProviderError {
+        ProviderError::Http {
+            status,
+            body: body.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_prompt_that_outgrew_this_rung_is_not_a_broken_request() {
+        // The real messages, as each provider phrases it. A long agent conversation eventually
+        // exceeds the cheapest rung's window; treating that 400 as fatal fails the whole request
+        // even when the rung above has a window twice the size.
+        assert!(is_context_overflow(&http(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#
+        )));
+        assert!(is_context_overflow(&http(
+            400,
+            r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens"}}"#
+        )));
+        assert!(is_context_overflow(&http(
+            400,
+            r#"{"error":{"message":"The input token count exceeds the maximum"}}"#
+        )));
+        assert!(is_context_overflow(&http(413, "too many tokens")));
+    }
+
+    #[test]
+    fn an_unrecognised_400_stays_fatal() {
+        // Deliberately narrow. Escalating a genuinely malformed request only buys the same
+        // rejection at a higher price, so anything not clearly a capacity limit still aborts.
+        assert!(!is_context_overflow(&http(
+            400,
+            r#"{"error":{"message":"messages: field required"}}"#
+        )));
+        assert!(!is_context_overflow(&http(401, "invalid api key")));
+        assert!(!is_context_overflow(&http(500, "prompt is too long")));
+        assert!(!is_context_overflow(&ProviderError::Decode("bad".into())));
+    }
     use crate::gate::{JsonValidGate, NonEmptyGate};
     use crate::provider::{MockProvider, Provider};
     use serde_json::Value;
@@ -1070,6 +1167,85 @@ mod tests {
         let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
         map.insert("anthropic".to_owned(), Arc::new(mock));
         (ProviderRegistry::from_map(map), log)
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_climbs_the_ladder_instead_of_failing_the_request() {
+        // The workload this matters for: a long agent conversation outgrows the cheap rung's
+        // window. Before this, the 400 aborted the whole request even though sonnet — configured
+        // directly above, with a larger window — would have served it.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let (providers, log) = counted_registry(vec![
+            (
+                HAIKU,
+                Err(http(
+                    400,
+                    r#"{"error":{"message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+                )),
+            ),
+            (SONNET, Ok(resp(SONNET, "served by the bigger window"))),
+        ]);
+        let health = GateHealthRegistry::new();
+
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+
+        assert!(
+            matches!(out, EngineOutcome::Served(_)),
+            "must serve from the rung that fits, not fail the request: {out:?}"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![HAIKU.to_owned(), SONNET.to_owned()],
+            "the ladder must climb past the rung that could not hold the prompt"
+        );
+        assert_eq!(trace.final_.served_rung, Some(1));
+        // The receipt must say the escalation was forced by capacity, not by a quality judgement —
+        // otherwise the two are pooled in every statistic computed over gate outcomes.
+        assert_eq!(
+            trace.attempts[0].gates[0].reason.as_deref(),
+            Some(firstpass_core::verdict::reason::CONTEXT_OVERFLOW),
+            "{:?}",
+            trace.attempts[0].gates
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_request_still_aborts_without_paying_the_next_rung() {
+        // The other half: escalating a genuinely broken request only buys the same rejection at a
+        // higher price, so an unrecognised 400 must still stop the ladder.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let (providers, log) = counted_registry(vec![
+            (
+                HAIKU,
+                Err(http(
+                    400,
+                    r#"{"error":{"message":"messages: field required"}}"#,
+                )),
+            ),
+            (SONNET, Ok(resp(SONNET, "never reached"))),
+        ]);
+        let health = GateHealthRegistry::new();
+
+        let (out, _trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+
+        assert!(!matches!(out, EngineOutcome::Served(_)), "{out:?}");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![HAIKU.to_owned()],
+            "a broken request must not be re-sent at a higher price"
+        );
     }
 
     #[tokio::test]

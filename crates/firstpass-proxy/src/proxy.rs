@@ -33,9 +33,7 @@ use crate::provider::{Auth, ChatMessage, ModelRequest, ModelResponse, ProviderRe
 use crate::router::{EnforceCtx, EngineOutcome, route_enforce};
 use crate::store;
 use crate::tenant_auth::{TenantId, auth_middleware};
-use crate::upstream::{
-    forward_anthropic, forward_anthropic_streaming, forward_openai, forward_openai_streaming,
-};
+use crate::upstream::{forward_anthropic, forward_anthropic_streaming};
 use firstpass_core::Route;
 use firstpass_core::trace::ShadowSignal;
 
@@ -1665,6 +1663,44 @@ async fn enforce_pipeline_openai(
     tenant: String,
     routing_mode: RoutingMode,
 ) -> Result<Value, ProxyError> {
+    enforce_pipeline_openai_as(
+        state,
+        headers,
+        body,
+        body,
+        "openai.chat_completions",
+        features,
+        route,
+        route_ix,
+        session_header,
+        tenant,
+        routing_mode,
+    )
+    .await
+}
+
+/// As [`enforce_pipeline_openai`], but records `api` on the receipt and hashes `receipt_body`
+/// rather than the body that was routed.
+///
+/// The two differ for `/v1/responses`, which translates the client's request into the Chat
+/// Completions shape before routing it. The receipt is an audit record of what the **client**
+/// sent, so hashing the translated body would make it un-reconcilable against the request the
+/// client actually made — and labelling it `openai.chat_completions` would misreport which API was
+/// called.
+#[allow(clippy::too_many_arguments)]
+async fn enforce_pipeline_openai_as(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    receipt_body: &Bytes,
+    api: &str,
+    features: Features,
+    route: &Route,
+    route_ix: usize,
+    session_header: Option<String>,
+    tenant: String,
+    routing_mode: RoutingMode,
+) -> Result<Value, ProxyError> {
     // Decide between verbatim raw-carry (all-OpenAI ladder) and translation (Anthropic ladder).
     let providers = &state.providers;
     let all_openai = route.ladder.iter().all(|rung| {
@@ -1681,14 +1717,14 @@ async fn enforce_pipeline_openai(
     let auth = Auth::from_headers(headers);
     let resp = enforce_pipeline_inner(
         state,
-        body,
+        receipt_body,
         base_request,
         auth,
         features,
         route,
         session_header,
         tenant,
-        "openai.chat_completions",
+        api,
         routing_mode,
         route_ix,
     )
@@ -2931,13 +2967,39 @@ async fn observe_passthrough_openai(
     session_header: Option<String>,
     tenant: String,
 ) -> Response {
+    observe_passthrough_openai_path(
+        state,
+        headers,
+        body,
+        session_header,
+        tenant,
+        crate::upstream::OPENAI_CHAT_PATH,
+    )
+    .await
+}
+
+/// As [`observe_passthrough_openai`], relaying to an explicit upstream path.
+///
+/// The path is not cosmetic. A Responses-shaped body relayed to `/v1/chat/completions` is rejected
+/// by the upstream, so a `/v1/responses` request that falls back to passthrough — streaming, or no
+/// enforce route — would fail for the very clients the endpoint exists to serve.
+async fn observe_passthrough_openai_path(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    session_header: Option<String>,
+    tenant: String,
+    path: &'static str,
+) -> Response {
     if is_stream_request(&body) {
-        return observe_stream_openai(state, headers, body, session_header, tenant).await;
+        return observe_stream_openai_path(state, headers, body, session_header, tenant, path)
+            .await;
     }
     let start = Instant::now();
-    let result = forward_openai(
+    let result = crate::upstream::forward_openai_path(
         &state.http,
         &state.config.upstream_openai,
+        path,
         &headers,
         body.clone(),
     )
@@ -2963,17 +3025,21 @@ async fn observe_passthrough_openai(
 }
 
 /// Observe streaming for `POST /v1/chat/completions`.
-async fn observe_stream_openai(
+/// As [`observe_stream_openai`], relaying to an explicit upstream path — see
+/// [`observe_passthrough_openai_path`] for why the path has to be preserved.
+async fn observe_stream_openai_path(
     state: AppState,
     headers: HeaderMap,
     body: Bytes,
     session_header: Option<String>,
     tenant: String,
+    path: &'static str,
 ) -> Response {
     let start = Instant::now();
-    let result = forward_openai_streaming(
+    let result = crate::upstream::forward_openai_streaming_path(
         &state.http,
         &state.config.upstream_openai,
+        path,
         &headers,
         body.clone(),
     )
@@ -3073,11 +3139,27 @@ async fn responses(
     // through matters: the upstream speaks Responses too, and handing it a translated body would
     // return Chat-shaped events to a client waiting for Responses ones.
     if is_stream_request(&body) {
-        return observe_passthrough_openai(state, headers, body, session_header, tenant).await;
+        return observe_passthrough_openai_path(
+            state,
+            headers,
+            body,
+            session_header,
+            tenant,
+            crate::upstream::OPENAI_RESPONSES_PATH,
+        )
+        .await;
     }
 
     let Ok(parsed) = serde_json::from_slice::<Value>(&body) else {
-        return observe_passthrough_openai(state, headers, body, session_header, tenant).await;
+        return observe_passthrough_openai_path(
+            state,
+            headers,
+            body,
+            session_header,
+            tenant,
+            crate::upstream::OPENAI_RESPONSES_PATH,
+        )
+        .await;
     };
     let chat_body = Bytes::from(crate::responses::request_to_chat(&parsed).to_string());
 
@@ -3104,10 +3186,12 @@ async fn responses(
                     Dialect::Openai,
                 )
             {
-                return match enforce_pipeline_openai(
+                return match enforce_pipeline_openai_as(
                     &state,
                     &headers,
                     &chat_body,
+                    &body,
+                    "openai.responses",
                     features,
                     &route,
                     route_ix,
@@ -3123,7 +3207,15 @@ async fn responses(
             }
         }
     }
-    observe_passthrough_openai(state, headers, body, session_header, tenant).await
+    observe_passthrough_openai_path(
+        state,
+        headers,
+        body,
+        session_header,
+        tenant,
+        crate::upstream::OPENAI_RESPONSES_PATH,
+    )
+    .await
 }
 
 #[cfg(test)]

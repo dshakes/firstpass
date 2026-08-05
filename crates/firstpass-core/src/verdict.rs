@@ -125,6 +125,14 @@ pub mod reason {
     pub const GATE_CRASH: &str = "gate_crash";
     /// The gate was auto-disabled for exceeding its error budget (§7.2).
     pub const GATE_DISABLED: &str = "gate_disabled";
+    /// The prompt did not fit *this rung's* context window.
+    ///
+    /// Distinct from [`PROVIDER_ERROR`] because it means something categorically different: the
+    /// request is fine, this rung is simply too small for it. A rung above with a larger window
+    /// may well serve it, so the ladder must climb rather than abort — and the receipt must be able
+    /// to say the escalation was forced by **capacity**, not by a quality judgement, or the two get
+    /// pooled in every statistic computed over gate outcomes.
+    pub const CONTEXT_OVERFLOW: &str = "context_overflow";
 }
 
 impl GateResult {
