@@ -83,10 +83,25 @@ on your traffic, not a free optimisation:
   rest: roughly 67% of the gate's input cost, bought with an extra round trip of latency **in the
   serving path**.
 
-That second point is a genuine cost/latency tradeoff rather than an optimisation, and it is why
-turning this on by default still needs a measurement — a `--coding-policy` run with and without,
-reporting both `$/success` and p95 latency. The knob shipping is not the same decision as the
-default changing.
+That second point is a genuine cost/latency tradeoff rather than an optimisation, and it applies
+only to k-sample gates — **not** to the routed request, where an agent's turn 2 naturally reuses the
+prefix written by turn 1 because the calls are sequential. So the two halves of the default-on
+question separate cleanly:
+
+- **Routed caller requests** — no latency cost at all, and break-even is exactly **one reuse**.
+  Any multi-turn session with a stable system prompt and tool set is past break-even by its second
+  turn.
+- **k-sample gates** — would need sample 1 serialized, which is the tradeoff above. Not implemented,
+  and it is what a `--coding-policy` run reporting `$/success` and p95 latency would settle.
+
+It stays opt-in nonetheless, because single-shot traffic is past no break-even and would pay the 25%
+write premium for nothing. That is a fact about your traffic, not about this code. What has changed
+is that the guard below makes leaving it on materially safer:
+
+**A prefix too small to qualify is never marked.** Anthropic refuses to cache below a per-model
+minimum (1024 tokens; 2048 on Haiku), so marking a shorter prefix is not merely wasted — it is a
+request the API can reject. The estimate is deliberately conservative, skipping only prefixes that
+could not possibly qualify.
 
 Callers that place their own `cache_control` are left untouched: they know their prefix better than
 this code does, and extra breakpoints would exceed Anthropic's limit and re-bill the write premium.
@@ -102,18 +117,31 @@ Restricted to the exhausted-ladder case the trade is no longer "faithful vs degr
 vs no answer at all", and the overflow attempts stay on the receipt so the elision is visible rather
 than inferred.
 
-## Known limitation: tool-using Responses requests are not gated
+## Tool-using Responses requests are gated
 
-`/v1/responses` translates only what provably round-trips — plain text/image conversations with no
-tools. A model given tools may reply with a tool call, which has no representation on the way back,
-so those requests take the un-gated passthrough.
+Function tools and the `function_call` / `function_call_output` round trip translate in **both**
+directions: a tool definition becomes Chat's nested `function` shape, a tool call becomes an
+`assistant` message with `tool_calls`, a result becomes a `tool` message, and a tool call in the
+reply comes back as a `function_call` item rather than vanishing. A turn awaiting a tool result
+reports `status: "incomplete"`, because telling an agent the turn is `completed` while the model
+waits on it is its own wrong answer.
 
-This is an allow-list because the deny-list version lost three times running: images, then files,
-then tool calls were each silently dropped, each producing a confidently wrong answer rather than an
-error. Enumerating what breaks loses that game whenever a provider adds a field.
+That closes the limitation this section previously recorded — agentic clients, the ones this
+endpoint exists for, are now verified rather than passed through.
 
-It costs gating for exactly the agentic clients the endpoint targets, which is a real limitation.
-Lifting it needs tool-call translation in both directions.
+Still un-gated, and these are genuine rather than provisional:
+
+- **Hosted tools** (`web_search`, `file_search`, `computer_use`) run inside the provider and have no
+  Chat equivalent. Sending a partial tool set is worse than not routing at all: a model missing one
+  of its tools produces a confidently wrong plan.
+- **Reasoning items**, which carry provider-internal state.
+- **`previous_response_id`** threading, where the upstream holds history we do not have — a
+  translated request is then not the conversation the client is continuing.
+
+The check is an allow-list rather than a deny-list because the deny-list lost three times running:
+images, then files, then tool calls were each silently dropped, each producing a confidently wrong
+answer rather than an error. Enumerating what breaks loses that game whenever a provider adds a
+field.
 
 ## Where this list came from
 

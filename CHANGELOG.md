@@ -65,6 +65,13 @@ correctness.
 
 ### Added
 
+- **Tool calls translate both ways on `/v1/responses`**, so tool-using agentic requests are
+  **gated** rather than passed through un-verified. A tool definition becomes Chat's nested
+  `function` shape, a tool call becomes an `assistant` message with `tool_calls`, a result becomes a
+  `tool` message, and a tool call in the reply returns as a `function_call` item. A turn awaiting a
+  tool result reports `status: "incomplete"` — telling an agent the turn is `completed` while the
+  model waits on it is its own wrong answer. Hosted tools (`web_search`, `file_search`,
+  `computer_use`), reasoning items, and `previous_response_id` threading still take passthrough.
 - **`POST /v1/responses`** — the OpenAI Responses API. Newer OpenAI-family agents speak Responses
   rather than Chat Completions, and without this they could not point at Firstpass at all. Served
   by translating to and from the Chat Completions path, so the gate, ladder, budget, and receipt are
@@ -78,7 +85,9 @@ correctness.
   0.1×, so roughly one reuse of the prefix covers the premium and everything after saves heavily —
   but single-shot traffic never reuses and would pay a 25% surcharge for nothing. Whether that
   trade pays is a fact about your traffic, not something this code can infer. A caller that already
-  places its own `cache_control` is left untouched.
+  places its own `cache_control` is left untouched, and a prefix too small to qualify is never
+  marked — Anthropic refuses to cache below a per-model minimum (1024 tokens; 2048 on Haiku), so
+  marking a shorter one is a request the API can reject rather than merely wasted spend.
 - **`[escalation.condense]`** — last-resort context condensing. When a conversation has overflowed
   the context window of *every* rung, the middle of the history is dropped (head and tail kept, with
   a marker turn telling the model its history is incomplete) and the top rung is retried **once**.

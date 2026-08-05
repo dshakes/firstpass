@@ -662,8 +662,24 @@ pub fn normalize_reasoning(body: &mut serde_json::Map<String, Value>, target: Wi
 ///
 /// Idempotent: a caller already using `cache_control` keeps their own breakpoints and gets none
 /// added, since they have placed them with knowledge this code does not have.
+/// Smallest serialized prefix worth marking, in characters.
+///
+/// Anthropic's minimum cacheable prefix is 1024 tokens (2048 on Haiku). At roughly 4 characters per
+/// token that is ~4096 characters; this floor sits deliberately below it, so the guard only skips
+/// prefixes that could not possibly qualify rather than second-guessing the tokenizer.
+const MIN_CACHEABLE_PREFIX_CHARS: usize = 3000;
+
 pub fn add_cache_breakpoints(body: &mut serde_json::Map<String, Value>) {
     if body_has_cache_control(body) {
+        return;
+    }
+    // Anthropic refuses to cache a prefix below a per-model minimum (1024 tokens for Sonnet/Opus,
+    // 2048 for Haiku). Marking a shorter one is not merely wasted — it is a request the API can
+    // reject outright. Estimated from serialized bytes at the usual ~4 chars/token, floored well
+    // under the real minimum so this only skips prefixes that are clearly too small to qualify.
+    let prefix_chars = body.get("system").map_or(0, |v| v.to_string().len())
+        + body.get("tools").map_or(0, |v| v.to_string().len());
+    if prefix_chars < MIN_CACHEABLE_PREFIX_CHARS {
         return;
     }
     let marker = serde_json::json!({ "type": "ephemeral" });
@@ -1616,7 +1632,7 @@ mod tests {
         // turns. The conversation after them is not cached, and must not be marked.
         let mut body = obj(serde_json::json!({
             "model": "claude-sonnet-5",
-            "system": "you are a careful assistant",
+            "system": "you are a careful assistant. ".repeat(200),
             "tools": [{ "name": "a" }, { "name": "b" }],
             "messages": [{ "role": "user", "content": "hi" }],
         }));
@@ -1626,7 +1642,12 @@ mod tests {
         // A bare string system cannot carry cache_control — it must become the block form.
         assert_eq!(body["system"][0]["type"], "text");
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(body["system"][0]["text"], "you are a careful assistant");
+        assert!(
+            body["system"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("you are a careful")
+        );
         // Only the LAST tool: a breakpoint marks the end of a prefix, and one per tool would
         // spend the write premium several times over for the same prefix.
         assert!(body["tools"][0].get("cache_control").is_none());
@@ -1635,6 +1656,22 @@ mod tests {
             body["messages"][0].get("cache_control").is_none(),
             "the conversation is not the stable prefix"
         );
+    }
+
+    #[test]
+    fn a_prefix_too_small_to_qualify_is_not_marked() {
+        // Anthropic refuses to cache below a per-model minimum (1024 tokens, 2048 on Haiku), and
+        // marking a shorter prefix is not merely wasted — it is a request the API can reject.
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "system": "be terse",
+            "messages": [{ "role": "user", "content": "hi" }],
+        }));
+        let before = body.clone();
+
+        add_cache_breakpoints(&mut body);
+
+        assert_eq!(body, before, "a two-word system prompt cannot be cached");
     }
 
     #[test]
@@ -1670,11 +1707,12 @@ mod tests {
         // The default path must be byte-identical to before this existed.
         let raw = serde_json::json!({
             "model": "claude-sonnet-5", "max_tokens": 64,
-            "system": "s", "messages": [{ "role": "user", "content": "hi" }],
+            "system": "a long stable system prefix. ".repeat(200),
+            "messages": [{ "role": "user", "content": "hi" }],
         });
         let req = ModelRequest {
             model: "anthropic/claude-sonnet-5".to_owned(),
-            system: Some("s".to_owned()),
+            system: Some("a long stable system prefix. ".repeat(200)),
             messages: vec![ChatMessage::text("user", "hi")],
             max_tokens: 64,
             tools: Value::Null,
@@ -1683,7 +1721,7 @@ mod tests {
         };
 
         let body = anthropic_wire_body(&req);
-        assert_eq!(body["system"], "s", "unchanged when opted out");
+        assert!(body["system"].is_string(), "unchanged when opted out");
 
         let opted = ModelRequest {
             cache_prefix: true,
@@ -1701,7 +1739,7 @@ mod tests {
         // long conversations it exists to pay for.
         let req = ModelRequest {
             model: "anthropic/claude-sonnet-5".to_owned(),
-            system: Some("stable prefix".to_owned()),
+            system: Some("stable prefix. ".repeat(300)),
             messages: vec![ChatMessage::text("user", "hi")],
             max_tokens: 64,
             tools: serde_json::json!([{ "name": "a" }]),
