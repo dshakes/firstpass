@@ -105,6 +105,18 @@ async fn spawn_proxy(
     ladder: &[&str],
     providers_toml: &str,
 ) -> (String, std::path::PathBuf) {
+    spawn_proxy_with(upstream, ladder, providers_toml, "").await
+}
+
+/// As [`spawn_proxy`], plus arbitrary extra routing TOML (e.g. an `[escalation.*]` block), so a
+/// test can exercise a feature exactly as an operator would configure it rather than by reaching
+/// into `AppState`.
+async fn spawn_proxy_with(
+    upstream: &str,
+    ladder: &[&str],
+    providers_toml: &str,
+    extra_toml: &str,
+) -> (String, std::path::PathBuf) {
     let db_path = std::env::temp_dir().join(format!("firstpass-e2e-{}.db", uuid::Uuid::now_v7()));
     let ladder_toml = ladder
         .iter()
@@ -125,7 +137,7 @@ async fn spawn_proxy(
         })
         .collect();
     let routing = format!(
-        "{providers_toml}\n{price_toml}\n[[route]]\nmatch = {{}}\nmode = \"enforce\"\nladder = [{ladder_toml}]\ngates = [\"non-empty\"]\n"
+        "{providers_toml}\n{price_toml}\n{extra_toml}\n[[route]]\nmatch = {{}}\nmode = \"enforce\"\nladder = [{ladder_toml}]\ngates = [\"non-empty\"]\n"
     );
     let upstream = upstream.to_owned();
     let db_str = db_path.to_string_lossy().into_owned();
@@ -152,6 +164,7 @@ async fn spawn_proxy(
         &config.upstream_openai,
     );
     let (traces, _writer) = store::open(&db_path).unwrap();
+    let promoter = firstpass_proxy::proxy::build_promoter(&config).unwrap();
     let state = AppState {
         config: Arc::new(config),
         http: reqwest::Client::new(),
@@ -162,6 +175,7 @@ async fn spawn_proxy(
         traces,
         adaptive: None,
         bandit: None,
+        promoter,
         predictor: None,
         tenant_rate_limiter: None,
         spill: None,
@@ -351,4 +365,84 @@ async fn gemini_dialect_serves_over_real_http() {
     verify_chain(&traces, GENESIS_HASH).unwrap();
 
     let _ = std::fs::remove_file(&db);
+}
+
+/// Session promotion, end to end over real HTTP and configured exactly as an operator would.
+///
+/// This is the wiring test, and it exists because `[escalation.session_promotion]` shipped as a
+/// block that parsed and did nothing at all. Unit tests on the promoter would have passed happily
+/// against that same dead config, so the assertion that matters is not "the promoter works" but
+/// "a second request on this session really did skip the rung that already failed".
+#[tokio::test]
+async fn session_promotion_skips_the_rung_that_already_failed() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy_with(
+        &upstream,
+        &[
+            "anthropic/claude-haiku-4-5",
+            "anthropic/claude-sonnet-5",
+            "anthropic/claude-opus-4-8",
+        ],
+        "",
+        "[escalation.session_promotion]\nafter_failures = 1\nwindow = \"30m\"\n",
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let send = |session: &str| {
+        let client = client.clone();
+        let proxy = proxy.clone();
+        let session = session.to_owned();
+        async move {
+            client
+                .post(format!("{proxy}/v1/messages"))
+                .header("x-api-key", "byok-test")
+                .header("x-firstpass-session", session)
+                .json(&json!({
+                    "model": "claude-haiku-4-5",
+                    "max_tokens": 256,
+                    "messages": [{ "role": "user", "content": "write a hello world" }],
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Turn 1: haiku fails the gate, the ladder climbs, sonnet serves.
+    assert_eq!(send("sess-promote").await.status(), 200);
+    let first = wait_for_traces(&db, 1).await;
+    assert_eq!(first[0].attempts.len(), 2, "turn 1 must climb 0 → 1");
+    assert_eq!(first[0].attempts[0].rung, 0);
+
+    // Turn 2, same session: the promotion should start it at rung 1, so haiku — which is still
+    // configured, still cheapest, and still fails — is never called at all.
+    assert_eq!(send("sess-promote").await.status(), 200);
+    let both = wait_for_traces(&db, 2).await;
+    let second = both
+        .iter()
+        .find(|t| t.trace_id != first[0].trace_id)
+        .expect("second trace");
+
+    assert_eq!(
+        second.attempts.len(),
+        1,
+        "promoted turn must not re-attempt the failing rung: {:?}",
+        second.attempts.iter().map(|a| a.rung).collect::<Vec<_>>()
+    );
+    assert_eq!(second.attempts[0].rung, 1, "started on the promoted rung");
+    assert_eq!(second.final_.served_rung, Some(1));
+
+    // A different session must not inherit it — promotion is per conversation, not global.
+    assert_eq!(send("sess-other").await.status(), 200);
+    let all = wait_for_traces(&db, 3).await;
+    let other = all
+        .iter()
+        .find(|t| t.trace_id != first[0].trace_id && t.trace_id != second.trace_id)
+        .expect("third trace");
+    assert_eq!(
+        other.attempts.len(),
+        2,
+        "an unrelated session starts cold and climbs on its own"
+    );
 }

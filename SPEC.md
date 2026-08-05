@@ -451,8 +451,23 @@ on_exhausted    = "serve_best_attempt"   # never brick the customer
 
 [escalation]
 max_rungs_per_request = 3
-session_promotion = { after_failures = 3, window = "30m" }  # start higher for the rest of a struggling session
+
+# Start a continuing session on the rung it already needed, instead of re-paying for the rung
+# that already failed it. Absent = every request starts cold (the default).
+[escalation.session_promotion]
+after_failures = 3        # escalations within `window` before the session is promoted
+window         = "30m"    # sliding window, and the idle TTL after which a promotion is forgotten
+probe_every    = 5        # every 5th turn, start one rung LOWER to test whether it is still needed
+max_sessions   = 10000    # hard cap on tracked sessions; oldest evicted first
 ```
+
+`probe_every` is not optional tuning. Promotion on its own is one-way: a session that escalates
+once would stay on the expensive rung for the rest of its life, including the trivial turns at the
+end. The periodic downward probe is the only way a promotion is ever released, so `probe_every = 0`
+is rejected at parse rather than silently pinning the session forever.
+
+Promotion chooses only where the ladder **starts**. The gate still verifies whatever is served, so
+a wrong promotion costs money, never correctness — and the probe bounds even that.
 
 ---
 

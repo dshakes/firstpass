@@ -68,6 +68,11 @@ pub struct AppState {
     /// queries it for a predicted start rung per request and feeds back gate verdicts for online
     /// learning — all in-memory, per-process.
     pub bandit: Option<Arc<std::sync::Mutex<crate::bandit::StartRungBandit>>>,
+    /// Optional session promotion (`[escalation.session_promotion]`). `None` (default) = every
+    /// request starts cold, byte-identical to today. When present, a session that had to escalate
+    /// starts its next turn on the rung it actually needed instead of re-paying for the rung that
+    /// already failed — with a periodic downward probe so the promotion is not one-way.
+    pub promoter: Option<Arc<crate::affinity::SessionPromoter>>,
     /// Optional per-query gate-pass predictor (ADR 0008 Phase 2). `None` (default) = no
     /// prediction, byte-identical to today. When `Some`, `handle_enforce` records its
     /// `P(gate-pass)` for the start rung on the receipt in **shadow** (never acted on) and
@@ -87,6 +92,31 @@ pub struct AppState {
 /// Build the per-tenant keyed rate limiter from config (ADR 0004 §D6). Returns `None` when
 /// `FIRSTPASS_TENANT_RATE_PER_SEC` is unset (the default) — single-operator and existing
 /// deployments see no limiter and no behavior change.
+/// Build the session promoter from `[escalation.session_promotion]`, or `None` when it is absent.
+///
+/// Lives here, and is used by both `run::serve` and the end-to-end tests, so a test cannot pass
+/// against a differently-wired `AppState` than production builds. The first version of the
+/// promotion test did exactly that — the harness hardcoded `promoter: None`, so it failed with the
+/// feature fully implemented and correctly wired everywhere that shipped.
+///
+/// # Errors
+/// [`firstpass_core::Error::BadDuration`] when `window` does not parse. `Config::parse` already
+/// rejects that, so reaching this is a config built in code rather than read from a file.
+pub fn build_promoter(
+    config: &ProxyConfig,
+) -> firstpass_core::Result<Option<Arc<crate::affinity::SessionPromoter>>> {
+    match config
+        .routing
+        .as_ref()
+        .and_then(|r| r.escalation.session_promotion.as_ref())
+    {
+        Some(sp) => Ok(Some(Arc::new(crate::affinity::SessionPromoter::new(
+            sp.clone(),
+        )?))),
+        None => Ok(None),
+    }
+}
+
 #[must_use]
 pub fn build_tenant_rate_limiter(
     config: &ProxyConfig,
@@ -1307,6 +1337,23 @@ async fn enforce_pipeline_inner(
         (greedy_rung, base_policy_id, false, None)
     };
 
+    // Session promotion: a floor, not an override. A session that already had to climb should not
+    // re-pay for the rung that already failed it — but if the bandit independently wants to start
+    // higher, that is also evidence, so take the greater of the two. A downward probe lowers the
+    // floor rather than forcing the start, for the same reason.
+    let promotion = state
+        .promoter
+        .as_ref()
+        .map(|p| p.decide(&tenant, &session_id, std::time::Instant::now()))
+        .unwrap_or(crate::affinity::Decision::Cold);
+    let start_rung = start_rung.max(promotion.start_rung());
+    // The ctx below takes `tenant` and `session_id` by value, so keep a copy for the post-route
+    // bookkeeping — but only when promotion is on, so the default path allocates nothing.
+    let promo_key = state
+        .promoter
+        .as_ref()
+        .map(|_| (tenant.clone(), session_id.clone()));
+
     // Apply start_at_top mode override: Max mode skips bandit/epsilon and jumps to top rung.
     // ponytail: if ladder is empty start_rung stays 0 (saturating_sub handles it).
     let start_rung = if preset.start_at_top {
@@ -1401,6 +1448,23 @@ async fn enforce_pipeline_inner(
         for attempt in &trace.attempts {
             b.observe(&bandit_ctx, attempt.rung, attempt.verdict);
         }
+    }
+
+    // Session promotion bookkeeping: record which rung actually served and whether the ladder had
+    // to climb to get there. "Escalated" is judged against where this request *started*, not
+    // against rung 0 — a promoted request that served at its promoted rung did not escalate, and
+    // counting it as one would ratchet the promotion upward on every turn.
+    if let Some(promoter) = state.promoter.as_ref()
+        && let Some((tenant_key, session_key)) = promo_key.as_ref()
+        && let Some(served) = trace.final_.served_rung
+    {
+        promoter.record(
+            tenant_key,
+            session_key,
+            served,
+            served > start_rung,
+            std::time::Instant::now(),
+        );
     }
 
     // ── Per-query gate-pass predictor (ADR 0008 Phase 2) ────────────────────────────────────
@@ -3157,6 +3221,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            promoter: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -3335,6 +3400,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            promoter: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -3744,6 +3810,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            promoter: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -3953,6 +4020,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            promoter: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -4205,6 +4273,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            promoter: None,
             predictor: None,
             tenant_rate_limiter,
             spill: None,
@@ -4573,6 +4642,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            promoter: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -4936,6 +5006,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            promoter: None,
             predictor: None,
             tenant_rate_limiter,
             spill: None,
@@ -5053,6 +5124,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            promoter: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -5328,6 +5400,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            promoter: None,
             predictor,
             tenant_rate_limiter: None,
             spill: None,
@@ -5417,6 +5490,7 @@ mod tests {
             traces,
             adaptive: None,
             bandit: None,
+            promoter: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,

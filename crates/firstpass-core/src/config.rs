@@ -785,8 +785,31 @@ impl Default for Escalation {
 pub struct SessionPromotion {
     /// Failure count that triggers promotion.
     pub after_failures: u32,
-    /// Sliding window, e.g. `"30m"`.
+    /// Sliding window, e.g. `"30m"`. Also the idle TTL: a session untouched for this long forgets
+    /// its promotion, so a reused session id never inherits a stale rung.
     pub window: String,
+    /// Re-probe one rung below the promotion every `probe_every` turns.
+    ///
+    /// Without this, promotion is a **ratchet**: a session that escalates once stays expensive for
+    /// its whole life, so every later turn — including the trivial ones — pays the higher rung.
+    /// The periodic probe is the only way a promotion comes back down. `1` re-probes every turn
+    /// (promotion effectively off); large values approach a permanent ratchet.
+    #[serde(default = "default_promotion_probe_every")]
+    pub probe_every: u32,
+    /// Hard cap on tracked sessions; oldest evicted first. A routing optimisation must never be
+    /// able to exhaust memory on a proxy under load.
+    #[serde(default = "default_promotion_max_sessions")]
+    pub max_sessions: usize,
+}
+
+const fn default_promotion_probe_every() -> u32 {
+    // Every 5th turn probes one rung down: quick enough to recover from an over-promotion, rare
+    // enough that the escalation tax is still mostly avoided.
+    5
+}
+
+const fn default_promotion_max_sessions() -> usize {
+    10_000
 }
 
 impl SessionPromotion {
@@ -873,6 +896,26 @@ impl Config {
         }
         if let Some(g) = &config.guardrail {
             g.validate().map_err(Error::InvalidConfig)?;
+        }
+        if let Some(p) = &config.escalation.session_promotion {
+            // `window` is also the idle TTL, so an unparseable one would silently disable expiry.
+            p.window_duration()?;
+            // probe_every = 0 would make promotion one-way: a session that escalated once stays on
+            // the expensive rung for its whole life, including the trivial turns at the end. That
+            // is a cost regression an operator would only find in a bill, so it is rejected here
+            // rather than quietly coerced to something they did not ask for.
+            if p.probe_every == 0 {
+                return Err(Error::InvalidConfig(
+                    "[escalation.session_promotion] probe_every must be >= 1. It is how a promoted \
+                     session ever returns to a cheaper rung; 0 would pin it permanently."
+                        .to_owned(),
+                ));
+            }
+            if p.max_sessions == 0 {
+                return Err(Error::InvalidConfig(
+                    "[escalation.session_promotion] max_sessions must be >= 1".to_owned(),
+                ));
+            }
         }
         let mut seen = std::collections::HashSet::new();
         for def in &config.gate_defs {

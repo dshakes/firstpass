@@ -77,6 +77,12 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         });
     let tenant_rate_limiter = crate::proxy::build_tenant_rate_limiter(&config);
 
+    // Session promotion (opt-in): in-memory and per-process by design. A promotion is a statement
+    // about a live conversation, so it should not outlive the process that observed it — and a
+    // stale pin restored from disk would start a fresh session on an expensive rung for reasons
+    // nobody can see. Built via the shared helper so tests cannot wire it differently.
+    let promoter = crate::proxy::build_promoter(&config)?;
+
     // UCB1 start-rung bandit (opt-in): warm-start from stored traces so learning survives
     // restarts. Forgiving: an unreadable or absent store simply yields an empty bandit.
     // ponytail: operator-wide load (load_all_traces) is correct here — the bandit is also
@@ -157,6 +163,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
         traces,
         adaptive,
+        promoter,
         bandit,
         predictor,
         tenant_rate_limiter,
