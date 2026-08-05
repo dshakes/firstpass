@@ -719,9 +719,15 @@ fn gemini_request_body(req: &ModelRequest) -> Value {
             "reasoning_effort".to_owned(),
             Value::String(effort.as_str().to_owned()),
         );
-        carry.insert("generationConfig".to_owned(), map["generationConfig"].clone());
+        carry.insert(
+            "generationConfig".to_owned(),
+            map["generationConfig"].clone(),
+        );
         normalize_reasoning(&mut carry, Wire::Gemini);
-        map.insert("generationConfig".to_owned(), carry["generationConfig"].clone());
+        map.insert(
+            "generationConfig".to_owned(),
+            carry["generationConfig"].clone(),
+        );
     }
     body
 }
@@ -1378,7 +1384,11 @@ mod tests {
 
         normalize_reasoning(&mut body, Wire::Anthropic);
 
-        assert_eq!(Value::Object(body), before, "no reasoning request, no rewrite");
+        assert_eq!(
+            Value::Object(body),
+            before,
+            "no reasoning request, no rewrite"
+        );
     }
 
     #[test]
@@ -1390,12 +1400,18 @@ mod tests {
 
         normalize_reasoning(&mut body, Wire::Gemini);
 
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 1024);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            1024
+        );
         assert_eq!(
             body["generationConfig"]["maxOutputTokens"], 4096,
             "must not clobber the rest of generationConfig"
         );
-        assert!(!body.contains_key("thinkingConfig"), "top level is wrong for Gemini");
+        assert!(
+            !body.contains_key("thinkingConfig"),
+            "top level is wrong for Gemini"
+        );
     }
 
     #[test]

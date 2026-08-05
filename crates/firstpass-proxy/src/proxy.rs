@@ -306,7 +306,16 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
 
 /// `GET /healthz` — liveness probe.
 async fn healthz() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok" }))
+    // `service` is not decoration. A bare `{"status":"ok"}` is indistinguishable from any other
+    // service that happens to hold the port, so anything using this endpoint to confirm *Firstpass*
+    // is listening — `firstpass launch` before it hands an agent a base url, a probe, a script —
+    // would accept a stranger and route real traffic into it. Cheaper to identify ourselves here
+    // than to debug that.
+    Json(serde_json::json!({
+        "status": "ok",
+        "service": "firstpass",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 /// `GET /v1/capabilities` — agent-first discovery (SPEC §0.2, §7.4): what this proxy speaks,
@@ -3504,6 +3513,20 @@ mod tests {
             .as_f64()
             .expect("a first-party rung has a price");
         assert!(haiku_in < opus_in, "{haiku_in} should undercut {opus_in}");
+    }
+
+    #[tokio::test]
+    async fn healthz_names_the_service_so_a_client_can_tell_us_from_a_stranger() {
+        // The other half of `launch`'s foreign-listener check. If this endpoint stops naming
+        // itself, `firstpass launch` classifies a real proxy as foreign and refuses to start
+        // anything — so the coupling is asserted against the actual handler, not a copy of it.
+        let body = healthz().await.into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), 64 * 1024)
+            .await
+            .expect("healthz body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("healthz is json");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["service"], "firstpass");
     }
 
     #[test]
