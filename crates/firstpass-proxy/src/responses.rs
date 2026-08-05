@@ -91,20 +91,75 @@ fn turn_to_message(turn: &Value) -> Option<Value> {
     let role = obj.get("role").and_then(Value::as_str).unwrap_or("user");
     let content = match obj.get("content") {
         Some(Value::String(s)) => Value::String(s.clone()),
-        // Typed parts: concatenate the text ones. Anything else (images, files) is not represented
-        // in a plain string, so it is dropped here rather than being mangled into one — those
-        // requests should take the passthrough path.
         Some(Value::Array(parts)) => {
-            let text: String = parts
+            // All-text collapses to a plain string (what a Chat client would have sent). Mixed
+            // content keeps the typed-part array, with images carried across in Chat's spelling.
+            // Dropping them here is not an option: `has_images` is computed from the TRANSLATED
+            // body, so a dropped image also erases the signal that would have routed the request
+            // to passthrough — and a multimodal request would be gated and served as text-only,
+            // silently, having thrown away the thing it was asking about.
+            if parts
                 .iter()
-                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("");
-            Value::String(text)
+                .all(|p| p.get("type").and_then(Value::as_str) != Some("input_image"))
+            {
+                let text: String = parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("");
+                Value::String(text)
+            } else {
+                Value::Array(parts.iter().filter_map(part_to_chat).collect())
+            }
         }
         _ => return None,
     };
     Some(serde_json::json!({ "role": role, "content": content }))
+}
+
+/// One Responses content part → its Chat Completions spelling.
+fn part_to_chat(part: &Value) -> Option<Value> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("input_text" | "output_text" | "text") => Some(serde_json::json!({
+            "type": "text",
+            "text": part.get("text").and_then(Value::as_str).unwrap_or_default(),
+        })),
+        Some("input_image") => {
+            // Responses puts the URL directly on the part; Chat nests it under `image_url`.
+            let url = part.get("image_url").and_then(|u| {
+                u.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| u.get("url").and_then(Value::as_str).map(str::to_owned))
+            })?;
+            Some(serde_json::json!({ "type": "image_url", "image_url": { "url": url } }))
+        }
+        _ => None,
+    }
+}
+
+/// Whether this request contains content the translation cannot faithfully represent.
+///
+/// Files, audio, and any part type added after this code was written have no Chat Completions
+/// equivalent here. A request carrying one must take the passthrough path rather than be silently
+/// translated into something smaller than what the client sent — being un-gated is a limitation,
+/// being answered about content that was thrown away is a wrong answer.
+#[must_use]
+pub fn has_untranslatable_content(body: &Value) -> bool {
+    let Some(Value::Array(turns)) = body.get("input") else {
+        return false;
+    };
+    turns.iter().any(|turn| {
+        turn.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    !matches!(
+                        p.get("type").and_then(Value::as_str),
+                        Some("input_text" | "output_text" | "text" | "input_image")
+                    )
+                })
+            })
+    })
 }
 
 /// Convert a Chat Completions response into the Responses shape.
@@ -189,6 +244,57 @@ mod tests {
         assert_eq!(out["messages"][0]["content"], "be terse");
         assert_eq!(out["messages"][1]["role"], "user");
         assert!(out.get("instructions").is_none());
+    }
+
+    #[test]
+    fn an_image_survives_translation_instead_of_being_silently_dropped() {
+        // Caught in review. `has_images` is computed from the TRANSLATED body, so dropping the
+        // image here also erased the signal that routes multimodal requests to passthrough — a
+        // request with a picture would be gated and answered as text-only, having discarded the
+        // very thing it asked about.
+        let out = request_to_chat(&serde_json::json!({
+            "model": "gpt-5.5",
+            "input": [{ "role": "user", "content": [
+                { "type": "input_text", "text": "what is this?" },
+                { "type": "input_image", "image_url": "data:image/png;base64,AAAA" },
+            ]}],
+        }));
+
+        let parts = out["messages"][0]["content"]
+            .as_array()
+            .expect("mixed content stays a typed array");
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0]["type"], "text");
+        // Chat nests the url; Responses puts it directly on the part.
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn content_we_cannot_represent_is_flagged_for_passthrough() {
+        // A file part has no Chat equivalent here. Translating it would quietly produce a smaller
+        // request than the client sent, so the caller routes it to passthrough instead.
+        let with_file = serde_json::json!({
+            "input": [{ "role": "user", "content": [
+                { "type": "input_text", "text": "summarise" },
+                { "type": "input_file", "file_id": "file_123" },
+            ]}],
+        });
+        assert!(has_untranslatable_content(&with_file));
+
+        let text_and_image = serde_json::json!({
+            "input": [{ "role": "user", "content": [
+                { "type": "input_text", "text": "hi" },
+                { "type": "input_image", "image_url": "data:..." },
+            ]}],
+        });
+        assert!(
+            !has_untranslatable_content(&text_and_image),
+            "text and images ARE representable — they must still be gated"
+        );
+        assert!(!has_untranslatable_content(
+            &serde_json::json!({ "input": "plain" })
+        ));
     }
 
     #[test]

@@ -3161,6 +3161,20 @@ async fn responses(
         )
         .await;
     };
+    // Content this translation cannot represent (files, audio, a part type newer than this code)
+    // must not be silently reduced to a smaller request. Being un-gated is a limitation; being
+    // answered about content that was thrown away is a wrong answer.
+    if crate::responses::has_untranslatable_content(&parsed) {
+        return observe_passthrough_openai_path(
+            state,
+            headers,
+            body,
+            session_header,
+            tenant,
+            crate::upstream::OPENAI_RESPONSES_PATH,
+        )
+        .await;
+    }
     let chat_body = Bytes::from(crate::responses::request_to_chat(&parsed).to_string());
 
     if let Some(routing) = state.config.routing.as_ref() {
