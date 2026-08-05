@@ -906,6 +906,7 @@ mod tests {
             max_tokens: 256,
             tools: Value::Null,
             raw: Value::Null,
+            cache_prefix: false,
         }
     }
 

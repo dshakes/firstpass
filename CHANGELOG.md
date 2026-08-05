@@ -72,6 +72,13 @@ correctness.
   Buffered only: `enforce` cannot stream, because the gate must see the whole candidate before it
   can judge it, so a streaming Responses request takes the same observe passthrough that Chat
   Completions already uses for a request it cannot gate faithfully.
+- **`[escalation] prompt_cache`** — insert Anthropic prompt-cache breakpoints on the stable prefix
+  (system prompt + tool definitions), the part of an agent request that repeats byte-for-byte every
+  turn. **Off by default, and deliberately so**: a cache write costs 1.25× base input and a read
+  0.1×, so roughly one reuse of the prefix covers the premium and everything after saves heavily —
+  but single-shot traffic never reuses and would pay a 25% surcharge for nothing. Whether that
+  trade pays is a fact about your traffic, not something this code can infer. A caller that already
+  places its own `cache_control` is left untouched.
 - **`[escalation.condense]`** — last-resort context condensing. When a conversation has overflowed
   the context window of *every* rung, the middle of the history is dropped (head and tail kept, with
   a marker turn telling the model its history is incomplete) and the top rung is retried **once**.

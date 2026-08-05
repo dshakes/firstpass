@@ -560,6 +560,16 @@ pub struct Escalation {
     /// exhausted, where the choice is no longer "faithful vs degraded" but "degraded vs failed".
     #[serde(default)]
     pub condense: Option<CondenseConfig>,
+    /// Insert Anthropic prompt-cache breakpoints on the stable prefix (system + tools).
+    /// `false` (default) = today's behaviour: whatever the caller sent, unchanged.
+    ///
+    /// Opt-in because it is a bet on your traffic, not a free optimisation. A cache write costs
+    /// 1.25x base input and a read 0.1x, so roughly one reuse of the prefix covers the premium and
+    /// everything after it saves heavily. A long agent session with a fixed system prompt and tool
+    /// set reuses constantly; single-shot traffic never does, and pays a 25% surcharge on the
+    /// prefix for nothing.
+    #[serde(default)]
+    pub prompt_cache: bool,
     /// Speculative-deferral band: when set (and the bandit has a warm gate-pass estimate for
     /// the chosen start rung), speculative prefetch fires **only** when that estimate falls
     /// inside `[low, high]` — the marginal zone where the next rung is *probably but not
@@ -801,6 +811,7 @@ impl Default for Escalation {
             speculation_band: None,
             bandit: None,
             condense: None,
+            prompt_cache: false,
             exploration: None,
             probe: None,
             predictor: None,

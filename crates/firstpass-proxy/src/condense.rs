@@ -86,6 +86,7 @@ mod tests {
             max_tokens: 1024,
             tools: serde_json::Value::Null,
             raw: serde_json::json!({ "messages": "the full original" }),
+            cache_prefix: false,
         }
     }
 

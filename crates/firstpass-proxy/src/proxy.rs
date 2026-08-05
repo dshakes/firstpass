@@ -824,6 +824,15 @@ async fn evaluate_shadow(
             )
         });
 
+    let mut base_request = base_request;
+    // Prompt-cache breakpoints on the stable prefix, when the operator has opted in. Off by
+    // default: a cache write costs 1.25x and only repays on reuse, which is a fact about their
+    // traffic rather than something this code can infer.
+    base_request.cache_prefix = state
+        .config
+        .routing
+        .as_ref()
+        .is_some_and(|r| r.escalation.prompt_cache);
     let ctx = EnforceCtx {
         condense: routing_cfg_condense(state),
         ladder: &route.ladder,
@@ -1410,6 +1419,15 @@ async fn enforce_pipeline_inner(
         .increment(1);
     }
 
+    let mut base_request = base_request;
+    // Prompt-cache breakpoints on the stable prefix, when the operator has opted in. Off by
+    // default: a cache write costs 1.25x and only repays on reuse, which is a fact about their
+    // traffic rather than something this code can infer.
+    base_request.cache_prefix = state
+        .config
+        .routing
+        .as_ref()
+        .is_some_and(|r| r.escalation.prompt_cache);
     let ctx = EnforceCtx {
         condense: routing_cfg_condense(state),
         ladder: &route.ladder,
@@ -1881,6 +1899,7 @@ fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
         max_tokens,
         tools,
         raw,
+        cache_prefix: false,
     })
 }
 
@@ -2733,6 +2752,7 @@ pub fn parse_openai_request(body: &[u8], carry_raw: bool) -> Option<ModelRequest
         max_tokens,
         tools,
         raw,
+        cache_prefix: false,
     })
 }
 

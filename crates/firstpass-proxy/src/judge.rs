@@ -140,6 +140,9 @@ pub fn build_judge_request(judge_model: &str, rubric: &str, candidate: &str) -> 
         max_tokens: 256,
         tools: Value::Null, // the judge runs no tools (§8.3)
         raw: Value::Null,   // synthesized request — normalized fields are the wire truth
+        // A judge prompt is synthesized here, not routed from a caller; caching it is a separate
+        // decision from the operator's `[escalation] prompt_cache` for their own traffic.
+        cache_prefix: false,
     }
 }
 
