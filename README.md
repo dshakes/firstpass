@@ -4,11 +4,13 @@
 
 # ⚡ Firstpass
 
-### The adaptive LLM router that proves the answer instead of guessing the model.
+### The verification layer for LLM serving. Nothing ships until a real check passes.
 
 **On 974 real coding tasks it recovered +15.2 points of quality over the cheap model alone — and made _zero_ of those 974 tasks worse.** At 12–57% lower cost per success, depending on how expensive your top rung is.
 
-Open every request on the **cheapest** model, **gate the real output** with your own test / schema / judge, escalate **only on proof of need**, and seal a **hash-chained receipt** every time. Wrong answers are capped by a **distribution-free guarantee**, not a promise.
+Your check — your tests, your schema, your judge — runs on **every answer before it is served**. What passes ships; what fails escalates and is checked again. Every decision leaves a **hash-chained receipt** you can re-derive, and wrong answers are capped by a **distribution-free guarantee** rather than a promise.
+
+Routing falls out of that. Because the cheapest model clears the gate most of the time, you stop paying frontier prices for work that never needed them — but the cost saving is the **consequence**, not the mechanism.
 
 <p>
 <a href="https://github.com/dshakes/firstpass/actions/workflows/ci.yml"><img src="https://github.com/dshakes/firstpass/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -26,11 +28,23 @@ Open every request on the **cheapest** model, **gate the real output** with your
 
 ## Proof over prediction
 
-Most routers decide by **prediction**: a classifier reads your prompt and *guesses* which model can handle it — before a single token of output exists. Guess wrong and you find out in production, with no artifact explaining why.
+Every other way of choosing a model decides **before the output exists** — a classifier reads your
+prompt and guesses, or a gateway picks on price and availability. Guess wrong and you find out in
+production, with no artifact explaining why.
+
+Firstpass is not in that race. It decides **after** the output exists, which is the only point at
+which the question "is this good enough to serve?" can actually be answered.
 
 Firstpass decides by **proof**. It opens on the cheapest model in your ladder, then **gates the actual output** — runs your tests, checks a schema, asks a judge, or measures self-consistency. Pass → it serves. Fail → it escalates exactly one rung and gates again. The cheap model handles most traffic; the frontier model is spent **only when the cheap one is provably not enough**. Every decision is a tamper-evident, hash-chained receipt you (or an auditor) can re-derive independently — and a **distribution-free bound caps how often a wrong answer is served**.
 
 > **Cheap until proven otherwise.** You pay frontier prices only when a real check proves you must.
+
+**Where this fits, stated plainly.** Verification needs something to verify against, so Firstpass is
+strongest where "correct" is checkable — code with tests, structured output against a schema,
+extraction, anything with an oracle. For open-ended prose the available gates are a judge or
+k-sample self-consistency, and on our own measurements a judge gate did not pay for itself once its
+calls were metered. If your output has no check, this is the wrong tool and we would rather say so
+here than after you have deployed it.
 
 The measured consequence, on 974 real coding tasks: gating lifted quality **+15.2 points** over serving
 the cheap model alone (95% CI [+12.9, +17.5]) and **regressed not one of the 974** — because a rung is
