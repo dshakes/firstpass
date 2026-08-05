@@ -122,9 +122,15 @@ than inferred.
 Function tools and the `function_call` / `function_call_output` round trip translate in **both**
 directions: a tool definition becomes Chat's nested `function` shape, a tool call becomes an
 `assistant` message with `tool_calls`, a result becomes a `tool` message, and a tool call in the
-reply comes back as a `function_call` item rather than vanishing. A turn awaiting a tool result
-reports `status: "incomplete"`, because telling an agent the turn is `completed` while the model
-waits on it is its own wrong answer.
+reply comes back as a `function_call` item rather than vanishing. `tool_choice` is translated too:
+Responses spells it `{type, name}`, Chat `{type, function: {name}}`, and forwarding it unchanged
+does not error — it just lets the model ignore a tool the caller demanded.
+
+A response carrying a pending tool call is **`status: "completed"`**. `completed` means generation
+finished, not that the agent loop is done; the API reserves `incomplete` for a truncated reply,
+with `incomplete_details.reason`, which this endpoint now reports for that real cause. An earlier
+draft of this file asserted the opposite by analogy, which would have stalled any client that gates
+on `completed` before reading `output`.
 
 That closes the limitation this section previously recorded — agentic clients, the ones this
 endpoint exists for, are now verified rather than passed through.
