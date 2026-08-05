@@ -94,6 +94,81 @@ pub struct EnforceCtx<'a> {
 ///
 /// The trace's `prev_hash` is left as [`GENESIS_HASH`]; the trace-store writer overwrites it with
 /// the real chain head when persisting (keeping the single-writer chain invariant).
+/// Run whichever engine is configured, then apply last-resort condensing if the whole ladder
+/// overflowed.
+///
+/// Lives above the engine choice rather than inside one of them, because a feature that silently
+/// does nothing under speculation is worse than one that is absent — the config would read as
+/// enabled and the receipts would show requests failing anyway.
+async fn run_ladder(ctx: &EnforceCtx<'_>) -> LadderRun {
+    let run = if ctx.speculation == 0 {
+        run_serial(ctx).await
+    } else {
+        run_speculative(ctx).await
+    };
+
+    // Every rung overflowed and nothing was served. The ladder is exhausted, so the choice is no
+    // longer "faithful answer vs degraded answer" — it is "degraded answer vs no answer".
+    //
+    // Re-running with `condense: None` is what makes this provably terminate: the retry cannot
+    // condense again, no matter what the provider says.
+    let Some(cfg) = ctx.condense else { return run };
+    if run.served_rung.is_some()
+        || run.attempts.is_empty()
+        || !run.attempts.iter().all(|a| {
+            a.gates
+                .iter()
+                .any(|g| g.reason.as_deref() == Some(reason::CONTEXT_OVERFLOW))
+        })
+    {
+        return run;
+    }
+    let Some(c) = crate::condense::condense(ctx.base_request, cfg.keep_head, cfg.keep_tail) else {
+        return run;
+    };
+    tracing::info!(
+        dropped = c.dropped,
+        "context overflowed every rung; retrying once with the middle condensed"
+    );
+    let retry_ctx = EnforceCtx {
+        condense: None,
+        base_request: &c.request,
+        features: ctx.features.clone(),
+        tenant_id: ctx.tenant_id.clone(),
+        session_id: ctx.session_id.clone(),
+        prompt_hash: ctx.prompt_hash.clone(),
+        api: ctx.api.clone(),
+        policy_id: ctx.policy_id.clone(),
+        ladder: ctx.ladder,
+        gates: ctx.gates,
+        health: ctx.health,
+        providers: ctx.providers,
+        auth: ctx.auth,
+        prices: ctx.prices,
+        budget_per_request_usd: ctx.budget_per_request_usd,
+        max_rungs: ctx.max_rungs,
+        speculation: ctx.speculation,
+        serve_threshold: ctx.serve_threshold,
+        elastic: ctx.elastic,
+        // Retry on the rung with the largest window.
+        start_rung: (ctx.ladder.len().saturating_sub(1)) as u32,
+    };
+    let mut retry = Box::pin(run_ladder(&retry_ctx)).await;
+    // Keep the overflow attempts on the receipt: they are WHY the answer is condensed, and a
+    // record that hid them would show a served response with no explanation for the elision.
+    let mut merged = run.attempts;
+    merged.append(&mut retry.attempts);
+    LadderRun {
+        attempts: merged,
+        spent: run.spent + retry.spent,
+        gate_cost_total: run.gate_cost_total + retry.gate_cost_total,
+        best: retry.best,
+        served_rung: retry.served_rung,
+        hard_error: retry.hard_error,
+        elastic: retry.elastic,
+    }
+}
+
 pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
     // Speculation is off by default (serial); the serial path is the original, proven engine, left
     // untouched. Both paths produce the same ladder state; only the tail (serve + trace) is shared.
@@ -105,11 +180,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
         mut served_rung,
         hard_error,
         elastic,
-    } = if ctx.speculation == 0 {
-        run_serial(&ctx).await
-    } else {
-        run_speculative(&ctx).await
-    };
+    } = run_ladder(&ctx).await;
 
     // Decide what to serve.
     let (outcome, served_from, served_tokens) = match (served_rung, &best) {
@@ -433,65 +504,6 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                 }
             }
         }
-    }
-
-    // Every rung overflowed and nothing was served. The ladder is exhausted, so the choice is no
-    // longer "faithful answer vs degraded answer" — it is "degraded answer vs no answer". Condense
-    // once and re-run.
-    //
-    // Re-running with `condense: None` is what makes this provably terminate: the retry cannot
-    // condense again, so at most one extra pass happens no matter what the provider says.
-    if served_rung.is_none()
-        && let Some(cfg) = ctx.condense
-        && !attempts.is_empty()
-        && attempts.iter().all(|a| {
-            a.gates
-                .iter()
-                .any(|g| g.reason.as_deref() == Some(reason::CONTEXT_OVERFLOW))
-        })
-        && let Some(c) = crate::condense::condense(ctx.base_request, cfg.keep_head, cfg.keep_tail)
-    {
-        tracing::info!(
-            dropped = c.dropped,
-            "context overflowed every rung; retrying once with the middle condensed"
-        );
-        let retry_ctx = EnforceCtx {
-            condense: None,
-            base_request: &c.request,
-            features: ctx.features.clone(),
-            tenant_id: ctx.tenant_id.clone(),
-            session_id: ctx.session_id.clone(),
-            prompt_hash: ctx.prompt_hash.clone(),
-            api: ctx.api.clone(),
-            policy_id: ctx.policy_id.clone(),
-            ladder: ctx.ladder,
-            gates: ctx.gates,
-            health: ctx.health,
-            providers: ctx.providers,
-            auth: ctx.auth,
-            prices: ctx.prices,
-            budget_per_request_usd: ctx.budget_per_request_usd,
-            max_rungs: ctx.max_rungs,
-            speculation: ctx.speculation,
-            serve_threshold: ctx.serve_threshold,
-            elastic: ctx.elastic,
-            // Retry the rung that actually has the largest window.
-            start_rung: (ctx.ladder.len().saturating_sub(1)) as u32,
-        };
-        let mut run = Box::pin(run_serial(&retry_ctx)).await;
-        // Keep the overflow attempts on the receipt. They are why the answer is condensed, and a
-        // record that hid them would show a served response with no explanation for the elision.
-        let mut merged = attempts;
-        merged.append(&mut run.attempts);
-        return LadderRun {
-            attempts: merged,
-            spent: spent + run.spent,
-            gate_cost_total: gate_cost_total + run.gate_cost_total,
-            best: run.best,
-            served_rung: run.served_rung,
-            hard_error: run.hard_error,
-            elastic: run.elastic,
-        };
     }
 
     LadderRun {
@@ -1422,6 +1434,43 @@ mod tests {
             trace.attempts.iter().map(|a| a.rung).collect::<Vec<_>>()
         );
         assert!(trace.attempts[0].gates[0].reason.as_deref() == Some(reason::CONTEXT_OVERFLOW));
+    }
+
+    #[tokio::test]
+    async fn condensing_works_under_speculation_too() {
+        // Found in review: condensing lived inside the serial engine, so with speculation on the
+        // config read as enabled and did nothing — the receipts would show requests failing
+        // anyway, with no signal that the feature had opted out.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let mut req = base_request();
+        req.messages = (0..40)
+            .map(|i| crate::provider::ChatMessage::text("user", format!("turn {i}")))
+            .collect();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let cfg = firstpass_core::config::CondenseConfig {
+            keep_head: 2,
+            keep_tail: 3,
+        };
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(CondenseAwareProvider::new(HashMap::new(), 10)),
+        );
+        let providers = ProviderRegistry::from_map(map);
+        let health = GateHealthRegistry::new();
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.condense = Some(&cfg);
+        c.speculation = 1; // the path that silently skipped condensing
+
+        let (out, _trace) = route_enforce(c).await;
+
+        assert!(
+            matches!(out, EngineOutcome::Served(_)),
+            "condensing must work under speculation, not just serial: {out:?}"
+        );
     }
 
     #[tokio::test]

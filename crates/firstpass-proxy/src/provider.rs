@@ -269,6 +269,15 @@ pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
     if !req.tools.is_null() {
         body["tools"] = req.tools.clone();
     }
+    // This branch is not a rare fallback: it is the path every translated request takes, and
+    // every CONDENSED one — condensing clears `raw` precisely so the smaller message list is what
+    // gets sent. Applying breakpoints only in the raw branch above would mean `prompt_cache`
+    // silently did nothing for exactly the long conversations it exists to pay for.
+    if req.cache_prefix
+        && let Some(map) = body.as_object_mut()
+    {
+        add_cache_breakpoints(map);
+    }
     body
 }
 
@@ -1682,6 +1691,28 @@ mod tests {
         };
         let body = anthropic_wire_body(&opted);
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn breakpoints_apply_on_the_normalized_path_too() {
+        // Found in review. The normalized branch is not a rare fallback — it is what every
+        // translated request uses, and every CONDENSED one, since condensing clears `raw` on
+        // purpose. Marking only the raw branch meant `prompt_cache` did nothing for exactly the
+        // long conversations it exists to pay for.
+        let req = ModelRequest {
+            model: "anthropic/claude-sonnet-5".to_owned(),
+            system: Some("stable prefix".to_owned()),
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 64,
+            tools: serde_json::json!([{ "name": "a" }]),
+            raw: Value::Null, // no raw body → normalized build path
+            cache_prefix: true,
+        };
+
+        let body = anthropic_wire_body(&req);
+
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
