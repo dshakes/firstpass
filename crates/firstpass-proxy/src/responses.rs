@@ -59,6 +59,30 @@ pub fn request_to_chat(body: &Value) -> Value {
         }
         _ => {}
     }
+    // Tool definitions: Responses puts name/parameters on the item; Chat nests them under
+    // `function`.
+    if let Some(Value::Array(tools)) = obj.get("tools") {
+        let converted: Vec<Value> = tools.iter().filter_map(tool_to_chat).collect();
+        if converted.len() == tools.len() {
+            out.insert("tools".to_owned(), Value::Array(converted));
+        }
+    }
+    // `tool_choice` naming a specific function differs in shape between the two APIs. Passing the
+    // Responses spelling through unchanged does not error — Chat simply does not recognise it, so
+    // the model is free to ignore a tool the caller demanded. Silent, and exactly the failure this
+    // file keeps having to design against.
+    if let Some(tc) = obj.get("tool_choice") {
+        match tool_choice_to_chat(tc) {
+            Some(v) => {
+                out.insert("tool_choice".to_owned(), v);
+            }
+            // Unrepresentable (a hosted-tool choice). `has_untranslatable_content` routes these to
+            // passthrough, so dropping here is belt-and-braces rather than the real guard.
+            None => {
+                out.remove("tool_choice");
+            }
+        }
+    }
     // A caller that sent `messages` directly (some SDKs accept both) keeps them.
     if !messages.is_empty() {
         out.insert("messages".to_owned(), Value::Array(messages));
@@ -88,6 +112,12 @@ pub fn request_to_chat(body: &Value) -> Value {
 /// One Responses `input` turn → one Chat Completions message.
 fn turn_to_message(turn: &Value) -> Option<Value> {
     let obj = turn.as_object()?;
+    // Typed items carry no role/content pair — they are the tool round trip.
+    match obj.get("type").and_then(Value::as_str) {
+        Some("function_call") => return function_call_to_chat(obj),
+        Some("function_call_output") => return function_output_to_chat(obj),
+        _ => {}
+    }
     let role = obj.get("role").and_then(Value::as_str).unwrap_or("user");
     let content = match obj.get("content") {
         Some(Value::String(s)) => Value::String(s.clone()),
@@ -115,6 +145,90 @@ fn turn_to_message(turn: &Value) -> Option<Value> {
         _ => return None,
     };
     Some(serde_json::json!({ "role": role, "content": content }))
+}
+
+/// One Responses tool definition → its Chat Completions spelling.
+///
+/// `{type: function, name, parameters}` → `{type: function, function: {name, parameters}}`.
+/// Returns `None` for a tool type with no Chat equivalent (hosted tools like `web_search`), which
+/// makes the caller route the whole request to passthrough rather than send a partial tool set —
+/// a model missing one of its tools produces a confidently wrong plan.
+fn tool_to_chat(tool: &Value) -> Option<Value> {
+    let obj = tool.as_object()?;
+    // Already in Chat shape (some SDKs send it): pass through.
+    if obj.contains_key("function") {
+        return Some(tool.clone());
+    }
+    if obj.get("type").and_then(Value::as_str) != Some("function") {
+        return None;
+    }
+    let mut f = serde_json::Map::new();
+    f.insert("name".to_owned(), obj.get("name")?.clone());
+    if let Some(d) = obj.get("description") {
+        f.insert("description".to_owned(), d.clone());
+    }
+    if let Some(p) = obj.get("parameters") {
+        f.insert("parameters".to_owned(), p.clone());
+    }
+    if let Some(st) = obj.get("strict") {
+        f.insert("strict".to_owned(), st.clone());
+    }
+    Some(serde_json::json!({ "type": "function", "function": Value::Object(f) }))
+}
+
+/// A Responses `tool_choice` → its Chat spelling.
+///
+/// The string forms (`auto` / `none` / `required`) are identical. Naming a specific function is
+/// not: Responses says `{type: "function", name: "f"}`, Chat says
+/// `{type: "function", function: {name: "f"}}`.
+fn tool_choice_to_chat(tc: &Value) -> Option<Value> {
+    match tc {
+        Value::String(_) => Some(tc.clone()),
+        Value::Object(o) => {
+            if o.contains_key("function") {
+                return Some(tc.clone()); // already Chat-shaped
+            }
+            if o.get("type").and_then(Value::as_str) != Some("function") {
+                return None; // hosted-tool choice — no Chat equivalent
+            }
+            Some(serde_json::json!({
+                "type": "function", "function": { "name": o.get("name")?.clone() }
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// A Responses tool-call item → the Chat `assistant` message that carries it.
+fn function_call_to_chat(item: &serde_json::Map<String, Value>) -> Option<Value> {
+    Some(serde_json::json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": [{
+            "id": item.get("call_id").or_else(|| item.get("id"))?.clone(),
+            "type": "function",
+            "function": {
+                "name": item.get("name")?.clone(),
+                // Chat wants a JSON string; Responses already sends one.
+                "arguments": item.get("arguments").cloned()
+                    .unwrap_or_else(|| Value::String("{}".to_owned())),
+            },
+        }],
+    }))
+}
+
+/// A Responses tool-result item → the Chat `tool` message that carries it.
+fn function_output_to_chat(item: &serde_json::Map<String, Value>) -> Option<Value> {
+    let output = match item.get("output") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => return None,
+    };
+    Some(serde_json::json!({
+        "role": "tool",
+        "tool_call_id": item.get("call_id")?.clone(),
+        "content": output,
+    }))
 }
 
 /// One Responses content part → its Chat Completions spelling.
@@ -149,20 +263,27 @@ fn part_to_chat(part: &Value) -> Option<Value> {
 /// answer, and between the two this proxy takes the limitation.
 ///
 /// Currently translatable: plain `user`/`assistant`/`system`/`developer` turns whose content is
-/// text, or text-and-image parts, in a request that defines **no tools**.
+/// text or text-and-image parts, function tool definitions, and the `function_call` /
+/// `function_call_output` round trip — in both directions, so a tool call in the reply comes back
+/// as a `function_call` item rather than vanishing.
 ///
-/// Tools are excluded on the *request* side even though a tool definition itself translates fine,
-/// because a model given tools may answer with a tool call — and a tool call has no representation
-/// on the way back through [`response_from_chat`]. Routing a request whose reply cannot be
-/// represented is the same defect one step later.
+/// Still excluded: **hosted** tools (`web_search`, `file_search`, `computer_use`), which run inside
+/// the provider and have no Chat equivalent; reasoning items; and `previous_response_id` threading,
+/// where the upstream holds history we do not have, so a translated request is not the conversation
+/// the client is continuing.
 #[must_use]
 pub fn has_untranslatable_content(body: &Value) -> bool {
-    // A tools-bearing request may produce a tool call we cannot translate back.
-    if body
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|t| !t.is_empty())
-        || body.get("tool_choice").is_some()
+    // Hosted tools (web_search, file_search, computer_use) run inside the provider and have no
+    // Chat Completions equivalent. Sending a partial tool set is worse than not routing: a model
+    // missing one of its tools produces a confidently wrong plan.
+    if let Some(Value::Array(tools)) = body.get("tools")
+        && tools.iter().any(|t| tool_to_chat(t).is_none())
+    {
+        return true;
+    }
+    // A `tool_choice` we cannot express would let the model ignore a tool the caller demanded.
+    if let Some(tc) = body.get("tool_choice")
+        && tool_choice_to_chat(tc).is_none()
     {
         return true;
     }
@@ -178,10 +299,12 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
         let Some(obj) = turn.as_object() else {
             return true;
         };
-        // A turn with no `role`/`content` pair is a typed item — a function_call, a
-        // function_call_output, a reasoning item. None of those survive this translation.
-        if !obj.contains_key("role") || !obj.contains_key("content") {
-            return true;
+        // Typed items: ask the translator itself rather than restating its rules here. A
+        // `function_call` missing its `call_id` translates to nothing, and a check that only
+        // looked at `type` would wave it through and let the turn vanish — the exact silent drop
+        // this allow-list exists to prevent. One source of truth cannot drift from itself.
+        if obj.contains_key("type") && !obj.contains_key("role") {
+            return turn_to_message(turn).is_none();
         }
         if !matches!(
             obj.get("role").and_then(Value::as_str),
@@ -230,18 +353,71 @@ pub fn response_from_chat(chat: &Value) -> Value {
     let mut resp = Map::new();
     resp.insert("id".to_owned(), Value::String(id.to_owned()));
     resp.insert("object".to_owned(), Value::String("response".to_owned()));
-    resp.insert("status".to_owned(), Value::String("completed".to_owned()));
     resp.insert("model".to_owned(), Value::String(model.to_owned()));
-    resp.insert(
-        "output".to_owned(),
-        serde_json::json!([{
+
+    // A reply may carry text, tool calls, or both. Dropping the tool calls here would hand an
+    // agent a plausible-looking message where it expected a call to make — the failure being
+    // silent is what makes it dangerous.
+    let mut output: Vec<Value> = Vec::new();
+    if !text.is_empty() {
+        output.push(serde_json::json!({
             "type": "message",
             "id": format!("msg_{id}"),
             "status": "completed",
             "role": "assistant",
             "content": [{ "type": "output_text", "text": text, "annotations": [] }],
-        }]),
-    );
+        }));
+    }
+    let tool_calls = chat
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array);
+    if let Some(calls) = tool_calls {
+        for (i, call) in calls.iter().enumerate() {
+            output.push(serde_json::json!({
+                "type": "function_call",
+                "id": format!("fc_{id}_{i}"),
+                "status": "completed",
+                "call_id": call.get("id").cloned().unwrap_or(Value::Null),
+                "name": call.pointer("/function/name").cloned().unwrap_or(Value::Null),
+                "arguments": call
+                    .pointer("/function/arguments")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("{}".to_owned())),
+            }));
+        }
+    }
+    // A reply with neither text nor calls still needs a well-formed message item.
+    if output.is_empty() {
+        output.push(serde_json::json!({
+            "type": "message",
+            "id": format!("msg_{id}"),
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "", "annotations": [] }],
+        }));
+    }
+    // `completed` means GENERATION finished, not that the agent loop is done — a response is
+    // `completed` even when `output` carries a `function_call` the caller still has to run. The
+    // Responses API reserves `incomplete` for a TRUNCATED response, with `incomplete_details`
+    // naming the reason.
+    //
+    // An earlier version of this reported a tool-call turn as `incomplete` by analogy: the model
+    // is waiting, so surely it is not complete. That is wrong against the spec and would stall any
+    // client that checks `status == "completed"` before reading `output`.
+    let truncated = chat
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        == Some("length");
+    if truncated {
+        resp.insert("status".to_owned(), Value::String("incomplete".to_owned()));
+        resp.insert(
+            "incomplete_details".to_owned(),
+            serde_json::json!({ "reason": "max_output_tokens" }),
+        );
+    } else {
+        resp.insert("status".to_owned(), Value::String("completed".to_owned()));
+    }
+    resp.insert("output".to_owned(), Value::Array(output));
     // The SDK convenience accessor. Populating it means `response.output_text` works rather than
     // returning nothing on a response this proxy produced.
     resp.insert("output_text".to_owned(), Value::String(text.to_owned()));
@@ -338,17 +514,232 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_using_request_is_not_translated() {
-        // Found in review, and the fourth silently-dropped content type on this endpoint. A model
-        // given tools may answer with a tool call, and a tool call has no representation on the way
-        // back — so routing it at all is the same defect one step later. Agentic clients are the
-        // exact target here, which is why this is passthrough rather than a partial translation.
+    fn a_tool_round_trip_survives_in_both_directions() {
+        // This is what unblocks gating for agentic clients. Previously the whole request took
+        // un-gated passthrough because a tool call had no representation coming back.
+        let out = request_to_chat(&serde_json::json!({
+            "model": "gpt-5.5",
+            "tools": [{
+                "type": "function", "name": "get_weather",
+                "description": "look up weather",
+                "parameters": { "type": "object", "properties": { "city": { "type": "string" } } },
+            }],
+            "input": [
+                { "role": "user", "content": "weather in Paris?" },
+                { "type": "function_call", "call_id": "call_1", "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\"}" },
+                { "type": "function_call_output", "call_id": "call_1", "output": "22C" },
+            ],
+        }));
+
+        // Tool definition: Responses puts name/parameters on the item, Chat nests under `function`.
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(out["tools"][0]["function"]["parameters"]["type"], "object");
+
+        let msgs = out["messages"].as_array().expect("messages");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "get_weather");
+        // The tool result becomes a `tool` message keyed by the call id.
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "call_1");
+        assert_eq!(msgs[2]["content"], "22C");
+    }
+
+    #[test]
+    fn a_tool_call_in_the_reply_comes_back_as_a_function_call_item() {
+        // Dropping this would hand an agent a plausible-looking message where it expected a call
+        // to make. Silent, and therefore dangerous.
+        let chat = serde_json::json!({
+            "id": "chatcmpl_1", "model": "openai/gpt-5.5",
+            "choices": [{ "message": {
+                "role": "assistant", "content": null,
+                "tool_calls": [{
+                    "id": "call_9", "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" },
+                }],
+            }}],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5 },
+        });
+
+        let out = response_from_chat(&chat);
+
+        let item = &out["output"][0];
+        assert_eq!(item["type"], "function_call");
+        assert_eq!(item["call_id"], "call_9");
+        assert_eq!(item["name"], "get_weather");
+        assert_eq!(item["arguments"], "{\"city\":\"Paris\"}");
+        // `completed` is correct even with a tool call pending: it means GENERATION finished, not
+        // that the agent loop is done. An earlier version reported `incomplete` here by analogy,
+        // which is wrong against the spec and stalls any client that gates on `completed`.
+        assert_eq!(out["status"], "completed");
+    }
+
+    #[test]
+    fn text_alongside_a_tool_call_keeps_both() {
+        let chat = serde_json::json!({
+            "id": "c", "model": "m",
+            "choices": [{ "message": {
+                "content": "let me check",
+                "tool_calls": [{ "id": "c1", "function": { "name": "f", "arguments": "{}" } }],
+            }}],
+        });
+
+        let out = response_from_chat(&chat);
+
+        assert_eq!(out["output"][0]["type"], "message");
+        assert_eq!(out["output"][0]["content"][0]["text"], "let me check");
+        assert_eq!(out["output"][1]["type"], "function_call");
+    }
+
+    #[test]
+    fn a_truncated_reply_is_the_only_incomplete_one() {
+        // The Responses API reserves `incomplete` for truncation, with `incomplete_details` naming
+        // the reason — which is what `finish_reason: "length"` means on the Chat side.
+        let chat = serde_json::json!({
+            "id": "c", "model": "m",
+            "choices": [{ "finish_reason": "length", "message": { "content": "cut off mid-" } }],
+        });
+
+        let out = response_from_chat(&chat);
+
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    #[test]
+    fn tool_choice_is_translated_not_passed_through_in_the_wrong_shape() {
+        // Responses: {type, name}. Chat: {type, function: {name}}. Forwarded unchanged this does
+        // not error — Chat just does not recognise it, so the model is free to ignore a tool the
+        // caller demanded. Silent, which is the whole problem.
+        let out = request_to_chat(&serde_json::json!({
+            "input": "hi",
+            "tools": [{ "type": "function", "name": "f" }],
+            "tool_choice": { "type": "function", "name": "f" },
+        }));
+        assert_eq!(out["tool_choice"]["type"], "function");
+        assert_eq!(out["tool_choice"]["function"]["name"], "f");
+
+        // The string forms are identical in both APIs.
+        for word in ["auto", "none", "required"] {
+            let out = request_to_chat(&serde_json::json!({
+                "input": "hi", "tool_choice": word,
+            }));
+            assert_eq!(out["tool_choice"], word);
+        }
+    }
+
+    #[test]
+    fn a_tool_choice_we_cannot_express_routes_to_passthrough() {
         assert!(has_untranslatable_content(&serde_json::json!({
+            "input": "hi",
+            "tool_choice": { "type": "file_search" },
+        })));
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "input": "hi",
+            "tools": [{ "type": "function", "name": "f" }],
+            "tool_choice": { "type": "function", "name": "f" },
+        })));
+    }
+
+    #[test]
+    fn hosted_tools_still_take_passthrough() {
+        // web_search / file_search run inside the provider. Sending a partial tool set is worse
+        // than not routing: a model missing one of its tools makes a confidently wrong plan.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "input": "search for it",
+            "tools": [
+                { "type": "function", "name": "f" },
+                { "type": "web_search" },
+            ],
+        })));
+    }
+
+    #[test]
+    fn function_tools_are_now_gated_rather_than_passed_through() {
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "input": [
+                { "role": "user", "content": "weather?" },
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "22C" },
+            ],
+            "tools": [{ "type": "function", "name": "f" }],
+        })));
+    }
+
+    #[test]
+    fn a_malformed_tool_item_routes_to_passthrough_rather_than_vanishing() {
+        // Found in review: the gate said `function_call` translates while the translator returned
+        // None for one missing its `call_id`, so the turn was silently dropped. The gate now asks
+        // the translator, so the two cannot disagree.
+        let no_call_id = serde_json::json!({
+            "input": [{ "type": "function_call", "name": "f", "arguments": "{}" }],
+        });
+        assert!(has_untranslatable_content(&no_call_id));
+
+        let no_name = serde_json::json!({
+            "input": [{ "type": "function_call", "call_id": "c1", "arguments": "{}" }],
+        });
+        assert!(has_untranslatable_content(&no_name));
+
+        let no_output = serde_json::json!({
+            "input": [{ "type": "function_call_output", "call_id": "c1" }],
+        });
+        assert!(has_untranslatable_content(&no_output));
+
+        // The well-formed pair still translates and is still gated.
+        let ok = serde_json::json!({
+            "input": [
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "42" },
+            ],
+        });
+        assert!(!has_untranslatable_content(&ok));
+    }
+
+    #[test]
+    fn every_allowed_turn_actually_produces_a_message() {
+        // The invariant behind the fix, stated directly: anything the gate allows must translate
+        // to something. If these two ever disagree again, a turn goes missing with no error.
+        let body = serde_json::json!({
+            "input": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [{ "type": "output_text", "text": "yes" }] },
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "42" },
+            ],
+        });
+        assert!(!has_untranslatable_content(&body));
+
+        let turns = body["input"].as_array().expect("array");
+        let out = request_to_chat(&body);
+        assert_eq!(
+            out["messages"].as_array().expect("messages").len(),
+            turns.len(),
+            "every allowed turn must survive translation"
+        );
+    }
+
+    #[test]
+    fn reasoning_items_still_take_passthrough() {
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "input": [{ "type": "reasoning", "summary": [] }],
+        })));
+    }
+
+    #[test]
+    fn a_tool_using_request_is_not_translated_when_hosted() {
+        // Function tools now translate both ways, so they are gated. Only provider-hosted tools
+        // remain untranslatable.
+        assert!(!has_untranslatable_content(&serde_json::json!({
             "input": "hi",
             "tools": [{ "type": "function", "name": "get_weather" }],
         })));
         assert!(has_untranslatable_content(&serde_json::json!({
-            "input": "hi", "tool_choice": "auto",
+            "input": "hi",
+            "tools": [{ "type": "computer_use_preview" }],
         })));
     }
 
@@ -357,9 +748,9 @@ mod tests {
         // function_call / function_call_output / reasoning items carry no role+content pair.
         // The earlier deny-list version returned None for these and dropped the turn entirely.
         for item in [
-            serde_json::json!({ "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" }),
-            serde_json::json!({ "type": "function_call_output", "call_id": "c1", "output": "42" }),
+            // function_call / function_call_output now translate; only these remain.
             serde_json::json!({ "type": "reasoning", "summary": [] }),
+            serde_json::json!({ "type": "web_search_call", "id": "ws_1" }),
         ] {
             assert!(
                 has_untranslatable_content(&serde_json::json!({ "input": [item.clone()] })),

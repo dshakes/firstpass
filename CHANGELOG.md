@@ -1,6 +1,16 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0]
+
+Feature parity with the rest of the proxy-router category, reached mostly by **fixing silent wrong
+numbers** rather than adding features. Three of the items below were bugs that produced a confident
+wrong answer or a fabricated figure with no error to notice: a config block that parsed and did
+nothing, cached prompts billed as free, and a long conversation failing outright when the rung above
+would have served it.
+
+Not breaking: every new config field is optional and every new receipt field is omitted when zero,
+so existing receipts re-derive the same hash. **Reported costs will go up** on cached traffic —
+that is the fix, not a regression.
 
 ### Fixed: cached prompts were billed as if they were free
 
@@ -65,6 +75,16 @@ correctness.
 
 ### Added
 
+- **Tool calls translate both ways on `/v1/responses`**, so tool-using agentic requests are
+  **gated** rather than passed through un-verified. A tool definition becomes Chat's nested
+  `function` shape, a tool call becomes an `assistant` message with `tool_calls`, a result becomes a
+  `tool` message, and a tool call in the reply returns as a `function_call` item. `tool_choice` is
+  translated too — Responses spells it `{type, name}` and Chat `{type, function: {name}}`, and
+  forwarding it unchanged does not error, it just lets the model ignore a tool the caller demanded.
+  A response carrying a pending tool call is `status: "completed"` (generation finished — the agent
+  loop being unfinished is not the same thing); `incomplete` is now reported for its real cause, a
+  truncated reply, with `incomplete_details.reason`. Hosted tools (`web_search`, `file_search`,
+  `computer_use`), reasoning items, and `previous_response_id` threading still take passthrough.
 - **`POST /v1/responses`** — the OpenAI Responses API. Newer OpenAI-family agents speak Responses
   rather than Chat Completions, and without this they could not point at Firstpass at all. Served
   by translating to and from the Chat Completions path, so the gate, ladder, budget, and receipt are
@@ -78,7 +98,9 @@ correctness.
   0.1×, so roughly one reuse of the prefix covers the premium and everything after saves heavily —
   but single-shot traffic never reuses and would pay a 25% surcharge for nothing. Whether that
   trade pays is a fact about your traffic, not something this code can infer. A caller that already
-  places its own `cache_control` is left untouched.
+  places its own `cache_control` is left untouched, and a prefix too small to qualify is never
+  marked — Anthropic refuses to cache below a per-model minimum (1024 tokens; 2048 on Haiku), so
+  marking a shorter one is a request the API can reject rather than merely wasted spend.
 - **`[escalation.condense]`** — last-resort context condensing. When a conversation has overflowed
   the context window of *every* rung, the middle of the history is dropped (head and tail kept, with
   a marker turn telling the model its history is incomplete) and the top rung is retried **once**.
