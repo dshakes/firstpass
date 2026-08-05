@@ -134,9 +134,13 @@ Still un-gated, and these are genuine rather than provisional:
 - **Hosted tools** (`web_search`, `file_search`, `computer_use`) run inside the provider and have no
   Chat equivalent. Sending a partial tool set is worse than not routing at all: a model missing one
   of its tools produces a confidently wrong plan.
+- **A `tool_choice` naming a hosted tool**, for the same reason.
 - **Reasoning items**, which carry provider-internal state.
 - **`previous_response_id`** threading, where the upstream holds history we do not have — a
   translated request is then not the conversation the client is continuing.
+- **A malformed tool item** — a `function_call` missing its `call_id`, say. The gate asks the
+  translator rather than restating its rules, so anything that would translate to nothing routes to
+  passthrough instead of silently losing the turn.
 
 The check is an allow-list rather than a deny-list because the deny-list lost three times running:
 images, then files, then tool calls were each silently dropped, each producing a confidently wrong

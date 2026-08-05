@@ -78,9 +78,12 @@ correctness.
 - **Tool calls translate both ways on `/v1/responses`**, so tool-using agentic requests are
   **gated** rather than passed through un-verified. A tool definition becomes Chat's nested
   `function` shape, a tool call becomes an `assistant` message with `tool_calls`, a result becomes a
-  `tool` message, and a tool call in the reply returns as a `function_call` item. A turn awaiting a
-  tool result reports `status: "incomplete"` — telling an agent the turn is `completed` while the
-  model waits on it is its own wrong answer. Hosted tools (`web_search`, `file_search`,
+  `tool` message, and a tool call in the reply returns as a `function_call` item. `tool_choice` is
+  translated too — Responses spells it `{type, name}` and Chat `{type, function: {name}}`, and
+  forwarding it unchanged does not error, it just lets the model ignore a tool the caller demanded.
+  A response carrying a pending tool call is `status: "completed"` (generation finished — the agent
+  loop being unfinished is not the same thing); `incomplete` is now reported for its real cause, a
+  truncated reply, with `incomplete_details.reason`. Hosted tools (`web_search`, `file_search`,
   `computer_use`), reasoning items, and `previous_response_id` threading still take passthrough.
 - **`POST /v1/responses`** — the OpenAI Responses API. Newer OpenAI-family agents speak Responses
   rather than Chat Completions, and without this they could not point at Firstpass at all. Served
