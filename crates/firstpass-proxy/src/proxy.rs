@@ -302,6 +302,7 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
     let business = Router::new()
         .route("/v1/messages", post(messages))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
         .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/models", get(models))
@@ -453,7 +454,7 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
         "feature_version": FEATURE_VERSION,
         "modes": ["observe", "enforce"],
         "routing_modes": routing_modes,
-        "wire_apis": ["anthropic.messages", "openai.chat_completions"],
+        "wire_apis": ["anthropic.messages", "openai.chat_completions", "openai.responses"],
         "ladder": ladder,
         "gates": gates,
         "feedback_api": "POST /v1/feedback",
@@ -3047,6 +3048,79 @@ async fn chat_completions(
             tracing::info!(
                 "enforce route matched but OpenAI structured request can't be routed faithfully (flag/ladder); serving via observe passthrough"
             );
+        }
+    }
+    observe_passthrough_openai(state, headers, body, session_header, tenant).await
+}
+
+/// `POST /v1/responses` — the OpenAI Responses API, served by translating to and from the Chat
+/// Completions path so the gate, ladder, budget, and receipt are the *same* ones, not a parallel
+/// implementation that could drift.
+///
+/// Falls back to the OpenAI observe passthrough for anything it cannot gate faithfully — a
+/// streaming request (enforce is inherently buffered: the gate must see the whole candidate), or
+/// no matching enforce route. That is the same fallback `/v1/chat/completions` already uses, so a
+/// request that cannot be verified is still served rather than refused.
+async fn responses(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant)): Extension<TenantId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let session_header = header_str(&headers, SESSION_HEADER);
+
+    // Streaming cannot be gated, so it never enters the enforce path. Passing the ORIGINAL body
+    // through matters: the upstream speaks Responses too, and handing it a translated body would
+    // return Chat-shaped events to a client waiting for Responses ones.
+    if is_stream_request(&body) {
+        return observe_passthrough_openai(state, headers, body, session_header, tenant).await;
+    }
+
+    let Ok(parsed) = serde_json::from_slice::<Value>(&body) else {
+        return observe_passthrough_openai(state, headers, body, session_header, tenant).await;
+    };
+    let chat_body = Bytes::from(crate::responses::request_to_chat(&parsed).to_string());
+
+    if let Some(routing) = state.config.routing.as_ref() {
+        let features = extract_openai_features(&headers, &chat_body);
+        if let Some(route) = routing
+            .route_for(&features)
+            .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
+        {
+            let route_ix = routing
+                .routes
+                .iter()
+                .position(|r| std::ptr::eq(r, route))
+                .unwrap_or(0);
+            let route = route.clone();
+            let routing_mode = resolve_mode(&headers, &route, &state.config);
+            if routing_mode != RoutingMode::Observe
+                && enforce_can_handle(
+                    &features,
+                    &chat_body,
+                    routing.escalation.enforce_structured,
+                    &route.ladder,
+                    &state.providers,
+                    Dialect::Openai,
+                )
+            {
+                return match enforce_pipeline_openai(
+                    &state,
+                    &headers,
+                    &chat_body,
+                    features,
+                    &route,
+                    route_ix,
+                    session_header,
+                    tenant,
+                    routing_mode,
+                )
+                .await
+                {
+                    Ok(chat) => Json(crate::responses::response_from_chat(&chat)).into_response(),
+                    Err(e) => e.into_response(),
+                };
+            }
         }
     }
     observe_passthrough_openai(state, headers, body, session_header, tenant).await

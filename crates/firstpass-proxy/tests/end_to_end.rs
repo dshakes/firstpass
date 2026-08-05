@@ -446,3 +446,64 @@ async fn session_promotion_skips_the_rung_that_already_failed() {
         "an unrelated session starts cold and climbs on its own"
     );
 }
+
+/// The Responses API served through the real gated ladder over real HTTP.
+///
+/// The point is not the translation — that is unit-tested. It is that a Responses client gets the
+/// *same* engine: the cheap rung is tried, its empty answer fails the gate, the ladder escalates,
+/// and the receipt records both attempts. A parallel implementation would be the easy mistake here,
+/// and it would drift on exactly the parts that matter.
+#[tokio::test]
+async fn responses_api_is_gated_by_the_same_ladder() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy(
+        &upstream,
+        &["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"],
+        "",
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/responses"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({
+            "model": "claude-haiku-4-5",
+            "instructions": "be terse",
+            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "write a hello world" }] }],
+            "max_output_tokens": 256,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    // Responses shape, not Chat shape leaking through.
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(
+        body["output"][0]["content"][0]["text"],
+        "fn main() {} // compiles"
+    );
+    assert_eq!(body["output_text"], "fn main() {} // compiles");
+    // Responses spells usage differently; Chat's spelling here would read as a free call.
+    assert!(
+        body["usage"]["input_tokens"].as_u64().unwrap() > 0,
+        "{}",
+        body["usage"]
+    );
+    assert!(body["usage"]["output_tokens"].as_u64().unwrap() > 0);
+
+    // And it went through the real ladder: haiku failed the gate, sonnet served.
+    let traces = wait_for_traces(&db, 1).await;
+    assert_eq!(traces[0].attempts.len(), 2, "same gate, same escalation");
+    assert_eq!(traces[0].attempts[0].verdict, Verdict::Fail);
+    assert_eq!(traces[0].final_.served_rung, Some(1));
+    assert!(
+        verify_chain(&traces, GENESIS_HASH).is_ok(),
+        "receipt chain intact"
+    );
+}

@@ -27,7 +27,7 @@ config surface — two items on the first pass turned out to already exist and w
 
 | # | Capability | Why it matters | Size | Status |
 |---|---|---|---|---|
-| 1 | `/v1/responses` (OpenAI Responses API) | Newer OpenAI agents speak Responses, not Chat Completions; without it they cannot point at us at all | M | planned |
+| 1 | `/v1/responses` (OpenAI Responses API) | Newer OpenAI agents speak Responses, not Chat Completions; without it they cannot point at us at all | M | **done** |
 | 2 | `/v1/models` catalog | Agent CLIs call it to populate a model picker; its absence shows an empty list | S | **done** |
 | 3 | Session affinity | A multi-turn session that escalated re-pays the gate cycle from rung 0 every turn | M | **done** |
 | 4 | Agent launchers (`firstpass launch …`) | One command beats a page of env-var instructions | S | **done** |

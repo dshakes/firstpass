@@ -65,6 +65,13 @@ correctness.
 
 ### Added
 
+- **`POST /v1/responses`** — the OpenAI Responses API. Newer OpenAI-family agents speak Responses
+  rather than Chat Completions, and without this they could not point at Firstpass at all. Served
+  by translating to and from the Chat Completions path, so the gate, ladder, budget, and receipt are
+  the **same** ones — not a parallel implementation that could drift on the parts that matter.
+  Buffered only: `enforce` cannot stream, because the gate must see the whole candidate before it
+  can judge it, so a streaming Responses request takes the same observe passthrough that Chat
+  Completions already uses for a request it cannot gate faithfully.
 - **`GET /v1/models`** — OpenAI-shaped discovery so agent CLIs can populate a model picker.
   Reports distinct ladder rungs in ladder order (that order is the cost gradient) with the real
   per-1M prices from the table that bills the receipt.
