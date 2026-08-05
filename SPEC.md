@@ -492,7 +492,10 @@ a wrong promotion costs money, never correctness — and the probe bounds even t
   "attempts": [
     {
       "rung": 0, "model": "claude-haiku-4-5", "provider": "anthropic",
-      "in_tokens": 8123, "out_tokens": 512,
+      // `in_tokens` is the UNCACHED remainder. With prompt caching the bulk of the prompt is in
+      // the two fields below, billed at 1.25x (write) and 0.1x (read) — both omitted when zero,
+      // so pre-cache receipts hash identically. True prompt size = the sum of all three.
+      "in_tokens": 8123, "cache_write_tokens": 0, "cache_read_tokens": 0, "out_tokens": 512,
       "cost_usd": 0.0031, "latency_ms": 1740,
       "gates": [
         { "gate_id": "schema@v1",     "verdict": "pass", "score": 1.0,  "cost_usd": 0, "ms": 2 },

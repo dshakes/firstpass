@@ -504,6 +504,8 @@ mod tests {
             model: HAIKU.to_owned(),
             provider: "anthropic".to_owned(),
             in_tokens: 1000,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 500,
             cost_usd: 0.001,
             latency_ms: 10,

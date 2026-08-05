@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### Fixed: cached prompts were billed as if they were free
+
+Token usage was read as `usage.input_tokens` alone. Providers that support prompt caching do not
+report the prompt there — they split it:
+
+| field | what it is | billed at |
+| --- | --- | --- |
+| `input_tokens` | the uncached remainder | 1× |
+| `cache_creation_input_tokens` | prompt written to cache | **1.25×** |
+| `cache_read_input_tokens` | prompt served from cache | **0.1×** |
+
+Firstpass counted only the first. A caller using prompt caching — which coding agents do by
+default — sends a large stable prefix, so a turn with a 190k-token cached prompt arrives as an
+`input_tokens` of about **20**. The receipt recorded roughly **$0.0001 for a call that cost about
+$0.72**, and `[budget]` caps, which are fed by that same total, could not trip on it.
+
+This is the same defect class as the unpriced-rung bug fixed in 0.3.0: not a missing number, a
+**fabricated** one, in the record whose whole purpose is being auditable.
+
+Cache traffic is now parsed, priced at its own multipliers, and recorded on the receipt as
+`cache_write_tokens` / `cache_read_tokens`. Both the enforce path and observe-mode passthrough are
+fixed — observe reads usage off the same response body and had the same gap.
+
+**The hash chain is unaffected.** Both fields are omitted from canonical JSON when zero, so every
+receipt written before this change serializes byte-identically and re-derives the same hash, and
+older receipts still deserialize. Verified directly, not assumed.
+
+`Attempt::billable_input()` returns the true prompt size (uncached + written + read); prefer it
+over `in_tokens` for anything cost- or volume-shaped.
+
 ### Fixed: `[escalation.session_promotion]` parsed and did nothing
 
 The block has been in the config schema — and exported from `firstpass-core` — since before this

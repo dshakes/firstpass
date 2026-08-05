@@ -192,6 +192,8 @@ mod tests {
             model: model.to_owned(),
             text: text.to_owned(),
             in_tokens: 10,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 10,
             raw: Value::Null,
         }

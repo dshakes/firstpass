@@ -310,9 +310,18 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
             }
             Ok(resp) => {
                 let ms = elapsed_ms(start);
+                // Cache-aware: prompt-cache traffic bills at its own rates, and counting only
+                // `in_tokens` understates a cached request by orders of magnitude (a 190k cached
+                // prefix reports ~20 input tokens). `[budget]` is fed by this same total.
                 let model_cost = ctx
                     .prices
-                    .cost_usd(model_str, resp.in_tokens, resp.out_tokens)
+                    .cost_usd_with_cache(
+                        model_str,
+                        resp.in_tokens,
+                        resp.cache_write_tokens,
+                        resp.cache_read_tokens,
+                        resp.out_tokens,
+                    )
                     .unwrap_or(0.0);
                 spent += model_cost;
 
@@ -385,6 +394,8 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                     model: model_str.clone(),
                     provider: provider.id().to_owned(),
                     in_tokens: resp.in_tokens,
+                    cache_write_tokens: resp.cache_write_tokens,
+                    cache_read_tokens: resp.cache_read_tokens,
                     out_tokens: resp.out_tokens,
                     cost_usd: model_cost,
                     latency_ms: ms,
@@ -524,9 +535,18 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                 done = true;
             }
             Ok(Ok(resp)) => {
+                // Cache-aware: prompt-cache traffic bills at its own rates, and counting only
+                // `in_tokens` understates a cached request by orders of magnitude (a 190k cached
+                // prefix reports ~20 input tokens). `[budget]` is fed by this same total.
                 let model_cost = ctx
                     .prices
-                    .cost_usd(model_str, resp.in_tokens, resp.out_tokens)
+                    .cost_usd_with_cache(
+                        model_str,
+                        resp.in_tokens,
+                        resp.cache_write_tokens,
+                        resp.cache_read_tokens,
+                        resp.out_tokens,
+                    )
                     .unwrap_or(0.0);
                 spent += model_cost;
 
@@ -560,6 +580,8 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                     model: model_str.clone(),
                     provider: provider.id().to_owned(),
                     in_tokens: resp.in_tokens,
+                    cache_write_tokens: resp.cache_write_tokens,
+                    cache_read_tokens: resp.cache_read_tokens,
                     out_tokens: resp.out_tokens,
                     cost_usd: model_cost,
                     latency_ms: ms,
@@ -642,6 +664,9 @@ fn abstain_attempt(rung: u32, model: &str, provider: &str, reason: &str, ms: u64
         model: model.to_owned(),
         provider: provider.to_owned(),
         in_tokens: 0,
+        // Nothing was served, so there is no cache traffic to account for.
+        cache_write_tokens: 0,
+        cache_read_tokens: 0,
         out_tokens: 0,
         cost_usd: 0.0,
         latency_ms: ms,
@@ -693,6 +718,8 @@ mod tests {
             model: model.to_owned(),
             text: text.to_owned(),
             in_tokens: 1000,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
             out_tokens: 500,
             raw: Value::Null,
         }
