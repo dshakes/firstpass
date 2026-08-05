@@ -274,6 +274,7 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
+        .route("/v1/models", get(models))
         // Inside the authed group on purpose: receipts are per-tenant operational data, and a
         // panel is not a reason to hand one tenant another's routing history.
         .route("/v1/receipts", get(receipts))
@@ -419,6 +420,53 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
         "feedback_api": "POST /v1/feedback",
         "offboarding": "unset ANTHROPIC_BASE_URL (or OPENAI_BASE_URL for OpenAI clients)",
     }))
+}
+
+/// `GET /v1/models` — OpenAI-shaped model discovery. Agent CLIs (and the OpenAI SDK's
+/// `client.models.list()`) call this to populate a model picker; without it they show an empty
+/// list, so a proxy that answers `/v1/chat/completions` but not this is only half-pointable.
+///
+/// Reports the distinct ladder rungs across every configured route, cheapest-first within each
+/// ladder and de-duplicated across them. Each entry carries its real per-1M price from the same
+/// table that bills the receipt — so a caller can see the cost gradient it is being routed along,
+/// which the plain OpenAI shape has no field for.
+///
+/// Inside the authed group with `/v1/capabilities`: the ladder names which providers and models an
+/// operator runs, which is not public information.
+async fn models(State(state): State<AppState>) -> impl IntoResponse {
+    Json(model_list(state.config.routing.as_ref()))
+}
+
+/// The body of `GET /v1/models`, split from the handler so it is reachable from a test without
+/// standing up a server.
+fn model_list(routing: Option<&firstpass_core::config::Config>) -> serde_json::Value {
+    let prices = routing.map(|c| c.price_table()).unwrap_or_default();
+    // Preserve first-seen (cheapest-first) order rather than sorting: the ladder order IS the cost
+    // gradient, and a caller reading top-to-bottom should see what the router tries first.
+    let mut seen = std::collections::HashSet::new();
+    let data: Vec<serde_json::Value> = routing
+        .map(|c| c.routes.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|r| r.ladder.iter())
+        .filter(|id| seen.insert(id.as_str()))
+        .map(|id| {
+            let price = prices.get(id);
+            serde_json::json!({
+                "id": id,
+                "object": "model",
+                // No real creation date to report; 0 is the honest placeholder for a field the
+                // OpenAI shape requires and this proxy does not know.
+                "created": 0,
+                "owned_by": id.split_once('/').map_or("firstpass", |(p, _)| p),
+                "firstpass": {
+                    "input_per_mtok": price.map(|p| p.input_per_mtok),
+                    "output_per_mtok": price.map(|p| p.output_per_mtok),
+                },
+            })
+        })
+        .collect();
+    serde_json::json!({ "object": "list", "data": data })
 }
 
 /// Body of `POST /v1/feedback`: a downstream outcome reported for a past decision.
@@ -3408,6 +3456,65 @@ mod tests {
         assert!(modes.contains(&"latency"));
         assert!(modes.contains(&"max"));
         assert!(modes.contains(&"observe"));
+    }
+
+    #[test]
+    fn model_list_dedups_across_ladders_keeping_cheapest_first_order() {
+        // Two routes sharing a rung: the shared id must appear once, and the order must be the
+        // ladder's (cheapest first), not sorted — the order IS the cost gradient.
+        let config = firstpass_core::config::Config::parse(
+            r#"
+            [[route]]
+            mode = "enforce"
+            ladder = ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
+            [[route]]
+            mode = "enforce"
+            ladder = ["anthropic/claude-sonnet-5", "anthropic/claude-opus-4-8"]
+            "#,
+        )
+        .expect("test config parses");
+
+        let out = model_list(Some(&config));
+
+        let ids: Vec<&str> = out["data"]
+            .as_array()
+            .expect("data is an array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id is a string"))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "anthropic/claude-haiku-4-5",
+                "anthropic/claude-sonnet-5",
+                "anthropic/claude-opus-4-8",
+            ],
+            "sonnet appears once, and ladder order is preserved"
+        );
+        assert_eq!(out["object"], "list");
+        assert_eq!(out["data"][0]["owned_by"], "anthropic");
+        // The price must be the real one from the billing table, not a placeholder: this is the
+        // field that would silently become null if `price_table()` were dropped.
+        let haiku_in = out["data"][0]["firstpass"]["input_per_mtok"]
+            .as_f64()
+            .expect("a first-party rung has a price");
+        assert!(haiku_in > 0.0, "expected a real price, got {haiku_in}");
+        // And it must be cheaper than the rung above it, or the ladder is not a cost gradient.
+        let opus_in = out["data"][2]["firstpass"]["input_per_mtok"]
+            .as_f64()
+            .expect("a first-party rung has a price");
+        assert!(haiku_in < opus_in, "{haiku_in} should undercut {opus_in}");
+    }
+
+    #[test]
+    fn model_list_is_empty_without_routing_config() {
+        let out = model_list(None);
+        assert_eq!(out["object"], "list");
+        assert_eq!(
+            out["data"].as_array().expect("data is an array").len(),
+            0,
+            "an observe-only deployment advertises no models"
+        );
     }
 
     #[test]
