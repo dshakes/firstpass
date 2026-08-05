@@ -237,6 +237,7 @@ pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
             Value::String(wire_model(&req.model).to_owned()),
         );
         body.remove("stream");
+        normalize_reasoning(&mut body, Wire::Anthropic);
         return Value::Object(body);
     }
     let messages: Vec<Value> = req
@@ -410,6 +411,7 @@ pub fn openai_wire_body(req: &ModelRequest) -> Value {
             Value::String(wire_model(&req.model).to_owned()),
         );
         body.remove("stream");
+        normalize_reasoning(&mut body, Wire::OpenAi);
         return Value::Object(body);
     }
     // Fallback: reconstruct from normalized fields (translation path or synthesized requests).
@@ -431,6 +433,164 @@ pub fn openai_wire_body(req: &ModelRequest) -> Value {
         body["tools"] = req.tools.clone();
     }
     body
+}
+
+/// How hard the caller asked the model to think, independent of how any one provider spells it.
+///
+/// A cascade crosses vendors by design — a ladder is routinely `openai/…` under `anthropic/…` —
+/// so the caller's reasoning request has to survive the crossing. Without this, an OpenAI client
+/// that sets `reasoning_effort` gets a **400** the moment the router escalates it onto an
+/// Anthropic rung, because raw bodies pass through verbatim and Anthropic rejects the unknown
+/// field. The caller did nothing wrong; the ladder moved under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    /// Anthropic/Gemini want a token budget rather than a word. These are deliberately modest:
+    /// the budget is billed as output tokens, so a generous default would silently raise the cost
+    /// of every request that merely mentioned reasoning.
+    const fn budget_tokens(self) -> u32 {
+        match self {
+            Self::Low => 1024, // Anthropic's documented floor; below it the field is invalid.
+            Self::Medium => 4096,
+            Self::High => 16384,
+        }
+    }
+
+    /// Read back a budget as a level, so a caller that spelled it in tokens keeps its intent when
+    /// the request lands on a provider that spells it in words.
+    const fn from_budget(tokens: u64) -> Self {
+        if tokens < 2048 {
+            Self::Low
+        } else if tokens < 8192 {
+            Self::Medium
+        } else {
+            Self::High
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Read the caller's reasoning request out of a raw inbound body, in any dialect. Returns `None`
+/// for a body that is not an object or asked for no reasoning.
+#[must_use]
+pub fn effort_of(raw: &Value) -> Option<Effort> {
+    read_effort(raw.as_object()?)
+}
+
+/// Read whichever spelling the caller used, in any dialect.
+fn read_effort(body: &serde_json::Map<String, Value>) -> Option<Effort> {
+    // OpenAI: a word.
+    if let Some(s) = body.get("reasoning_effort").and_then(Value::as_str) {
+        return match s {
+            "low" | "minimal" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            _ => None,
+        };
+    }
+    // Anthropic: a budget, but only when thinking is actually enabled.
+    if let Some(t) = body.get("thinking").and_then(Value::as_object)
+        && t.get("type").and_then(Value::as_str) != Some("disabled")
+        && let Some(b) = t.get("budget_tokens").and_then(Value::as_u64)
+    {
+        return Some(Effort::from_budget(b));
+    }
+    // Gemini: a budget under a camelCase key.
+    if let Some(b) = body
+        .get("thinkingConfig")
+        .and_then(Value::as_object)
+        .and_then(|c| c.get("thinkingBudget"))
+        .and_then(Value::as_u64)
+    {
+        return Some(Effort::from_budget(b));
+    }
+    None
+}
+
+/// Which wire dialect a body is being prepared for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    Anthropic,
+    OpenAi,
+    Gemini,
+}
+
+/// Rewrite `body` so the caller's reasoning request is spelled the way `target` expects, and no
+/// other dialect's spelling is left behind to be rejected.
+///
+/// Pure and total: a body with no reasoning request loses nothing, and a request that *cannot* be
+/// expressed within the target's constraints is dropped rather than sent invalid.
+pub fn normalize_reasoning(body: &mut serde_json::Map<String, Value>, target: Wire) {
+    // If the caller already spelled it the target's way, this is a same-dialect request: leave it
+    // completely alone. ADR 0005 promises a raw body reaches its own provider verbatim, and that
+    // promise covers the caller's mistakes too — a budget the caller's `max_tokens` cannot fit is
+    // theirs to see as a provider error, not ours to silently rewrite into a different request.
+    // Only a request whose spelling is *foreign* to where it landed needs translating, which is
+    // the cross-vendor escalation this exists for.
+    let native = match target {
+        Wire::OpenAi => "reasoning_effort",
+        Wire::Anthropic => "thinking",
+        Wire::Gemini => "thinkingConfig",
+    };
+    if body.contains_key(native) {
+        return;
+    }
+    let effort = read_effort(body);
+    // Strip every dialect first, so nothing foreign survives the crossing.
+    body.remove("reasoning_effort");
+    body.remove("thinking");
+    body.remove("thinkingConfig");
+    let Some(effort) = effort else { return };
+
+    match target {
+        Wire::OpenAi => {
+            body.insert(
+                "reasoning_effort".to_owned(),
+                Value::String(effort.as_str().to_owned()),
+            );
+        }
+        Wire::Anthropic => {
+            // Anthropic requires `max_tokens > budget_tokens`, and a budget of at least 1024.
+            // A caller with a small `max_tokens` cannot satisfy both, and sending it anyway is a
+            // 400 — so serve the request without extended thinking instead of failing it.
+            let max = body.get("max_tokens").and_then(Value::as_u64).unwrap_or(0);
+            let budget = u64::from(effort.budget_tokens()).min(max.saturating_sub(1));
+            if budget >= 1024 {
+                body.insert(
+                    "thinking".to_owned(),
+                    serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
+                );
+                // Extended thinking rejects any temperature but the default; the caller's value
+                // was chosen without knowing the router would enable thinking.
+                body.remove("temperature");
+                body.remove("top_p");
+            }
+        }
+        Wire::Gemini => {
+            // Gemini nests this under `generationConfig`, not at the top level.
+            body.entry("generationConfig")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .map(|c| {
+                    c.insert(
+                        "thinkingConfig".to_owned(),
+                        serde_json::json!({ "thinkingBudget": effort.budget_tokens() }),
+                    )
+                });
+        }
+    }
 }
 
 /// Speaks `POST {base}/v1/chat/completions` (OpenAI Chat Completions API).
@@ -550,6 +710,24 @@ fn gemini_request_body(req: &ModelRequest) -> Value {
     });
     if let Some(system) = req.system.as_deref() {
         body["system_instruction"] = serde_json::json!({ "parts": [{ "text": system }] });
+    }
+    // This builder reconstructs from normalized fields, so the caller's reasoning request is only
+    // in `raw` — carry it across rather than dropping it on the Gemini rung.
+    if let (Some(effort), Some(map)) = (effort_of(&req.raw), body.as_object_mut()) {
+        let mut carry = serde_json::Map::new();
+        carry.insert(
+            "reasoning_effort".to_owned(),
+            Value::String(effort.as_str().to_owned()),
+        );
+        carry.insert(
+            "generationConfig".to_owned(),
+            map["generationConfig"].clone(),
+        );
+        normalize_reasoning(&mut carry, Wire::Gemini);
+        map.insert(
+            "generationConfig".to_owned(),
+            carry["generationConfig"].clone(),
+        );
     }
     body
 }
@@ -1124,6 +1302,141 @@ impl Provider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn obj(v: Value) -> serde_json::Map<String, Value> {
+        v.as_object().expect("test literal is an object").clone()
+    }
+
+    #[test]
+    fn openai_reasoning_effort_crosses_onto_an_anthropic_rung() {
+        // The bug this exists for: a ladder is routinely cross-vendor, so an OpenAI client that
+        // set `reasoning_effort` gets escalated onto an Anthropic rung. Forwarded verbatim that
+        // is a 400 on a request the caller wrote correctly.
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 8192, "reasoning_effort": "high",
+        }));
+
+        normalize_reasoning(&mut body, Wire::Anthropic);
+
+        assert!(
+            !body.contains_key("reasoning_effort"),
+            "the foreign spelling must not survive: {body:?}"
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        // Clamped to max_tokens - 1: "high" wants 16384, but Anthropic requires the budget to
+        // leave room for the answer itself.
+        assert_eq!(body["thinking"]["budget_tokens"], 8191);
+    }
+
+    #[test]
+    fn anthropic_thinking_budget_crosses_onto_an_openai_rung_as_a_word() {
+        let mut body = obj(serde_json::json!({
+            "model": "gpt-5.5",
+            "thinking": { "type": "enabled", "budget_tokens": 16384 },
+        }));
+
+        normalize_reasoning(&mut body, Wire::OpenAi);
+
+        assert!(!body.contains_key("thinking"));
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn thinking_is_dropped_rather_than_sent_invalid_when_max_tokens_cannot_fit_it() {
+        // Anthropic requires budget >= 1024 AND max_tokens > budget. A caller asking for high
+        // effort with max_tokens=500 cannot have both; sending it anyway is a 400. Serving
+        // without extended thinking is the answer the caller can actually use.
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 500, "reasoning_effort": "high",
+        }));
+
+        normalize_reasoning(&mut body, Wire::Anthropic);
+
+        assert!(
+            !body.contains_key("thinking"),
+            "must not emit a budget max_tokens cannot satisfy: {body:?}"
+        );
+        assert!(!body.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn enabling_thinking_clears_a_temperature_the_caller_chose_without_knowing() {
+        // Extended thinking rejects any temperature but the default. The caller set it before the
+        // router decided to enable thinking, so keeping it would 400.
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 8192,
+            "reasoning_effort": "medium", "temperature": 0.2, "top_p": 0.9,
+        }));
+
+        normalize_reasoning(&mut body, Wire::Anthropic);
+
+        assert_eq!(body["thinking"]["budget_tokens"], 4096);
+        assert!(!body.contains_key("temperature"), "{body:?}");
+        assert!(!body.contains_key("top_p"), "{body:?}");
+    }
+
+    #[test]
+    fn a_body_that_asked_for_no_reasoning_is_left_alone() {
+        let before = serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 1024, "temperature": 0.7,
+        });
+        let mut body = obj(before.clone());
+
+        normalize_reasoning(&mut body, Wire::Anthropic);
+
+        assert_eq!(
+            Value::Object(body),
+            before,
+            "no reasoning request, no rewrite"
+        );
+    }
+
+    #[test]
+    fn gemini_gets_a_nested_budget_not_a_top_level_one() {
+        let mut body = obj(serde_json::json!({
+            "contents": [], "generationConfig": { "maxOutputTokens": 4096 },
+            "reasoning_effort": "low",
+        }));
+
+        normalize_reasoning(&mut body, Wire::Gemini);
+
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            1024
+        );
+        assert_eq!(
+            body["generationConfig"]["maxOutputTokens"], 4096,
+            "must not clobber the rest of generationConfig"
+        );
+        assert!(
+            !body.contains_key("thinkingConfig"),
+            "top level is wrong for Gemini"
+        );
+    }
+
+    #[test]
+    fn a_same_dialect_body_is_never_rewritten_even_when_the_caller_got_it_wrong() {
+        // budget_tokens(1024) > max_tokens(512) is invalid at Anthropic — and this request is
+        // already Anthropic-spelled, so it is not ours to "fix". Rewriting it would serve a
+        // different request than the caller wrote and hide the error that explains why.
+        let before = serde_json::json!({
+            "max_tokens": 512,
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+        });
+        let mut body = obj(before.clone());
+
+        normalize_reasoning(&mut body, Wire::Anthropic);
+
+        assert_eq!(Value::Object(body), before);
+    }
+
+    #[test]
+    fn disabled_thinking_is_not_read_as_a_request_to_think() {
+        let body = obj(serde_json::json!({
+            "thinking": { "type": "disabled", "budget_tokens": 16384 },
+        }));
+        assert_eq!(read_effort(&body), None);
+    }
 
     #[test]
     fn wire_model_strips_the_provider_prefix() {

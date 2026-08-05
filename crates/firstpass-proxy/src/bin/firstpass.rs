@@ -26,6 +26,10 @@ USAGE:
         [--provider anthropic|openai|google|local] [--shape json|code|prose|mixed]
         [--mode observe|enforce]  answer non-interactively (an agent piping input never blocks)
         [--yes] [--no-config]     take the defaults / skip config generation entirely
+    firstpass launch <agent> [-- args…]
+                                  start a coding agent already pointed here (claude, codex, or
+                                  openai -- <cmd>). Refuses if no proxy is listening, so a down
+                                  proxy does not surface as the agent looking broken.
     firstpass offboard            undo it: strip the rc line, stop the proxy, print the unset
     firstpass up                  start the proxy (serves until Ctrl-C)
     firstpass doctor              validate config, provider key, and gate binaries
@@ -74,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
             Ok(())
         }
+        "launch" => firstpass_proxy::launch::run(&args[2..]).await,
         "upgrade" => cmd_upgrade(),
         "onboard" => cmd_onboard(args.iter().any(|a| a == "--apply")),
         "offboard" => cmd_offboard(),
