@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Added: eight more providers work without a `[[provider]]` block
+
+`groq`, `deepseek`, `together`, `fireworks`, `mistral`, `openrouter`, `xai`, and `cerebras` are
+registered out of the box alongside `anthropic` and `openai`. Naming `groq/llama-3.3-70b-versatile`
+in a ladder now just works, given the key. An explicit `[[provider]]` with the same id still wins —
+an operator pointing `groq` at a gateway of their own must override the default, not be silently
+routed to the public endpoint.
+
+**Endpoints only — prices are deliberately NOT built in.** A base URL is a stable fact; a price is
+not. These platforms change pricing without notice, and a stale built-in price would write a wrong
+`cost_usd` into a tamper-evident receipt and mis-feed `[budget]` caps — the exact defect 0.4.0
+shipped a breaking change to eliminate. A rung on one of these still requires an explicit
+`[[price]]`, and `Config::parse` refuses to start without it, naming the model and printing the
+block to paste.
+
+Self-hosted runtimes (Ollama, vLLM, LM Studio) stay `[[provider]]` blocks: they have no key and no
+fixed host, and guessing `localhost:11434` would be a default that silently points at the wrong
+machine.
+
+`firstpass doctor` now **fails** when a configured rung's provider key is missing, instead of
+letting the first real request discover it. Only providers the ladder actually names are checked —
+warning about all eight would be noise, and noise trains an operator to skip the report.
+
+
 ### Added: a response cache that can only replay a **proven** answer
 
 `[escalation.verified_cache]`, absent by default. A hit skips the ladder entirely — but only for an
