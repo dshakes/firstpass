@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.1]
+
+**npm only — no code change from 0.4.0.** The npm package is now the unscoped
+`firstpass-proxy`, matching the crate on crates.io, the Homebrew formula, and the binary. It was
+previously published under a scope.
+
+```bash
+npm i -g firstpass-proxy
+```
+
+It is **not** `firstpass`: that name on npm belongs to an unrelated CLI published before this
+project existed. Anyone who guessed the obvious command was installing a stranger's package, which
+is why the README and `llms.txt` now name the package explicitly.
+
+Users of the old scoped package should switch — it stays at 0.4.0 and will not receive updates.
+
 ## [0.4.0]
 
 Feature parity with the rest of the proxy-router category, reached mostly by **fixing silent wrong
