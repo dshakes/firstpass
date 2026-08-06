@@ -69,6 +69,13 @@ jobs:
         # first publish needs a token (use a classic Automation token — it bypasses
         # 2FA). Once the package exists + a Trusted Publisher is configured, delete
         # the NPM_TOKEN secret and every future release publishes via OIDC (no token).
+        #
+        # Three auth failures are possible here and they look nearly identical in npm's
+        # output while having completely different fixes: wrong TOKEN TYPE (EOTP — a
+        # Publish token still wants a one-time password), a missing TRUSTED PUBLISHER
+        # (OIDC with no token, package exists), and a package that does not exist yet
+        # (OIDC cannot bootstrap one). Each is named explicitly below — the first two
+        # have each already cost a release cycle here.
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -95,4 +102,35 @@ jobs:
               exit 1
             fi
           fi
-          npm publish "$TARBALL" --access public
+          # Capture rather than stream, so the failure can be classified. npm's auth errors
+          # all look alike at a glance and each has a completely different remedy; the run
+          # log is usually read by someone who has just been paged, not by someone holding
+          # this file's history in their head.
+          set +e
+          out="$(npm publish "$TARBALL" --access public 2>&1)"
+          rc=$?
+          set -e
+          echo "$out"
+          [ $rc -eq 0 ] && exit 0
+
+          if echo "$out" | grep -q 'EOTP'; then
+            echo "::error::npm demanded a one-time password, which CI cannot answer. The \
+          NPM_TOKEN secret is a Publish or granular token; only a CLASSIC AUTOMATION token bypasses \
+          2FA. npmjs.com -> Access Tokens -> Generate New Token -> Classic Token -> Automation, then \
+          re-set the secret and re-run this workflow with the same tag."
+          # BEFORE the auth branch: republishing also returns E403, and matching that as an
+          # authorization failure would report a broken Trusted Publisher to someone whose setup
+          # is fine. The specific reading of an ambiguous error has to win over the general one.
+          elif echo "$out" | grep -qiE 'E409|cannot publish over|already exists|previously published'; then
+            echo "::error::$NAME at this version is already on npm. Nothing to do — npm forbids \
+          republishing a version. Bump the version to publish again."
+          elif [ -z "$NPM_TOKEN" ] && echo "$out" | grep -qiE 'ENEEDAUTH|E401|E403|need auth|must be logged in|not authorized|unable to authenticate|forbidden'; then
+            echo "::error::$NAME exists on npm but this workflow was not authorized to publish it, \
+          and no NPM_TOKEN is set — so the Trusted Publisher is almost certainly missing or does not \
+          match. On npmjs.com -> $NAME -> Trusted Publisher, set organization/user 'dshakes', \
+          repository 'firstpass', workflow filename 'npm-publish.yml', and leave the environment \
+          BLANK. All four must match this workflow exactly, the filename included."
+          else
+            echo "::error::npm publish failed for $NAME (exit $rc) — see the output above."
+          fi
+          exit $rc
