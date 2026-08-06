@@ -548,3 +548,220 @@ mod tests {
         assert_eq!(tasks[0].visible_cases.len(), 1);
     }
 }
+
+// ── Structured extraction ───────────────────────────────────────────────────────────────────────
+//
+// The sharpest objection to every number this project publishes is that they all come from coding
+// tasks with executable tests — the one domain where a gate is easy. Extraction answers it in the
+// same currency: the output is machine-checkable, so a real gate exists, but nothing is executed
+// and the task is not programming.
+//
+// Modelled as a `CodingTask` rather than a parallel harness so the entire policy machinery —
+// measure-once-replay-many, paired bootstrap, the gate/oracle split — is reused unchanged. A second
+// harness would be free to drift on exactly the statistics that make the claim.
+
+/// Load a structured-extraction dataset as [`CodingTask`]s.
+///
+/// One JSON object per line:
+///
+/// ```json
+/// {"id": "inv-1",
+///  "text": "Invoice from Acme Corp dated 2026-03-04, total $1,240.50",
+///  "required": ["vendor", "date", "total"],
+///  "expected": {"vendor": "Acme Corp", "date": "2026-03-04", "total": "1240.50"}}
+/// ```
+///
+/// The **gate** (`visible_cases`) checks only that the answer is well-formed JSON carrying the
+/// required keys. The **oracle** (`hidden_cases`) additionally checks every value against ground
+/// truth. That gap is the point and mirrors the coding case exactly: a model can emit perfectly
+/// shaped JSON with the wrong vendor in it, pass the gate, and still be wrong — which is what makes
+/// a served-failure bound meaningful rather than circular.
+///
+/// # Errors
+/// Unreadable file, malformed line, or a record missing `text`/`expected`.
+pub fn load_extraction_jsonl(path: &str) -> Result<Vec<CodingTask>, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+        .map(|(i, line)| parse_extraction_line(line).map_err(|e| format!("{path}:{}: {e}", i + 1)))
+        .collect()
+}
+
+fn parse_extraction_line(line: &str) -> Result<CodingTask, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| format!("invalid JSON: {e}"))?;
+    let id = v
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing `id`")?
+        .to_owned();
+    let text = v
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing `text`")?;
+    let expected = v
+        .get("expected")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("missing `expected` object")?;
+    // Absent `required` defaults to every expected key: the weakest honest gate is "the shape is
+    // there", and defaulting to nothing would make the gate vacuous and the comparison meaningless.
+    let required: Vec<String> = match v.get("required").and_then(serde_json::Value::as_array) {
+        Some(a) => a
+            .iter()
+            .filter_map(|k| k.as_str().map(str::to_owned))
+            .collect(),
+        None => expected.keys().cloned().collect(),
+    };
+
+    let schema_hint = required
+        .iter()
+        .map(|k| format!("  \"{k}\": <string>"))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let prompt = format!(
+        "Extract the following fields from the text and reply with ONLY a JSON object — no prose, \
+         no code fence.\n\nFields:\n{{\n{schema_hint}\n}}\n\nText:\n{text}\n"
+    );
+
+    Ok(CodingTask {
+        id,
+        prompt,
+        // The model's raw reply is written here verbatim; the generated suite reads it as TEXT and
+        // parses it, so nothing is imported and no code is executed.
+        entrypoint: "solution.py".to_owned(),
+        visible_cases: vec!["test_parses".to_owned(), "test_required_fields".to_owned()],
+        hidden_cases: {
+            let mut h = vec!["test_parses".to_owned(), "test_required_fields".to_owned()];
+            h.extend((0..expected.len()).map(|i| format!("test_field_{i}")));
+            h
+        },
+        unit_test: Some(extraction_suite(&required, expected)),
+    })
+}
+
+/// Generate the Python suite for one extraction task.
+///
+/// Values are embedded with `serde_json::to_string`, never interpolated raw: an expected value
+/// containing a quote or a backslash would otherwise produce a syntactically broken suite, and a
+/// suite that fails to import scores as a task the model got wrong. That would quietly bias the
+/// measurement against the model on exactly the records with awkward data.
+fn extraction_suite(
+    required: &[String],
+    expected: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let mut s = String::from(
+        "import json, unittest, pathlib\n\n\
+         def _load():\n\
+         \x20   raw = pathlib.Path('solution.py').read_text().strip()\n\
+         \x20   # Models fence JSON even when told not to; unwrap rather than score it wrong for\n\
+         \x20   # a formatting habit the gate is not trying to measure.\n\
+         \x20   if raw.startswith('```'):\n\
+         \x20       raw = raw.split('```')[1]\n\
+         \x20       if raw.startswith('json'):\n\
+         \x20           raw = raw[4:]\n\
+         \x20   return json.loads(raw)\n\n\
+         class T(unittest.TestCase):\n\
+         \x20   def test_parses(self):\n\
+         \x20       self.assertIsInstance(_load(), dict)\n\n\
+         \x20   def test_required_fields(self):\n\
+         \x20       d = _load()\n",
+    );
+    for k in required {
+        s.push_str(&format!(
+            "        self.assertIn({}, d)\n",
+            serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_owned())
+        ));
+    }
+    for (i, (k, want)) in expected.iter().enumerate() {
+        let kq = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_owned());
+        let wq = serde_json::to_string(want).unwrap_or_else(|_| "null".to_owned());
+        s.push_str(&format!(
+            "\n    def test_field_{i}(self):\n\
+             \x20       d = _load()\n\
+             \x20       self.assertEqual(str(d.get({kq})).strip(), str(json.loads({})).strip())\n",
+            serde_json::to_string(&wq).unwrap_or_else(|_| "\"null\"".to_owned())
+        ));
+    }
+    s
+}
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+
+    fn line() -> &'static str {
+        r#"{"id":"inv-1","text":"Invoice from Acme Corp dated 2026-03-04","required":["vendor"],"expected":{"vendor":"Acme Corp","date":"2026-03-04"}}"#
+    }
+
+    #[test]
+    fn the_gate_is_strictly_weaker_than_the_oracle() {
+        // The entire design rests on this gap. If the gate checked values too, every gate pass
+        // would be a correct answer by construction, the served-failure bound would be trivially
+        // zero, and the benchmark would prove nothing.
+        let t = parse_extraction_line(line()).expect("parses");
+
+        assert_eq!(t.visible_cases, ["test_parses", "test_required_fields"]);
+        assert!(
+            t.hidden_cases.len() > t.visible_cases.len(),
+            "oracle must check more than the gate: {:?}",
+            t.hidden_cases
+        );
+        for v in &t.visible_cases {
+            assert!(t.hidden_cases.contains(v), "oracle must subsume the gate");
+        }
+        // One value check per expected field.
+        assert!(t.hidden_cases.contains(&"test_field_0".to_owned()));
+        assert!(t.hidden_cases.contains(&"test_field_1".to_owned()));
+    }
+
+    #[test]
+    fn the_prompt_carries_the_text_and_asks_for_bare_json() {
+        let t = parse_extraction_line(line()).expect("parses");
+        assert!(
+            t.prompt.contains("Acme Corp dated 2026-03-04"),
+            "{}",
+            t.prompt
+        );
+        assert!(t.prompt.contains("ONLY a JSON object"), "{}", t.prompt);
+        assert!(t.prompt.contains("\"vendor\""), "{}", t.prompt);
+    }
+
+    #[test]
+    fn absent_required_defaults_to_every_expected_key() {
+        // Defaulting to an EMPTY required list would make the gate vacuous — it would pass any
+        // parseable JSON, so "gate passed" would carry no information at all.
+        let t = parse_extraction_line(r#"{"id":"x","text":"t","expected":{"a":"1","b":"2"}}"#)
+            .expect("parses");
+        let suite = t.unit_test.expect("suite");
+        assert!(suite.contains("self.assertIn(\"a\", d)"), "{suite}");
+        assert!(suite.contains("self.assertIn(\"b\", d)"), "{suite}");
+    }
+
+    #[test]
+    fn awkward_values_do_not_break_the_generated_suite() {
+        // A quote or backslash interpolated raw would produce a suite that fails to IMPORT, which
+        // scores as the model getting it wrong — biasing the measurement against the model on
+        // exactly the records with difficult data.
+        let t = parse_extraction_line(
+            r#"{"id":"q","text":"t","expected":{"name":"O'Brien \"Bob\" \\ Co"}}"#,
+        )
+        .expect("parses");
+        let suite = t.unit_test.expect("suite");
+        // Balanced quoting is the property that matters; assert the raw text did not leak in.
+        assert!(
+            !suite.contains("O'Brien \"Bob\""),
+            "raw value leaked unescaped:\n{suite}"
+        );
+        assert!(suite.contains("test_field_0"), "{suite}");
+    }
+
+    #[test]
+    fn a_record_without_ground_truth_is_rejected() {
+        // No oracle means no correctness signal — such a record would silently count as a pass.
+        assert!(parse_extraction_line(r#"{"id":"x","text":"t"}"#).is_err());
+        assert!(parse_extraction_line(r#"{"id":"x","expected":{"a":"1"}}"#).is_err());
+    }
+}

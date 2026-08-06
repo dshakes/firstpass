@@ -137,7 +137,13 @@ impl VerifiedCache {
         if !passed {
             return false;
         }
-        // 4. A deferred verdict that arrived later and said "fail" retracts the proof.
+        // 4. A deferred verdict already on the receipt that says Fail retracts the proof.
+        //
+        //    This is rarely the path that matters: deferred verdicts usually arrive minutes later
+        //    via `/v1/feedback`, long after insertion, so this check alone would be close to a
+        //    no-op — a safety rule that never fires, which is worse than none because the comment
+        //    claims protection it does not give. `retract()` below is the half that actually runs
+        //    in production, called from the feedback handler.
         if trace.deferred.iter().any(|d| d.verdict == Verdict::Fail) {
             return false;
         }
@@ -171,6 +177,25 @@ impl VerifiedCache {
             },
         );
         true
+    }
+
+    /// Evict every entry proven by `source`, because that proof has been retracted.
+    ///
+    /// Called when a deferred gate or downstream outcome reports a Fail for a decision. Without
+    /// this, an answer the world has since disproven keeps being replayed until its TTL expires —
+    /// and each replay carries a `cache_source` pointing at a receipt that now records a failure,
+    /// so the audit trail would actively contradict what was served.
+    ///
+    /// Returns how many entries were dropped. A single decision can back several keys once the
+    /// same prompt is seen under more than one ladder, so this scans by source rather than
+    /// assuming one.
+    pub fn retract(&self, source: uuid::Uuid) -> usize {
+        let Ok(mut map) = self.entries.lock() else {
+            return 0;
+        };
+        let before = map.len();
+        map.retain(|_, e| e.source != source);
+        before - map.len()
     }
 
     /// Entries currently held (tests and `/metrics`).
@@ -342,6 +367,40 @@ mod tests {
         });
 
         assert!(!c.offer(&t, &resp("looked fine"), &ladder(), now));
+    }
+
+    #[test]
+    fn a_retraction_evicts_the_answer_it_disproved() {
+        // Found in review: rule 4 only inspects the receipt at INSERT time, and deferred verdicts
+        // arrive later via /v1/feedback — so on its own it is a no-op in production and a
+        // disproven answer keeps being served until TTL. This is the half that actually runs.
+        let c = VerifiedCache::new(Duration::from_secs(600), 100);
+        let now = Instant::now();
+        let t = trace(ServedFrom::Attempt, Verdict::Pass);
+        assert!(c.offer(&t, &resp("looked fine"), &ladder(), now));
+        assert!(c.get("t", "hash-abc", &ladder(), now).is_some());
+
+        assert_eq!(c.retract(t.trace_id), 1);
+
+        assert!(
+            c.get("t", "hash-abc", &ladder(), now).is_none(),
+            "an answer whose proof was retracted must stop being replayed immediately"
+        );
+    }
+
+    #[test]
+    fn retracting_an_unrelated_decision_evicts_nothing() {
+        let c = VerifiedCache::new(Duration::from_secs(600), 100);
+        let now = Instant::now();
+        c.offer(
+            &trace(ServedFrom::Attempt, Verdict::Pass),
+            &resp("a"),
+            &ladder(),
+            now,
+        );
+
+        assert_eq!(c.retract(uuid::Uuid::now_v7()), 0);
+        assert!(c.get("t", "hash-abc", &ladder(), now).is_some());
     }
 
     #[test]

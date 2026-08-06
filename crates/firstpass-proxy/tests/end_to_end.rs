@@ -667,3 +667,76 @@ async fn a_verified_answer_is_replayed_with_the_receipt_that_proved_it() {
     // The chain still verifies with a cache receipt in it.
     assert!(verify_chain(&both, GENESIS_HASH).is_ok());
 }
+
+/// A `/v1/feedback` Fail must stop the cache replaying the answer it disproved.
+///
+/// Found in review: the insert-time deferred check can never see a verdict that arrives later, so
+/// on its own it is a no-op in production. This exercises the half that actually runs.
+#[tokio::test]
+async fn a_failing_outcome_stops_the_cache_replaying_that_answer() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy_with(
+        &upstream,
+        &["anthropic/claude-sonnet-5"],
+        "",
+        "[escalation.verified_cache]\nttl_secs = 600\n",
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let ask = || {
+        let (client, proxy) = (client.clone(), proxy.clone());
+        async move {
+            client
+                .post(format!("{proxy}/v1/messages"))
+                .header("x-api-key", "byok-test")
+                .json(&json!({
+                    "model": "claude-sonnet-5",
+                    "max_tokens": 256,
+                    "messages": [{ "role": "user", "content": "write a hello world" }],
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(ask().await.status(), 200);
+    let first = wait_for_traces(&db, 1).await;
+    let proven = first[0].trace_id;
+
+    // Confirm it IS being cached before retracting — otherwise the assertion below could pass
+    // simply because caching never worked.
+    assert_eq!(ask().await.status(), 200);
+    let two = wait_for_traces(&db, 2).await;
+    assert!(
+        two.iter()
+            .any(|t| t.final_.served_from == ServedFrom::Cache),
+        "precondition: the answer must be cached before a retraction can matter"
+    );
+
+    // CI ran the real tests and the answer was wrong after all.
+    let fb = client
+        .post(format!("{proxy}/v1/feedback"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({
+            "trace_id": proven.to_string(),
+            "gate_id": "tests",
+            "verdict": "fail",
+            "reporter": "ci",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fb.status(), 202, "feedback rejected: {:?}", fb.text().await);
+
+    // The next identical request must run the ladder again, not replay the disproven answer.
+    assert_eq!(ask().await.status(), 200);
+    let all = wait_for_traces(&db, 4).await;
+    let latest = all.iter().max_by_key(|t| t.ts).expect("a latest trace");
+    assert_ne!(
+        latest.final_.served_from,
+        ServedFrom::Cache,
+        "an answer whose proof was retracted must not keep being replayed"
+    );
+}

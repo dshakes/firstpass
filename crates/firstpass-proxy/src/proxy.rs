@@ -681,6 +681,21 @@ async fn feedback(
         }
     }
 
+    // A Fail retracts the proof: evict anything the verified cache is replaying on this decision's
+    // authority. Done here rather than only at insert time because deferred verdicts arrive
+    // minutes after the decision — checking the receipt at insert can never see them, so without
+    // this an answer the world has since disproven keeps being served until its TTL expires.
+    if verdict == Verdict::Fail
+        && let Some(cache) = state.verified_cache.as_ref()
+        && let Ok(source) = req.trace_id.parse::<uuid::Uuid>()
+    {
+        let dropped = cache.retract(source);
+        if dropped > 0 {
+            tracing::info!(%source, dropped, "verified cache: retracted a disproven answer");
+            metrics::counter!("firstpass_cache_retractions_total").increment(dropped as u64);
+        }
+    }
+
     // Correctness signal for the online adaptive loop — only a clear Pass/Fail nudges the threshold.
     let feedback_signal = match verdict {
         Verdict::Pass => Some(true),
