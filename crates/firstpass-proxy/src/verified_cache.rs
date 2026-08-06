@@ -342,6 +342,14 @@ impl std::fmt::Debug for RedisStore {
     }
 }
 
+/// How long to wait for Redis at startup before giving up.
+///
+/// Short on purpose: this runs before the listener binds, so every second here is a second the
+/// proxy is not serving. A reachable Redis answers in milliseconds; one that needs ten seconds is
+/// not one to put in the request path.
+#[cfg(feature = "redis-cache")]
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[cfg(feature = "redis-cache")]
 impl RedisStore {
     /// Connect to `url`.
@@ -352,9 +360,45 @@ impl RedisStore {
     /// who configured Redis should be told it is not working.
     pub async fn connect(url: &str, ttl_secs: u64) -> Result<Self, String> {
         let client = redis::Client::open(url).map_err(|e| format!("redis url {url:?}: {e}"))?;
-        let mgr = redis::aio::ConnectionManager::new(client)
+        // Bounded, because `ConnectionManager::new` retries a dead server indefinitely by default
+        // — the proxy simply never finishes starting, with no error and no listening socket. A
+        // hang is the worst of the three outcomes here: an operator can act on a refusal and can
+        // live with a degraded cache, but "startup never returns" looks like a deploy that stalled
+        // for unrelated reasons.
+        let mgr = tokio::time::timeout(CONNECT_TIMEOUT, redis::aio::ConnectionManager::new(client))
             .await
+            .map_err(|_| {
+                format!(
+                    "redis at {url:?} did not answer within {}s. The proxy refuses to start rather \
+                 than run with a cache that silently stays per-replica — check the server is \
+                 reachable, or remove redis_url to use the in-process cache.",
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })?
             .map_err(|e| format!("redis connect {url:?}: {e}"))?;
+
+        // `ConnectionManager::new` connects LAZILY: it returns Ok against a server that is not
+        // running, the proxy logs "shared via redis", binds, and serves with a cache that never
+        // works. That is worse than degrading to per-replica — it is non-functional while
+        // announcing success, which is the exact failure this fail-fast exists to prevent.
+        //
+        // So prove the connection with a real round trip before claiming it.
+        let mut probe = mgr.clone();
+        let pong: Result<String, _> = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            redis::cmd("PING").query_async(&mut probe),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "redis at {url:?} did not answer PING within {}s. Refusing to start rather than \
+                 run with a cache that reports itself as shared and never works — check the \
+                 server is reachable, or remove redis_url to use the in-process cache.",
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })?;
+        pong.map_err(|e| format!("redis at {url:?} rejected PING: {e}"))?;
+
         Ok(Self {
             client: mgr,
             ttl_secs,
