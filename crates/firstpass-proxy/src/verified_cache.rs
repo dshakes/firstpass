@@ -350,6 +350,27 @@ impl std::fmt::Debug for RedisStore {
 #[cfg(feature = "redis-cache")]
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Strip credentials from a Redis URL so it can appear in a log line.
+///
+/// `redis://user:hunter2@cache:6379/0` → `redis://cache:6379/0`. A connect failure has to name the
+/// server or the message is useless for fixing it, and the userinfo is the one part that must not
+/// be named. This module's own `Debug` impl avoids printing the URL for exactly this reason; the
+/// error paths were interpolating it raw, which made that care pointless.
+#[cfg(feature = "redis-cache")]
+#[must_use]
+pub fn redact_redis_url(url: &str) -> String {
+    // Split on the LAST `@` before any path: a password may itself contain `@`, and splitting on
+    // the first would leak the tail of it.
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<malformed redis url>".to_owned();
+    };
+    let host_part = match rest.rfind('@') {
+        Some(i) => &rest[i + 1..],
+        None => rest,
+    };
+    format!("{scheme}://{host_part}")
+}
+
 #[cfg(feature = "redis-cache")]
 impl RedisStore {
     /// Connect to `url`.
@@ -359,7 +380,8 @@ impl RedisStore {
     /// cache that silently degrades to "always miss" looks like the feature is off, and an operator
     /// who configured Redis should be told it is not working.
     pub async fn connect(url: &str, ttl_secs: u64) -> Result<Self, String> {
-        let client = redis::Client::open(url).map_err(|e| format!("redis url {url:?}: {e}"))?;
+        let safe = redact_redis_url(url);
+        let client = redis::Client::open(url).map_err(|e| format!("redis url {safe}: {e}"))?;
         // Bounded, because `ConnectionManager::new` retries a dead server indefinitely by default
         // — the proxy simply never finishes starting, with no error and no listening socket. A
         // hang is the worst of the three outcomes here: an operator can act on a refusal and can
@@ -369,13 +391,13 @@ impl RedisStore {
             .await
             .map_err(|_| {
                 format!(
-                    "redis at {url:?} did not answer within {}s. The proxy refuses to start rather \
+                    "redis at {safe} did not answer within {}s. The proxy refuses to start rather \
                  than run with a cache that silently stays per-replica — check the server is \
                  reachable, or remove redis_url to use the in-process cache.",
                     CONNECT_TIMEOUT.as_secs()
                 )
             })?
-            .map_err(|e| format!("redis connect {url:?}: {e}"))?;
+            .map_err(|e| format!("redis connect {safe}: {e}"))?;
 
         // `ConnectionManager::new` connects LAZILY: it returns Ok against a server that is not
         // running, the proxy logs "shared via redis", binds, and serves with a cache that never
@@ -391,13 +413,13 @@ impl RedisStore {
         .await
         .map_err(|_| {
             format!(
-                "redis at {url:?} did not answer PING within {}s. Refusing to start rather than \
+                "redis at {safe} did not answer PING within {}s. Refusing to start rather than \
                  run with a cache that reports itself as shared and never works — check the \
                  server is reachable, or remove redis_url to use the in-process cache.",
                 CONNECT_TIMEOUT.as_secs()
             )
         })?;
-        pong.map_err(|e| format!("redis at {url:?} rejected PING: {e}"))?;
+        pong.map_err(|e| format!("redis at {safe} rejected PING: {e}"))?;
 
         Ok(Self {
             client: mgr,
@@ -647,6 +669,104 @@ mod tests {
         });
 
         assert!(!c.offer(&t, &resp("looked fine"), &ladder(), now));
+    }
+
+    #[cfg(feature = "redis-cache")]
+    #[test]
+    fn a_redis_url_never_reaches_a_log_line_with_its_password() {
+        // The module's own Debug impl avoids printing the URL for this reason; the error paths
+        // were interpolating it raw, which made that care pointless.
+        assert_eq!(
+            redact_redis_url("redis://user:hunter2@cache:6379/0"),
+            "redis://cache:6379/0"
+        );
+        // A password containing '@' must not leak its tail — split on the LAST '@', not the first.
+        assert_eq!(
+            redact_redis_url("redis://user:p@ss@cache:6379/0"),
+            "redis://cache:6379/0"
+        );
+        assert_eq!(
+            redact_redis_url("redis://cache:6379/0"),
+            "redis://cache:6379/0"
+        );
+        assert_eq!(redact_redis_url("rediss://u:p@h:6380"), "rediss://h:6380");
+        assert_eq!(redact_redis_url("nonsense"), "<malformed redis url>");
+
+        for u in [
+            "redis://user:hunter2@cache:6379/0",
+            "redis://user:p@ss@cache:6379/0",
+        ] {
+            let out = redact_redis_url(u);
+            assert!(!out.contains("hunter2"), "{out}");
+            assert!(!out.contains("p@ss"), "{out}");
+            assert!(!out.contains("user"), "{out}");
+        }
+    }
+
+    /// Exercise the real Redis backend.
+    ///
+    /// Requires a reachable server at `FIRSTPASS_TEST_REDIS`. **Absent, this fails rather than
+    /// skipping**: a suite that quietly passes when its subject is unavailable reports green while
+    /// testing nothing, which is how this repo's `provider-smoke` job once read as verified.
+    #[cfg(feature = "redis-cache")]
+    #[tokio::test]
+    async fn redis_store_round_trips_and_retracts() {
+        let url = std::env::var("FIRSTPASS_TEST_REDIS").unwrap_or_else(|_| {
+            panic!(
+                "set FIRSTPASS_TEST_REDIS (e.g. redis://127.0.0.1:6379/15) to run the redis-cache \
+                 tests. Not skipped on purpose: a green suite that tested nothing is worse than a \
+                 red one."
+            )
+        });
+        let store = RedisStore::connect(&url, 60).await.expect("connect");
+
+        let t = trace(ServedFrom::Attempt, Verdict::Pass);
+        let k = VerifiedCache::compose_key("t", &format!("h-{}", t.trace_id), &ladder());
+        let now = Instant::now();
+        let entry = Entry::new(resp("shared answer"), &t, now);
+
+        store.put(&k, t.trace_id, entry, now).await;
+        let got = store
+            .get(&k, now)
+            .await
+            .expect("entry crossed the boundary");
+        assert_eq!(got.response.text, "shared answer");
+        // The PROOF is what has to survive; a replay's receipt is built from it.
+        assert_eq!(got.source, t.trace_id);
+
+        // Retraction must work through the source index, since feedback names a decision, not a key.
+        assert_eq!(store.retract(t.trace_id).await, 1);
+        assert!(
+            store.get(&k, now).await.is_none(),
+            "a retracted answer must stop being replayable in the SHARED store too"
+        );
+    }
+
+    #[cfg(feature = "redis-cache")]
+    #[tokio::test]
+    async fn redis_store_isolates_tenants() {
+        // The cross-tenant leak found in review must not reappear through the shared surface.
+        let url = std::env::var("FIRSTPASS_TEST_REDIS")
+            .expect("set FIRSTPASS_TEST_REDIS to run the redis-cache tests");
+        let store = RedisStore::connect(&url, 60).await.expect("connect");
+
+        let mut t = trace(ServedFrom::Attempt, Verdict::Pass);
+        t.tenant_id = "tenant-a".to_owned();
+        let hash = format!("iso-{}", t.trace_id);
+        let ka = VerifiedCache::compose_key("tenant-a", &hash, &ladder());
+        let kb = VerifiedCache::compose_key("tenant-b", &hash, &ladder());
+        let now = Instant::now();
+
+        store
+            .put(&ka, t.trace_id, Entry::new(resp("a"), &t, now), now)
+            .await;
+
+        assert!(
+            store.get(&kb, now).await.is_none(),
+            "cross-tenant replay is a data leak"
+        );
+        assert!(store.get(&ka, now).await.is_some());
+        store.retract(t.trace_id).await;
     }
 
     #[tokio::test]
