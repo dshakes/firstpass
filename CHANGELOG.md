@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.6.0]
+
+One feature: the verified cache can be shared across replicas, which is what makes Firstpass
+deployable behind a load balancer rather than on a single instance.
+
+### Added: a Redis-backed verified cache
+
+`[escalation.verified_cache] redis_url`, behind a `redis-cache` build feature that is off by
+default.
+
+In-process was a deliberate choice and it holds for one instance. Behind N replicas it does not:
+the same answer is cached N times over, the hit rate drops roughly by N, and — the part that
+actually matters — a **retraction reaches only the replica that received the feedback**, leaving
+the other N-1 serving an answer the world has disproven.
+
+```toml
+[escalation.verified_cache]
+ttl_secs  = 900
+redis_url = "redis://cache:6379/0"
+```
+
+Design points that carry weight:
+
+- **Expiry is Redis's own TTL**, not a timestamp comparison. Two replicas comparing monotonic
+  clocks would disagree about what is stale.
+- **A `fp:vc:src:<uuid>` index** maps a decision to the entries it proved, so a retraction naming a
+  decision can find them. Given the same TTL, so the index cannot outlive what it points at.
+- **No local caching of shared reads.** A stale local copy would survive a retraction issued
+  elsewhere — precisely what this exists to prevent.
+- **`is_cacheable` is the single place the pass-only rules live**, so an in-process and a shared
+  store cannot disagree about what was proven. A disagreement there would be silent: an unverified
+  answer served from cache looks exactly like a verified one.
+- **Startup fails loudly.** A `redis_url` set without the feature, or a server that does not answer
+  a PING within 5s, refuses to start. `ConnectionManager` connects lazily, so without the PING the
+  proxy would announce "shared via redis" and serve a cache that never works.
+- **Connection errors name the host, never the credentials.** A Redis URL carries
+  `user:password@`, and every error path redacts it before it reaches a log line.
+
+### Breaking for `firstpass-proxy` library consumers only — not for the proxy
+
+Config, receipts, and wire APIs are unchanged; an existing `firstpass.toml` needs no edit and
+existing receipts re-derive the same hash. But `AppState.verified_cache` is now
+`Option<Arc<dyn CacheStore>>` rather than a concrete type, and `build_verified_cache` is `async`
+and returns `Result`. Code constructing `AppState` directly or calling that builder must `.await?`
+it.
+
 ## [0.5.0]
 
 Three additions that each close a gap against the rest of the router category, plus one the category
