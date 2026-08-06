@@ -716,11 +716,25 @@ async fn a_failing_outcome_stops_the_cache_replaying_that_answer() {
     );
 
     // CI ran the real tests and the answer was wrong after all.
+    //
+    // Reported against the REPLAY's trace id, not the original decision's — which is what a real
+    // caller does, because the replay is the response it received. A retraction keyed only on the
+    // reported id would match nothing here (a hit is logged under a new trace id), and the
+    // disproven answer would keep serving until TTL. Found in review.
+    let replay_id = two
+        .iter()
+        .find(|t| t.final_.served_from == ServedFrom::Cache)
+        .map(|t| t.trace_id)
+        .expect("a cache replay");
+    assert_ne!(
+        replay_id, proven,
+        "a replay is logged under its own trace id"
+    );
     let fb = client
         .post(format!("{proxy}/v1/feedback"))
         .header("x-api-key", "byok-test")
         .json(&json!({
-            "trace_id": proven.to_string(),
+            "trace_id": replay_id.to_string(),
             "gate_id": "tests",
             "verdict": "fail",
             "reporter": "ci",

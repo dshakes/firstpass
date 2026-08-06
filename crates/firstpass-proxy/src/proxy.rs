@@ -687,11 +687,33 @@ async fn feedback(
     // this an answer the world has since disproven keeps being served until its TTL expires.
     if verdict == Verdict::Fail
         && let Some(cache) = state.verified_cache.as_ref()
-        && let Ok(source) = req.trace_id.parse::<uuid::Uuid>()
     {
-        let dropped = cache.retract(source);
+        // Two ids can need retracting, and using only the reported one is a hole: a cache HIT is
+        // recorded under a NEW trace id, so an outcome reported against a replayed answer would
+        // retract nothing and the disproven entry would keep serving until TTL. When the reported
+        // trace is itself a replay, the entry is keyed by the decision it was proven by.
+        let reported = req.trace_id.parse::<uuid::Uuid>().ok();
+        let origin = {
+            let (d, t, i) = (db.clone(), tenant.clone(), req.trace_id.clone());
+            tokio::task::spawn_blocking(move || store::trace_cache_source(&d, &t, &i))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+                .flatten()
+        };
+        let dropped: usize = reported
+            .into_iter()
+            .chain(origin)
+            .map(|id| cache.retract(id))
+            .sum();
         if dropped > 0 {
-            tracing::info!(%source, dropped, "verified cache: retracted a disproven answer");
+            tracing::info!(
+                trace = %req.trace_id,
+                ?origin,
+                dropped,
+                "verified cache: retracted a disproven answer"
+            );
             metrics::counter!("firstpass_cache_retractions_total").increment(dropped as u64);
         }
     }

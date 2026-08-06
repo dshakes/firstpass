@@ -410,6 +410,37 @@ pub fn trace_exists(
 ///
 /// # Errors
 /// On a store read failure.
+/// The decision a trace's answer was originally proven by, if it was itself a cache replay.
+///
+/// A cache hit is recorded under a NEW trace id, with `cache_source` naming the decision whose gate
+/// passed. So feedback arriving on a replay must be applied to that source, not to the replay's own
+/// id — otherwise a Fail reported against a replayed answer retracts nothing and the disproven
+/// entry keeps serving until TTL.
+///
+/// Returns `Ok(None)` for an unknown trace, `Ok(Some(None))` for one that ran the ladder itself.
+///
+/// # Errors
+/// [`StoreError`] when the database cannot be opened or queried.
+pub fn trace_cache_source(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+    trace_id: &str,
+) -> Result<Option<Option<uuid::Uuid>>, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let body: Option<String> = conn
+        .query_row(
+            "SELECT body FROM traces WHERE tenant = ?1 AND trace_id = ?2",
+            [tenant, trace_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(body.map(|b: String| {
+        serde_json::from_str::<firstpass_core::Trace>(&b)
+            .ok()
+            .and_then(|t| t.final_.cache_source)
+    }))
+}
+
 pub fn trace_route(
     db_path: impl AsRef<Path>,
     tenant: &str,
