@@ -35,7 +35,7 @@ use firstpass_core::{ServedFrom, Trace, Verdict};
 use crate::provider::ModelResponse;
 
 /// An answer that passed, kept for replay.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     /// The response that was served.
     ///
@@ -48,7 +48,12 @@ pub struct Entry {
     pub source: uuid::Uuid,
     /// What that decision cost, so a replay can report the spend it avoided rather than guess.
     pub original_cost_usd: f64,
-    /// Insert time, for TTL.
+    /// Insert time, for the in-process store's TTL.
+    ///
+    /// Skipped on the wire and re-stamped on read: an `Instant` is meaningless in another process,
+    /// and expiry in the shared store is Redis's own TTL rather than a timestamp we compare. Two
+    /// replicas comparing monotonic clocks would disagree about what is stale.
+    #[serde(skip, default = "Instant::now")]
     stored: Instant,
 }
 
@@ -61,6 +66,31 @@ pub struct Entry {
 /// entirely normal.
 fn key(tenant: &str, prompt_hash: &str, ladder: &[String]) -> String {
     format!("{tenant}|{prompt_hash}|{}", ladder.join(">"))
+}
+
+/// Where verified entries live.
+///
+/// Exists so the in-process store stays exactly what it was — the version four review rounds
+/// hardened — while a shared L2 can sit behind it. A single-instance deployment keeps byte-identical
+/// behaviour and no Redis dependency; a multi-replica one gets entries and, critically,
+/// **retractions** that cross process boundaries.
+///
+/// Async because an L2 is a network hop. Blocking one inside an async proxy would stall the runtime
+/// on a cache lookup, which is precisely the wrong place to lose latency.
+#[async_trait::async_trait]
+pub trait CacheStore: Send + Sync + std::fmt::Debug {
+    /// Fetch a live entry, if one exists.
+    async fn get(&self, key: &str, now: Instant) -> Option<Entry>;
+    /// Store an entry under `key`, proven by `source`.
+    ///
+    /// `source` is passed separately because a backend has to index by it: retraction arrives
+    /// naming a decision, not a key, and one decision can back several keys once the same prompt
+    /// is seen under more than one ladder.
+    async fn put(&self, key: &str, source: uuid::Uuid, entry: Entry, now: Instant);
+    /// Drop every entry proven by `source`. Returns how many went.
+    async fn retract(&self, source: uuid::Uuid) -> usize;
+    /// Entries currently held, for tests and `/metrics`.
+    async fn entry_count(&self) -> usize;
 }
 
 /// A bounded, in-process store of verified answers.
@@ -179,6 +209,44 @@ impl VerifiedCache {
         true
     }
 
+    /// Fetch by a pre-built key. The key-level primitive behind [`CacheStore`]; the
+    /// tenant/prompt/ladder composition lives in [`key`] so both stores agree on it.
+    #[must_use]
+    pub fn get_by_key(&self, key: &str, now: Instant) -> Option<Entry> {
+        let Ok(map) = self.entries.lock() else {
+            return None;
+        };
+        map.get(key)
+            .filter(|e| now.duration_since(e.stored) < self.ttl)
+            .cloned()
+    }
+
+    /// Store by a pre-built key, applying the same bound as `offer`.
+    pub fn put_by_key(&self, key: &str, entry: Entry) {
+        let Ok(mut map) = self.entries.lock() else {
+            return;
+        };
+        let now = entry.stored;
+        if map.len() >= self.max_entries {
+            map.retain(|_, e| now.duration_since(e.stored) < self.ttl);
+            if map.len() >= self.max_entries {
+                let mut by_age: Vec<(String, Instant)> =
+                    map.iter().map(|(k, e)| (k.clone(), e.stored)).collect();
+                by_age.sort_by_key(|(_, t)| *t);
+                for (k, _) in by_age.into_iter().take(self.max_entries.max(2) / 2) {
+                    map.remove(&k);
+                }
+            }
+        }
+        map.insert(key.to_owned(), entry);
+    }
+
+    /// Compose the key both stores use, so an entry written by one is found by the other.
+    #[must_use]
+    pub fn compose_key(tenant: &str, prompt_hash: &str, ladder: &[String]) -> String {
+        key(tenant, prompt_hash, ladder)
+    }
+
     /// Evict every entry proven by `source`, because that proof has been retracted.
     ///
     /// Called when a deferred gate or downstream outcome reports a Fail for a decision. Without
@@ -208,6 +276,170 @@ impl VerifiedCache {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[async_trait::async_trait]
+impl CacheStore for VerifiedCache {
+    // Delegates to the existing synchronous methods rather than reimplementing them. The
+    // in-process path is the one four review rounds hardened — a parallel async copy would be free
+    // to drift on exactly the rules that keep an unproven answer out.
+    async fn get(&self, key: &str, now: Instant) -> Option<Entry> {
+        self.get_by_key(key, now)
+    }
+
+    async fn put(&self, key: &str, _source: uuid::Uuid, entry: Entry, _now: Instant) {
+        self.put_by_key(key, entry);
+    }
+
+    async fn retract(&self, source: uuid::Uuid) -> usize {
+        Self::retract(self, source)
+    }
+
+    async fn entry_count(&self) -> usize {
+        Self::len(self)
+    }
+}
+
+/// A Redis-backed L2, so entries and retractions cross process boundaries.
+///
+/// Enabled by the `redis-cache` feature and a `redis_url`. Without it the cache is per-replica:
+/// behind N instances a session's answer is cached N times over and the hit rate drops roughly by
+/// N. Worse, a retraction only reaches the replica that received the feedback — the other N-1 keep
+/// serving an answer the world has disproven, which is the multi-instance form of the bug this
+/// module already had once.
+///
+/// ## Keys
+///
+/// - `fp:vc:<key>` → the serialized entry, with a Redis TTL so expiry is the server's job rather
+///   than ours. A manual sweep across replicas would race; `SETEX` does not.
+/// - `fp:vc:src:<uuid>` → a SET of the entry keys that decision proved, so `retract` can find them.
+///   Given the same TTL, so the index cannot outlive what it points at and leak.
+///
+/// ## What it deliberately does not do
+///
+/// No local caching of L2 reads. A stale local copy would survive a retraction issued on another
+/// replica — exactly the failure this exists to prevent — and a cache that can serve a disproven
+/// answer is worse than no cache in a product whose claim is that it does not.
+#[cfg(feature = "redis-cache")]
+pub struct RedisStore {
+    client: redis::aio::ConnectionManager,
+    ttl_secs: u64,
+}
+
+// Hand-written: `ConnectionManager` is not `Debug`, and printing it would risk putting a
+// credential-bearing URL into a log line anyway.
+#[cfg(feature = "redis-cache")]
+impl std::fmt::Debug for RedisStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisStore")
+            .field("ttl_secs", &self.ttl_secs)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "redis-cache")]
+impl RedisStore {
+    /// Connect to `url`.
+    ///
+    /// # Errors
+    /// A malformed URL or an unreachable server. Surfaced at startup rather than swallowed: a
+    /// cache that silently degrades to "always miss" looks like the feature is off, and an operator
+    /// who configured Redis should be told it is not working.
+    pub async fn connect(url: &str, ttl_secs: u64) -> Result<Self, String> {
+        let client = redis::Client::open(url).map_err(|e| format!("redis url {url:?}: {e}"))?;
+        let mgr = redis::aio::ConnectionManager::new(client)
+            .await
+            .map_err(|e| format!("redis connect {url:?}: {e}"))?;
+        Ok(Self {
+            client: mgr,
+            ttl_secs,
+        })
+    }
+
+    fn entry_key(key: &str) -> String {
+        format!("fp:vc:{key}")
+    }
+
+    fn source_key(source: uuid::Uuid) -> String {
+        format!("fp:vc:src:{source}")
+    }
+}
+
+#[cfg(feature = "redis-cache")]
+#[async_trait::async_trait]
+impl CacheStore for RedisStore {
+    async fn get(&self, key: &str, _now: Instant) -> Option<Entry> {
+        let mut c = self.client.clone();
+        let raw: Option<String> = redis::cmd("GET")
+            .arg(Self::entry_key(key))
+            .query_async(&mut c)
+            .await
+            .ok()?;
+        // A malformed value is treated as a miss rather than an error: the request simply runs the
+        // ladder, which is always safe. Failing the request because a cache entry did not
+        // deserialize would turn an optimisation into an outage.
+        serde_json::from_str(&raw?).ok()
+    }
+
+    async fn put(&self, key: &str, source: uuid::Uuid, entry: Entry, _now: Instant) {
+        let Ok(body) = serde_json::to_string(&entry) else {
+            return;
+        };
+        let mut c = self.client.clone();
+        let ek = Self::entry_key(key);
+        // Pipelined, not transactional: if the index write is lost the entry becomes unretractable
+        // until TTL, so the TTL is the backstop that bounds that window. A MULTI would remove the
+        // race but not the failure mode, and the entry TTL already caps the exposure.
+        let _: Result<(), _> = redis::pipe()
+            .cmd("SETEX")
+            .arg(&ek)
+            .arg(self.ttl_secs)
+            .arg(body)
+            .ignore()
+            .cmd("SADD")
+            .arg(Self::source_key(source))
+            .arg(&ek)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(Self::source_key(source))
+            .arg(self.ttl_secs)
+            .ignore()
+            .query_async::<()>(&mut c)
+            .await;
+    }
+
+    async fn retract(&self, source: uuid::Uuid) -> usize {
+        let mut c = self.client.clone();
+        let sk = Self::source_key(source);
+        let keys: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(&sk)
+            .query_async(&mut c)
+            .await
+            .unwrap_or_default();
+        if keys.is_empty() {
+            return 0;
+        }
+        let n: usize = redis::cmd("DEL")
+            .arg(&keys)
+            .query_async(&mut c)
+            .await
+            .unwrap_or(0);
+        let _: Result<(), _> = redis::cmd("DEL").arg(&sk).query_async(&mut c).await;
+        n
+    }
+
+    async fn entry_count(&self) -> usize {
+        let mut c = self.client.clone();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg("fp:vc:*")
+            .query_async(&mut c)
+            .await
+            .unwrap_or_default();
+        // ponytail: KEYS is O(n) and blocks Redis; acceptable because this is only read by
+        // /metrics and tests, never on the request path. Switch to SCAN if it is ever called
+        // per-request.
+        keys.iter().filter(|k| !k.starts_with("fp:vc:src:")).count()
     }
 }
 
@@ -367,6 +599,56 @@ mod tests {
         });
 
         assert!(!c.offer(&t, &resp("looked fine"), &ladder(), now));
+    }
+
+    #[tokio::test]
+    async fn the_trait_and_the_concrete_api_agree_on_keys() {
+        // The two stores must compose the key identically or a multi-replica deployment silently
+        // never hits: one writes under a key the other never looks up, and the only symptom is a
+        // hit rate that quietly stays at zero.
+        let c = VerifiedCache::new(Duration::from_secs(60), 100);
+        let now = Instant::now();
+        let t = trace(ServedFrom::Attempt, Verdict::Pass);
+        assert!(c.offer(&t, &resp("via offer"), &ladder(), now));
+
+        let k = VerifiedCache::compose_key("t", "hash-abc", &ladder());
+        let via_trait = CacheStore::get(&c, &k, now)
+            .await
+            .expect("trait sees offer's entry");
+        assert_eq!(via_trait.response.text, "via offer");
+    }
+
+    #[tokio::test]
+    async fn the_trait_path_still_isolates_tenants() {
+        // The leak found in review must not reappear through the new surface: `compose_key` is the
+        // single place the tenant enters, and both stores go through it.
+        let a = VerifiedCache::compose_key("tenant-a", "h", &ladder());
+        let b = VerifiedCache::compose_key("tenant-b", "h", &ladder());
+        assert_ne!(a, b, "tenant must be part of the key on the trait path too");
+        assert!(a.starts_with("tenant-a|"), "{a}");
+    }
+
+    #[tokio::test]
+    async fn an_entry_survives_a_serde_round_trip_without_its_local_clock() {
+        // Redis carries entries between processes, where an Instant is meaningless. The proof
+        // (source) and the answer must survive; `stored` is re-stamped, and expiry there is
+        // Redis's TTL rather than a comparison of two machines' monotonic clocks.
+        let e = Entry {
+            response: resp("answer"),
+            source: uuid::Uuid::now_v7(),
+            original_cost_usd: 0.01,
+            stored: Instant::now(),
+        };
+        let wire = serde_json::to_string(&e).expect("serializes");
+        assert!(
+            !wire.contains("stored"),
+            "a local Instant must not go on the wire: {wire}"
+        );
+
+        let back: Entry = serde_json::from_str(&wire).expect("deserializes");
+        assert_eq!(back.response.text, "answer");
+        assert_eq!(back.source, e.source, "the PROOF must survive the crossing");
+        assert!((back.original_cost_usd - 0.01).abs() < f64::EPSILON);
     }
 
     #[test]
