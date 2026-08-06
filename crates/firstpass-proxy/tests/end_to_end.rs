@@ -186,6 +186,7 @@ async fn spawn_proxy_with(
     );
     let (traces, _writer) = store::open(&db_path).unwrap();
     let promoter = firstpass_proxy::proxy::build_promoter(&config).unwrap();
+    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config);
     let state = AppState {
         config: Arc::new(config),
         http: reqwest::Client::new(),
@@ -197,6 +198,7 @@ async fn spawn_proxy_with(
         adaptive: None,
         bandit: None,
         promoter,
+        verified_cache,
         predictor: None,
         tenant_rate_limiter: None,
         spill: None,
@@ -584,5 +586,171 @@ async fn a_responses_receipt_names_the_api_the_client_actually_called() {
     assert_eq!(
         traces[0].request.api, "openai.responses",
         "an audit record that misnames the API cannot be reconciled against the client's logs"
+    );
+}
+
+/// The verified cache, end to end over real HTTP.
+///
+/// This is the wiring test, and it exists because a module with passing unit tests and no caller is
+/// exactly the defect this release already had to fix once. The assertions that matter are not
+/// "the cache works" but "the second request never reached the provider, and its receipt names the
+/// decision that proved the answer".
+#[tokio::test]
+async fn a_verified_answer_is_replayed_with_the_receipt_that_proved_it() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy_with(
+        &upstream,
+        &["anthropic/claude-sonnet-5"],
+        "",
+        "[escalation.verified_cache]\nttl_secs = 300\n",
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let send = || {
+        let (client, proxy) = (client.clone(), proxy.clone());
+        async move {
+            client
+                .post(format!("{proxy}/v1/messages"))
+                .header("x-api-key", "byok-test")
+                .json(&json!({
+                    "model": "claude-sonnet-5",
+                    "max_tokens": 256,
+                    "messages": [{ "role": "user", "content": "write a hello world" }],
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Turn 1: runs the ladder, passes the gate, and is cached.
+    let first = send().await;
+    assert_eq!(first.status(), 200);
+    let first_body: Value = first.json().await.unwrap();
+    assert_eq!(first_body["content"][0]["text"], "fn main() {} // compiles");
+
+    let one = wait_for_traces(&db, 1).await;
+    assert_eq!(one[0].final_.served_from, ServedFrom::Attempt);
+    assert!(one[0].final_.cache_source.is_none());
+
+    // Turn 2: identical prompt. Must be replayed, not re-routed.
+    let second = send().await;
+    assert_eq!(second.status(), 200);
+    let second_body: Value = second.json().await.unwrap();
+    assert_eq!(
+        second_body["content"][0]["text"], "fn main() {} // compiles",
+        "the replay must be the same answer"
+    );
+
+    let both = wait_for_traces(&db, 2).await;
+    let hit = both
+        .iter()
+        .find(|t| t.final_.served_from == ServedFrom::Cache)
+        .expect("second request should have been served from cache");
+
+    // No model was called and no gate ran today — synthesizing an attempt here would claim a
+    // verification that did not happen and inflate every rate computed over receipts.
+    assert!(hit.attempts.is_empty(), "{:?}", hit.attempts);
+    // What makes the serve defensible: the receipt NAMES the decision whose gate passed.
+    assert_eq!(
+        hit.final_.cache_source,
+        Some(one[0].trace_id),
+        "a hit must link to the decision that proved it, not merely say 'cached'"
+    );
+    assert_eq!(hit.final_.total_cost_usd, 0.0, "a replay spends nothing");
+    assert!(
+        hit.final_.savings_usd > 0.0,
+        "and the saving is the avoided call"
+    );
+
+    // The chain still verifies with a cache receipt in it.
+    assert!(verify_chain(&both, GENESIS_HASH).is_ok());
+}
+
+/// A `/v1/feedback` Fail must stop the cache replaying the answer it disproved.
+///
+/// Found in review: the insert-time deferred check can never see a verdict that arrives later, so
+/// on its own it is a no-op in production. This exercises the half that actually runs.
+#[tokio::test]
+async fn a_failing_outcome_stops_the_cache_replaying_that_answer() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy_with(
+        &upstream,
+        &["anthropic/claude-sonnet-5"],
+        "",
+        "[escalation.verified_cache]\nttl_secs = 600\n",
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let ask = || {
+        let (client, proxy) = (client.clone(), proxy.clone());
+        async move {
+            client
+                .post(format!("{proxy}/v1/messages"))
+                .header("x-api-key", "byok-test")
+                .json(&json!({
+                    "model": "claude-sonnet-5",
+                    "max_tokens": 256,
+                    "messages": [{ "role": "user", "content": "write a hello world" }],
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(ask().await.status(), 200);
+    let first = wait_for_traces(&db, 1).await;
+    let proven = first[0].trace_id;
+
+    // Confirm it IS being cached before retracting — otherwise the assertion below could pass
+    // simply because caching never worked.
+    assert_eq!(ask().await.status(), 200);
+    let two = wait_for_traces(&db, 2).await;
+    assert!(
+        two.iter()
+            .any(|t| t.final_.served_from == ServedFrom::Cache),
+        "precondition: the answer must be cached before a retraction can matter"
+    );
+
+    // CI ran the real tests and the answer was wrong after all.
+    //
+    // Reported against the REPLAY's trace id, not the original decision's — which is what a real
+    // caller does, because the replay is the response it received. A retraction keyed only on the
+    // reported id would match nothing here (a hit is logged under a new trace id), and the
+    // disproven answer would keep serving until TTL. Found in review.
+    let replay_id = two
+        .iter()
+        .find(|t| t.final_.served_from == ServedFrom::Cache)
+        .map(|t| t.trace_id)
+        .expect("a cache replay");
+    assert_ne!(
+        replay_id, proven,
+        "a replay is logged under its own trace id"
+    );
+    let fb = client
+        .post(format!("{proxy}/v1/feedback"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({
+            "trace_id": replay_id.to_string(),
+            "gate_id": "tests",
+            "verdict": "fail",
+            "reporter": "ci",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fb.status(), 202, "feedback rejected: {:?}", fb.text().await);
+
+    // The next identical request must run the ladder again, not replay the disproven answer.
+    assert_eq!(ask().await.status(), 200);
+    let all = wait_for_traces(&db, 4).await;
+    let latest = all.iter().max_by_key(|t| t.ts).expect("a latest trace");
+    assert_ne!(
+        latest.final_.served_from,
+        ServedFrom::Cache,
+        "an answer whose proof was retracted must not keep being replayed"
     );
 }

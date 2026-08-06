@@ -340,6 +340,7 @@ async fn spawn(toml: &str, db: &Path) -> Result<(String, tokio::task::JoinHandle
         traces,
         adaptive: None,
         promoter: None,
+        verified_cache: None,
         bandit: None,
         predictor: None,
         tenant_rate_limiter: None,

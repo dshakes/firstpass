@@ -570,6 +570,15 @@ pub struct Escalation {
     /// prefix for nothing.
     #[serde(default)]
     pub prompt_cache: bool,
+    /// Replay a previously **verified** answer for an identical prompt, skipping the ladder
+    /// entirely. `None` (default) = every request runs the ladder, byte-identical to today.
+    ///
+    /// Unlike an ordinary response cache, an entry is written only when the receipt shows the
+    /// request was served on a passing verdict — so a hit cannot serve something that was never
+    /// proven. The receipt records `served_from: cache` and `cache_source`, naming the decision
+    /// whose gate passed.
+    #[serde(default)]
+    pub verified_cache: Option<VerifiedCacheConfig>,
     /// Speculative-deferral band: when set (and the bandit has a warm gate-pass estimate for
     /// the chosen start rung), speculative prefetch fires **only** when that estimate falls
     /// inside `[low, high]` — the marginal zone where the next rung is *probably but not
@@ -739,6 +748,29 @@ const fn default_condense_keep_tail() -> usize {
     6
 }
 
+/// Verified-response cache (§8.4). See [`Escalation::verified_cache`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedCacheConfig {
+    /// How long a proven answer stays replayable.
+    ///
+    /// A proof has a shelf life: the model, the gate, and the world all move. Short by default
+    /// because replaying a stale answer confidently is worse than paying to re-derive it.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Hard cap on entries; oldest evicted first.
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+}
+
+const fn default_cache_ttl_secs() -> u64 {
+    15 * 60
+}
+
+const fn default_cache_max_entries() -> usize {
+    10_000
+}
+
 /// Config for the UCB1 start-rung bandit (`firstpass_proxy::bandit::StartRungBandit`).
 ///
 /// Absent (`None`) → start every request at rung 0 (byte-identical to today).
@@ -812,6 +844,7 @@ impl Default for Escalation {
             bandit: None,
             condense: None,
             prompt_cache: false,
+            verified_cache: None,
             exploration: None,
             probe: None,
             predictor: None,
