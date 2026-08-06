@@ -48,7 +48,38 @@ SOURCES = {
         "config": "default",
         "split": "test",
     },
+    # Structured extraction, for the non-coding domain proof. SQuAD v2 is used because its answers
+    # are EXACT SPANS of the context with published ground truth — so the oracle is a string
+    # comparison against a human label, not a model judging a model. That matters more here than
+    # richness: a domain proof whose oracle is itself an LLM proves nothing about LLM reliability.
+    #
+    # Unanswerable questions are filtered out below. They are a real and interesting case, but
+    # "correctly declining to answer" needs its own gate semantics, and mixing it in would make a
+    # single accuracy number mean two different things.
+    "extraction": {
+        "dataset": "rajpurkar/squad_v2",
+        "config": "squad_v2",
+        "split": "validation",
+    },
 }
+
+
+def to_extraction(row: dict) -> dict | None:
+    """Reshape a SQuAD row into the extraction schema `load_extraction_jsonl` reads.
+
+    Returns None for a row with no answer — see the note on unanswerables above.
+    """
+    answers = (row.get("answers") or {}).get("text") or []
+    if not answers:
+        return None
+    # SQuAD lists several annotator spellings; the first is the canonical one and the only one the
+    # oracle checks. Accepting any of them would be a more forgiving oracle than the label implies.
+    return {
+        "id": row.get("id"),
+        "text": f"{row.get('context', '')}\n\nQuestion: {row.get('question', '')}",
+        "required": ["answer"],
+        "expected": {"answer": answers[0]},
+    }
 
 
 def swebench_image(instance_id: str) -> str:
@@ -97,7 +128,12 @@ def write_out(path: str, kept: list[dict], src: dict, split: str, filt: str, sca
                 "filter": filt,
                 "scanned": scanned,
                 "kept": len(kept),
-                "task_ids": [t.get("task_id", t.get("instance_id")) for t in kept],
+                # Each dataset names its id differently; extraction rows use `id`. Falling through
+                # all three keeps the manifest a real record of WHICH rows were used rather than a
+                # list of nulls that looks like provenance without being any.
+                "task_ids": [
+                    t.get("task_id") or t.get("instance_id") or t.get("id") for t in kept
+                ],
             },
             f,
             indent=2,
@@ -130,6 +166,30 @@ def main() -> int:
 
     # MBPP is plain stdlib Python by construction, and its rows carry `test_list` rather than a
     # unittest class, so the lib filter neither applies nor is needed.
+    if args.dataset == "extraction":
+        # Rows are reshaped, and unanswerable ones dropped, so `scanned` and `kept` differ — the
+        # manifest records both, because a subset is only honest when it names what was left out.
+        kept, scanned = [], 0
+        while len(kept) < args.limit:
+            rows = fetch_page(src, split, scanned, PAGE)
+            if not rows:
+                break
+            scanned += len(rows)
+            for row in rows:
+                rec = to_extraction(row)
+                if rec is not None and len(kept) < args.limit:
+                    kept.append(rec)
+        write_out(
+            args.out,
+            kept,
+            src,
+            split,
+            "answerable questions only (unanswerable rows dropped: declining needs its own gate)",
+            scanned,
+        )
+        print(f"wrote {len(kept)} extraction tasks to {args.out} (scanned {scanned})")
+        return 0
+
     if args.dataset == "swebench":
         kept, scanned = [], 0
         while scanned < args.limit:
