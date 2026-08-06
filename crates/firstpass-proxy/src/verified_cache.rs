@@ -35,7 +35,7 @@ use firstpass_core::{ServedFrom, Trace, Verdict};
 use crate::provider::ModelResponse;
 
 /// An answer that passed, kept for replay.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     /// The response that was served.
     ///
@@ -48,8 +48,66 @@ pub struct Entry {
     pub source: uuid::Uuid,
     /// What that decision cost, so a replay can report the spend it avoided rather than guess.
     pub original_cost_usd: f64,
-    /// Insert time, for TTL.
+    /// Insert time, for the in-process store's TTL.
+    ///
+    /// Skipped on the wire and re-stamped on read: an `Instant` is meaningless in another process,
+    /// and expiry in the shared store is Redis's own TTL rather than a timestamp we compare. Two
+    /// replicas comparing monotonic clocks would disagree about what is stale.
+    #[serde(skip, default = "Instant::now")]
     stored: Instant,
+}
+
+/// Whether a finished decision may be cached at all.
+///
+/// **The single place these rules live.** They were duplicated nowhere and must stay that way: a
+/// second backend re-deriving "was this proven?" from its own reading of the receipt is how one of
+/// them eventually accepts something the other would reject, and the failure is silent — an
+/// unverified answer served from cache looks exactly like a verified one.
+///
+/// Rejects, in order:
+/// 1. **Not served from a real attempt.** `BestAttempt` is the budget-exhausted fallback, served
+///    *without* a passing verdict; caching it would replay an answer that never passed anything.
+/// 2. **A cache hit.** Harmless in itself, but it would relocate `cache_source` onto a replay
+///    rather than the decision that ran a gate, letting the provenance chain go a hop stale.
+/// 3. **A verdict that is not an unambiguous Pass.** An `Abstain` is "the gate could not tell",
+///    which is precisely the state that must never be frozen and replayed.
+/// 4. **A deferred Fail already on the receipt.** Rarely the path that matters — deferred verdicts
+///    usually arrive later via `/v1/feedback`, which is what `retract` handles — but free to check.
+#[must_use]
+pub fn is_cacheable(trace: &Trace) -> bool {
+    if trace.final_.served_from != ServedFrom::Attempt {
+        return false;
+    }
+    if trace.final_.cache_source.is_some() {
+        return false;
+    }
+    let Some(served) = trace.final_.served_rung else {
+        return false;
+    };
+    if !trace
+        .attempts
+        .iter()
+        .any(|a| a.rung == served && a.verdict == Verdict::Pass)
+    {
+        return false;
+    }
+    !trace.deferred.iter().any(|d| d.verdict == Verdict::Fail)
+}
+
+impl Entry {
+    /// Build an entry from a decision and what it served.
+    ///
+    /// Takes the proof off the trace rather than as a parameter, for the same reason the tenant is
+    /// read off the receipt: a call site cannot then file an answer under the wrong decision.
+    #[must_use]
+    pub fn new(response: ModelResponse, trace: &Trace, now: Instant) -> Self {
+        Self {
+            response,
+            source: trace.trace_id,
+            original_cost_usd: trace.final_.total_cost_usd,
+            stored: now,
+        }
+    }
 }
 
 /// Key: tenant, then the salted prompt hash, then the ladder that answered it.
@@ -61,6 +119,31 @@ pub struct Entry {
 /// entirely normal.
 fn key(tenant: &str, prompt_hash: &str, ladder: &[String]) -> String {
     format!("{tenant}|{prompt_hash}|{}", ladder.join(">"))
+}
+
+/// Where verified entries live.
+///
+/// Exists so the in-process store stays exactly what it was — the version four review rounds
+/// hardened — while a shared L2 can sit behind it. A single-instance deployment keeps byte-identical
+/// behaviour and no Redis dependency; a multi-replica one gets entries and, critically,
+/// **retractions** that cross process boundaries.
+///
+/// Async because an L2 is a network hop. Blocking one inside an async proxy would stall the runtime
+/// on a cache lookup, which is precisely the wrong place to lose latency.
+#[async_trait::async_trait]
+pub trait CacheStore: Send + Sync + std::fmt::Debug {
+    /// Fetch a live entry, if one exists.
+    async fn get(&self, key: &str, now: Instant) -> Option<Entry>;
+    /// Store an entry under `key`, proven by `source`.
+    ///
+    /// `source` is passed separately because a backend has to index by it: retraction arrives
+    /// naming a decision, not a key, and one decision can back several keys once the same prompt
+    /// is seen under more than one ladder.
+    async fn put(&self, key: &str, source: uuid::Uuid, entry: Entry, now: Instant);
+    /// Drop every entry proven by `source`. Returns how many went.
+    async fn retract(&self, source: uuid::Uuid) -> usize;
+    /// Entries currently held, for tests and `/metrics`.
+    async fn entry_count(&self) -> usize;
 }
 
 /// A bounded, in-process store of verified answers.
@@ -113,50 +196,44 @@ impl VerifiedCache {
         ladder: &[String],
         now: Instant,
     ) -> bool {
-        // 1. It must have been served from a real attempt. `BestAttempt` is the budget-exhausted
-        //    fallback — served without a passing verdict, and caching it would replay an answer
-        //    that never passed anything.
-        if trace.final_.served_from != ServedFrom::Attempt {
+        if !is_cacheable(trace) {
             return false;
         }
-        // 2. Never re-cache a cache hit. Harmless in itself, but it would relocate `cache_source`
-        //    onto a replay rather than the decision that actually ran a gate, and the provenance
-        //    chain is the feature.
-        if trace.final_.cache_source.is_some() {
-            return false;
-        }
-        // 3. The served rung's verdict must be an unambiguous Pass. An Abstain is "the gate could
-        //    not tell", which is precisely the state that must not be frozen and replayed.
-        let Some(served) = trace.final_.served_rung else {
-            return false;
+        let mut entry = Entry {
+            response: response.clone(),
+            source: trace.trace_id,
+            original_cost_usd: trace.final_.total_cost_usd,
+            stored: now,
         };
-        let passed = trace
-            .attempts
-            .iter()
-            .any(|a| a.rung == served && a.verdict == Verdict::Pass);
-        if !passed {
-            return false;
-        }
-        // 4. A deferred verdict already on the receipt that says Fail retracts the proof.
-        //
-        //    This is rarely the path that matters: deferred verdicts usually arrive minutes later
-        //    via `/v1/feedback`, long after insertion, so this check alone would be close to a
-        //    no-op — a safety rule that never fires, which is worse than none because the comment
-        //    claims protection it does not give. `retract()` below is the half that actually runs
-        //    in production, called from the feedback handler.
-        if trace.deferred.iter().any(|d| d.verdict == Verdict::Fail) {
-            return false;
-        }
+        entry.stored = now;
+        self.put_by_key(
+            &key(&trace.tenant_id, &trace.request.prompt_hash, ladder),
+            entry,
+        );
+        true
+    }
 
-        let Ok(mut map) = self.entries.lock() else {
-            return false;
+    /// Fetch by a pre-built key. The key-level primitive behind [`CacheStore`]; the
+    /// tenant/prompt/ladder composition lives in [`key`] so both stores agree on it.
+    #[must_use]
+    pub fn get_by_key(&self, key: &str, now: Instant) -> Option<Entry> {
+        let Ok(map) = self.entries.lock() else {
+            return None;
         };
+        map.get(key)
+            .filter(|e| now.duration_since(e.stored) < self.ttl)
+            .cloned()
+    }
+
+    /// Store by a pre-built key, applying the same bound as `offer`.
+    pub fn put_by_key(&self, key: &str, entry: Entry) {
+        let Ok(mut map) = self.entries.lock() else {
+            return;
+        };
+        let now = entry.stored;
         if map.len() >= self.max_entries {
             map.retain(|_, e| now.duration_since(e.stored) < self.ttl);
             if map.len() >= self.max_entries {
-                // ponytail: drop the oldest half on the rare over-cap write rather than maintain an
-                // LRU list on every read. A cache is an optimisation; its bookkeeping should not
-                // cost more than the thing it saves.
                 let mut by_age: Vec<(String, Instant)> =
                     map.iter().map(|(k, e)| (k.clone(), e.stored)).collect();
                 by_age.sort_by_key(|(_, t)| *t);
@@ -165,18 +242,13 @@ impl VerifiedCache {
                 }
             }
         }
-        map.insert(
-            // The tenant comes off the RECEIPT, not from a parameter a caller could pass wrong —
-            // the same reason the pass-only rule is checked against the receipt.
-            key(&trace.tenant_id, &trace.request.prompt_hash, ladder),
-            Entry {
-                response: response.clone(),
-                source: trace.trace_id,
-                original_cost_usd: trace.final_.total_cost_usd,
-                stored: now,
-            },
-        );
-        true
+        map.insert(key.to_owned(), entry);
+    }
+
+    /// Compose the key both stores use, so an entry written by one is found by the other.
+    #[must_use]
+    pub fn compose_key(tenant: &str, prompt_hash: &str, ladder: &[String]) -> String {
+        key(tenant, prompt_hash, ladder)
     }
 
     /// Evict every entry proven by `source`, because that proof has been retracted.
@@ -208,6 +280,236 @@ impl VerifiedCache {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[async_trait::async_trait]
+impl CacheStore for VerifiedCache {
+    // Delegates to the existing synchronous methods rather than reimplementing them. The
+    // in-process path is the one four review rounds hardened — a parallel async copy would be free
+    // to drift on exactly the rules that keep an unproven answer out.
+    async fn get(&self, key: &str, now: Instant) -> Option<Entry> {
+        self.get_by_key(key, now)
+    }
+
+    async fn put(&self, key: &str, _source: uuid::Uuid, entry: Entry, _now: Instant) {
+        self.put_by_key(key, entry);
+    }
+
+    async fn retract(&self, source: uuid::Uuid) -> usize {
+        Self::retract(self, source)
+    }
+
+    async fn entry_count(&self) -> usize {
+        Self::len(self)
+    }
+}
+
+/// A Redis-backed L2, so entries and retractions cross process boundaries.
+///
+/// Enabled by the `redis-cache` feature and a `redis_url`. Without it the cache is per-replica:
+/// behind N instances a session's answer is cached N times over and the hit rate drops roughly by
+/// N. Worse, a retraction only reaches the replica that received the feedback — the other N-1 keep
+/// serving an answer the world has disproven, which is the multi-instance form of the bug this
+/// module already had once.
+///
+/// ## Keys
+///
+/// - `fp:vc:<key>` → the serialized entry, with a Redis TTL so expiry is the server's job rather
+///   than ours. A manual sweep across replicas would race; `SETEX` does not.
+/// - `fp:vc:src:<uuid>` → a SET of the entry keys that decision proved, so `retract` can find them.
+///   Given the same TTL, so the index cannot outlive what it points at and leak.
+///
+/// ## What it deliberately does not do
+///
+/// No local caching of L2 reads. A stale local copy would survive a retraction issued on another
+/// replica — exactly the failure this exists to prevent — and a cache that can serve a disproven
+/// answer is worse than no cache in a product whose claim is that it does not.
+#[cfg(feature = "redis-cache")]
+pub struct RedisStore {
+    client: redis::aio::ConnectionManager,
+    ttl_secs: u64,
+}
+
+// Hand-written: `ConnectionManager` is not `Debug`, and printing it would risk putting a
+// credential-bearing URL into a log line anyway.
+#[cfg(feature = "redis-cache")]
+impl std::fmt::Debug for RedisStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisStore")
+            .field("ttl_secs", &self.ttl_secs)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How long to wait for Redis at startup before giving up.
+///
+/// Short on purpose: this runs before the listener binds, so every second here is a second the
+/// proxy is not serving. A reachable Redis answers in milliseconds; one that needs ten seconds is
+/// not one to put in the request path.
+#[cfg(feature = "redis-cache")]
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Strip credentials from a Redis URL so it can appear in a log line.
+///
+/// `redis://user:hunter2@cache:6379/0` → `redis://cache:6379/0`. A connect failure has to name the
+/// server or the message is useless for fixing it, and the userinfo is the one part that must not
+/// be named. This module's own `Debug` impl avoids printing the URL for exactly this reason; the
+/// error paths were interpolating it raw, which made that care pointless.
+#[cfg(feature = "redis-cache")]
+#[must_use]
+pub fn redact_redis_url(url: &str) -> String {
+    // Split on the LAST `@` before any path: a password may itself contain `@`, and splitting on
+    // the first would leak the tail of it.
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<malformed redis url>".to_owned();
+    };
+    let host_part = match rest.rfind('@') {
+        Some(i) => &rest[i + 1..],
+        None => rest,
+    };
+    format!("{scheme}://{host_part}")
+}
+
+#[cfg(feature = "redis-cache")]
+impl RedisStore {
+    /// Connect to `url`.
+    ///
+    /// # Errors
+    /// A malformed URL or an unreachable server. Surfaced at startup rather than swallowed: a
+    /// cache that silently degrades to "always miss" looks like the feature is off, and an operator
+    /// who configured Redis should be told it is not working.
+    pub async fn connect(url: &str, ttl_secs: u64) -> Result<Self, String> {
+        let safe = redact_redis_url(url);
+        let client = redis::Client::open(url).map_err(|e| format!("redis url {safe}: {e}"))?;
+        // Bounded, because `ConnectionManager::new` retries a dead server indefinitely by default
+        // — the proxy simply never finishes starting, with no error and no listening socket. A
+        // hang is the worst of the three outcomes here: an operator can act on a refusal and can
+        // live with a degraded cache, but "startup never returns" looks like a deploy that stalled
+        // for unrelated reasons.
+        let mgr = tokio::time::timeout(CONNECT_TIMEOUT, redis::aio::ConnectionManager::new(client))
+            .await
+            .map_err(|_| {
+                format!(
+                    "redis at {safe} did not answer within {}s. The proxy refuses to start rather \
+                 than run with a cache that silently stays per-replica — check the server is \
+                 reachable, or remove redis_url to use the in-process cache.",
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })?
+            .map_err(|e| format!("redis connect {safe}: {e}"))?;
+
+        // `ConnectionManager::new` connects LAZILY: it returns Ok against a server that is not
+        // running, the proxy logs "shared via redis", binds, and serves with a cache that never
+        // works. That is worse than degrading to per-replica — it is non-functional while
+        // announcing success, which is the exact failure this fail-fast exists to prevent.
+        //
+        // So prove the connection with a real round trip before claiming it.
+        let mut probe = mgr.clone();
+        let pong: Result<String, _> = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            redis::cmd("PING").query_async(&mut probe),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "redis at {safe} did not answer PING within {}s. Refusing to start rather than \
+                 run with a cache that reports itself as shared and never works — check the \
+                 server is reachable, or remove redis_url to use the in-process cache.",
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })?;
+        pong.map_err(|e| format!("redis at {safe} rejected PING: {e}"))?;
+
+        Ok(Self {
+            client: mgr,
+            ttl_secs,
+        })
+    }
+
+    fn entry_key(key: &str) -> String {
+        format!("fp:vc:{key}")
+    }
+
+    fn source_key(source: uuid::Uuid) -> String {
+        format!("fp:vc:src:{source}")
+    }
+}
+
+#[cfg(feature = "redis-cache")]
+#[async_trait::async_trait]
+impl CacheStore for RedisStore {
+    async fn get(&self, key: &str, _now: Instant) -> Option<Entry> {
+        let mut c = self.client.clone();
+        let raw: Option<String> = redis::cmd("GET")
+            .arg(Self::entry_key(key))
+            .query_async(&mut c)
+            .await
+            .ok()?;
+        // A malformed value is treated as a miss rather than an error: the request simply runs the
+        // ladder, which is always safe. Failing the request because a cache entry did not
+        // deserialize would turn an optimisation into an outage.
+        serde_json::from_str(&raw?).ok()
+    }
+
+    async fn put(&self, key: &str, source: uuid::Uuid, entry: Entry, _now: Instant) {
+        let Ok(body) = serde_json::to_string(&entry) else {
+            return;
+        };
+        let mut c = self.client.clone();
+        let ek = Self::entry_key(key);
+        // Pipelined, not transactional: if the index write is lost the entry becomes unretractable
+        // until TTL, so the TTL is the backstop that bounds that window. A MULTI would remove the
+        // race but not the failure mode, and the entry TTL already caps the exposure.
+        let _: Result<(), _> = redis::pipe()
+            .cmd("SETEX")
+            .arg(&ek)
+            .arg(self.ttl_secs)
+            .arg(body)
+            .ignore()
+            .cmd("SADD")
+            .arg(Self::source_key(source))
+            .arg(&ek)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(Self::source_key(source))
+            .arg(self.ttl_secs)
+            .ignore()
+            .query_async::<()>(&mut c)
+            .await;
+    }
+
+    async fn retract(&self, source: uuid::Uuid) -> usize {
+        let mut c = self.client.clone();
+        let sk = Self::source_key(source);
+        let keys: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(&sk)
+            .query_async(&mut c)
+            .await
+            .unwrap_or_default();
+        if keys.is_empty() {
+            return 0;
+        }
+        let n: usize = redis::cmd("DEL")
+            .arg(&keys)
+            .query_async(&mut c)
+            .await
+            .unwrap_or(0);
+        let _: Result<(), _> = redis::cmd("DEL").arg(&sk).query_async(&mut c).await;
+        n
+    }
+
+    async fn entry_count(&self) -> usize {
+        let mut c = self.client.clone();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg("fp:vc:*")
+            .query_async(&mut c)
+            .await
+            .unwrap_or_default();
+        // ponytail: KEYS is O(n) and blocks Redis; acceptable because this is only read by
+        // /metrics and tests, never on the request path. Switch to SCAN if it is ever called
+        // per-request.
+        keys.iter().filter(|k| !k.starts_with("fp:vc:src:")).count()
     }
 }
 
@@ -367,6 +669,154 @@ mod tests {
         });
 
         assert!(!c.offer(&t, &resp("looked fine"), &ladder(), now));
+    }
+
+    #[cfg(feature = "redis-cache")]
+    #[test]
+    fn a_redis_url_never_reaches_a_log_line_with_its_password() {
+        // The module's own Debug impl avoids printing the URL for this reason; the error paths
+        // were interpolating it raw, which made that care pointless.
+        assert_eq!(
+            redact_redis_url("redis://user:hunter2@cache:6379/0"),
+            "redis://cache:6379/0"
+        );
+        // A password containing '@' must not leak its tail — split on the LAST '@', not the first.
+        assert_eq!(
+            redact_redis_url("redis://user:p@ss@cache:6379/0"),
+            "redis://cache:6379/0"
+        );
+        assert_eq!(
+            redact_redis_url("redis://cache:6379/0"),
+            "redis://cache:6379/0"
+        );
+        assert_eq!(redact_redis_url("rediss://u:p@h:6380"), "rediss://h:6380");
+        assert_eq!(redact_redis_url("nonsense"), "<malformed redis url>");
+
+        for u in [
+            "redis://user:hunter2@cache:6379/0",
+            "redis://user:p@ss@cache:6379/0",
+        ] {
+            let out = redact_redis_url(u);
+            assert!(!out.contains("hunter2"), "{out}");
+            assert!(!out.contains("p@ss"), "{out}");
+            assert!(!out.contains("user"), "{out}");
+        }
+    }
+
+    /// Exercise the real Redis backend.
+    ///
+    /// Requires a reachable server at `FIRSTPASS_TEST_REDIS`. **Absent, this fails rather than
+    /// skipping**: a suite that quietly passes when its subject is unavailable reports green while
+    /// testing nothing, which is how this repo's `provider-smoke` job once read as verified.
+    #[cfg(feature = "redis-cache")]
+    #[tokio::test]
+    async fn redis_store_round_trips_and_retracts() {
+        let url = std::env::var("FIRSTPASS_TEST_REDIS").unwrap_or_else(|_| {
+            panic!(
+                "set FIRSTPASS_TEST_REDIS (e.g. redis://127.0.0.1:6379/15) to run the redis-cache \
+                 tests. Not skipped on purpose: a green suite that tested nothing is worse than a \
+                 red one."
+            )
+        });
+        let store = RedisStore::connect(&url, 60).await.expect("connect");
+
+        let t = trace(ServedFrom::Attempt, Verdict::Pass);
+        let k = VerifiedCache::compose_key("t", &format!("h-{}", t.trace_id), &ladder());
+        let now = Instant::now();
+        let entry = Entry::new(resp("shared answer"), &t, now);
+
+        store.put(&k, t.trace_id, entry, now).await;
+        let got = store
+            .get(&k, now)
+            .await
+            .expect("entry crossed the boundary");
+        assert_eq!(got.response.text, "shared answer");
+        // The PROOF is what has to survive; a replay's receipt is built from it.
+        assert_eq!(got.source, t.trace_id);
+
+        // Retraction must work through the source index, since feedback names a decision, not a key.
+        assert_eq!(store.retract(t.trace_id).await, 1);
+        assert!(
+            store.get(&k, now).await.is_none(),
+            "a retracted answer must stop being replayable in the SHARED store too"
+        );
+    }
+
+    #[cfg(feature = "redis-cache")]
+    #[tokio::test]
+    async fn redis_store_isolates_tenants() {
+        // The cross-tenant leak found in review must not reappear through the shared surface.
+        let url = std::env::var("FIRSTPASS_TEST_REDIS")
+            .expect("set FIRSTPASS_TEST_REDIS to run the redis-cache tests");
+        let store = RedisStore::connect(&url, 60).await.expect("connect");
+
+        let mut t = trace(ServedFrom::Attempt, Verdict::Pass);
+        t.tenant_id = "tenant-a".to_owned();
+        let hash = format!("iso-{}", t.trace_id);
+        let ka = VerifiedCache::compose_key("tenant-a", &hash, &ladder());
+        let kb = VerifiedCache::compose_key("tenant-b", &hash, &ladder());
+        let now = Instant::now();
+
+        store
+            .put(&ka, t.trace_id, Entry::new(resp("a"), &t, now), now)
+            .await;
+
+        assert!(
+            store.get(&kb, now).await.is_none(),
+            "cross-tenant replay is a data leak"
+        );
+        assert!(store.get(&ka, now).await.is_some());
+        store.retract(t.trace_id).await;
+    }
+
+    #[tokio::test]
+    async fn the_trait_and_the_concrete_api_agree_on_keys() {
+        // The two stores must compose the key identically or a multi-replica deployment silently
+        // never hits: one writes under a key the other never looks up, and the only symptom is a
+        // hit rate that quietly stays at zero.
+        let c = VerifiedCache::new(Duration::from_secs(60), 100);
+        let now = Instant::now();
+        let t = trace(ServedFrom::Attempt, Verdict::Pass);
+        assert!(c.offer(&t, &resp("via offer"), &ladder(), now));
+
+        let k = VerifiedCache::compose_key("t", "hash-abc", &ladder());
+        let via_trait = CacheStore::get(&c, &k, now)
+            .await
+            .expect("trait sees offer's entry");
+        assert_eq!(via_trait.response.text, "via offer");
+    }
+
+    #[tokio::test]
+    async fn the_trait_path_still_isolates_tenants() {
+        // The leak found in review must not reappear through the new surface: `compose_key` is the
+        // single place the tenant enters, and both stores go through it.
+        let a = VerifiedCache::compose_key("tenant-a", "h", &ladder());
+        let b = VerifiedCache::compose_key("tenant-b", "h", &ladder());
+        assert_ne!(a, b, "tenant must be part of the key on the trait path too");
+        assert!(a.starts_with("tenant-a|"), "{a}");
+    }
+
+    #[tokio::test]
+    async fn an_entry_survives_a_serde_round_trip_without_its_local_clock() {
+        // Redis carries entries between processes, where an Instant is meaningless. The proof
+        // (source) and the answer must survive; `stored` is re-stamped, and expiry there is
+        // Redis's TTL rather than a comparison of two machines' monotonic clocks.
+        let e = Entry {
+            response: resp("answer"),
+            source: uuid::Uuid::now_v7(),
+            original_cost_usd: 0.01,
+            stored: Instant::now(),
+        };
+        let wire = serde_json::to_string(&e).expect("serializes");
+        assert!(
+            !wire.contains("stored"),
+            "a local Instant must not go on the wire: {wire}"
+        );
+
+        let back: Entry = serde_json::from_str(&wire).expect("deserializes");
+        assert_eq!(back.response.text, "answer");
+        assert_eq!(back.source, e.source, "the PROOF must survive the crossing");
+        assert!((back.original_cost_usd - 0.01).abs() < f64::EPSILON);
     }
 
     #[test]

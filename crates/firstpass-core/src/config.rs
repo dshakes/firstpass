@@ -758,9 +758,22 @@ pub struct VerifiedCacheConfig {
     /// because replaying a stale answer confidently is worse than paying to re-derive it.
     #[serde(default = "default_cache_ttl_secs")]
     pub ttl_secs: u64,
-    /// Hard cap on entries; oldest evicted first.
+    /// Hard cap on entries; oldest evicted first. In-process store only — a Redis-backed cache is
+    /// bounded by its TTL and the server's own eviction policy.
     #[serde(default = "default_cache_max_entries")]
     pub max_entries: usize,
+    /// Redis URL for a **shared** cache across replicas. Absent (default) = in-process only.
+    ///
+    /// Without it the cache is per-replica: behind N instances the same answer is cached N times
+    /// over, the hit rate drops roughly by N, and — the part that matters — a retraction only
+    /// reaches the replica that received the feedback, leaving the other N-1 serving an answer
+    /// that has been disproven.
+    ///
+    /// Requires the `redis-cache` build feature. Configuring a URL without it is rejected at
+    /// startup rather than silently ignored: a cache that quietly stays per-replica looks
+    /// identical to one that is working.
+    #[serde(default)]
+    pub redis_url: Option<String>,
 }
 
 const fn default_cache_ttl_secs() -> u64 {

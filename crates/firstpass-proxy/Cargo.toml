@@ -40,6 +40,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
+redis = { workspace = true, optional = true }
 tower.workspace = true
 governor.workspace = true
 metrics.workspace = true
@@ -55,3 +56,10 @@ tokio = { workspace = true, features = ["test-util", "time"] }
 
 [lints]
 workspace = true
+
+[features]
+default = []
+# Back the verified cache with Redis so a cache entry — and a retraction — is shared across
+# replicas. Off by default: a single-instance deployment gains nothing and would pay a dependency
+# and a network hop for it.
+redis-cache = ["dep:redis"]

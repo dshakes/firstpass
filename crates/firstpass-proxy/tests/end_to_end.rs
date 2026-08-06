@@ -186,7 +186,9 @@ async fn spawn_proxy_with(
     );
     let (traces, _writer) = store::open(&db_path).unwrap();
     let promoter = firstpass_proxy::proxy::build_promoter(&config).unwrap();
-    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config);
+    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config)
+        .await
+        .unwrap();
     let state = AppState {
         config: Arc::new(config),
         http: reqwest::Client::new(),
