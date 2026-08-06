@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### Added: `firstpass latency` — the number this proxy could not previously state about itself
+
+Every gateway in this category publishes an overhead figure. Firstpass recorded total request time
+and per-attempt provider time on every receipt, and never subtracted one from the other — so it had
+no answer to "what does the proxy itself cost me", which is the first question an evaluator asks.
+
+`firstpass latency [--json]` reports p50/p95/p99 of the time Firstpass added beyond the provider
+calls and gates it dispatched, computed from your own receipts. Derived rather than stored: an
+auditor recomputes it from the same timings, and it cannot drift from the numbers beside it.
+
+Two honesty properties, because a latency number is easy to flatter:
+
+- **Concurrent receipts are excluded, not floored.** Under speculation, rungs overlap, so dispatched
+  work legitimately exceeds wall-clock and the subtraction is meaningless. Those receipts are
+  skipped and the skip count is reported — flooring them to 0 would quietly drag a p95 down.
+- **Percentiles are observed values, nearest-rank.** Interpolation would invent a number between two
+  real measurements and print it as fact.
+
 ## [0.4.1]
 
 **npm only — no code change from 0.4.0.** The npm package is now the unscoped
