@@ -57,6 +57,59 @@ pub struct Entry {
     stored: Instant,
 }
 
+/// Whether a finished decision may be cached at all.
+///
+/// **The single place these rules live.** They were duplicated nowhere and must stay that way: a
+/// second backend re-deriving "was this proven?" from its own reading of the receipt is how one of
+/// them eventually accepts something the other would reject, and the failure is silent — an
+/// unverified answer served from cache looks exactly like a verified one.
+///
+/// Rejects, in order:
+/// 1. **Not served from a real attempt.** `BestAttempt` is the budget-exhausted fallback, served
+///    *without* a passing verdict; caching it would replay an answer that never passed anything.
+/// 2. **A cache hit.** Harmless in itself, but it would relocate `cache_source` onto a replay
+///    rather than the decision that ran a gate, letting the provenance chain go a hop stale.
+/// 3. **A verdict that is not an unambiguous Pass.** An `Abstain` is "the gate could not tell",
+///    which is precisely the state that must never be frozen and replayed.
+/// 4. **A deferred Fail already on the receipt.** Rarely the path that matters — deferred verdicts
+///    usually arrive later via `/v1/feedback`, which is what `retract` handles — but free to check.
+#[must_use]
+pub fn is_cacheable(trace: &Trace) -> bool {
+    if trace.final_.served_from != ServedFrom::Attempt {
+        return false;
+    }
+    if trace.final_.cache_source.is_some() {
+        return false;
+    }
+    let Some(served) = trace.final_.served_rung else {
+        return false;
+    };
+    if !trace
+        .attempts
+        .iter()
+        .any(|a| a.rung == served && a.verdict == Verdict::Pass)
+    {
+        return false;
+    }
+    !trace.deferred.iter().any(|d| d.verdict == Verdict::Fail)
+}
+
+impl Entry {
+    /// Build an entry from a decision and what it served.
+    ///
+    /// Takes the proof off the trace rather than as a parameter, for the same reason the tenant is
+    /// read off the receipt: a call site cannot then file an answer under the wrong decision.
+    #[must_use]
+    pub fn new(response: ModelResponse, trace: &Trace, now: Instant) -> Self {
+        Self {
+            response,
+            source: trace.trace_id,
+            original_cost_usd: trace.final_.total_cost_usd,
+            stored: now,
+        }
+    }
+}
+
 /// Key: tenant, then the salted prompt hash, then the ladder that answered it.
 ///
 /// **The tenant is not optional.** The prompt salt is per-deployment, not per-tenant, so two
@@ -143,68 +196,19 @@ impl VerifiedCache {
         ladder: &[String],
         now: Instant,
     ) -> bool {
-        // 1. It must have been served from a real attempt. `BestAttempt` is the budget-exhausted
-        //    fallback — served without a passing verdict, and caching it would replay an answer
-        //    that never passed anything.
-        if trace.final_.served_from != ServedFrom::Attempt {
+        if !is_cacheable(trace) {
             return false;
         }
-        // 2. Never re-cache a cache hit. Harmless in itself, but it would relocate `cache_source`
-        //    onto a replay rather than the decision that actually ran a gate, and the provenance
-        //    chain is the feature.
-        if trace.final_.cache_source.is_some() {
-            return false;
-        }
-        // 3. The served rung's verdict must be an unambiguous Pass. An Abstain is "the gate could
-        //    not tell", which is precisely the state that must not be frozen and replayed.
-        let Some(served) = trace.final_.served_rung else {
-            return false;
+        let mut entry = Entry {
+            response: response.clone(),
+            source: trace.trace_id,
+            original_cost_usd: trace.final_.total_cost_usd,
+            stored: now,
         };
-        let passed = trace
-            .attempts
-            .iter()
-            .any(|a| a.rung == served && a.verdict == Verdict::Pass);
-        if !passed {
-            return false;
-        }
-        // 4. A deferred verdict already on the receipt that says Fail retracts the proof.
-        //
-        //    This is rarely the path that matters: deferred verdicts usually arrive minutes later
-        //    via `/v1/feedback`, long after insertion, so this check alone would be close to a
-        //    no-op — a safety rule that never fires, which is worse than none because the comment
-        //    claims protection it does not give. `retract()` below is the half that actually runs
-        //    in production, called from the feedback handler.
-        if trace.deferred.iter().any(|d| d.verdict == Verdict::Fail) {
-            return false;
-        }
-
-        let Ok(mut map) = self.entries.lock() else {
-            return false;
-        };
-        if map.len() >= self.max_entries {
-            map.retain(|_, e| now.duration_since(e.stored) < self.ttl);
-            if map.len() >= self.max_entries {
-                // ponytail: drop the oldest half on the rare over-cap write rather than maintain an
-                // LRU list on every read. A cache is an optimisation; its bookkeeping should not
-                // cost more than the thing it saves.
-                let mut by_age: Vec<(String, Instant)> =
-                    map.iter().map(|(k, e)| (k.clone(), e.stored)).collect();
-                by_age.sort_by_key(|(_, t)| *t);
-                for (k, _) in by_age.into_iter().take(self.max_entries.max(2) / 2) {
-                    map.remove(&k);
-                }
-            }
-        }
-        map.insert(
-            // The tenant comes off the RECEIPT, not from a parameter a caller could pass wrong —
-            // the same reason the pass-only rule is checked against the receipt.
-            key(&trace.tenant_id, &trace.request.prompt_hash, ladder),
-            Entry {
-                response: response.clone(),
-                source: trace.trace_id,
-                original_cost_usd: trace.final_.total_cost_usd,
-                stored: now,
-            },
+        entry.stored = now;
+        self.put_by_key(
+            &key(&trace.tenant_id, &trace.request.prompt_hash, ladder),
+            entry,
         );
         true
     }

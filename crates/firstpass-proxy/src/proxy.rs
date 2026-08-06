@@ -74,7 +74,7 @@ pub struct AppState {
     /// Optional verified-response cache (`[escalation.verified_cache]`). `None` (default) = every
     /// request runs the ladder. A hit replays an answer that previously PASSED a gate, and the
     /// receipt names the decision that proved it.
-    pub verified_cache: Option<Arc<crate::verified_cache::VerifiedCache>>,
+    pub verified_cache: Option<Arc<dyn crate::verified_cache::CacheStore>>,
     /// Optional per-query gate-pass predictor (ADR 0008 Phase 2). `None` (default) = no
     /// prediction, byte-identical to today. When `Some`, `handle_enforce` records its
     /// `P(gate-pass)` for the start rung on the receipt in **shadow** (never acted on) and
@@ -180,17 +180,38 @@ fn cache_hit_trace(
     }
 }
 
-pub fn build_verified_cache(
+pub async fn build_verified_cache(
     config: &ProxyConfig,
-) -> Option<Arc<crate::verified_cache::VerifiedCache>> {
-    let c = config
+) -> Result<Option<Arc<dyn crate::verified_cache::CacheStore>>, String> {
+    let Some(c) = config
         .routing
         .as_ref()
-        .and_then(|r| r.escalation.verified_cache.as_ref())?;
-    Some(Arc::new(crate::verified_cache::VerifiedCache::new(
+        .and_then(|r| r.escalation.verified_cache.as_ref())
+    else {
+        return Ok(None);
+    };
+    if let Some(url) = c.redis_url.as_deref() {
+        #[cfg(feature = "redis-cache")]
+        {
+            let store = crate::verified_cache::RedisStore::connect(url, c.ttl_secs).await?;
+            tracing::info!("verified cache: shared via redis");
+            return Ok(Some(Arc::new(store)));
+        }
+        #[cfg(not(feature = "redis-cache"))]
+        {
+            let _ = url;
+            return Err(
+                "[escalation.verified_cache] redis_url is set, but this binary was built without \
+                 the `redis-cache` feature. Rebuild with `--features redis-cache`, or remove \
+                 redis_url to use the in-process cache."
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(Some(Arc::new(crate::verified_cache::VerifiedCache::new(
         std::time::Duration::from_secs(c.ttl_secs),
         c.max_entries,
-    )))
+    ))))
 }
 
 pub fn build_promoter(
@@ -702,11 +723,10 @@ async fn feedback(
                 .flatten()
                 .flatten()
         };
-        let dropped: usize = reported
-            .into_iter()
-            .chain(origin)
-            .map(|id| cache.retract(id))
-            .sum();
+        let mut dropped = 0usize;
+        for id in reported.into_iter().chain(origin) {
+            dropped += cache.retract(id).await;
+        }
         if dropped > 0 {
             tracing::info!(
                 trace = %req.trace_id,
@@ -1581,12 +1601,16 @@ async fn enforce_pipeline_inner(
     // carry — a cache keyed on anything else could hit for a request the trace describes
     // differently, and the provenance link would point at the wrong decision.
     if let Some(cache) = state.verified_cache.as_ref()
-        && let Some(entry) = cache.get(
-            &ctx.tenant_id,
-            &ctx.prompt_hash,
-            &route.ladder,
-            std::time::Instant::now(),
-        )
+        && let Some(entry) = cache
+            .get(
+                &crate::verified_cache::VerifiedCache::compose_key(
+                    &ctx.tenant_id,
+                    &ctx.prompt_hash,
+                    &route.ladder,
+                ),
+                std::time::Instant::now(),
+            )
+            .await
     {
         metrics::counter!("firstpass_cache_hits_total").increment(1);
         let trace = cache_hit_trace(&ctx, &entry, mode_now());
@@ -1776,10 +1800,26 @@ async fn enforce_pipeline_inner(
     // Offer this decision to the verified cache. `offer` re-reads the finished receipt and stores
     // only what was served on a passing verdict, so the rule lives in one place rather than being
     // re-derived here from local variables that might disagree with what was recorded.
+    // `is_cacheable` is the single place the pass-only rules live, so an in-process and a shared
+    // store cannot disagree about what was proven — a disagreement there would be silent, and an
+    // unverified answer served from cache looks exactly like a verified one.
     if let Some(cache) = state.verified_cache.as_ref()
         && let EngineOutcome::Served(resp) = &outcome
-        && cache.offer(&trace, resp, &route.ladder, std::time::Instant::now())
+        && crate::verified_cache::is_cacheable(&trace)
     {
+        let now = std::time::Instant::now();
+        cache
+            .put(
+                &crate::verified_cache::VerifiedCache::compose_key(
+                    &trace.tenant_id,
+                    &trace.request.prompt_hash,
+                    &route.ladder,
+                ),
+                trace.trace_id,
+                crate::verified_cache::Entry::new(resp.clone(), &trace, now),
+                now,
+            )
+            .await;
         metrics::counter!("firstpass_cache_stores_total").increment(1);
     }
 

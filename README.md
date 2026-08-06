@@ -360,6 +360,26 @@ Agent sessions get long, and that breaks routers in ways that are invisible unti
   (`[escalation.condense]`, off by default) — but only once *every* rung has overflowed, where the
   choice is a degraded answer versus none at all.
 
+### Running more than one replica
+
+The verified cache and session promotion are **in-process by default**. Behind a load balancer that
+means each replica keeps its own — the same answer is cached N times over, the hit rate drops
+roughly by N, and, the part that matters, a retraction only reaches the replica that received the
+feedback while the others keep serving an answer that has been disproven.
+
+Point the cache at Redis to share both entries and retractions:
+
+```toml
+[escalation.verified_cache]
+ttl_secs  = 900
+redis_url = "redis://cache:6379/0"
+```
+
+Requires a build with the `redis-cache` feature (`cargo install firstpass-proxy --features
+redis-cache`). Setting `redis_url` without it, or pointing it at an unreachable server, **fails at
+startup** rather than quietly falling back — a cache that silently stays per-replica looks exactly
+like one that is working.
+
 ### Modes
 
 One header, five profiles — set per request via `x-firstpass-mode` (or per route / env): `cost` · `balanced` · `quality` · `latency` · `max`. Same ladder, different serve threshold and escalation appetite: `cost` serves the cheapest thing that clears the gate, `quality`/`max` climb sooner, `latency` prefers the speculative path.
