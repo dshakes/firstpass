@@ -214,6 +214,40 @@ pub async fn build_verified_cache(
     ))))
 }
 
+pub async fn build_promoter_async(
+    config: &ProxyConfig,
+) -> Result<Option<Arc<crate::affinity::SessionPromoter>>, String> {
+    let Some(sp) = config
+        .routing
+        .as_ref()
+        .and_then(|r| r.escalation.session_promotion.as_ref())
+    else {
+        return Ok(None);
+    };
+    let promoter = crate::affinity::SessionPromoter::new(sp.clone()).map_err(|e| e.to_string())?;
+    if let Some(url) = sp.redis_url.as_deref() {
+        #[cfg(feature = "redis-cache")]
+        {
+            let ttl = sp.window_duration().map_err(|e| e.to_string())?.as_secs();
+            let store = crate::affinity::RedisPromotionStore::connect(url, ttl).await?;
+            tracing::info!("session promotion: shared via redis");
+            return Ok(Some(Arc::new(promoter.with_shared(Arc::new(store)))));
+        }
+        #[cfg(not(feature = "redis-cache"))]
+        {
+            let _ = url;
+            return Err(
+                "[escalation.session_promotion] redis_url is set, but this binary was \
+                        built without the `redis-cache` feature. Rebuild with \
+                        `--features redis-cache`, or remove redis_url to keep promotion \
+                        in-process."
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(Some(Arc::new(promoter)))
+}
+
 pub fn build_promoter(
     config: &ProxyConfig,
 ) -> firstpass_core::Result<Option<Arc<crate::affinity::SessionPromoter>>> {
@@ -1504,11 +1538,16 @@ async fn enforce_pipeline_inner(
     // re-pay for the rung that already failed it — but if the bandit independently wants to start
     // higher, that is also evidence, so take the greater of the two. A downward probe lowers the
     // floor rather than forcing the start, for the same reason.
-    let promotion = state
-        .promoter
-        .as_ref()
-        .map(|p| p.decide(&tenant, &session_id, std::time::Instant::now()))
-        .unwrap_or(crate::affinity::Decision::Cold);
+    let promotion = state.promoter.as_ref().cloned();
+    // Awaited outside the closure so the borrows of `tenant`/`session_id` end here — the ctx below
+    // takes them by value.
+    let promotion = match promotion {
+        Some(p) => {
+            p.decide_async(&tenant, &session_id, std::time::Instant::now())
+                .await
+        }
+        None => crate::affinity::Decision::Cold,
+    };
     let start_rung = start_rung.max(promotion.start_rung());
     // The ctx below takes `tenant` and `session_id` by value, so keep a copy for the post-route
     // bookkeeping — but only when promotion is on, so the default path allocates nothing.
@@ -1653,13 +1692,15 @@ async fn enforce_pipeline_inner(
         && let Some((tenant_key, session_key)) = promo_key.as_ref()
         && let Some(served) = trace.final_.served_rung
     {
-        promoter.record(
-            tenant_key,
-            session_key,
-            served,
-            served > start_rung,
-            std::time::Instant::now(),
-        );
+        promoter
+            .record_async(
+                tenant_key,
+                session_key,
+                served,
+                served > start_rung,
+                std::time::Instant::now(),
+            )
+            .await;
     }
 
     // ── Per-query gate-pass predictor (ADR 0008 Phase 2) ────────────────────────────────────

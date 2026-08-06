@@ -367,12 +367,17 @@ means each replica keeps its own — the same answer is cached N times over, the
 roughly by N, and, the part that matters, a retraction only reaches the replica that received the
 feedback while the others keep serving an answer that has been disproven.
 
-Point the cache at Redis to share both entries and retractions:
+Point both at Redis to share them:
 
 ```toml
 [escalation.verified_cache]
 ttl_secs  = 900
 redis_url = "redis://cache:6379/0"
+
+[escalation.session_promotion]
+after_failures = 2
+window         = "30m"
+redis_url      = "redis://cache:6379/0"
 ```
 
 Requires a build with the `redis-cache` feature (`cargo install firstpass-proxy --features

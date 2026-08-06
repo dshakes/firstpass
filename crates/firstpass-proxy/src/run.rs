@@ -81,7 +81,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
     // about a live conversation, so it should not outlive the process that observed it — and a
     // stale pin restored from disk would start a fresh session on an expensive rung for reasons
     // nobody can see. Built via the shared helper so tests cannot wire it differently.
-    let promoter = crate::proxy::build_promoter(&config)?;
+    let promoter = crate::proxy::build_promoter_async(&config).await?;
 
     // Verified-response cache (opt-in): in-memory and per-process, like the promoter. A cached
     // answer is a claim that a gate passed, and that claim should not outlive the process that

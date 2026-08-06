@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased]
+
+### Added: session promotion can be shared across replicas
+
+`[escalation.session_promotion] redis_url`, behind the same `redis-cache` build feature as the
+verified cache.
+
+Without it, promotion fragments behind a load balancer: a session that escalated on one replica
+starts cold on the next, so the escalation tax this feature exists to remove — measured at 18% of
+first-pass spend — is paid again on roughly (N-1)/N of turns. The feature reports nothing wrong
+while doing a fraction of its job.
+
+- **Expiry is Redis's TTL**, set from `window`, for the same reason as the cache: two replicas
+  comparing monotonic clocks would disagree about what is stale.
+- **`Pin.seen` is `#[serde(skip)]`** — an `Instant` is meaningless in another process. The routing
+  state (rung, failures, probe counter) is what crosses.
+- **`max_sessions` is in-process only.** A per-replica cap on a shared store would have each
+  replica evicting the others' sessions.
+- **Concurrent turns of one session race.** `record` is a read-modify-write and last write wins, so
+  two replicas can lose an increment. Deliberate: the cost is a promotion arriving one turn late —
+  one extra cheap-rung call — and the gate still verifies whatever is served, so it cannot affect
+  correctness. Removing the race would need a Lua script or WATCH loop, which is real complexity
+  for an optimisation.
+- **Startup fails loudly** on a `redis_url` without the feature, or a server that does not answer
+  PING within 5s.
+
 ## [0.6.0]
 
 One feature: the verified cache can be shared across replicas, which is what makes Firstpass
