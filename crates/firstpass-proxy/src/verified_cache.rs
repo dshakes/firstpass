@@ -52,9 +52,15 @@ pub struct Entry {
     stored: Instant,
 }
 
-/// Key: the salted prompt hash plus the ladder that answered it.
-fn key(prompt_hash: &str, ladder: &[String]) -> String {
-    format!("{prompt_hash}|{}", ladder.join(">"))
+/// Key: tenant, then the salted prompt hash, then the ladder that answered it.
+///
+/// **The tenant is not optional.** The prompt salt is per-deployment, not per-tenant, so two
+/// tenants sending an identical prompt produce an identical hash — a key without the tenant would
+/// serve one customer's paid-for, verified answer to another. That is a cross-tenant data leak in
+/// a multi-tenant proxy, not merely a wrong cache hit, and it is silent: the receipt would look
+/// entirely normal.
+fn key(tenant: &str, prompt_hash: &str, ladder: &[String]) -> String {
+    format!("{tenant}|{prompt_hash}|{}", ladder.join(">"))
 }
 
 /// A bounded, in-process store of verified answers.
@@ -78,13 +84,19 @@ impl VerifiedCache {
 
     /// Look up a proven answer for this prompt under this ladder.
     #[must_use]
-    pub fn get(&self, prompt_hash: &str, ladder: &[String], now: Instant) -> Option<Entry> {
+    pub fn get(
+        &self,
+        tenant: &str,
+        prompt_hash: &str,
+        ladder: &[String],
+        now: Instant,
+    ) -> Option<Entry> {
         let Ok(map) = self.entries.lock() else {
             // A poisoned lock must not take serving down. Missing the cache is always safe: the
             // request simply runs the ladder, which is the behaviour with caching off.
             return None;
         };
-        map.get(&key(prompt_hash, ladder))
+        map.get(&key(tenant, prompt_hash, ladder))
             .filter(|e| now.duration_since(e.stored) < self.ttl)
             .cloned()
     }
@@ -148,7 +160,9 @@ impl VerifiedCache {
             }
         }
         map.insert(
-            key(&trace.request.prompt_hash, ladder),
+            // The tenant comes off the RECEIPT, not from a parameter a caller could pass wrong —
+            // the same reason the pass-only rule is checked against the receipt.
+            key(&trace.tenant_id, &trace.request.prompt_hash, ladder),
             Entry {
                 response: response.clone(),
                 source: trace.trace_id,
@@ -257,7 +271,7 @@ mod tests {
 
         assert!(c.offer(&t, &resp("the answer"), &ladder(), now));
 
-        let hit = c.get("hash-abc", &ladder(), now).expect("hit");
+        let hit = c.get("t", "hash-abc", &ladder(), now).expect("hit");
         assert_eq!(hit.response.text, "the answer");
         // Not merely "cached" — the decision whose gate passed, so the proof is one lookup away.
         assert_eq!(hit.source, t.trace_id);
@@ -277,7 +291,7 @@ mod tests {
         ));
 
         assert!(
-            c.get("hash-abc", &ladder(), now).is_none(),
+            c.get("t", "hash-abc", &ladder(), now).is_none(),
             "must not be replayable"
         );
     }
@@ -294,7 +308,7 @@ mod tests {
             &ladder(),
             now
         ));
-        assert!(c.get("hash-abc", &ladder(), now).is_none());
+        assert!(c.get("t", "hash-abc", &ladder(), now).is_none());
     }
 
     #[test]
@@ -309,7 +323,7 @@ mod tests {
             &ladder(),
             now
         ));
-        assert!(c.get("hash-abc", &ladder(), now).is_none());
+        assert!(c.get("t", "hash-abc", &ladder(), now).is_none());
     }
 
     #[test]
@@ -342,6 +356,42 @@ mod tests {
     }
 
     #[test]
+    fn one_tenant_can_never_replay_anothers_answer() {
+        // Caught in review, and the worst bug in this feature: the key was
+        // `prompt_hash | ladder`, with no tenant. The prompt salt is per-DEPLOYMENT, so two
+        // tenants sending an identical prompt hash identically — tenant B would have been served
+        // tenant A's paid-for, verified answer, with a receipt that looked entirely normal.
+        let c = VerifiedCache::new(Duration::from_secs(60), 100);
+        let now = Instant::now();
+        let mut t = trace(ServedFrom::Attempt, Verdict::Pass);
+        t.tenant_id = "tenant-a".to_owned();
+        assert!(c.offer(&t, &resp("a's private answer"), &ladder(), now));
+
+        assert!(
+            c.get("tenant-b", "hash-abc", &ladder(), now).is_none(),
+            "cross-tenant replay — this is a data leak, not a cache miss"
+        );
+        assert!(
+            c.get("tenant-a", "hash-abc", &ladder(), now).is_some(),
+            "the owning tenant must still hit"
+        );
+    }
+
+    #[test]
+    fn the_cached_tenant_comes_from_the_receipt_not_the_caller() {
+        // Reading it off the receipt means a call site cannot pass the wrong tenant and quietly
+        // file an answer under someone else's key.
+        let c = VerifiedCache::new(Duration::from_secs(60), 100);
+        let now = Instant::now();
+        let mut t = trace(ServedFrom::Attempt, Verdict::Pass);
+        t.tenant_id = "owner".to_owned();
+        c.offer(&t, &resp("x"), &ladder(), now);
+
+        assert!(c.get("owner", "hash-abc", &ladder(), now).is_some());
+        assert!(c.get("t", "hash-abc", &ladder(), now).is_none());
+    }
+
+    #[test]
     fn a_different_ladder_is_a_different_question() {
         // An answer proven against one gate/ladder configuration says nothing about another.
         let c = VerifiedCache::new(Duration::from_secs(60), 100);
@@ -354,8 +404,8 @@ mod tests {
         );
 
         let other = vec!["openai/gpt-5.5".to_owned()];
-        assert!(c.get("hash-abc", &other, now).is_none());
-        assert!(c.get("hash-abc", &ladder(), now).is_some());
+        assert!(c.get("t", "hash-abc", &other, now).is_none());
+        assert!(c.get("t", "hash-abc", &ladder(), now).is_some());
     }
 
     #[test]
@@ -369,9 +419,9 @@ mod tests {
             t0,
         );
 
-        assert!(c.get("hash-abc", &ladder(), t0).is_some());
+        assert!(c.get("t", "hash-abc", &ladder(), t0).is_some());
         assert!(
-            c.get("hash-abc", &ladder(), t0 + Duration::from_secs(2))
+            c.get("t", "hash-abc", &ladder(), t0 + Duration::from_secs(2))
                 .is_none(),
             "a stale proof is not a proof"
         );

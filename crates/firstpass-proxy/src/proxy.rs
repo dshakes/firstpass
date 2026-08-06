@@ -1544,7 +1544,12 @@ async fn enforce_pipeline_inner(
     // carry — a cache keyed on anything else could hit for a request the trace describes
     // differently, and the provenance link would point at the wrong decision.
     if let Some(cache) = state.verified_cache.as_ref()
-        && let Some(entry) = cache.get(&ctx.prompt_hash, &route.ladder, std::time::Instant::now())
+        && let Some(entry) = cache.get(
+            &ctx.tenant_id,
+            &ctx.prompt_hash,
+            &route.ladder,
+            std::time::Instant::now(),
+        )
     {
         metrics::counter!("firstpass_cache_hits_total").increment(1);
         let trace = cache_hit_trace(&ctx, &entry, mode_now());
