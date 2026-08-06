@@ -282,6 +282,32 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+impl Trace {
+    /// Milliseconds this proxy added on top of the work it actually dispatched — provider calls
+    /// plus gates. The number a gateway is judged on, and the one Firstpass could not previously
+    /// state about itself.
+    ///
+    /// Returns `None` rather than a wrong figure when it cannot be computed honestly. Under
+    /// speculation, rungs run concurrently, so the summed work legitimately exceeds wall-clock and
+    /// the subtraction is meaningless; a receipt like that is excluded from an overhead
+    /// distribution instead of being floored to zero, which would silently drag a p95 down.
+    ///
+    /// Deliberately derived rather than stored: a recorded overhead field could disagree with the
+    /// timings beside it, and this way an auditor recomputes it from the same numbers we do.
+    #[must_use]
+    pub fn overhead_ms(&self) -> Option<u64> {
+        let dispatched: u64 = self
+            .attempts
+            .iter()
+            .map(|a| {
+                a.latency_ms
+                    .saturating_add(a.gates.iter().map(|g| g.ms).sum::<u64>())
+            })
+            .sum();
+        self.final_.total_latency_ms.checked_sub(dispatched)
+    }
+}
+
 impl Attempt {
     /// Total prompt tokens this call actually consumed, cached or not.
     ///

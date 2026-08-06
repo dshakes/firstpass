@@ -35,6 +35,7 @@ USAGE:
     firstpass doctor              validate config, provider key, and gate binaries
     firstpass trace [--limit N]   print recent audit traces as JSON lines (default 20)
     firstpass savings [--json]    spend vs the always-top counterfactual, from your own receipts
+    firstpass latency [--json]    p50/p95/p99 of the time THIS proxy adds, from your own receipts
     firstpass evals [--json]      per-gate verdict rates + escalation + serve-by-rung, from receipts
     firstpass predictor-eval [--json] [--lr L] [--l2 R]
                                    prequential AUC/Brier of the per-query P(pass) predictor
@@ -88,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "doctor" => cmd_doctor(),
         "trace" => cmd_trace(&args),
         "savings" => cmd_savings(&args),
+        "latency" => cmd_latency(&args),
         "evals" => cmd_evals(&args),
         "predictor-eval" => cmd_predictor_eval(&args),
         "explain" => cmd_explain(&args),
@@ -435,6 +437,21 @@ fn cmd_trace(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// `firstpass savings [--json] [--tenant ID]` — aggregate spend vs the always-top counterfactual
 /// from the trace store: the operator's own measured number, not a marketing claim. Empty or
 /// missing store prints the zero state and exits 0, like `trace`.
+/// `firstpass latency [--json]` — how much time this proxy itself adds, from your own receipts.
+fn cmd_latency(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ProxyConfig::from_env()?;
+    let tenant = tenant_arg(args, &config);
+    let traces = store::load_tenant_traces(std::path::Path::new(&config.db_path), &tenant)
+        .unwrap_or_default();
+    let summary = cli::summarize_overhead(&traces);
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!("{}", cli::format_overhead(&summary));
+    }
+    Ok(())
+}
+
 fn cmd_savings(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let config = ProxyConfig::from_env()?;
     let tenant = tenant_arg(args, &config);

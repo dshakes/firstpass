@@ -664,6 +664,102 @@ impl TrainingRow {
     }
 }
 
+/// Firstpass's own added latency, summarized from receipts.
+///
+/// Percentiles rather than a mean: overhead is right-skewed (a cold gate process, a slow
+/// subprocess spawn), and a mean hides exactly the tail a caller feels.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OverheadSummary {
+    /// Receipts that yielded an honest figure.
+    pub n: usize,
+    /// Receipts skipped because concurrency made the subtraction meaningless (speculation).
+    ///
+    /// Reported, never silently dropped: if most of a deployment's traffic is speculative, the
+    /// percentiles below describe a minority of it and the reader needs to know that.
+    pub skipped_concurrent: usize,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub max_ms: u64,
+}
+
+/// Summarize proxy overhead across `traces`.
+#[must_use]
+pub fn summarize_overhead(traces: &[Trace]) -> OverheadSummary {
+    let mut v: Vec<u64> = Vec::with_capacity(traces.len());
+    let mut skipped = 0usize;
+    for t in traces {
+        match t.overhead_ms() {
+            Some(ms) => v.push(ms),
+            None => skipped += 1,
+        }
+    }
+    v.sort_unstable();
+    // Nearest-rank percentile: with a handful of receipts an interpolated one invents a value
+    // between two real measurements, and every number here should be one we actually observed.
+    let pct = |p: f64| -> u64 {
+        if v.is_empty() {
+            return 0;
+        }
+        let rank = (p * v.len() as f64).ceil() as usize;
+        v[rank.clamp(1, v.len()) - 1]
+    };
+    OverheadSummary {
+        n: v.len(),
+        skipped_concurrent: skipped,
+        p50_ms: pct(0.50),
+        p95_ms: pct(0.95),
+        p99_ms: pct(0.99),
+        max_ms: v.last().copied().unwrap_or(0),
+    }
+}
+
+/// Render [`summarize_overhead`] for a terminal.
+#[must_use]
+pub fn format_overhead(s: &OverheadSummary) -> String {
+    if s.n == 0 {
+        return format!(
+            "no receipts with a measurable overhead ({} skipped as concurrent).\n\
+             Route some traffic first, or run with speculation off to measure it.\n",
+            s.skipped_concurrent
+        );
+    }
+    // Built line by line rather than as one continued literal: a `\`-continuation silently keeps
+    // the next line's indentation, which is how the first version of this shipped a wrapped
+    // sentence indented fifteen spaces into the middle of a report.
+    let mut lines = vec![
+        "Firstpass overhead — time added beyond the provider calls and gates it ran".to_owned(),
+        String::new(),
+        format!("  p50  {:>6} ms", s.p50_ms),
+        format!("  p95  {:>6} ms", s.p95_ms),
+        format!("  p99  {:>6} ms", s.p99_ms),
+        format!("  max  {:>6} ms", s.max_ms),
+        String::new(),
+        format!("  over {} receipt(s)", s.n),
+    ];
+    // A p95 of 0 is a real result for a Rust proxy, but printed bare it reads like the number is
+    // not being measured at all. Receipt timings are whole milliseconds, so say what 0 means.
+    if s.p95_ms == 0 {
+        lines.push(
+            "  0 ms is the floor, not a missing measurement: receipts record whole".to_owned(),
+        );
+        lines.push(
+            "  milliseconds, so the proxy's own work stayed under 1 ms per request.".to_owned(),
+        );
+    }
+    if s.skipped_concurrent > 0 {
+        lines.push(format!(
+            "  {} skipped: speculative rungs run concurrently, so subtracting dispatched",
+            s.skipped_concurrent
+        ));
+        lines.push(
+            "  work from wall-clock is meaningless there — excluded, not floored to 0.".to_owned(),
+        );
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
 /// Reshape receipts into JSONL training rows (`firstpass export --format rl`).
 #[must_use]
 pub fn export_training_jsonl(traces: &[Trace]) -> String {
@@ -962,6 +1058,130 @@ mod tests {
         assert!(
             parse_receipt_jsonl("\n\n").unwrap().is_empty(),
             "blank lines skipped"
+        );
+    }
+
+    fn trace_with_timing(total_ms: u64, attempts: &[(u64, u64)]) -> Trace {
+        use firstpass_core::{
+            Attempt, Features, FinalOutcome, GENESIS_HASH, GateResult, PolicyRef, RequestInfo,
+            ServedFrom, TaskKind, Verdict,
+        };
+        Trace {
+            trace_id: uuid::Uuid::now_v7(),
+            prev_hash: GENESIS_HASH.to_owned(),
+            tenant_id: "default".to_owned(),
+            session_id: "s".to_owned(),
+            ts: jiff::Timestamp::UNIX_EPOCH,
+            mode: Mode::Enforce,
+            policy: PolicyRef {
+                id: "static-ladder@v0".to_owned(),
+                explore: false,
+                propensity: None,
+                mode_profile: None,
+            },
+            request: RequestInfo {
+                api: "anthropic.messages".to_owned(),
+                prompt_hash: "x".to_owned(),
+                features: Features::new(TaskKind::CodeEdit),
+            },
+            attempts: attempts
+                .iter()
+                .enumerate()
+                .map(|(i, (model_ms, gate_ms))| Attempt {
+                    rung: i as u32,
+                    model: "anthropic/claude-haiku-4-5".to_owned(),
+                    provider: "anthropic".to_owned(),
+                    in_tokens: 1,
+                    cache_write_tokens: 0,
+                    cache_read_tokens: 0,
+                    out_tokens: 1,
+                    cost_usd: 0.0,
+                    latency_ms: *model_ms,
+                    gates: vec![GateResult::deterministic(
+                        "non-empty",
+                        Verdict::Pass,
+                        *gate_ms,
+                    )],
+                    verdict: Verdict::Pass,
+                })
+                .collect(),
+            final_: FinalOutcome {
+                served_rung: Some(0),
+                served_from: ServedFrom::Attempt,
+                total_cost_usd: 0.0,
+                gate_cost_usd: 0.0,
+                total_latency_ms: total_ms,
+                escalations: 0,
+                counterfactual_baseline_usd: 0.0,
+                savings_usd: 0.0,
+            },
+            deferred: vec![],
+            predicted_pass: None,
+            probe: None,
+            elastic: None,
+            rollout: None,
+            shadow: None,
+            route_ix: None,
+        }
+    }
+
+    #[test]
+    fn overhead_is_wall_clock_minus_the_work_actually_dispatched() {
+        // 500ms total, 400ms in the provider, 60ms in the gate → 40ms is ours.
+        let t = trace_with_timing(500, &[(400, 60)]);
+        assert_eq!(t.overhead_ms(), Some(40));
+
+        // Escalation: two provider calls and two gate runs all count against wall-clock.
+        let t = trace_with_timing(1000, &[(400, 50), (500, 20)]);
+        assert_eq!(t.overhead_ms(), Some(30));
+    }
+
+    #[test]
+    fn a_concurrent_receipt_is_excluded_rather_than_floored_to_zero() {
+        // Speculation runs rungs in parallel, so dispatched work legitimately exceeds wall-clock.
+        // Flooring that to 0 would be a fabricated measurement that drags a p95 down — exactly the
+        // kind of quietly-wrong number this codebase keeps having to remove.
+        let t = trace_with_timing(600, &[(400, 50), (500, 50)]);
+        assert_eq!(t.overhead_ms(), None, "must not report a made-up 0");
+
+        let s = summarize_overhead(&[t, trace_with_timing(500, &[(400, 60)])]);
+        assert_eq!(s.n, 1, "only the measurable one counts");
+        assert_eq!(
+            s.skipped_concurrent, 1,
+            "and the skip is reported, not hidden"
+        );
+        assert_eq!(s.p50_ms, 40);
+    }
+
+    #[test]
+    fn percentiles_are_observed_values_not_interpolated_ones() {
+        // Nearest-rank: every number printed is one we actually measured. Interpolation would
+        // invent a value between two real observations and report it as fact.
+        let traces: Vec<Trace> = [10u64, 20, 30, 40, 100]
+            .iter()
+            .map(|ms| trace_with_timing(100 + ms, &[(100, 0)]))
+            .collect();
+
+        let s = summarize_overhead(&traces);
+
+        assert_eq!(s.n, 5);
+        assert_eq!(s.p50_ms, 30);
+        assert_eq!(s.p95_ms, 100);
+        assert_eq!(s.p99_ms, 100);
+        assert_eq!(s.max_ms, 100);
+        for v in [s.p50_ms, s.p95_ms, s.p99_ms] {
+            assert!([10, 20, 30, 40, 100].contains(&v), "{v} was never observed");
+        }
+    }
+
+    #[test]
+    fn no_receipts_reports_that_rather_than_zeros() {
+        let s = summarize_overhead(&[]);
+        assert_eq!(s.n, 0);
+        assert!(
+            format_overhead(&s).contains("no receipts"),
+            "{}",
+            format_overhead(&s)
         );
     }
 
