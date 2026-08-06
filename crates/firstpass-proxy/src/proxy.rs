@@ -219,6 +219,10 @@ fn record_trace_metrics(trace: &Trace) {
         ServedFrom::Attempt => "attempt",
         ServedFrom::BestAttempt => "best_attempt",
         ServedFrom::Error => "error",
+        // Broken out rather than folded into "attempt": a cache replay called no model and ran no
+        // gate today, so counting it as an attempt would inflate every rate computed from this
+        // series — pass rate, escalation rate, cost per serve.
+        ServedFrom::Cache => "cache",
     };
     metrics::counter!("firstpass_served_total", "served_from" => served_from).increment(1);
     if trace.final_.served_from == ServedFrom::Error {
@@ -2292,6 +2296,7 @@ fn build_trace(
         escalations: 0,
         counterfactual_baseline_usd: cost_usd,
         savings_usd: 0.0,
+        cache_source: None,
     };
     trace.recompute_savings();
     trace
@@ -2337,6 +2342,7 @@ fn build_stream_trace(
         escalations: 0,
         counterfactual_baseline_usd: 0.0,
         savings_usd: 0.0,
+        cache_source: None,
     };
     trace.recompute_savings();
     trace
@@ -2364,6 +2370,7 @@ fn build_error_trace(
         escalations: 0,
         counterfactual_baseline_usd: 0.0,
         savings_usd: 0.0,
+        cache_source: None,
     };
     trace.recompute_savings();
     trace
@@ -2410,6 +2417,7 @@ fn base_trace(
             escalations: 0,
             counterfactual_baseline_usd: 0.0,
             savings_usd: 0.0,
+            cache_source: None,
         },
         probe: None,
         rollout: None,

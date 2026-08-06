@@ -287,6 +287,7 @@ mod tests {
                 escalations: 0,
                 counterfactual_baseline_usd: 0.001,
                 savings_usd: 0.0,
+                cache_source: None,
             },
             probe: None,
             rollout: None,

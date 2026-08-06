@@ -52,6 +52,7 @@ pub mod store;
 pub mod subprocess;
 pub mod tenant_auth;
 pub mod upstream;
+pub mod verified_cache;
 
 pub use config::ProxyConfig;
 pub use error::ProxyError;

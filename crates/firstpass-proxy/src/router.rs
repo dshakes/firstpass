@@ -243,6 +243,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
             escalations,
             counterfactual_baseline_usd: baseline,
             savings_usd: 0.0,
+            cache_source: None,
         },
         probe: None,
         rollout: None,

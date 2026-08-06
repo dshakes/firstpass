@@ -348,6 +348,14 @@ pub enum ServedFrom {
     BestAttempt,
     /// No output served; a structured error was returned.
     Error,
+    /// Replayed from the verified cache: this exact prompt was answered before, that answer
+    /// **passed its gate**, and the receipt names the decision that proved it.
+    ///
+    /// Distinct from [`ServedFrom::Attempt`] because no model was called — a receipt that reported
+    /// this as a normal attempt would claim a verification that did not run today, and inflate
+    /// every pass-rate computed over receipts. `cache_source` carries the trace it came from, so
+    /// the proof is one lookup away rather than asserted.
+    Cache,
 }
 
 /// The final outcome and economics of a decision.
@@ -368,6 +376,14 @@ pub struct FinalOutcome {
     pub escalations: u32,
     /// What always calling the top rung would have cost (§9.1 counterfactual).
     pub counterfactual_baseline_usd: f64,
+    /// The decision this answer was replayed from, when `served_from = cache`.
+    ///
+    /// The whole point of a verified cache: the receipt does not merely say "cached", it names the
+    /// earlier decision whose gate passed, so an auditor can follow the link and check that the
+    /// thing being replayed was actually proven. Absent otherwise, so pre-cache receipts serialize
+    /// byte-identically and re-derive the same hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_source: Option<Uuid>,
     /// `counterfactual_baseline_usd - total_cost_usd` — the savings this decision proves.
     pub savings_usd: f64,
 }
@@ -475,6 +491,7 @@ mod tests {
                 escalations: 1,
                 counterfactual_baseline_usd: 0.0630,
                 savings_usd: 0.0,
+                cache_source: None,
             },
             probe: None,
             rollout: None,
