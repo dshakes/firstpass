@@ -187,7 +187,7 @@ Or through your package manager — each row is live and republishes on every re
 | 🍺 **Homebrew** | `brew install dshakes/tap/firstpass-proxy` |
 | 🐳 **Docker** | `docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest` |
 | 🦀 **Cargo** | `cargo install firstpass-proxy` <sub>(crates.io, live since v0.4.0; needs a Rust toolchain)</sub> |
-| 📦 **npm** | `npm i -g @dshakesnotbot/firstpass-proxy` <sub>(scoped — the bare `firstpass` on npm is an unrelated package)</sub> |
+| 📦 **npm** | `npm i -g firstpass-proxy` <sub>(not `firstpass` — that name on npm is an unrelated CLI)</sub> |
 | ⬇️ **Binaries** | macOS · Linux · Windows, checksummed, self-updating (`firstpass-proxy-update`) — [Releases](https://github.com/dshakes/firstpass/releases) |
 
 ## Quickstart
