@@ -32,11 +32,18 @@ use std::time::{Duration, Instant};
 
 use firstpass_core::{ServedFrom, Trace, Verdict};
 
+use crate::provider::ModelResponse;
+
 /// An answer that passed, kept for replay.
 #[derive(Debug, Clone)]
 pub struct Entry {
-    /// The response body served, verbatim.
-    pub body: Vec<u8>,
+    /// The response that was served.
+    ///
+    /// Stored as the normalized [`ModelResponse`] rather than raw wire bytes, so a replay flows
+    /// back out through the same dialect-shaping the live path uses. Caching bytes would mean an
+    /// answer cached from an Anthropic caller could not be replayed to an OpenAI one, and the two
+    /// paths would drift.
+    pub response: ModelResponse,
     /// The decision that proved it — recorded on every replay's receipt.
     pub source: uuid::Uuid,
     /// What that decision cost, so a replay can report the spend it avoided rather than guess.
@@ -87,7 +94,13 @@ impl VerifiedCache {
     /// Returns whether it was stored. Everything about the safety of this feature is in the
     /// rejection rules below, so they are checked here — in one place, against the receipt — rather
     /// than trusted to each call site to have got right.
-    pub fn offer(&self, trace: &Trace, body: &[u8], ladder: &[String], now: Instant) -> bool {
+    pub fn offer(
+        &self,
+        trace: &Trace,
+        response: &ModelResponse,
+        ladder: &[String],
+        now: Instant,
+    ) -> bool {
         // 1. It must have been served from a real attempt. `BestAttempt` is the budget-exhausted
         //    fallback — served without a passing verdict, and caching it would replay an answer
         //    that never passed anything.
@@ -137,7 +150,7 @@ impl VerifiedCache {
         map.insert(
             key(&trace.request.prompt_hash, ladder),
             Entry {
-                body: body.to_vec(),
+                response: response.clone(),
                 source: trace.trace_id,
                 original_cost_usd: trace.final_.total_cost_usd,
                 stored: now,
@@ -166,6 +179,18 @@ mod tests {
         Attempt, DeferredVerdict, Features, FinalOutcome, GENESIS_HASH, GateResult, Mode,
         PolicyRef, RequestInfo, TaskKind,
     };
+
+    fn resp(text: &str) -> ModelResponse {
+        ModelResponse {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            text: text.to_owned(),
+            in_tokens: 10,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 5,
+            raw: serde_json::Value::Null,
+        }
+    }
 
     fn ladder() -> Vec<String> {
         vec!["anthropic/claude-haiku-4-5".to_owned()]
@@ -230,10 +255,10 @@ mod tests {
         let now = Instant::now();
         let t = trace(ServedFrom::Attempt, Verdict::Pass);
 
-        assert!(c.offer(&t, b"the answer", &ladder(), now));
+        assert!(c.offer(&t, &resp("the answer"), &ladder(), now));
 
         let hit = c.get("hash-abc", &ladder(), now).expect("hit");
-        assert_eq!(hit.body, b"the answer");
+        assert_eq!(hit.response.text, "the answer");
         // Not merely "cached" — the decision whose gate passed, so the proof is one lookup away.
         assert_eq!(hit.source, t.trace_id);
         assert!((hit.original_cost_usd - 0.01).abs() < f64::EPSILON);
@@ -246,7 +271,7 @@ mod tests {
 
         assert!(!c.offer(
             &trace(ServedFrom::Attempt, Verdict::Fail),
-            b"bad",
+            &resp("bad"),
             &ladder(),
             now
         ));
@@ -265,7 +290,7 @@ mod tests {
         let now = Instant::now();
         assert!(!c.offer(
             &trace(ServedFrom::Attempt, Verdict::Abstain),
-            b"?",
+            &resp("?"),
             &ladder(),
             now
         ));
@@ -280,7 +305,7 @@ mod tests {
         let now = Instant::now();
         assert!(!c.offer(
             &trace(ServedFrom::BestAttempt, Verdict::Pass),
-            b"x",
+            &resp("x"),
             &ladder(),
             now
         ));
@@ -302,7 +327,7 @@ mod tests {
             reporter: "ci".to_owned(),
         });
 
-        assert!(!c.offer(&t, b"looked fine", &ladder(), now));
+        assert!(!c.offer(&t, &resp("looked fine"), &ladder(), now));
     }
 
     #[test]
@@ -313,7 +338,7 @@ mod tests {
         let now = Instant::now();
         let mut t = trace(ServedFrom::Attempt, Verdict::Pass);
         t.final_.cache_source = Some(uuid::Uuid::now_v7());
-        assert!(!c.offer(&t, b"replayed", &ladder(), now));
+        assert!(!c.offer(&t, &resp("replayed"), &ladder(), now));
     }
 
     #[test]
@@ -323,7 +348,7 @@ mod tests {
         let now = Instant::now();
         c.offer(
             &trace(ServedFrom::Attempt, Verdict::Pass),
-            b"a",
+            &resp("a"),
             &ladder(),
             now,
         );
@@ -339,7 +364,7 @@ mod tests {
         let t0 = Instant::now();
         c.offer(
             &trace(ServedFrom::Attempt, Verdict::Pass),
-            b"a",
+            &resp("a"),
             &ladder(),
             t0,
         );
@@ -359,7 +384,7 @@ mod tests {
         for i in 0..100 {
             let mut t = trace(ServedFrom::Attempt, Verdict::Pass);
             t.request.prompt_hash = format!("h{i}");
-            c.offer(&t, b"a", &ladder(), now);
+            c.offer(&t, &resp("a"), &ladder(), now);
         }
         assert!(c.len() <= 10, "expected <= 10 entries, got {}", c.len());
     }

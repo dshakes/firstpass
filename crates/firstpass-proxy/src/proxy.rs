@@ -71,6 +71,10 @@ pub struct AppState {
     /// starts its next turn on the rung it actually needed instead of re-paying for the rung that
     /// already failed — with a periodic downward probe so the promotion is not one-way.
     pub promoter: Option<Arc<crate::affinity::SessionPromoter>>,
+    /// Optional verified-response cache (`[escalation.verified_cache]`). `None` (default) = every
+    /// request runs the ladder. A hit replays an answer that previously PASSED a gate, and the
+    /// receipt names the decision that proved it.
+    pub verified_cache: Option<Arc<crate::verified_cache::VerifiedCache>>,
     /// Optional per-query gate-pass predictor (ADR 0008 Phase 2). `None` (default) = no
     /// prediction, byte-identical to today. When `Some`, `handle_enforce` records its
     /// `P(gate-pass)` for the start rung on the receipt in **shadow** (never acted on) and
@@ -109,6 +113,84 @@ fn routing_cfg_condense(state: &AppState) -> Option<&firstpass_core::config::Con
         .routing
         .as_ref()
         .and_then(|r| r.escalation.condense.as_ref())
+}
+
+/// Build the verified cache from `[escalation.verified_cache]`, or `None` when absent.
+///
+/// Shared by `run::serve` and the end-to-end tests for the same reason `build_promoter` is: a test
+/// that constructs `AppState` by hand can otherwise pass against wiring production does not have.
+#[must_use]
+/// Current wall-clock as a trace timestamp.
+fn mode_now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+}
+
+/// The receipt for a cache hit.
+///
+/// Deliberately carries **no attempts**: no model was called and no gate ran on this request.
+/// Synthesizing an attempt would claim a verification that did not happen today and inflate every
+/// pass rate computed over receipts. What makes the serve defensible is `cache_source`, which names
+/// the earlier decision whose gate did pass — a reader follows the link rather than trusting this
+/// record to have re-proven anything.
+fn cache_hit_trace(
+    ctx: &crate::router::EnforceCtx<'_>,
+    entry: &crate::verified_cache::Entry,
+    ts: jiff::Timestamp,
+) -> Trace {
+    Trace {
+        trace_id: uuid::Uuid::now_v7(),
+        prev_hash: firstpass_core::GENESIS_HASH.to_owned(),
+        tenant_id: ctx.tenant_id.clone(),
+        session_id: ctx.session_id.clone(),
+        ts,
+        mode: Mode::Enforce,
+        policy: PolicyRef {
+            id: format!("{}+cache", ctx.policy_id),
+            explore: false,
+            propensity: None,
+            mode_profile: None,
+        },
+        request: RequestInfo {
+            api: ctx.api.clone(),
+            prompt_hash: ctx.prompt_hash.clone(),
+            features: ctx.features.clone(),
+        },
+        attempts: Vec::new(),
+        final_: FinalOutcome {
+            served_rung: None,
+            served_from: ServedFrom::Cache,
+            // A replay spends nothing. The counterfactual is what this request WOULD have cost,
+            // which is what the proven decision cost — so the saving is real and attributable
+            // rather than an invented figure.
+            total_cost_usd: 0.0,
+            gate_cost_usd: 0.0,
+            total_latency_ms: 0,
+            escalations: 0,
+            counterfactual_baseline_usd: entry.original_cost_usd,
+            savings_usd: entry.original_cost_usd,
+            cache_source: Some(entry.source),
+        },
+        deferred: Vec::new(),
+        predicted_pass: None,
+        probe: None,
+        elastic: None,
+        rollout: None,
+        shadow: None,
+        route_ix: None,
+    }
+}
+
+pub fn build_verified_cache(
+    config: &ProxyConfig,
+) -> Option<Arc<crate::verified_cache::VerifiedCache>> {
+    let c = config
+        .routing
+        .as_ref()
+        .and_then(|r| r.escalation.verified_cache.as_ref())?;
+    Some(Arc::new(crate::verified_cache::VerifiedCache::new(
+        std::time::Duration::from_secs(c.ttl_secs),
+        c.max_entries,
+    )))
 }
 
 pub fn build_promoter(
@@ -1457,6 +1539,19 @@ async fn enforce_pipeline_inner(
         policy_id,
     };
 
+    // Verified cache: replay an answer this exact prompt already earned under this exact ladder.
+    // Checked here, after the ctx is built, so the key uses the same salted hash the receipt will
+    // carry — a cache keyed on anything else could hit for a request the trace describes
+    // differently, and the provenance link would point at the wrong decision.
+    if let Some(cache) = state.verified_cache.as_ref()
+        && let Some(entry) = cache.get(&ctx.prompt_hash, &route.ladder, std::time::Instant::now())
+    {
+        metrics::counter!("firstpass_cache_hits_total").increment(1);
+        let trace = cache_hit_trace(&ctx, &entry, mode_now());
+        offer_trace(&state.traces, state.spill.as_ref(), trace);
+        return Ok(entry.response);
+    }
+
     let (outcome, mut trace) = route_enforce(ctx).await;
 
     // Stamp which route produced this decision, so a downstream outcome arriving minutes later
@@ -1635,6 +1730,16 @@ async fn enforce_pipeline_inner(
         }
     }
     // ── end shadow probe ─────────────────────────────────────────────────────────────────────
+
+    // Offer this decision to the verified cache. `offer` re-reads the finished receipt and stores
+    // only what was served on a passing verdict, so the rule lives in one place rather than being
+    // re-derived here from local variables that might disagree with what was recorded.
+    if let Some(cache) = state.verified_cache.as_ref()
+        && let EngineOutcome::Served(resp) = &outcome
+        && cache.offer(&trace, resp, &route.ladder, std::time::Instant::now())
+    {
+        metrics::counter!("firstpass_cache_stores_total").increment(1);
+    }
 
     // The trace is already built; enqueue it off-path (non-blocking `try_send`, so no spawn needed).
     offer_trace(&state.traces, state.spill.as_ref(), trace);
@@ -3476,6 +3581,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             promoter: None,
+            verified_cache: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -3655,6 +3761,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             promoter: None,
+            verified_cache: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -4067,6 +4174,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             promoter: None,
+            verified_cache: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -4279,6 +4387,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             promoter: None,
+            verified_cache: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -4532,6 +4641,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             promoter: None,
+            verified_cache: None,
             predictor: None,
             tenant_rate_limiter,
             spill: None,
@@ -4901,6 +5011,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             promoter: None,
+            verified_cache: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -5271,6 +5382,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             promoter: None,
+            verified_cache: None,
             predictor: None,
             tenant_rate_limiter,
             spill: None,
@@ -5389,6 +5501,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             promoter: None,
+            verified_cache: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,
@@ -5665,6 +5778,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             promoter: None,
+            verified_cache: None,
             predictor,
             tenant_rate_limiter: None,
             spill: None,
@@ -5755,6 +5869,7 @@ mod tests {
             adaptive: None,
             bandit: None,
             promoter: None,
+            verified_cache: None,
             predictor: None,
             tenant_rate_limiter: None,
             spill: None,

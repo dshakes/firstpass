@@ -199,6 +199,7 @@ pub(crate) async fn spawn_proxy(
         traces,
         adaptive: None,
         promoter: None,
+        verified_cache: None,
         bandit: None,
         predictor: None,
         tenant_rate_limiter: None,

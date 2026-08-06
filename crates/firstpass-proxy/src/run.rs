@@ -83,6 +83,11 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
     // nobody can see. Built via the shared helper so tests cannot wire it differently.
     let promoter = crate::proxy::build_promoter(&config)?;
 
+    // Verified-response cache (opt-in): in-memory and per-process, like the promoter. A cached
+    // answer is a claim that a gate passed, and that claim should not outlive the process that
+    // witnessed it — restoring one from disk would replay a proof nobody in this run observed.
+    let verified_cache = crate::proxy::build_verified_cache(&config);
+
     // UCB1 start-rung bandit (opt-in): warm-start from stored traces so learning survives
     // restarts. Forgiving: an unreadable or absent store simply yields an empty bandit.
     // ponytail: operator-wide load (load_all_traces) is correct here — the bandit is also
@@ -163,6 +168,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
         traces,
         adaptive,
+        verified_cache,
         promoter,
         bandit,
         predictor,

@@ -1115,6 +1115,7 @@ mod tests {
                 escalations: 0,
                 counterfactual_baseline_usd: 0.0,
                 savings_usd: 0.0,
+                cache_source: None,
             },
             deferred: vec![],
             predicted_pass: None,

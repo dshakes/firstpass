@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### Added: a response cache that can only replay a **proven** answer
+
+`[escalation.verified_cache]`, absent by default. A hit skips the ladder entirely — but only for an
+answer that previously passed a gate.
+
+That restriction is the whole feature. A conventional cache stores whatever the model said, and at
+a 40% hit rate a product claiming "nothing ships until a real check passes" would be serving 40% of
+its traffic unchecked. So the gate is on **insertion**: an entry is written only when the finished
+receipt shows the request was served on a passing verdict. Not cacheable — a `Fail`, an `Abstain`
+("the gate could not tell" is the state that must never be frozen and replayed), a budget-exhausted
+best-effort serve, a request whose deferred verdict later came back `Fail`, or a hit itself.
+
+A hit's receipt does not say "cached". It carries `served_from: cache` and **`cache_source`**, the
+trace id of the decision whose gate passed, so an auditor follows the link instead of taking the
+claim. It carries **no attempts**: no model ran and no gate ran today, and synthesizing one would
+claim a verification that did not happen and inflate every rate computed over receipts.
+
+Exact-match on the salted prompt hash, keyed with the ladder — the same prompt under a different
+ladder is a different question, since an answer proven against one gate configuration says nothing
+about another. Deliberately **not** semantic: two prompts that merely look similar can want
+different answers, and a verification product guessing that they don't is the one shortcut it
+cannot take.
+
+`cache_source` is omitted when absent, so existing receipts serialize byte-identically and
+re-derive the same hash.
+
 ### Added: `firstpass latency` — the number this proxy could not previously state about itself
 
 Every gateway in this category publishes an overhead figure. Firstpass recorded total request time
