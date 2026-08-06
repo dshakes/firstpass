@@ -281,6 +281,31 @@ Crossing vendors is handled, not assumed: a caller that sets `reasoning_effort` 
 ladder escalates onto an Anthropic rung (as `thinking`), and a tool call survives the round trip
 through `/v1/responses` in both directions rather than being quietly dropped.
 
+### Providers
+
+Eight OpenAI-compatible platforms work with **no `[[provider]]` block** — name the rung and set the
+key: `groq`, `deepseek`, `together`, `fireworks`, `mistral`, `openrouter`, `xai`, `cerebras`,
+alongside the built-in `anthropic` and `openai`.
+
+```toml
+[[route]]
+mode = "enforce"
+ladder = ["groq/llama-3.3-70b-versatile", "anthropic/claude-sonnet-5"]
+gates = ["non-empty"]
+
+[[price]]   # required — see below
+model = "groq/llama-3.3-70b-versatile"
+input_per_mtok = 0.59
+output_per_mtok = 0.79
+```
+
+**Endpoints ship built in; prices do not, deliberately.** A base URL is a stable fact. A price is
+not — these platforms change pricing without notice, and a stale built-in would write a wrong
+`cost_usd` into a tamper-evident receipt and mis-feed your `[budget]` caps. So a rung on one of
+these still needs an explicit `[[price]]`, and the proxy refuses to start without it, naming the
+model and printing the block to paste. `firstpass doctor` also fails loudly when a configured rung's
+API key is missing, rather than letting the first real request discover it.
+
 ### Every provider, including open-source
 
 A ladder rung is `<id>/<model>` — open on a free local model, escalate to a frontier model only on proven need:

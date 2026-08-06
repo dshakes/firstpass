@@ -116,6 +116,33 @@ pub fn doctor(config: &ProxyConfig, env: impl Fn(&str) -> Option<String>) -> Doc
         ));
     }
 
+    // A ladder rung on a built-in provider whose key is absent fails at the first REQUEST, not at
+    // startup — the least useful moment to find out. Checked per rung actually configured rather
+    // than for all eight built-ins, because warning about providers nobody is using is noise that
+    // trains an operator to skip the report.
+    let mut missing_keys: Vec<(String, &str)> = Vec::new();
+    if let Some(routing) = config.routing.as_ref() {
+        let mut seen = std::collections::HashSet::new();
+        for rung in routing.routes.iter().flat_map(|r| r.ladder.iter()) {
+            let Some((prov, _)) = rung.split_once('/') else {
+                continue;
+            };
+            let Some(key_env) = crate::provider::builtin_key_env(prov) else {
+                continue; // anthropic/openai are covered above; a [[provider]] block owns its own
+            };
+            if seen.insert(prov.to_owned()) && env(key_env).is_none_or(|k| k.is_empty()) {
+                missing_keys.push((prov.to_owned(), key_env));
+            }
+        }
+    }
+    for (prov, key_env) in missing_keys {
+        checks.push(Check::new(
+            format!("provider:{prov}"),
+            CheckStatus::Fail,
+            format!("{key_env} not set — a rung on `{prov}` will fail at the first request"),
+        ));
+    }
+
     // Every configured gate command must resolve, or that gate silently abstains at runtime.
     let path = env("PATH");
     let gate_defs = config.routing.as_ref().map_or(&[][..], |c| &c.gate_defs);
@@ -879,6 +906,56 @@ mod tests {
             _ => None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn doctor_flags_a_ladder_rung_whose_provider_key_is_missing() {
+        // Without this the failure surfaces on the first real request, in production, as an
+        // upstream error — the least useful moment to learn the key was never set.
+        let toml = "[[route]]\nmode = \"enforce\"\nladder = [\"groq/llama-3.3-70b-versatile\"]\n\
+                    [[price]]\nmodel = \"groq/llama-3.3-70b-versatile\"\n\
+                    input_per_mtok = 0.59\noutput_per_mtok = 0.79\n";
+        let config = config_with(Some(toml), "/tmp/doctor-groq.db");
+
+        let report = doctor(&config, |k| match k {
+            "PATH" => Some("/usr/bin".to_owned()),
+            _ => None, // no GROQ_API_KEY
+        });
+
+        let groq = report
+            .checks
+            .iter()
+            .find(|c| c.name == "provider:groq")
+            .expect("groq rung should be checked");
+        assert_eq!(groq.status, CheckStatus::Fail);
+        assert!(groq.detail.contains("GROQ_API_KEY"), "{}", groq.detail);
+        assert!(
+            !report.healthy(),
+            "a rung that cannot authenticate is not healthy"
+        );
+    }
+
+    #[test]
+    fn doctor_stays_quiet_about_providers_the_ladder_does_not_use() {
+        // Warning about all eight built-ins would be noise, and noise trains an operator to skip
+        // the report — which is how the one real warning gets missed.
+        let toml = "[[route]]\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n";
+        let config = config_with(Some(toml), "/tmp/doctor-quiet.db");
+
+        let report = doctor(&config, |k| match k {
+            "PATH" => Some("/usr/bin".to_owned()),
+            "ANTHROPIC_API_KEY" => Some("sk-test".to_owned()),
+            _ => None,
+        });
+
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.name.starts_with("provider:")),
+            "unused providers must not be reported: {:?}",
+            report.checks.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]

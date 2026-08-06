@@ -1268,6 +1268,54 @@ impl std::fmt::Debug for ProviderRegistry {
     }
 }
 
+/// OpenAI-compatible providers registered out of the box: `(id, base_url, api_key_env)`.
+///
+/// Every one of these speaks the OpenAI Chat Completions wire format, so a ladder can name
+/// `groq/…` or `deepseek/…` without a `[[provider]]` block. A user block with the same id still
+/// wins — this is a default, not a lock.
+///
+/// **Endpoints only, deliberately no prices.** A base URL is a stable fact; a price is not. Model
+/// pricing on these platforms changes without notice, and a stale built-in price would write a
+/// wrong `cost_usd` into a tamper-evident receipt and quietly mis-feed `[budget]` caps — the exact
+/// defect class 0.4.0 shipped a breaking change to eliminate. So a rung on one of these providers
+/// still requires an explicit `[[price]]`, and `Config::parse` refuses to start without it, naming
+/// the model and printing the block to paste. Declaring the number you are actually billed is a
+/// second of work; discovering months later that every receipt was wrong is not.
+///
+/// A self-hosted runtime (Ollama, vLLM, LM Studio) has no key and no fixed host, so it stays a
+/// `[[provider]]` block: guessing `localhost:11434` for someone would be a default that silently
+/// points at the wrong machine.
+const BUILTIN_OPENAI_COMPATIBLE: &[(&str, &str, &str)] = &[
+    ("groq", "https://api.groq.com/openai", "GROQ_API_KEY"),
+    ("deepseek", "https://api.deepseek.com", "DEEPSEEK_API_KEY"),
+    ("together", "https://api.together.xyz", "TOGETHER_API_KEY"),
+    (
+        "fireworks",
+        "https://api.fireworks.ai/inference",
+        "FIREWORKS_API_KEY",
+    ),
+    ("mistral", "https://api.mistral.ai", "MISTRAL_API_KEY"),
+    (
+        "openrouter",
+        "https://openrouter.ai/api",
+        "OPENROUTER_API_KEY",
+    ),
+    ("xai", "https://api.x.ai", "XAI_API_KEY"),
+    ("cerebras", "https://api.cerebras.ai", "CEREBRAS_API_KEY"),
+];
+
+/// The env var a built-in OpenAI-compatible provider reads its key from, if `id` is one.
+///
+/// Exposed so `doctor` can report a missing key at setup time rather than letting the first real
+/// request discover it.
+#[must_use]
+pub fn builtin_key_env(id: &str) -> Option<&'static str> {
+    BUILTIN_OPENAI_COMPATIBLE
+        .iter()
+        .find(|(p, _, _)| *p == id)
+        .map(|(_, _, k)| *k)
+}
+
 impl ProviderRegistry {
     /// One HTTP client shared by every provider. The enforce path is request/response (never
     /// streamed through the adapter), so it carries a total request timeout as well as a connect
@@ -1318,6 +1366,19 @@ impl ProviderRegistry {
                 http: http.clone(),
             }),
         );
+        // Registered BEFORE user `[[provider]]` blocks so an explicit definition overrides the
+        // built-in — an operator pointing `groq` at a proxy of their own must win over our default.
+        for (id, base, key_env) in BUILTIN_OPENAI_COMPATIBLE {
+            providers.insert(
+                (*id).to_owned(),
+                Arc::new(OpenAiProvider {
+                    id: (*id).to_owned(),
+                    base_url: (*base).to_owned(),
+                    api_key_env: Some((*key_env).to_owned()),
+                    http: http.clone(),
+                }),
+            );
+        }
         for def in defs {
             // Auth scheme comes first (ADR 0006): `aws_sigv4`/`gcp_oauth` are bespoke-auth
             // backends that wrap the Anthropic body shape regardless of `dialect`; `api_key`
@@ -1751,6 +1812,60 @@ mod tests {
 
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn common_openai_compatible_providers_work_without_a_config_block() {
+        // The breadth gap: a ladder naming `groq/…` previously needed a `[[provider]]` block, so
+        // "bring your own provider" meant boilerplate before the first request.
+        let reg = ProviderRegistry::from_config(
+            &[],
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+        );
+        for id in [
+            "groq",
+            "deepseek",
+            "together",
+            "fireworks",
+            "mistral",
+            "openrouter",
+            "xai",
+            "cerebras",
+        ] {
+            assert!(reg.get(id).is_some(), "{id} should be built in");
+        }
+        // The originals are untouched.
+        assert!(reg.get("anthropic").is_some());
+        assert!(reg.get("openai").is_some());
+        assert!(reg.get("not-a-provider").is_none());
+    }
+
+    #[test]
+    fn an_explicit_provider_block_overrides_the_builtin() {
+        // An operator pointing `groq` at a gateway of their own must win over our default —
+        // otherwise the built-in silently routes their traffic to the public endpoint instead.
+        let defs = vec![firstpass_core::ProviderDef {
+            id: "groq".to_owned(),
+            base_url: "https://internal.example.com/groq".to_owned(),
+            api_key_env: Some("MY_KEY".to_owned()),
+            dialect: firstpass_core::Dialect::Openai,
+            auth: firstpass_core::AuthScheme::ApiKey,
+            region: None,
+            project: None,
+        }];
+
+        let reg = ProviderRegistry::from_config(
+            &defs,
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+        );
+
+        let p = reg.get("groq").expect("groq present");
+        assert!(
+            format!("{p:?}").contains("internal.example.com"),
+            "the explicit block must win: {p:?}"
+        );
     }
 
     #[test]
