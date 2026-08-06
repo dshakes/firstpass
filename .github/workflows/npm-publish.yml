@@ -1,8 +1,12 @@
 name: npm-publish
 # Publish the npm package via OIDC TRUSTED PUBLISHING — no token, no 2FA.
-# cargo-dist generates the @dshakesnotbot/firstpass-proxy tarball as a release
-# asset (npm is in `installers` but NOT `publish-jobs`); this job downloads it and
-# pushes it to npm using the repo's OIDC identity.
+# cargo-dist generates the `firstpass-proxy` tarball as a release asset (npm is in
+# `installers` but NOT `publish-jobs`); this job downloads it and pushes it to npm
+# using the repo's OIDC identity.
+#
+# The package is UNSCOPED `firstpass-proxy`, matching the crate on crates.io, the
+# Homebrew formula, and the binary. It is not `firstpass` because that name on npm
+# belongs to an unrelated CLI published before this repo existed.
 #
 # TRIGGER: `workflow_run` after the "Release" workflow finishes — NOT `release:
 # published`. A release created by GITHUB_TOKEN (which cargo-dist uses) does NOT
@@ -69,10 +73,26 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           TARBALL="$(ls ./*-npm-package.tar.gz)"
+          NAME="$(tar -xzOf "$TARBALL" --wildcards '*/package.json' 2>/dev/null | \
+                  python3 -c 'import sys,json;print(json.load(sys.stdin)["name"])' || echo '?')"
+          echo "publishing npm package: $NAME"
+
           if [ -n "$NPM_TOKEN" ]; then
             echo "bootstrap publish with NPM_TOKEN"
             echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
           else
             echo "OIDC trusted publishing (no token)"
+            # A trusted publisher can only be configured for a package that already
+            # EXISTS. Publishing a brand-new name via OIDC therefore cannot work, and
+            # npm's error for it is opaque. Say so here instead of leaving whoever
+            # reads this log to work it out from a 404.
+            if ! curl -sfo /dev/null "https://registry.npmjs.org/$NAME"; then
+              echo "::error::$NAME does not exist on npm yet, and OIDC trusted publishing \
+          cannot bootstrap a new package — a trusted publisher can only be attached to a package \
+          that already exists. Add an NPM_TOKEN secret (classic Automation token, bypasses 2FA) so \
+          this first publish can create it, then configure the Trusted Publisher for $NAME on \
+          npmjs.com and delete the secret again."
+              exit 1
+            fi
           fi
           npm publish "$TARBALL" --access public
