@@ -1,6 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0]
+
+Three additions that each close a gap against the rest of the router category, plus one the category
+cannot copy.
+
+**Breaking for `firstpass-core` LIBRARY consumers only — not for the proxy.** Receipts, configs, and
+the wire APIs are all unchanged, and existing receipts still deserialize and re-derive the same
+hash. But `ServedFrom` gained a `Cache` variant and `FinalOutcome` gained `cache_source`, and
+neither type is `#[non_exhaustive]` — so downstream Rust code that matches `ServedFrom` exhaustively
+or builds a `FinalOutcome` by struct literal will stop compiling. Add a `ServedFrom::Cache` arm and
+`cache_source: None`. If you run the proxy rather than depending on the crate, this release is
+purely additive.
 
 ### Added: eight more providers work without a `[[provider]]` block
 
