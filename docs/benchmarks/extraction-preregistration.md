@@ -7,9 +7,11 @@ demonstration.
 
 ## The objection this answers
 
-Every measurement Firstpass publishes comes from **coding tasks with executable tests** — MBPP, and
-the BigCodeBench/SWE-bench harnesses. That is the single domain where a gate is nearly free, and it
-is fair to ask whether verification-gated routing works anywhere a gate is harder to write.
+Every measurement Firstpass publishes comes from **coding tasks with executable tests** — MBPP,
+scored by the same harness that runs BigCodeBench. (A SWE-bench harness exists in the tree but has
+no CLI entry point, so nothing published rests on it — see ADR 0010.) That is the single domain
+where a gate is nearly free, and it is fair to ask whether verification-gated routing works
+anywhere a gate is harder to write.
 
 ## Task
 
