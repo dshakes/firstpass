@@ -1,7 +1,16 @@
 # ADR 0010 — Running SWE-bench without quietly dismantling the sandbox
 
-- Status: **Accepted and implemented** — `crates/firstpass-bench/src/swebench.rs`. D1's mechanism
-  is verified against a real published image (`astropy__astropy-12907`); see *"Verified"* below.
+- Status: **Accepted; mechanism implemented, not yet wired to the CLI** —
+  `crates/firstpass-bench/src/swebench.rs`. D1's mechanism is verified against a real published
+  image (`astropy__astropy-12907`); see *"Verified"* below.
+  **There is no `--swebench` flag**: `lib.rs`'s `pub mod swebench;` is the only reference to the
+  module in the crate, so `load_swebench_jsonl`/`evaluate` are reachable from tests and nothing
+  else. No published measurement depends on it — `docs/benchmarks/` holds MBPP, elastic and probe
+  artifacts only — so nothing here is falsified; the decision stands and the mechanism is sound.
+  Running a SWE-bench study needs an entry point first. Status says so rather than saying
+  "implemented", because "the code exists" and "the study can be run" are different claims and
+  this repo has already been bitten by conflating them (the extraction loader shipped fully
+  tested and unreachable for the same reason).
 - Date: 2026-08-03, revised same day — see *"D1, corrected"*: the premise that SWE-bench
   requires a writable rootfs turned out to be false when tested, so no isolation
   invariant is relaxed after all.

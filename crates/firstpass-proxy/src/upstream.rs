@@ -92,27 +92,17 @@ pub async fn forward_anthropic_streaming(
     Ok((status, out_headers, response))
 }
 
-/// Forward one `POST /v1/chat/completions` request and return its response **buffered**.
-/// Observe-mode passthrough for the OpenAI-compatible inbound endpoint — byte-identical relay.
-///
-/// # Errors
-/// Returns [`ProxyError::Upstream`] on a transport-level failure.
-pub async fn forward_openai(
-    client: &reqwest::Client,
-    base: &str,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
-    forward_openai_path(client, base, OPENAI_CHAT_PATH, headers, body).await
-}
-
 /// The OpenAI-compatible inbound paths this proxy relays for.
 pub const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 /// The Responses API path. A Responses-shaped body relayed to [`OPENAI_CHAT_PATH`] is rejected by
 /// the upstream, so the passthrough has to preserve which endpoint the client actually called.
 pub const OPENAI_RESPONSES_PATH: &str = "/v1/responses";
 
-/// As [`forward_openai`], but to an explicit upstream path.
+/// Forward one OpenAI-compatible request to an explicit upstream path and return its response
+/// **buffered**. Observe-mode passthrough — a byte-identical relay.
+///
+/// The path is explicit because a Responses-shaped body relayed to [`OPENAI_CHAT_PATH`] is
+/// rejected upstream; the caller knows which endpoint the client actually called.
 ///
 /// # Errors
 /// Returns [`ProxyError::Upstream`] on a transport-level failure.
@@ -132,20 +122,8 @@ pub async fn forward_openai_path(
     Ok((status, out_headers, body))
 }
 
-/// Forward one `POST /v1/chat/completions` request and return the raw response for streaming relay.
-///
-/// # Errors
-/// Returns [`ProxyError::Upstream`] on a transport-level failure.
-pub async fn forward_openai_streaming(
-    client: &reqwest::Client,
-    base: &str,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Result<(StatusCode, HeaderMap, reqwest::Response), ProxyError> {
-    forward_openai_streaming_path(client, base, OPENAI_CHAT_PATH, headers, body).await
-}
-
-/// As [`forward_openai_streaming`], but to an explicit upstream path.
+/// Forward one OpenAI-compatible request to an explicit upstream path and return the raw response
+/// for streaming relay.
 ///
 /// # Errors
 /// Returns [`ProxyError::Upstream`] on a transport-level failure.
