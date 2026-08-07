@@ -229,12 +229,19 @@ pub fn load_coding_dataset(path: &str) -> Result<Vec<CodingTask>, String> {
     if v.get("test_list").is_some() {
         return load_mbpp_jsonl(path);
     }
+    // Extraction carries its ground truth as an `expected` object rather than a test program, so
+    // it is the one shape with no `test` field at all — checked before the `test` match, not in
+    // its fallthrough, so a malformed coding row still reports as a coding row.
+    if v.get("expected").is_some_and(serde_json::Value::is_object) {
+        return load_extraction_jsonl(path);
+    }
     match v.get("test").and_then(serde_json::Value::as_str) {
         Some(t) if t.contains("unittest") => load_bigcodebench_jsonl(path),
         Some(t) if t.contains("def check(") => load_humaneval_jsonl(path),
         _ => Err(format!(
             "{path}: unrecognised dataset shape — expected MBPP (`test_list`), BigCodeBench \
-             (`test` holding a unittest.TestCase), or HumanEval (`test` holding `def check(`)"
+             (`test` holding a unittest.TestCase), HumanEval (`test` holding `def check(`), or \
+             extraction (an `expected` object)"
         )),
     }
 }
@@ -756,6 +763,22 @@ mod extraction_tests {
             "raw value leaked unescaped:\n{suite}"
         );
         assert!(suite.contains("test_field_0"), "{suite}");
+    }
+
+    #[test]
+    fn load_coding_dataset_detects_the_extraction_shape() {
+        // The binary calls `load_coding_dataset`, never `load_extraction_jsonl` directly. Every
+        // other test here calls the parser, so a missing dispatch branch stayed invisible: the
+        // whole extraction path parsed correctly and was still unreachable from the CLI.
+        let tmp =
+            std::env::temp_dir().join(format!("extraction-dispatch-{}.jsonl", std::process::id()));
+        std::fs::write(&tmp, line()).expect("write fixture");
+        let loaded = load_coding_dataset(tmp.to_str().expect("utf8 path"));
+        std::fs::remove_file(&tmp).ok();
+
+        let tasks = loaded.expect("extraction shape must be detected");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "inv-1");
     }
 
     #[test]
