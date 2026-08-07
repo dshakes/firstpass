@@ -185,7 +185,9 @@ async fn spawn_proxy_with(
         &config.upstream_openai,
     );
     let (traces, _writer) = store::open(&db_path).unwrap();
-    let promoter = firstpass_proxy::proxy::build_promoter(&config).unwrap();
+    let promoter = firstpass_proxy::proxy::build_promoter_async(&config)
+        .await
+        .unwrap();
     let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config)
         .await
         .unwrap();

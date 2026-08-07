@@ -884,9 +884,19 @@ pub struct SessionPromotion {
     #[serde(default = "default_promotion_probe_every")]
     pub probe_every: u32,
     /// Hard cap on tracked sessions; oldest evicted first. A routing optimisation must never be
-    /// able to exhaust memory on a proxy under load.
+    /// able to exhaust memory on a proxy under load. In-process only — a Redis-backed store is
+    /// bounded by its TTL and the server's own eviction policy, and a per-replica cap on a shared
+    /// store would have each replica evicting the others' sessions.
     #[serde(default = "default_promotion_max_sessions")]
     pub max_sessions: usize,
+    /// Redis URL for promotion state shared across replicas. Absent (default) = in-process only.
+    ///
+    /// Without it, promotion fragments behind a load balancer: a session that escalated on one
+    /// replica starts cold on the next, so the escalation tax this exists to remove is paid again
+    /// on roughly (N-1)/N of turns — configured, reporting nothing wrong, doing a fraction of its
+    /// job. Requires the `redis-cache` build feature.
+    #[serde(default)]
+    pub redis_url: Option<String>,
 }
 
 const fn default_promotion_probe_every() -> u32 {
