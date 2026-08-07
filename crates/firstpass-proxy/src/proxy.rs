@@ -248,21 +248,6 @@ pub async fn build_promoter_async(
     Ok(Some(Arc::new(promoter)))
 }
 
-pub fn build_promoter(
-    config: &ProxyConfig,
-) -> firstpass_core::Result<Option<Arc<crate::affinity::SessionPromoter>>> {
-    match config
-        .routing
-        .as_ref()
-        .and_then(|r| r.escalation.session_promotion.as_ref())
-    {
-        Some(sp) => Ok(Some(Arc::new(crate::affinity::SessionPromoter::new(
-            sp.clone(),
-        )?))),
-        None => Ok(None),
-    }
-}
-
 #[must_use]
 pub fn build_tenant_rate_limiter(
     config: &ProxyConfig,
@@ -1838,12 +1823,16 @@ async fn enforce_pipeline_inner(
     }
     // ── end shadow probe ─────────────────────────────────────────────────────────────────────
 
-    // Offer this decision to the verified cache. `offer` re-reads the finished receipt and stores
-    // only what was served on a passing verdict, so the rule lives in one place rather than being
-    // re-derived here from local variables that might disagree with what was recorded.
-    // `is_cacheable` is the single place the pass-only rules live, so an in-process and a shared
-    // store cannot disagree about what was proven — a disagreement there would be silent, and an
-    // unverified answer served from cache looks exactly like a verified one.
+    // Offer this decision to the verified cache. `is_cacheable` re-reads the finished receipt, so
+    // the pass-only rule is applied to what was actually recorded rather than re-derived here from
+    // local variables that might disagree with it. It is also the single place that rule lives, so
+    // an in-process and a shared store cannot disagree about what was proven — a disagreement
+    // there would be silent, and an unverified answer served from cache looks exactly like a
+    // verified one.
+    //
+    // This goes through the `CacheStore` trait (`is_cacheable` + `put`) rather than
+    // `VerifiedCache::offer`, which applies the same rule but is inherent to the in-process store
+    // and so cannot reach a Redis-backed one.
     if let Some(cache) = state.verified_cache.as_ref()
         && let EngineOutcome::Served(resp) = &outcome
         && crate::verified_cache::is_cacheable(&trace)
