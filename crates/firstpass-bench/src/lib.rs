@@ -13,16 +13,20 @@
 pub mod ablation;
 pub mod coding;
 pub mod coding_policy;
+pub mod costaware;
 pub mod dataset;
 pub mod elastic;
 pub mod live;
+pub mod metaverify;
 pub mod metrics;
 pub mod policy;
 pub mod report;
+pub mod routerbench;
 pub mod sandbox;
 pub mod sim;
 pub mod stats;
 pub mod swebench;
+pub mod sweep;
 
 use firstpass_core::PriceTable;
 use metrics::evaluate;

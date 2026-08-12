@@ -7,6 +7,7 @@
 //!   firstpass-bench --sandbox-selfcheck  # prove the code-exec sandbox isolates, then exit (ADR 0002)
 //!   firstpass-bench --coding       # coding-with-tests benchmark, MOCK solver in the sandbox (no spend)
 //!   firstpass-bench --coding-live  # coding-with-tests with a LIVE candidate model (needs ANTHROPIC_API_KEY)
+//!   firstpass-bench --replay <checkpoint.jsonl>  # re-study a paid run offline: no key, no sandbox, no spend
 
 use firstpass_bench::coding::{
     CandidateSolver, CodingReport, GeneratedSolver, Judge, LiveJudge, LiveSolver, coding_suite,
@@ -70,6 +71,56 @@ fn main() {
             .unwrap_or(10000);
         let r = firstpass_bench::elastic::run_elastic_validation(n, 0.10, 0.05, 1);
         println!("{}", firstpass_bench::elastic::render(&r));
+        return;
+    }
+
+    // Re-study an already-paid measurement. A checkpoint written by --coding-policy holds the
+    // per-task, per-rung outcomes, so every policy question after the run is arithmetic over that
+    // file — no key, no sandbox, no spend. This is what makes the published numbers reproducible
+    // by a reviewer who has neither our credentials nor our budget.
+    if let Some(i) = args.iter().position(|a| a == "--replay") {
+        let Some(path) = args.get(i + 1).filter(|p| !p.starts_with("--")) else {
+            eprintln!("--replay needs a checkpoint path: --replay <checkpoint.jsonl>");
+            std::process::exit(2);
+        };
+        // A file may hold several ladders; naming one is how you pick between experiments.
+        let want: Option<Vec<String>> = std::env::var("FIRSTPASS_CODING_LADDER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(',').map(|m| m.trim().to_owned()).collect());
+        match firstpass_bench::coding_policy::load_matrix(
+            std::path::Path::new(path),
+            want.as_deref(),
+        ) {
+            Ok((matrix, ladder)) => {
+                eprintln!(
+                    "replaying {} tasks x {} rungs from {path} (offline, no spend)",
+                    matrix.len(),
+                    ladder.len()
+                );
+                // The runtime tier is a property of the run that produced the file, not of this
+                // replay, so it is labelled as such rather than guessed.
+                let study = firstpass_bench::coding_policy::replay(&matrix, &ladder, "replay");
+                println!("{}", study.render());
+                // The same matrix, scored the way the field's standard benchmark scores routers,
+                // so the result is legible to a RouterBench reader without a second measurement.
+                let rb = firstpass_bench::routerbench::evaluate(&matrix, &ladder);
+                println!("\n{}", firstpass_bench::routerbench::render(&rb));
+                // What the gate does when it is allowed to be wrong, and whether treating its
+                // verdict as evidence rather than truth would have done better.
+                let sw = firstpass_bench::sweep::sweep(&matrix, 0.10, 0.05, 50);
+                println!("\n{}", firstpass_bench::sweep::render(&sw));
+                let mv = firstpass_bench::metaverify::study(&matrix);
+                println!("\n{}", firstpass_bench::metaverify::render(&mv));
+                // Whether spending the cheap attempt was the right call in the first place.
+                let ca = firstpass_bench::costaware::study(&matrix);
+                println!("\n{}", firstpass_bench::costaware::render(&ca));
+            }
+            Err(e) => {
+                eprintln!("cannot replay {path}: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 

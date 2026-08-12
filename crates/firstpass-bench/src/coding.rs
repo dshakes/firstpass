@@ -389,10 +389,18 @@ pub struct JudgeOpinion {
 /// ran, so the existing test-only path is byte-identical.
 #[must_use]
 pub fn combined_score(o: &TaskOutcome) -> f64 {
-    match o.judge_score {
-        Some(j) if o.gate_full_pass => 0.5 + 0.5 * j.clamp(0.0, 1.0),
-        Some(_) => 0.5 * o.gate_score,
-        None => o.gate_score,
+    combined_from(o.gate_score, o.gate_full_pass, o.judge_score)
+}
+
+/// [`combined_score`] over the bare fields, so the replayed [`crate::coding_policy::RungOutcome`]
+/// and the freshly-measured [`TaskOutcome`] cannot drift into two different definitions of a score
+/// that a published bound is calibrated against.
+#[must_use]
+pub fn combined_from(gate_score: f64, gate_full_pass: bool, judge_score: Option<f64>) -> f64 {
+    match judge_score {
+        Some(j) if gate_full_pass => 0.5 + 0.5 * j.clamp(0.0, 1.0),
+        Some(_) => 0.5 * gate_score,
+        None => gate_score,
     }
 }
 
@@ -1627,7 +1635,7 @@ fn binary_entropy(p: f64) -> f64 {
 
 /// AUC via the Mann–Whitney rank-sum identity: P(score(positive) > score(negative)), ties = 0.5.
 /// `labeled` is `(score, is_positive)`. Returns 0.5 when either class is empty (no signal).
-fn auc(labeled: &[(f64, bool)]) -> f64 {
+pub(crate) fn auc(labeled: &[(f64, bool)]) -> f64 {
     let pos: Vec<f64> = labeled
         .iter()
         .filter(|(_, y)| *y)
