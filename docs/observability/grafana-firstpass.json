@@ -40,7 +40,7 @@
       "gridPos": { "x": 12, "y": 5, "w": 12, "h": 8 },
       "targets": [
         { "expr": "rate(firstpass_escalations_total[5m])", "legendFormat": "escalations/s" },
-        { "expr": "rate(firstpass_upstream_failures_total[5m])", "legendFormat": "upstream failures/s" },
+        { "expr": "sum by (provider) (rate(firstpass_upstream_failures_total[5m]))", "legendFormat": "upstream failures/s" },
         { "expr": "rate(firstpass_traces_dropped_total[5m])", "legendFormat": "receipts dropped/s (should be 0)" }
       ]
     },
