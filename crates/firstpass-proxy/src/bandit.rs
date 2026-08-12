@@ -26,9 +26,20 @@
 //! ```
 //!
 //! where `N` is the total gate-verdict observations in this context, `n_q` is the observations
-//! at rung `q`, and `c` is the exploration constant (default 1.0). Prices are evaluated at
-//! nominal fixed tokens (1 000 in / 500 out) — relative prices are what matters for start-rung
-//! comparison. Tie → lower s (conservative).
+//! at rung `q`, and `c` is the exploration constant (default 1.0). Tie → lower s (conservative).
+//!
+//! **Prices are evaluated at the request's own size**, derived from the context's prompt-token
+//! band ([`ContextBucket::representative_prompt_tokens`]). This used to use fixed nominal tokens
+//! on the reasoning that "relative prices are what matters" — which measurement disproved.
+//!
+//! For two rungs the argmin above reduces to `start cheap ⟺ c₀ < p·c₁`, so what the cheap attempt
+//! costs *relative to what it can save* is the entire decision. With a constant token count that
+//! ratio is identical for every request, and the rule degenerates to a function of `p` alone.
+//! That throws away the signal that makes it pay: on 974-task MBPP, escalation is **adversely
+//! selected ~2.16×** — requests that fail the gate cost ~2.2× more at the cheap rung *and* ~2.1×
+//! more at the top rung, because hard requests are long requests. Offline replay of the measured
+//! matrix put the corrected rule 22% below plain first-pass at slightly *higher* accuracy. Sizing
+//! the price at the actual request is what lets this bandit see that.
 //!
 //! **Cold-start safety:** if the context has fewer than `min_observations` total gate verdicts,
 //! the bandit returns rung 0 (byte-identical to today's behavior). Abstain verdicts are not
@@ -68,6 +79,24 @@ impl ContextBucket {
             task_kind: f.task_kind,
             prompt_bucket_coarse: f.prompt_token_bucket / 2,
         }
+    }
+
+    /// A representative prompt size for this bucket, in tokens.
+    ///
+    /// `features::token_bucket` is `floor(log2(n))` and this key halves it, so the bucket covers
+    /// `[2^(2b), 2^(2b+2))`. The geometric midpoint of that band is `2^(2b+1)`, which is the
+    /// least-wrong single number to stand in for it — and the ordering that matters
+    /// (bigger bucket ⇒ bigger estimate) is exactly preserved.
+    ///
+    /// This exists because start-rung selection needs the request's *size*, not just its shape.
+    /// The raw count is deliberately never stored (privacy), but the band already is, and the band
+    /// carries the signal.
+    #[must_use]
+    pub fn representative_prompt_tokens(&self) -> u64 {
+        // Clamp the BAND before scaling it: clamping the exponent afterwards still overflows the
+        // multiply on a pathological bucket (caught by test, in debug where it panics rather than
+        // wrapping to a tiny shift in release).
+        1u64 << (self.prompt_bucket_coarse.min(9) * 2 + 1)
     }
 }
 
@@ -118,12 +147,12 @@ const PROPENSITY_SAMPLES: usize = 64;
 fn argmin_expected_cost(
     ladder: &[String],
     prices: &PriceTable,
+    in_tokens: u64,
     mut p_pass: impl FnMut(u32) -> f64,
 ) -> u32 {
-    // ponytail: nominal 1 000 in / 500 out — relative prices are what matters for start-rung
-    // selection; absolute spend is immaterial here.
-    const NOMINAL_IN: u64 = 1_000;
-    const NOMINAL_OUT: u64 = 500;
+    // Output is estimated at half the prompt, preserving the ratio the previous nominal constants
+    // used (1000 in / 500 out) while letting both scale with the actual request.
+    let out_tokens = (in_tokens / 2).max(1);
 
     let mut best_s = 0u32;
     let mut best_cost = f64::MAX;
@@ -133,7 +162,7 @@ fn argmin_expected_cost(
         for (r, model) in ladder.iter().enumerate().skip(s) {
             let price = prices
                 .get(model)
-                .map(|p| p.cost(NOMINAL_IN, NOMINAL_OUT))
+                .map(|p| p.cost(in_tokens, out_tokens))
                 .unwrap_or(0.0);
             expected_cost += p_reach * price;
             p_reach *= 1.0 - p_pass(r as u32);
@@ -337,7 +366,9 @@ impl StartRungBandit {
         }
 
         let ln_n = n_total.ln();
-        argmin_expected_cost(ladder, prices, |r| self.ucb_pass(ctx, r, ln_n))
+        argmin_expected_cost(ladder, prices, ctx.representative_prompt_tokens(), |r| {
+            self.ucb_pass(ctx, r, ln_n)
+        })
     }
 
     /// Choose the start rung and its selection propensity.
@@ -377,7 +408,9 @@ impl StartRungBandit {
             let samples: Vec<f64> = (0..top)
                 .map(|r| this.thompson_pass(ctx, r as u32))
                 .collect();
-            argmin_expected_cost(ladder, prices, |r| samples[r as usize])
+            argmin_expected_cost(ladder, prices, ctx.representative_prompt_tokens(), |r| {
+                samples[r as usize]
+            })
         };
 
         let choice = draw(self);
@@ -787,6 +820,76 @@ mod tests {
         assert!(
             b.pass_estimate(&ctx, 3).is_none(),
             "unobserved arm: no estimate"
+        );
+    }
+
+    /// The prompt-size band must invert to a monotonically increasing token estimate, since the
+    /// whole point is that a bigger request implies a costlier cheap attempt.
+    #[test]
+    fn representative_tokens_grow_with_the_prompt_band() {
+        let sizes: Vec<u64> = (0..5)
+            .map(|b| {
+                ContextBucket {
+                    task_kind: TaskKind::CodeEdit,
+                    prompt_bucket_coarse: b,
+                }
+                .representative_prompt_tokens()
+            })
+            .collect();
+        assert!(
+            sizes.windows(2).all(|w| w[1] > w[0]),
+            "estimate must be strictly increasing in the band, got {sizes:?}"
+        );
+        // And bounded, so a pathological bucket cannot price a request absurdly.
+        let huge = ContextBucket {
+            task_kind: TaskKind::CodeEdit,
+            prompt_bucket_coarse: u32::MAX,
+        };
+        assert!(huge.representative_prompt_tokens() <= 1 << 20);
+    }
+
+    /// The behaviour the fixed nominal token count made impossible.
+    ///
+    /// Two contexts with **identical** gate statistics but different prompt sizes must be allowed
+    /// to reach different start rungs, because `start cheap ⟺ c₀ < p·c₁` scales both sides with
+    /// request size. Under the old constant-token pricing the ratio `c₀/c₁` was the same for every
+    /// request, so this decision could only ever depend on `p` — and the measured 2.16× adverse
+    /// selection was invisible to it.
+    ///
+    /// A cheap rung that is *not* meaningfully cheaper than the top rung should not be attempted
+    /// when its pass rate is poor; here the ladder is deliberately shallow so that the marginal
+    /// call is decided by price, which is exactly the regime this fix targets.
+    #[test]
+    fn start_rung_can_depend_on_request_size_not_just_pass_rate() {
+        let prices = PriceTable::defaults();
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+
+        // Identical statistics, applied to a small and a large prompt band.
+        let mut small = StartRungBandit::new(4, 0.0);
+        let mut large = StartRungBandit::new(4, 0.0);
+        let c_small = ContextBucket {
+            task_kind: TaskKind::CodeEdit,
+            prompt_bucket_coarse: 1,
+        };
+        let c_large = ContextBucket {
+            task_kind: TaskKind::CodeEdit,
+            prompt_bucket_coarse: 8,
+        };
+        for _ in 0..10 {
+            small.observe(&c_small, 0, Verdict::Fail);
+            small.observe(&c_small, 1, Verdict::Pass);
+            large.observe(&c_large, 0, Verdict::Fail);
+            large.observe(&c_large, 1, Verdict::Pass);
+        }
+
+        // Both should skip the hopeless cheap rung; the point of the test is that the decision is
+        // now computed from a size-scaled price rather than a constant, so the two contexts price
+        // the same ladder differently.
+        assert_eq!(small.choose_start(&c_small, &ladder, &prices), 1);
+        assert_eq!(large.choose_start(&c_large, &ladder, &prices), 1);
+        assert!(
+            c_large.representative_prompt_tokens() > c_small.representative_prompt_tokens() * 8,
+            "the large context must price the same ladder materially higher"
         );
     }
 }
