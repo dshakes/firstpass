@@ -28,7 +28,7 @@ Routing falls out of that. Because the cheapest model clears the gate most of th
 
 ## Proof over prediction
 
-Every other way of choosing a model decides **before the output exists** — a classifier reads your
+Almost every way of choosing a model decides **before the output exists** — a classifier reads your
 prompt and guesses, or a gateway picks on price and availability. Guess wrong and you find out in
 production, with no artifact explaining why.
 
@@ -38,6 +38,10 @@ which the question "is this good enough to serve?" can actually be answered.
 Firstpass decides by **proof**. It opens on the cheapest model in your ladder, then **gates the actual output** — runs your tests, checks a schema, asks a judge, or measures self-consistency. Pass → it serves. Fail → it escalates exactly one rung and gates again. The cheap model handles most traffic; the frontier model is spent **only when the cheap one is provably not enough**. Every decision is a tamper-evident, hash-chained receipt you (or an auditor) can re-derive independently — and a **distribution-free bound caps how often a wrong answer is served**.
 
 > **Cheap until proven otherwise.** You pay frontier prices only when a real check proves you must.
+
+The cascade-with-verification idea is not ours — FrugalGPT published it in 2023 and AutoMix
+refined it in 2024. What no paper or product ships is the receipt, the served-failure bound, and
+adding a model without retraining anything. [What we borrow and what is new →](docs/related-work.md)
 
 **Where this fits, stated plainly.** Verification needs something to verify against, so Firstpass is
 strongest where "correct" is checkable — code with tests, structured output against a schema,

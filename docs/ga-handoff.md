@@ -1,16 +1,20 @@
 # GA handoff — what only a human can close
 
-Everything in Phases 0–3 that is **code** has shipped and is on `main` at v0.2.1, gate-green
-(365 tests, clippy `-D warnings`, fmt clean). What remains between here and a GA stamp is, by
-[ADR 0003](adr/0003-ga-readiness.md), deliberately **not** a code task — it needs a person,
-a clock, a credential, or an external party. This is that list.
+Everything in Phases 0–3 that is **code** has shipped and is on `main`, gate-green (653 tests
+across the workspace, clippy `-D warnings`, fmt clean). What remains between here and a GA stamp
+is, by [ADR 0003](adr/0003-production-ga-readiness.md), mostly **not** a code task — it needs a
+person, a clock, a credential, or an external party. This is that list.
+
+> **One code item is genuinely still open**, tracked in [the roadmap](roadmap.md) rather than here
+> because it is a commit, not a clock: **joint (rung, sample-count) routing**. It does not block a
+> self-host GA; it is named so nobody discovers it by surprise.
 
 ## Credentials / secrets (unblocks already-built automation)
 
 | Item | What's built | What you do |
 |---|---|---|
 | Provider live badges | `provider-smoke.yml` runs a real request through the proxy per provider and asserts served + receipt. Anthropic is proven. | Add `OPENAI_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY` as repo secrets. Each green run flips that provider from "implemented" to "wire-verified". |
-| crates.io publish | `crates-io.yml` is wired and gated on a token. | Add `CARGO_REGISTRY_TOKEN`; then `cargo install firstpass-proxy` (registry form) works and the README's cargo row loses its caveat. |
+| ~~crates.io publish~~ | **Done** — published since v0.4.0; `cargo install firstpass-proxy` resolves from the registry. | Nothing. |
 | npm publish | `npm-publish.yml` exists. | Add `NPM_TOKEN` if you want the npm channel; otherwise leave the row off. |
 | Homebrew tap | Formula name is `firstpass-proxy`. | Create/point the `dshakes/homebrew-tap` repo so `brew install dshakes/tap/firstpass-proxy` resolves. |
 
@@ -25,8 +29,13 @@ a clock, a credential, or an external party. This is that list.
   thompson-vs-ucb1 run on your workload shows the win (ADR 0007). Same for flipping the
   `speculation_band` on by default.
 - **Judged-gate MBPP artifact**: the base bound is committed; the LLM-judge variant needs one
-  more live run (`FIRSTPASS_CODING_JUDGE=claude-sonnet-5 … --coding-live`) to land its
-  artifact next to `mbpp-live-base.txt`. Cost ~$10, ~1h.
+  more live run to land its artifact next to `mbpp-live-base.txt`. Cost ~$17, and budget
+  **hours, not one hour** — measured at ~84 s/task, so 974 tasks is ~22 h wall-clock. It
+  checkpoints per task, so it can be interrupted and resumed, and
+  `firstpass-bench --replay <checkpoint>` produces every table from whatever is measured so far.
+  Use `FIRSTPASS_CODING_JUDGE_SAMPLES=5`: a single-sample judge returns an effectively **binary**
+  score (measured `{0.0, 1.0}`), which cannot support a conformal threshold; k=5 yields
+  `{0.0, 0.2, 0.4, 0.6, 1.0}`.
 
 ## External parties (someone outside the repo)
 
