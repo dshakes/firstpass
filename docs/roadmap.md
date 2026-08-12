@@ -31,7 +31,8 @@ Make every public claim reproducible or remove it.
       (`docs/benchmarks/`); the repro command for each number stated next to it.
 - [x] Provider table labeled honestly: **wire-verified** vs **implemented, awaiting live
       verification** — labels flip only via CI evidence (provider-smoke workflow).
-- [ ] crates.io publish (token-gated release step).
+- [x] crates.io publish (token-gated release step) — live since v0.4.0 via `crates-io.yml`;
+      `cargo install firstpass-proxy` resolves from the registry.
 
 **Exit gate:** every number and provider named in public surfaces regenerates from a
 committed command; no "unverified" code path sits behind a "live" claim.
@@ -80,8 +81,11 @@ baseline.
       distribution-free finite-sample risk control via fixed-sequence exact-binomial testing
       (Angelopoulos et al. 2021 / RCPS). Includes per-λ diagnostics and the gate's empirical
       false-accept rate (verifier ROC point) at the chosen threshold.
-- [ ] Live adaptive-conformal loop closing the guarantee under drift: ACI wired to the
+- [x] Live adaptive-conformal loop closing the guarantee under drift: ACI wired to the
       realized-served-failure gauge so the bound holds as the workload shifts.
+      (`[escalation.adaptive]` → `conformal::AdaptiveConformal`, read in `run.rs` and passed to
+      the server; `firstpass_serve_threshold` and `firstpass_realized_served_failure` are the
+      exported gauges. A live A/B of the loop under real drift is still unmeasured.)
 - [x] Verifier-imperfection rails: sample counts are hard-capped (consistency k &le; 8) and
       LTT calibration reports the gate's observed false-accept rate at the chosen threshold
       (an imperfect verifier inverse-scales — bounded use is a feature, not a limit).
@@ -111,8 +115,17 @@ GA is an audit + soak + process stamp, not a code stamp (ADR 0003).
 - [x] Durable receipts: `FIRSTPASS_RECEIPTS=durable` spills to `<db>.spill.jsonl` under
       backpressure (synced, ordered) and drains on boot with the hash chain verified valid —
       no receipt is ever silently dropped. (Postgres store option remains open.)
-- [ ] Observability suite: per-provider/per-rung/per-gate latency + failure + cost series,
+- [x] Observability suite: per-provider/per-rung/per-gate latency + failure + cost series,
       committed dashboards, false-pass SLO alarm (SPEC §M3).
+      Dimensioned series: `firstpass_attempt_latency_ms{provider,rung}`,
+      `firstpass_attempt_cost_usd_total{provider,rung}`, `firstpass_attempt_total{provider,rung}`,
+      `firstpass_gate_verdict_total{gate_id,verdict}`, `firstpass_gate_latency_ms{gate_id}`,
+      `firstpass_gate_cost_by_id_usd_total{gate_id}`, and
+      `firstpass_upstream_failures_total{provider}`. Label cardinality is bounded by the ladder,
+      not by traffic. The existing aggregate series are unchanged, so the committed dashboard's
+      panels keep their meaning (`sum(...)` over a new label reproduces the old total).
+      **Not yet done:** dashboard *panels* for the new per-attempt and per-gate series — the
+      dashboard gained the per-provider failure breakdown only.
 - [ ] 30-day soak on real agent traffic — calendar gate.
 - [x] Price-table refresh mechanism: `[[price]]` per-deployment overrides.
 

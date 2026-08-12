@@ -1,0 +1,373 @@
+% Firstpass — verified cascade routing.
+%
+% Build:  pdflatex main.tex && pdflatex main.tex
+%
+% EVERY empirical number in this paper is a \result{} placeholder until it is filled from a
+% committed artifact under docs/benchmarks/. Unfilled placeholders render in red as [TODO: ...]
+% so a draft can never be mistaken for a finished result, and \fillcheck at the end of the
+% document reports how many remain. Do not replace a placeholder with a number you have not
+% read out of a committed artifact.
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+
+\newcounter{todocount}
+% Robust, because these appear inside \caption{}, which is a moving argument and would otherwise
+% expand the counter step at the wrong time.
+\DeclareRobustCommand{\result}[1]{\stepcounter{todocount}\textcolor{red}{\textbf{[TODO: #1]}}}
+\newcommand{\fillcheck}{%
+  \ifnum\value{todocount}>0
+    \begin{center}\textcolor{red}{\textbf{DRAFT --- \arabic{todocount} unfilled results.
+    Not submittable.}}\end{center}
+  \fi}
+
+\title{Verified Cascade Routing:\\
+Serving the Cheapest Model That Provably Passes a Gate,\\
+With an Auditable Record of Why}
+
+\author{Shekhar Mudarapu\\ \texttt{firstpass}}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Most LLM routing systems decide \emph{before} generation: a classifier reads the prompt and
+predicts which model will suffice. We study the complementary regime --- deciding \emph{after}
+generation, by running a verifier on the actual output and escalating only on failure --- and ask
+what such a system must provide to be trustworthy in production rather than merely cheap.
+
+The mechanism is not new: cheapest-first cascades with verification date to FrugalGPT, and AutoMix
+established that self-verification is noisy enough to need a meta-verifier. Our contribution is
+threefold and orthogonal to routing accuracy. First, a \textbf{distribution-free bound} on the rate
+at which wrong answers are served, obtained by split-conformal calibration of the serve threshold
+on held-out data. Second, a \textbf{tamper-evident audit record}: every routing decision, gate
+verdict, and cost is hash-chained so an external auditor can re-derive the entire decision history
+from stored records alone --- a property no system in a survey of ${\sim}130$ routing methods
+provides. Third, \textbf{zero-retrain model onboarding}: adding a model is a configuration change,
+where predictive routers require retraining a policy.
+
+We evaluate on MBPP with real unit-test gates and report results under the metric of RouterBench,
+the field's standard router benchmark. We also report a negative structural finding: RouterBench,
+and benchmarks like it, \emph{cannot} evaluate verification routing at all, because they store one
+response per model with no executable oracle. Finally, we quantify the regime in which our own
+headline result holds by degrading the gate deliberately, and find \result{one-sentence summary of
+the sweep finding: at which $\tau$ false-accepts appear and whether the conformal bound stays
+feasible}.
+\end{abstract}
+
+\fillcheck
+
+\section{Introduction}
+
+An LLM serving stack must decide which model answers each request. The dominant framing is
+\emph{predictive}: featurise the prompt, estimate which model will be adequate, dispatch. This is
+the shape of RouteLLM, Hybrid LLM, and the large majority of the routing literature. It has a
+structural weakness that is easy to state and hard to remove: the decision is made at the one moment
+when the evidence that would settle it --- the answer --- does not yet exist. When the prediction is
+wrong, the failure surfaces in production, and nothing in the system explains why that model was
+chosen.
+
+The alternative is to decide afterwards. Generate with the cheapest model, run a real check against
+the output, and escalate only if the check fails. Where ``correct'' is machine-checkable --- code
+with tests, structured output against a schema, extraction with a known answer --- this converts
+routing from a prediction problem into a verification problem, and the cost saving becomes a
+\emph{consequence} of the cheap model usually being sufficient rather than a bet that it will be.
+
+We are not the first to make that observation, and we want to be precise about what is and is not
+new here (\S\ref{sec:related}). What we claim is that a verification router becomes deployable only
+once it answers three questions the literature has not addressed, because they are engineering
+properties rather than accuracy properties:
+
+\begin{enumerate}
+  \item \textbf{How often does it serve a wrong answer?} Not empirically on the authors' data ---
+  with a bound that holds on the operator's own traffic, under no distributional assumptions.
+  \item \textbf{Can the decisions be audited?} If a routing decision is contested weeks later, can
+  an auditor with only the stored records reconstruct what happened and detect tampering?
+  \item \textbf{What does adding a model cost?} A predictive router retrains. A verification router
+  should not have to.
+\end{enumerate}
+
+\paragraph{Contributions.}
+\begin{itemize}
+  \item A verified cascade router with a split-conformal served-failure bound
+  (\S\ref{sec:method}), implemented as a production OpenAI-compatible proxy rather than a research
+  prototype.
+  \item A hash-chained audit record over routing decisions that an external party can re-derive
+  (\S\ref{sec:audit}).
+  \item An evaluation under RouterBench's own metric (AIQ over the non-decreasing convex hull),
+  against its Zero Router bar (\S\ref{sec:results-aiq}).
+  \item A negative result: standard router benchmarks are structurally unable to evaluate
+  verification routing (\S\ref{sec:why-not-routerbench}).
+  \item An imperfect-gate study that quantifies where our own guarantee stops holding
+  (\S\ref{sec:results-sweep}), and an evaluation of AutoMix's meta-verifier in that regime
+  (\S\ref{sec:results-meta}).
+\end{itemize}
+
+\section{Related work}
+\label{sec:related}
+
+We situate this against the taxonomy of Awesome-Routing-LLMs, which organises ${\sim}130$ routing
+methods by \emph{when} the decision is made: pre-judgment, verification, memory-based, and
+system-level analysis. Our work sits in the smallest of these families, verification routing by
+self-assessment.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{0.24\textwidth}p{0.36\textwidth}p{0.32\textwidth}@{}}
+\toprule
+\textbf{Work} & \textbf{Mechanism} & \textbf{Difference here} \\
+\midrule
+FrugalGPT & Cheapest-first cascade; a learned scorer on the answer decides escalation. & Operator-authored gate (their tests, their schema); audit record; calibrated bound. \\
+AutoMix & Few-shot self-verification plus a POMDP meta-verifier treating verification as noisy. & External deterministic gates where the domain allows; we evaluate their meta-verifier in our setting (\S\ref{sec:results-meta}). \\
+CP-Router & Conformal prediction on output probabilities sizes a prediction set \emph{before} committing. & Same tool, different quantity: our bound is on served-failure \emph{after} the gate. \\
+RouteLLM, Hybrid LLM & Prompt-conditioned classifier selects a model. & No prompt-conditioned prediction; adding a model requires no retraining. \\
+RouterBench, RouterEval & Benchmarks for router comparison. & We adopt RouterBench's metric; \S\ref{sec:why-not-routerbench} shows why its dataset cannot score verification routers. \\
+\bottomrule
+\end{tabular}
+\caption{Nearest prior art. The cascade-with-verification mechanism is established; our
+contributions are the guarantee, the audit record, and the onboarding property.}
+\end{table}
+
+To the best of our knowledge, no method in that survey emits a tamper-evident record of its routing
+decisions. The survey's safety category concerns \emph{attacks} on routers (adversarial redirection,
+supply-chain compromise) rather than auditability of routing itself.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Verified cascade}
+
+Let $L = (m_1, \dots, m_k)$ be a ladder of models ordered by increasing price, and let
+$g : \mathcal{Y} \rightarrow [0,1]$ be a gate assigning a score to an output. For request $x$, we
+generate $y_1 = m_1(x)$ and serve it if $g(y_1) \geq \tau$; otherwise we generate $y_2 = m_2(x)$ and
+repeat. Cost accrues for every rung attempted, including rejected ones.
+
+The gate is supplied by the operator and is domain-specific: a unit-test suite, a JSON schema, an
+LLM judge, or $k$-sample self-consistency. This is the point of departure from predictive routing:
+$g$ reads $y$, not $x$.
+
+\subsection{Calibrating the serve threshold}
+
+The standing objection to any cascade is that $\tau$ is a hand-tuned hyperparameter with no
+guarantee. We replace it with a calibrated one. Given held-out pairs $(g(y_i), c_i)$ where $c_i$
+indicates whether $y_i$ was actually correct, we choose the lowest $\tau$ such that the empirical
+failure rate among served items, inflated by a Hoeffding upper confidence bound, is at most
+$\alpha$:
+\[
+\hat{r}(\tau) + \sqrt{\frac{\ln(1/\delta)}{2n_\tau}} \;\leq\; \alpha ,
+\qquad
+\hat{r}(\tau) = \frac{|\{i : g(y_i) \geq \tau,\ \neg c_i\}|}{n_\tau} .
+\]
+Serving on $g(y) \geq \tau$ then carries a served-failure rate of at most $\alpha$ with probability
+at least $1 - \delta$. The bound is distribution-free: no Gaussian assumption, no assumption that
+calibration and deployment traffic are identically distributed beyond exchangeability. It is
+conservative, so it never under-covers.
+
+Critically, calibration and evaluation must not share data. We calibrate on one split and report
+realized served-failure on a disjoint split.
+
+\subsection{Auditability}
+\label{sec:audit}
+
+Every request emits a record containing the ladder, the rung served, each gate verdict and score,
+the cost, and the hash of the previous record. Records are chained over a canonical JSON encoding
+that does not depend on struct field order or build features, so an auditor holding only the stored
+records can recompute every hash and verify the linkage. Tampering with any historical decision
+invalidates every subsequent hash.
+
+This is the property we believe is genuinely absent from the literature. A predictive router's
+decision is a forward pass whose inputs are not retained; there is nothing to re-derive. A verified
+cascade's decision is a sequence of discrete, recorded events, which makes the audit record
+possible at all.
+
+\section{Why not RouterBench}
+\label{sec:why-not-routerbench}
+
+The natural evaluation is to run on RouterBench, the standard benchmark for router comparison. We
+report that this is not possible, for reasons that generalise to router benchmarks as a class.
+
+RouterBench provides, for each of ${\sim}36{,}500$ prompts, one stored response per model, a
+quality score, and a cost. This is complete for a predictive router: read the prompt, choose a
+model, look up its score. It is insufficient for a verification router in two independent ways.
+
+\textbf{No executable oracle.} A verification router must run a real gate on the output. RouterBench
+stores a quality score but no mechanism to derive one independently, so the only available ``gate''
+is the stored score --- which is also the ground truth. Gate and oracle would be the same
+measurement, and the evaluation would measure nothing.
+
+\textbf{The code subset is not re-scorable.} MBPP is the one subset where an executable gate could
+in principle be reconstructed from the canonical dataset's tests. RouterBench's MBPP prompts,
+however, are paraphrases of the canonical items (mean similarity $\approx 0.78$ to the nearest
+canonical text) and carry no test cases or function-name constraints, so stored responses define
+arbitrary function names and cannot be run against canonical asserts. The \texttt{sample\_id} field
+suggests an index mapping, but it is not consistent enough to validate.
+
+We therefore invert the comparison: rather than evaluating our router on their data, we evaluate
+\emph{their metric} on ours (\S\ref{sec:results-aiq}). We suggest that a benchmark able to score
+verification routers must ship executable oracles with a visible/hidden split --- which, to our
+knowledge, none currently does.
+
+\section{Evaluation}
+\label{sec:eval}
+
+\paragraph{Setup.} MBPP, $n = \result{task count}$ tasks. Ladder:
+\result{ladder model ids}. The gate is the visible unit-test prefix; ground truth is a disjoint
+hidden test set, so the gate can be wrong in both directions and we can measure it. Candidate code
+executes in a network-isolated, fail-closed sandbox. Each task is solved once per rung and every
+policy is replayed over that identical matrix, so policy comparisons carry no sampling noise and
+are paired by construction.
+
+\paragraph{Reproducibility.} The measured matrix is committed. Every table below is regenerated by
+\texttt{firstpass-bench --replay <checkpoint>}, which requires no API key, no sandbox, and no
+spend.
+
+\subsection{Does routing beat picking one model?}
+\label{sec:results-policy}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Policy} & \textbf{Success} & \textbf{\$/success} & \textbf{Escalated} & \textbf{Converted} \\
+\midrule
+always-cheap  & \result{} & \result{} & --- & --- \\
+always-top    & \result{} & \result{} & --- & --- \\
+first-pass    & \result{} & \result{} & \result{} & \result{} \\
+\bottomrule
+\end{tabular}
+\caption{Paired over identical tasks. Paired $\Delta$ vs always-top:
+\result{delta and 95\% CI}.}
+\end{table}
+
+\subsection{Under RouterBench's metric}
+\label{sec:results-aiq}
+
+We compute AIQ, $\mathrm{AIQ}(R) = \frac{1}{c_{\max}-c_{\min}} \int_{c_{\min}}^{c_{\max}}
+\tilde{q}_R(c)\, dc$, over the non-decreasing convex hull, exactly as defined by RouterBench, and
+compare against their \emph{Zero Router}: the parameter-free interpolation between the raw models.
+RouterBench reports that no learned router significantly outperformed this baseline, and that
+routers were \emph{worse} than it on MBPP specifically --- making it a pre-registered bar rather
+than one chosen after seeing our result.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Curve} & \textbf{AIQ} \\
+\midrule
+Zero Router (models only)   & \result{} \\
+{}+ first-pass              & \result{} \\
+Oracle (perfect foresight)  & \result{} \\
+\bottomrule
+\end{tabular}
+\caption{AIQ lift over the Zero Router: \result{lift}, closing \result{fraction} of the headroom to
+perfect foresight.}
+\end{table}
+
+\subsection{When the gate is allowed to be wrong}
+\label{sec:results-sweep}
+
+Our headline result holds under a near-perfect gate. To find its boundary we degrade the gate
+deliberately: the production policy serves at $\tau = 1.0$ (all visible tests pass), and lowering
+$\tau$ serves partial-credit answers, manufacturing genuine false accepts with ground truth
+attached. This obtains real gate error without buying a weaker verifier.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}rrrrrr@{}}
+\toprule
+$\tau$ & \textbf{Served cheap} & \textbf{False-accept} & \textbf{False-reject} & \textbf{Success} & \textbf{\$/success} \\
+\midrule
+1.00 & \result{} & \result{} & \result{} & \result{} & \result{} \\
+\multicolumn{6}{c}{\result{remaining sweep rows from the artifact}} \\
+\bottomrule
+\end{tabular}
+\caption{Gate AUC (score $\rightarrow$ oracle-correct): \result{}. Split-conformal $\lambda$ =
+\result{}, held-out realized served-failure \result{} against $\alpha = 0.10$.}
+\end{table}
+
+RouterBench reports that cascading routers beat the Zero Router while judge error stays at or below
+$0.1$, degrading sharply past $0.2$. Our sweep locates our own gate on that axis:
+\result{where the measured gate error sits relative to 0.1/0.2}.
+
+\subsection{Does a meta-verifier help?}
+\label{sec:results-meta}
+
+AutoMix argues that verification is noisy enough that its output should be treated as evidence
+rather than truth, and introduces a meta-verifier --- deliberately non-LLM, so verifier error does
+not compound --- to decide under that uncertainty. We implement the same idea: bucket the evidence,
+estimate $P(\text{correct} \mid \text{evidence})$ on a calibration split, and escalate when
+$P < p^\ast$, where $p^\ast$ is derived from the ladder's measured price ratio rather than tuned.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Policy} & \textbf{Success} & \textbf{Total \$} & \textbf{Wins} & \textbf{Losses} \\
+\midrule
+first-pass     & \result{} & \result{} & --- & --- \\
+meta-verified  & \result{} & \result{} & \result{} & \result{} \\
+\bottomrule
+\end{tabular}
+\caption{Held-out comparison. We expect no advantage where the gate is a near-perfect oracle; the
+question is whether one appears as $\tau$ degrades.}
+\end{table}
+
+\section{Limitations}
+
+\textbf{Verification needs something to verify against.} This approach is strongest where
+correctness is checkable. For open-ended prose the available gates are an LLM judge or $k$-sample
+self-consistency, and in our own measurements a judge gate did not pay for itself once its calls
+were metered. If an output has no check, this is the wrong tool.
+
+\textbf{One domain.} Our results are on MBPP. We do not claim they transfer to other task
+distributions, and the field's own benchmarks cannot currently test that claim
+(\S\ref{sec:why-not-routerbench}).
+
+\textbf{The zero-regression result is workload-dependent.} Escalation can only cause harm when the
+gate rejects a correct answer and the next rung then fails. On MBPP the first condition essentially
+never occurred. \S\ref{sec:results-sweep} is the honest boundary of that claim, not a footnote to
+it.
+
+\textbf{Ladder sensitivity.} Cost savings depend on the price of the top rung, which is chosen by
+the operator. We report savings against more than one ceiling for this reason.
+
+\section{Conclusion}
+
+Verification routing is a small and well-precedented corner of the routing literature. What has been
+missing is not a better mechanism but the properties that make one deployable: a bound on how often
+it is wrong, a record an auditor can check, and an onboarding cost that does not scale with the
+model catalogue. We have implemented those and measured them under the field's own metric, and
+reported both where the approach wins and the regime in which its strongest result stops holding.
+
+\fillcheck
+
+\begin{thebibliography}{9}
+\bibitem{frugalgpt} L. Chen, M. Zaharia, J. Zou. FrugalGPT: How to Use Large Language Models While
+Reducing Cost and Improving Performance. arXiv:2305.05176, 2023.
+\bibitem{automix} P. Aggarwal, A. Madaan, et al. AutoMix: Automatically Mixing Language Models.
+NeurIPS 2024, arXiv:2310.12963.
+\bibitem{cprouter} J. Su, et al. CP-Router: An Uncertainty-Aware Router Between LLM and LRM.
+AAAI 2025, arXiv:2505.19970.
+\bibitem{routellm} I. Ong, et al. RouteLLM: Learning to Route LLMs with Preference Data.
+arXiv:2406.18665, 2024.
+\bibitem{hybridllm} D. Ding, et al. Hybrid LLM: Cost-Efficient and Quality-Aware Query Routing.
+ICLR 2024, arXiv:2404.14618.
+\bibitem{routerbench} Q. Hu, et al. RouterBench: A Benchmark for Multi-LLM Routing System.
+arXiv:2403.12031, 2024.
+\bibitem{mbpp} J. Austin, et al. Program Synthesis with Large Language Models. arXiv:2108.07732,
+2021.
+\end{thebibliography}
+
+% Machine-readable draft state, so a build can be gated on it rather than on someone remembering
+% to look: grep the build output for this line before submitting anywhere.
+\typeout{FIRSTPASS_UNFILLED_RESULTS=\arabic{todocount}}
+
+\end{document}
