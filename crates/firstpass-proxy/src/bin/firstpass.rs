@@ -336,14 +336,11 @@ fn cmd_onboard(apply: bool) -> Result<(), Box<dyn std::error::Error>> {
                 .is_ok_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
         },
         || {
+            // Not a bare TCP connect: anything holding the port would read as a running proxy, and
+            // onboard would then wire the agent's credentialed traffic into a stranger and report
+            // success. Ask who is answering.
             let bind = std::env::var("FIRSTPASS_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
-            std::net::TcpStream::connect_timeout(
-                &bind
-                    .parse()
-                    .unwrap_or_else(|_| ([127, 0, 0, 1], 8080).into()),
-                std::time::Duration::from_millis(400),
-            )
-            .is_ok()
+            onboard::firstpass_listening(&bind)
         },
     );
     let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
