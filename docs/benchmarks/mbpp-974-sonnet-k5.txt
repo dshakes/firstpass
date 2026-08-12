@@ -1,0 +1,104 @@
+# firstpass-bench --replay · MBPP n=974 · haiku→sonnet · k=5 judge
+# date: 2026-08-12 · cheap: claude-haiku-4-5 · top: claude-sonnet-5 · sandbox: docker (runc)
+# judge: claude-haiku-4-5, FIRSTPASS_CODING_JUDGE_SAMPLES=5 (k=1 returns an effectively
+#        BINARY score, which cannot support a conformal threshold; k=5 gives {0,.2,.4,.6,1})
+# reproduce (free, no key, no sandbox): firstpass-bench --replay <this checkpoint>
+#
+# HEADLINE, stated against the pre-registered criterion: first-pass FAILED it on this ladder.
+#   $/success 0.0170 vs always-top 0.0150; paired Δcost +0.00166, 95% CI [+0.00086, +0.00242]
+#   — the interval EXCLUDES zero, so this is a real loss, not sampling noise. 12 wins, 22 losses.
+#   AIQ lift over RouterBench's Zero Router: +0.0000.
+# The cause is measured, not guessed: escalation is adversely selected 1.93x — requests that
+# fail the gate cost ~2x more at BOTH rungs, because hard requests are long requests. The
+# standard cascade cost model c0 + e*c1 is optimistic by that factor.
+# The correction (start cheap iff c0 < p*c1) beats first-pass by 20% at +0.41pp success.
+## Routing policy on real coding tasks
+
+n = 974 tasks · ladder = anthropic/claude-haiku-4-5 → anthropic/claude-sonnet-5 · sandbox tier = replay
+
+| policy | success | 95% CI | total $ | $/success | served-failure | escalated | converted |
+|---|---|---|---|---|---|---|---|
+| always-cheap | 0.79 | [0.76, 0.82] | $10.6287 | $0.0138 | 0.21 | 0% | 0% |
+| always-top | 0.93 | [0.92, 0.95] | $13.6393 | $0.0150 | 0.07 | 0% | 0% |
+| first-pass | 0.92 | [0.91, 0.94] | $15.2522 | $0.0170 | 0.08 | 18% | 75% |
+| first-pass+judge | 0.93 | [0.91, 0.94] | $18.0965 | $0.0200 | 0.07 | 34% | 42% |
+
+Paired against always-top (same tasks, so the per-task difference is the test with the power this design actually has):
+
+| vs | Δ success | 95% CI | Δ $/task | 95% CI | fp wins | fp loses |
+|---|---|---|---|---|---|---|
+| always-top | -0.010 | [-0.023, +0.001] | +0.00166 | [+0.00086, +0.00242] | 12 | 22 |
+| always-cheap | +0.132 | [+0.111, +0.154] | +0.00475 | [+0.00396, +0.00558] | 129 | 0 |
+
+VERDICT: **STOP** — first-pass did not cost less per success ($0.0170 vs $0.0150). Escalation overhead exceeded what the cheap rung saved.
+
+
+## RouterBench metric (arXiv:2403.12031) on this matrix
+
+Cost domain: $0.01091 .. $0.01566 per task. AIQ is mean quality over that domain.
+
+| point | $/task | quality |
+|---|---|---|
+| anthropic/claude-haiku-4-5 | $0.01091 | 0.7906 |
+| anthropic/claude-sonnet-5 | $0.01400 | 0.9333 |
+| first-pass | $0.01566 | 0.9230 |
+| oracle | $0.01219 | 0.9456 |
+
+| curve | AIQ |
+|---|---|
+| Zero Router (models only) | 0.8868 |
+| + first-pass | 0.8868 |
+| oracle (perfect foresight) | 0.9247 |
+
+**AIQ lift over the Zero Router: +0.0000** — 0% of the headroom to perfect foresight.
+
+RouterBench reports that no learned router significantly beat the Zero Router, and that routers were worse than it on MBPP specifically. A non-positive lift here means first-pass does not beat that bar either, and should be reported as such.
+
+
+## Imperfect-gate sweep — serving below full-pass
+
+n = 974 tasks · signal = tests fused with a k-sample judge · distinct levels = 8 · AUC (score → oracle-correct) = 0.938
+
+| τ | served cheap | escalated | false-accept | false-reject | success | served-fail | $/success |
+|---|---|---|---|---|---|---|---|
+| 1.00 | 59% | 41% | 0.030 | 0.530 | 0.9271 | 0.0729 | $0.02136 |
+| 0.90 | 66% | 34% | 0.031 | 0.441 | 0.9271 | 0.0729 | $0.02004 |
+| 0.80 | 70% | 30% | 0.032 | 0.385 | 0.9251 | 0.0749 | $0.01940 |
+| 0.70 | 73% | 27% | 0.034 | 0.323 | 0.9271 | 0.0729 | $0.01872 |
+| 0.60 | 75% | 25% | 0.036 | 0.276 | 0.9261 | 0.0739 | $0.01824 |
+| 0.50 | 82% | 18% | 0.041 | 0.000 | 0.9230 | 0.0770 | $0.01697 |
+| 0.25 | 85% | 15% | 0.070 | 0.000 | 0.9025 | 0.0975 | $0.01671 |
+| 0.00 | 100% | 0% | 0.209 | 0.000 | 0.7906 | 0.2094 | $0.01380 |
+
+### Split-conformal bound (α = 0.10, δ = 0.05)
+
+No threshold met the target on the calibration half — the bound is **infeasible** on this gate, which is the honest reading when the score cannot separate a safe prefix.
+
+
+## Meta-verifier (AutoMix, arXiv:2310.12963) vs plain first-pass
+
+Fitted on 487 tasks, scored on 487 held-out tasks. Break-even p* = 0.221.
+
+| policy | success | total $ |
+|---|---|---|
+| first-pass | 0.9240 | $7.7321 |
+| meta-verified | 0.9240 | $7.7321 |
+
+Head to head on held-out tasks: **0 won, 0 lost**.
+
+On this matrix the meta-verifier does **not** beat treating the gate as authoritative — neither better nor cheaper. That is the expected result where the gate is a near-perfect oracle (unit tests), and it is reported rather than buried: the rule is worth shipping only on gates that actually err.
+
+
+## Cost-aware start rung — `start cheap ⟺ c₀ < p·c₁`
+
+Fitted on 487 tasks, scored on 974 held-out. Adverse-selection multiplier **1.93×** (mean top-rung cost among escalating tasks ÷ mean across all tasks; 1.00 = cost-neutral escalation, which is what the usual cascade cost model assumes).
+
+| policy | success | $/task | $/success | skipped cheap |
+|---|---|---|---|---|
+| always-top | 0.9333 | $0.01400 | $0.01500 | 100% |
+| first-pass | 0.9230 | $0.01566 | $0.01697 | 0% |
+| cost-aware (learned p) | 0.9271 | $0.01250 | $0.01348 | 48% |
+| cost-aware (ORACLE p — cheats) | 0.9261 | $0.01114 | $0.01203 | 46% |
+
+**Learned rule vs always-top: -10.8% cost/task at -0.0062 success.**
+
