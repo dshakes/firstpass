@@ -28,6 +28,21 @@ whatever the gate picked.
 
 ## 2. What to watch during the soak
 
+**Load the alert rules before you start.** `docs/observability/firstpass-alerts.yml` encodes
+every check in this runbook that can be expressed as a metric — the false-pass SLO, dropped
+receipts, guardrail trips, abstaining gates, escalation spikes, and spend above the counterfactual
+baseline. A thirty-day soak policed by grepping logs by hand is a soak that quietly stops being
+policed around day three.
+
+```
+promtool check rules docs/observability/firstpass-alerts.yml
+# then add to prometheus.yml:  rule_files: [ "firstpass-alerts.yml" ]
+```
+
+Two thresholds are deployment-specific and must be set from your own config before the soak
+begins: `FirstpassFalsePassSLOBreach` (your `[escalation]` alpha) and
+`FirstpassEscalationRateHigh`. They are marked TUNE in the file.
+
 A Prometheus `/metrics` endpoint ships today (`firstpass_enforce_latency_ms`,
 `firstpass_escalations_total`, `firstpass_served_total{served_from}`,
 `firstpass_upstream_failures_total`, `firstpass_traces_dropped_total`) — scrape

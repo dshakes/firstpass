@@ -1,17 +1,28 @@
-# firstpass-bench --replay · MBPP n=974 · haiku→sonnet · k=5 judge
-# date: 2026-08-12 · cheap: claude-haiku-4-5 · top: claude-sonnet-5 · sandbox: docker (runc)
-# judge: claude-haiku-4-5, FIRSTPASS_CODING_JUDGE_SAMPLES=5 (k=1 returns an effectively
-#        BINARY score, which cannot support a conformal threshold; k=5 gives {0,.2,.4,.6,1})
-# reproduce (free, no key, no sandbox): firstpass-bench --replay <this checkpoint>
+# firstpass-bench --coding-policy · MBPP · haiku→sonnet · k=5 JUDGED
+# date: 2026-08-12 · candidate: live Anthropic · sandbox: docker (runc tier)
+# dataset: mbpp-974.jsonl (974 rows, Muennighoff/mbpp full/test)
+# command: FIRSTPASS_CODING_DATASET=mbpp-974.jsonl \
+#          FIRSTPASS_CODING_JUDGE=anthropic/claude-haiku-4-5 \
+#          FIRSTPASS_CODING_JUDGE_SAMPLES=5 \
+#          firstpass-bench --coding-policy
+# replay:  firstpass-bench --replay docs/benchmarks/mbpp-974-sonnet-k5.checkpoint.jsonl
+#          (offline — no API key, no sandbox, no spend)
 #
-# HEADLINE, stated against the pre-registered criterion: first-pass FAILED it on this ladder.
-#   $/success 0.0170 vs always-top 0.0150; paired Δcost +0.00166, 95% CI [+0.00086, +0.00242]
-#   — the interval EXCLUDES zero, so this is a real loss, not sampling noise. 12 wins, 22 losses.
-#   AIQ lift over RouterBench's Zero Router: +0.0000.
-# The cause is measured, not guessed: escalation is adversely selected 1.93x — requests that
-# fail the gate cost ~2x more at BOTH rungs, because hard requests are long requests. The
-# standard cascade cost model c0 + e*c1 is optimistic by that factor.
-# The correction (start cheap iff c0 < p*c1) beats first-pass by 20% at +0.41pp success.
+# READ THIS BEFORE QUOTING THE COST NUMBERS.
+#
+# This run was measured WITH a k=5 judge, and `measure_resumable` bills judge tokens into EVERY
+# rung's cost_usd. That adds ~10 haiku calls per task to both rungs equally, which compresses the
+# ladder gradient the routing economics depend on: cheap:top reads 0.78 here against 0.455 in the
+# unjudged mbpp-policy-974.txt. The $/success comparison between policies in this file is
+# therefore NOT comparable to the unjudged artifact, and must not be used to evaluate whether
+# first-pass beats always-top. Use mbpp-policy-974.txt for that question.
+#
+# What this run IS good for: the k=5 judge is the only configuration measured so far that yields a
+# GRADED gate score. The test gate alone is empirically binary on MBPP ({0.0, 1.0} — a generated
+# function passes all of a task's asserts or none), which leaves split-conformal calibration with
+# two operating points and no separable safe prefix. Fused with the judge the score takes
+# {0.0, 0.2, 0.4, 0.6, 0.8, 1.0}, which is what the imperfect-gate sweep and the conformal block
+# below are computed over.
 ## Routing policy on real coding tasks
 
 n = 974 tasks · ladder = anthropic/claude-haiku-4-5 → anthropic/claude-sonnet-5 · sandbox tier = replay
