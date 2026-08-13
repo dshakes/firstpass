@@ -26,6 +26,74 @@ while doing a fraction of its job.
 - **Startup fails loudly** on a `redis_url` without the feature, or a server that does not answer
   PING within 5s.
 
+## [0.7.0]
+
+### Fixed: `onboard` accepted a foreign listener as the proxy
+
+`firstpass onboard` treated **any** process holding the bind port as Firstpass. The environment
+detector was a bare TCP connect that never issued an HTTP request, and `wait_healthz` matched
+`"200"` inside a 64-byte read that could not reach the response body.
+
+Found by running it: an unrelated dev server on `:8080` answered `/healthz` with its own JSON, and
+onboard reported *"verified — proxy healthy"* while writing `ANTHROPIC_BASE_URL` into the shell rc.
+That points an agent's **credentialed traffic** at an unidentified process, records no receipts, and
+looks like it worked. The proxy already names itself in `/healthz` for exactly this reason and
+`launch` already checked it; `onboard` now does too.
+
+### Added: a working gate wrapper, so writing a gate is not a research project
+
+`onboard` used to emit `cmd = ["your-test-runner", "--from-stdin"]` — honest, since a bare `pytest`
+really does abstain on every request, but it left every user to implement the stdin/stdout contract
+by hand. That was the single biggest piece of friction in adopting Firstpass for a code workload.
+
+`scripts/gates/run-tests.py` implements the contract once, with recipes for pytest, jest and cargo
+test. Two properties worth knowing:
+
+- **The score is graded.** Where the runner reports counts, the score is the pass *fraction* — a
+  candidate failing one of three tests scores `0.667`. Conformal calibration thresholds on that
+  score, and a strictly binary one leaves it two operating points with no separable safe prefix.
+- **A broken runner abstains, never fails.** `python3 -m pytest` with pytest uninstalled exits
+  non-zero through a *present* interpreter, so there is no "command not found" to catch. A gate
+  broken that way would fail every candidate, escalate every request, and bill the top rung
+  indefinitely while looking healthy. Conversely a candidate's *own* missing import is a genuine
+  failure and is reported as one — abstaining there would, under `on_abstain = "fail_open"`, serve
+  code that cannot import.
+
+### Added: dimensioned metrics and alert rules for the soak
+
+Latency, cost and failures were emitted without labels, so none of them could answer "which
+provider" or "which gate". Adds `firstpass_attempt_latency_ms{provider,rung}`,
+`firstpass_attempt_cost_usd_total{provider,rung}`, `firstpass_gate_verdict_total{gate_id,verdict}`
+and others, as new metric names so existing dashboard panels keep their meaning.
+
+`docs/observability/firstpass-alerts.yml` adds 10 Prometheus rules — the false-pass SLO, dropped
+receipts, guardrail trips, abstaining gates, per-provider upstream failures, escalation spikes and
+spend above the counterfactual baseline. Every expression is checked against a series the proxy
+actually emits; an alert on a non-existent metric is permanently green and reads as safety.
+
+### Added: offline replay and the benchmark harness behind it
+
+`firstpass-bench --replay <checkpoint>` re-studies a paid measurement with **no API key, no sandbox
+and no spend**, so every published number is reproducible by someone with neither credentials nor
+budget. Adds RouterBench's AIQ metric, an imperfect-gate threshold sweep, an AutoMix-style
+meta-verifier, and a cost-aware start-rung study.
+
+### Fixed: the start-rung decision was priced at a constant
+
+The bandit's expected-cost argmin already implemented the right rule, but evaluated every ladder at
+fixed nominal tokens — so the cheap/top cost ratio was identical for every request and the decision
+collapsed onto the pass probability alone. Prices are now sized from the request's own prompt-token
+band. No new data is retained: the band is already stored, the raw count deliberately is not.
+
+### Measured
+
+`docs/benchmarks/mbpp-974-opus.txt` — 974 MBPP tasks, real unit-test gates, haiku→opus, no judge:
+first-pass serves at quality indistinguishable from always-top (0.93 [0.92, 0.95] vs
+0.94 [0.93, 0.96]) for **58% less per success** ($0.0033 vs $0.0079), with 78% of escalations
+converting a failure into a success. Under RouterBench's own metric, AIQ lift over its Zero Router
+is **+0.0526** — 72% of the headroom to perfect foresight, and a bar RouterBench reports no learned
+router cleared.
+
 ## [0.6.0]
 
 One feature: the verified cache can be shared across replicas, which is what makes Firstpass
