@@ -609,8 +609,64 @@ pub fn execute(env: &Environment, steps: &[Step]) -> Result<String, std::io::Err
     Ok(out)
 }
 
-/// Poll `/healthz` until it answers 200 or the deadline passes. Blocking + std-only (the CLI calls
-/// this off the async runtime): a plain TCP connect + minimal HTTP/1.1 GET, no client dependency.
+/// Whether a `/healthz` response says **Firstpass** is on the other end.
+///
+/// A 200 alone proves only that *something* holds the port. That is not good enough here: onboard
+/// writes `ANTHROPIC_BASE_URL` into the user's shell rc, so accepting a stranger points the agent's
+/// credentialed traffic at an unrelated process, records no receipts, and still reports success.
+/// Found by running this for real — an unrelated dev server on `:8080` answered `/healthz 200` with
+/// its own JSON and onboard reported "verified — proxy healthy".
+///
+/// The proxy names itself in the body for exactly this reason (see `proxy::healthz`), which is the
+/// same discriminator `launch` uses before handing an agent a base url.
+#[must_use]
+pub fn healthz_is_firstpass(status_ok: bool, body: &str) -> bool {
+    if !status_ok {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("service")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s == "firstpass")
+        })
+        .unwrap_or(false)
+}
+
+/// One blocking `GET /healthz`, returning `(status_is_200, body)`. Std-only (the CLI calls this off
+/// the async runtime): a plain TCP connect + minimal HTTP/1.1 GET, no client dependency.
+///
+/// Reads to EOF rather than into a small fixed buffer — the identity marker lives in the body, and
+/// the previous 64-byte read could not reach past the status line.
+fn get_healthz(addr: &str) -> Option<(bool, String)> {
+    let mut s = std::net::TcpStream::connect(addr).ok()?;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let req = format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).ok()?;
+    use std::io::Read as _;
+    let mut raw = Vec::new();
+    // Cap the read so a chatty or hostile listener cannot make this hang on unbounded output.
+    let _ = s.take(64 * 1024).read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status_ok = text.lines().next().is_some_and(|l| l.contains(" 200"));
+    let body = text
+        .split_once("\r\n\r\n")
+        .map_or("", |(_, b)| b)
+        .to_owned();
+    Some((status_ok, body))
+}
+
+/// Whether **Firstpass** is answering at `addr` (`host:port`) right now. One probe, no waiting.
+///
+/// This is what the `onboard` environment detector must use: a bare TCP connect cannot tell a
+/// running proxy from any other process holding the port.
+#[must_use]
+pub fn firstpass_listening(addr: &str) -> bool {
+    get_healthz(addr).is_some_and(|(ok, body)| healthz_is_firstpass(ok, &body))
+}
+
+/// Poll until **Firstpass** answers `/healthz` or the deadline passes.
 fn wait_healthz(url: &str, deadline: std::time::Duration) -> bool {
     let Some(addr) = url
         .strip_prefix("http://")
@@ -621,19 +677,8 @@ fn wait_healthz(url: &str, deadline: std::time::Duration) -> bool {
     };
     let start = std::time::Instant::now();
     while start.elapsed() < deadline {
-        if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
-            let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-            let req = format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-            if s.write_all(req.as_bytes()).is_ok() {
-                let mut buf = [0u8; 64];
-                use std::io::Read as _;
-                if let Ok(n) = s.read(&mut buf)
-                    && n > 0
-                    && String::from_utf8_lossy(&buf[..n]).contains("200")
-                {
-                    return true;
-                }
-            }
+        if firstpass_listening(&addr) {
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
@@ -1102,5 +1147,36 @@ mod tests {
                 .unwrap_or_else(|e| panic!("preset #{n} does not parse: {e}\n{toml}"));
         }
         assert_eq!(n, 32, "expected all 32 presets to be checked, saw {n}");
+    }
+
+    /// A foreign listener on the bind port must never be mistaken for the proxy.
+    ///
+    /// This is a regression test for a real incident, not a hypothetical: an unrelated dev server
+    /// held `:8080`, answered `GET /healthz` with `200` and the body below, and `firstpass onboard`
+    /// reported "proxy already answering /healthz" and "verified — proxy healthy" — while writing
+    /// `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` into the shell rc. That points the agent's
+    /// credentialed traffic at a stranger and records no receipts, which is strictly worse than
+    /// nothing listening, because it looks like it worked.
+    #[test]
+    fn a_foreign_listener_answering_healthz_is_not_accepted_as_the_proxy() {
+        // Verbatim from the process that caused this.
+        let foreign = r#"{"status":"ok","llmMode":"api","rlsEnforce":false,"appPoolActive":false}"#;
+        assert!(
+            !healthz_is_firstpass(true, foreign),
+            "a 200 from a stranger must not read as Firstpass"
+        );
+
+        // The real proxy names itself (see proxy::healthz), which is the discriminator.
+        let ours = r#"{"status":"ok","service":"firstpass","version":"0.6.0"}"#;
+        assert!(
+            healthz_is_firstpass(true, ours),
+            "the real proxy must still be recognised"
+        );
+
+        // A non-200 is never Firstpass regardless of body, and neither is unparseable output.
+        assert!(!healthz_is_firstpass(false, ours));
+        assert!(!healthz_is_firstpass(true, "not json at all"));
+        // A bare ok-status body — the shape the old check accepted — is still not enough.
+        assert!(!healthz_is_firstpass(true, r#"{"status":"ok"}"#));
     }
 }
