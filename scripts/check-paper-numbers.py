@@ -41,7 +41,11 @@ def main() -> int:
     # split truncated each row at its first percentage and silently exempted every number after it
     # from verification. The check then reported all-clear while skipping most of the paper.
     tex = "\n".join(re.split(r"(?<!\\)%", l)[0] for l in tex.splitlines())
-    corpus = "\n".join(a.read_text(encoding="utf-8") for a in ARTIFACTS)
+    # Exact numeric tokens, not substrings. `0.902 in corpus` is True whenever the artifact
+    # contains 0.9025 — so a fabricated number passes whenever some real measurement happens to
+    # extend it. Flagged by review; the checker was weaker than its output suggested.
+    corpus_text = "\n".join(a.read_text(encoding="utf-8") for a in ARTIFACTS)
+    corpus = set(re.findall(r"\d+\.\d+", corpus_text))
 
     # Strip plot STYLING before looking for claims. Axis bounds, opacities, mark sizes and
     # number-format precisions are presentation choices, not measurements, and they change
@@ -56,6 +60,9 @@ def main() -> int:
         r"|\b(?:width|height|precision|opacity|mark size|line width|xshift|yshift)"
         r"\s*=\s*-?[\d.]+\w*"
         r"|fill opacity\s*=\s*[\d.]+"
+        # `axis cs:X,Y` places an ANNOTATION (a node or a rule) in data space. It is layout, not
+        # a measurement. Plot data lives in `coordinates {...}` and is deliberately left alone.
+        r"|axis cs:\s*-?[\d.]+\s*,\s*-?[\d.]+"
     )
     tex = styling.sub(" ", tex)
 

@@ -150,6 +150,16 @@ impl Submission {
                 self.id
             ));
         }
+        // `!is_finite()` rather than `< 0.0`: NaN fails EVERY comparison, so a NaN cost passes a
+        // negativity test AND passes the sum check below (|NaN| > eps is false), landing in the
+        // report as a silently poisoned total. Infinity is rejected for the same reason.
+        if !self.cost_usd.is_finite() || self.attempts.iter().any(|a| !a.cost_usd.is_finite()) {
+            return Err(format!(
+                "{}: cost must be finite (NaN and infinity are rejected — NaN would pass every \
+                 comparison below and poison the aggregate)",
+                self.id
+            ));
+        }
         if self.cost_usd < 0.0 || self.attempts.iter().any(|a| a.cost_usd < 0.0) {
             return Err(format!("{}: negative cost", self.id));
         }
@@ -215,6 +225,91 @@ pub struct Report {
     pub escalation_rate: f64,
     /// Total USD across all tasks.
     pub total_cost_usd: f64,
+    /// RouterBench's AIQ, when baselines were supplied (spec §5).
+    ///
+    /// `None` is the honest answer without them, and the report says so rather than printing a
+    /// number computed from a hull the router itself defines. AIQ is measured against the
+    /// **Zero Router** — the probabilistic mix of the raw models — so it needs each model's
+    /// solo (cost, quality) point. A single router's submission contains its own path and nothing
+    /// about what any model would have scored alone, so AIQ is not derivable from it.
+    pub aiq: Option<AiqBlock>,
+}
+
+/// AIQ and the bar it is measured against.
+#[derive(Debug, Clone)]
+pub struct AiqBlock {
+    /// AIQ of the Zero Router — the raw models' own hull.
+    pub zero_router: f64,
+    /// AIQ with the router's point added.
+    pub with_router: f64,
+    /// Shared cost domain both were integrated over.
+    pub domain: (f64, f64),
+}
+
+impl AiqBlock {
+    /// Lift over the Zero Router. Positive means the router beat the bar RouterBench reports no
+    /// learned router significantly clearing.
+    #[must_use]
+    pub fn lift(&self) -> f64 {
+        self.with_router - self.zero_router
+    }
+}
+
+/// One baseline: what a single model scored alone, across the same task set.
+///
+/// Supplied as its own single-shot submission per model, so a baseline is produced by exactly the
+/// same path as a router result and cannot be asserted rather than measured.
+#[derive(Debug, Clone)]
+pub struct Baseline {
+    /// Model id.
+    pub model: String,
+    /// Mean USD per task.
+    pub cost_per_task: f64,
+    /// Fraction of tasks it solved alone.
+    pub quality: f64,
+}
+
+/// Compute AIQ for a router against model baselines, exactly as RouterBench defines it.
+///
+/// Reuses [`crate::routerbench`] rather than reimplementing the hull, so VRBench's AIQ and the one
+/// this repo reports elsewhere cannot drift apart.
+#[must_use]
+pub fn aiq_against(
+    baselines: &[Baseline],
+    router_cost: f64,
+    router_quality: f64,
+) -> Option<AiqBlock> {
+    // Two models are the minimum for an interpolation to exist at all; with fewer there is no
+    // Zero Router and therefore no bar.
+    if baselines.len() < 2 {
+        return None;
+    }
+    let pts: Vec<(f64, f64)> = baselines
+        .iter()
+        .map(|b| (b.cost_per_task, b.quality))
+        .collect();
+    let mut with = pts.clone();
+    with.push((router_cost, router_quality));
+
+    let all: Vec<f64> = with.iter().map(|p| p.0).collect();
+    let c_min = all.iter().copied().fold(f64::INFINITY, f64::min);
+    let c_max = all.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !(c_min.is_finite() && c_max.is_finite()) || c_max <= c_min {
+        return None;
+    }
+    Some(AiqBlock {
+        zero_router: crate::routerbench::aiq(
+            &crate::routerbench::non_decreasing_hull(&pts),
+            c_min,
+            c_max,
+        ),
+        with_router: crate::routerbench::aiq(
+            &crate::routerbench::non_decreasing_hull(&with),
+            c_min,
+            c_max,
+        ),
+        domain: (c_min, c_max),
+    })
 }
 
 /// Aggregate scored outcomes into the reported metrics.
@@ -260,7 +355,17 @@ pub fn report(scored: &[Scored]) -> Report {
         ),
         escalation_rate: ratio(scored.iter().filter(|s| s.escalated).count(), n),
         total_cost_usd: total,
+        aiq: None,
     }
+}
+
+/// [`report`], plus AIQ measured against model baselines (spec §5).
+#[must_use]
+pub fn report_with_baselines(scored: &[Scored], baselines: &[Baseline]) -> Report {
+    let mut r = report(scored);
+    let n = scored.len().max(1) as f64;
+    r.aiq = aiq_against(baselines, r.total_cost_usd / n, r.success);
+    r
 }
 
 /// Parse a submission file, rejecting the whole file if any line is invalid.
@@ -310,6 +415,26 @@ pub fn render(r: &Report) -> String {
         "| escalation rate | {:.0}% |\n",
         r.escalation_rate * 100.0
     ));
+    match &r.aiq {
+        Some(a) => {
+            s.push_str(&format!(
+                "\n| curve | AIQ |\n|---|---|\n| Zero Router (models only) | {:.4} |\n\
+                 | + this router | {:.4} |\n\n**AIQ lift: {:+.4}** over the cost domain \
+                 ${:.5}..${:.5}.\n",
+                a.zero_router,
+                a.with_router,
+                a.lift(),
+                a.domain.0,
+                a.domain.1
+            ));
+        }
+        None => s.push_str(
+            "\nAIQ: **not computed** — it is measured against the Zero Router, the probabilistic \
+             mix of the raw models, so it needs each model's solo (cost, quality) point. Supply \
+             single-model baseline submissions to obtain it. Reporting a number without them \
+             would score the router against a hull it defined itself.\n",
+        ),
+    }
     s.push_str(
         "\nThe two gate-error rates exist only because tasks carry a router-visible gate set and a \
          harness-only oracle set. A benchmark with one check set can measure neither.\n",
@@ -385,12 +510,31 @@ pub fn score_all(
     use std::collections::HashMap;
     let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
 
-    if subs.len() != tasks.len() {
+    // Length equality is not coverage: a submission with one id twice and one task missing has
+    // the right count and the wrong population. Check the id SET.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for s in subs {
+        if !seen.insert(s.id.as_str()) {
+            return Err(format!("submission answers `{}` more than once", s.id));
+        }
+    }
+    let missing: Vec<&str> = tasks
+        .iter()
+        .map(|t| t.id.as_str())
+        .filter(|id| !seen.contains(id))
+        .collect();
+    if !missing.is_empty() {
         return Err(format!(
-            "submission covers {} of {} tasks — score the whole set or none, otherwise the \
-             reported population is not the benchmark",
-            subs.len(),
-            tasks.len()
+            "submission is missing {} of {} tasks (e.g. {}) — score the whole set or none, \
+             otherwise the reported population is not the benchmark",
+            missing.len(),
+            tasks.len(),
+            missing
+                .iter()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     let mut out = Vec::with_capacity(subs.len());
@@ -445,6 +589,26 @@ mod tests {
             model: model.to_owned(),
             cost_usd: cost,
             gate_verdict: v,
+        }
+    }
+
+    fn task(id: &str) -> Task {
+        Task {
+            vrbench_version: VRBENCH_VERSION,
+            id: id.to_owned(),
+            domain: "code/python".to_owned(),
+            prompt: "p".to_owned(),
+            visible: CheckSet {
+                kind: CheckKind::Pytest,
+                cases: vec!["f() == 1".into()],
+                entrypoint: None,
+            },
+            hidden: CheckSet {
+                kind: CheckKind::Pytest,
+                cases: vec!["f() == 1".into()],
+                entrypoint: None,
+            },
+            difficulty: None,
         }
     }
 
@@ -581,6 +745,108 @@ mod tests {
             "the only rejection was correct"
         );
         assert!((r.escalation_rate - 1.0 / 3.0).abs() < 1e-9);
+    }
+
+    /// NaN fails every comparison, so a NaN cost passes both the negativity test and the sum
+    /// check and lands in the aggregate as a silent poison. Caught by the PR reviewer.
+    #[test]
+    fn a_non_finite_cost_is_rejected() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let s = sub("t1", bad, vec![att("m", bad, GateVerdict::Pass)]);
+            let err = s
+                .validate()
+                .expect_err("non-finite cost must be rejected, got acceptance for {bad}");
+            assert!(err.contains("finite"), "got {err}");
+        }
+        // Sanity: the same shape with a finite cost is fine.
+        assert!(
+            sub("t1", 0.05, vec![att("m", 0.05, GateVerdict::Pass)])
+                .validate()
+                .is_ok()
+        );
+    }
+
+    /// Coverage is about the SET of ids, not the count. A submission answering one task twice
+    /// while omitting another has the right length and the wrong population.
+    #[test]
+    fn a_duplicate_id_cannot_stand_in_for_a_missing_task() {
+        let tasks = vec![task("a"), task("b")];
+        let subs = vec![
+            sub("a", 0.01, vec![att("m", 0.01, GateVerdict::Pass)]),
+            sub("a", 0.01, vec![att("m", 0.01, GateVerdict::Pass)]),
+        ];
+        // Length matches (2 == 2) but `b` is unanswered.
+        // Panicking stub: coverage is validated BEFORE any task is executed, so this must never
+        // be called. If it is, the ordering regressed and money/time would be spent on a
+        // submission that was already invalid.
+        struct NeverRuns;
+        impl Sandbox for NeverRuns {
+            fn runtime(&self) -> &str {
+                "never"
+            }
+            fn run(
+                &self,
+                _u: &ExecUnit,
+                _l: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                panic!("coverage must be checked before anything is executed")
+            }
+        }
+        let sb = NeverRuns;
+        let err = score_all(&sb, &tasks, &subs, &Limits::default())
+            .expect_err("duplicate id with a missing task must be rejected");
+        assert!(
+            err.contains("more than once") || err.contains("missing"),
+            "got {err}"
+        );
+    }
+
+    /// Spec §5 requires AIQ. It is measured against the Zero Router, so it needs the models' solo
+    /// points — which a single router's submission cannot contain. Absent baselines the report
+    /// must say so rather than invent a hull.
+    #[test]
+    fn aiq_is_withheld_without_baselines_and_computed_with_them() {
+        let scored = vec![Scored {
+            id: "a".into(),
+            oracle_pass: true,
+            gate: GateVerdict::Pass,
+            cost_usd: 0.003,
+            escalated: false,
+        }];
+        let plain = report(&scored);
+        assert!(plain.aiq.is_none(), "no baselines ⇒ no AIQ");
+        assert!(
+            render(&plain).contains("not computed"),
+            "the report must say why AIQ is absent"
+        );
+
+        let baselines = vec![
+            Baseline {
+                model: "cheap".into(),
+                cost_per_task: 0.001,
+                quality: 0.78,
+            },
+            Baseline {
+                model: "top".into(),
+                cost_per_task: 0.007,
+                quality: 0.94,
+            },
+        ];
+        let with = report_with_baselines(&scored, &baselines);
+        let a = with.aiq.clone().expect("baselines ⇒ AIQ");
+        assert!(a.zero_router > 0.0 && a.with_router > 0.0);
+        assert!(render(&with).contains("AIQ lift"));
+    }
+
+    /// One baseline is not an interpolation, so there is no Zero Router and no bar.
+    #[test]
+    fn a_single_baseline_yields_no_bar() {
+        let one = vec![Baseline {
+            model: "only".into(),
+            cost_per_task: 0.001,
+            quality: 0.8,
+        }];
+        assert!(aiq_against(&one, 0.002, 0.9).is_none());
     }
 
     /// Version skew must fail loudly rather than be interpreted optimistically.
