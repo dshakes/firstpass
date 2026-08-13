@@ -186,20 +186,30 @@ impl Shape {
                  schema     = { type = \"object\", required = [\"id\", \"total\"] }\n\
                  on_abstain = \"fail_closed\"\n"
                 .to_owned(),
-            // Deliberately a placeholder, not `cargo test` / `npm test`: a gate is not just any
-            // command. It must read the candidate as JSON on stdin and print
-            // {"verdict":"pass|fail|abstain"} on stdout, so naming a real test runner here would
-            // look wired up while silently abstaining on every call. `doctor` flags this until
-            // it is replaced, which is the intended nudge.
+            // A gate is not just any command: it must read the candidate as JSON on stdin and
+            // print {"verdict":...} on stdout, so a bare `pytest` here would look wired up while
+            // silently abstaining on every call.
+            //
+            // This used to emit a REPLACE-ME placeholder for exactly that reason. Correct, but it
+            // left every new user to implement the contract by hand, which is the single biggest
+            // piece of onboarding friction for a code workload. `scripts/gates/run-tests.py` now
+            // implements the contract, so what is emitted is a WORKING gate with only the user's
+            // own test command left to substitute.
             Self::Code => {
                 "[[gate]]\n\
-                 # REPLACE ME. A gate reads the candidate as JSON on stdin and prints\n\
-                 #   {\"verdict\":\"pass|fail|abstain\", \"score\"?: 0.0-1.0, \"reason\"?: \"...\"}\n\
-                 # on stdout. Wrap your real test command in that contract — a bare `cargo test`\n\
-                 # or `npm test` will not work, it would abstain on every request.\n\
-                 # `firstpass doctor` fails on this line until you point it at your wrapper.\n\
+                 # A working gate. `run-tests.py` implements the stdin/stdout contract: it pulls\n\
+                 # the code out of the model's reply, runs your command, and reports the pass\n\
+                 # FRACTION as the score (a graded score is what the conformal bound calibrates\n\
+                 # on; a bare pass/fail gives it only two operating points).\n\
+                 # Swap the command after `--` for yours:\n\
+                 #   jest:  \"--write\", \"solution.js\", \"--\", \"npx\", \"jest\", \"--silent\"\n\
+                 #   cargo: \"--write\", \"src/lib.rs\", \"--\", \"cargo\", \"test\", \"--quiet\"\n\
+                 # Add \"--copy\", \"tests/\" to bring your test files into the run directory, and\n\
+                 # \"--docker\", \"python:3.12-alpine\" to run untrusted code with no network.\n\
                  id  = \"unit-tests\"\n\
-                 cmd = [\"your-test-runner\", \"--from-stdin\"]\n"
+                 cmd = [\"python3\", \"scripts/gates/run-tests.py\",\n\
+                        \"--write\", \"solution.py\", \"--copy\", \"tests/\",\n\
+                        \"--\", \"python3\", \"-m\", \"pytest\", \"-q\"]\n"
                     .to_owned()
             }
             Self::Prose => format!(
