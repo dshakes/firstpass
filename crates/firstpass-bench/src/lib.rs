@@ -27,6 +27,7 @@ pub mod sim;
 pub mod stats;
 pub mod swebench;
 pub mod sweep;
+pub mod vrbench;
 
 use firstpass_core::PriceTable;
 use metrics::evaluate;
