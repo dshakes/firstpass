@@ -192,11 +192,14 @@ decision is a forward pass whose inputs are not retained; there is nothing to re
 cascade's decision is a sequence of discrete, recorded events, which makes the audit record
 possible at all.
 
-\section{Why not RouterBench}
+\section{Why the standard benchmarks cannot score this}
 \label{sec:why-not-routerbench}
 
-The natural evaluation is to run on RouterBench, the standard benchmark for router comparison. We
-report that this is not possible, for reasons that generalise to router benchmarks as a class.
+The natural evaluation is to run on the field's benchmarks. We report that this is not possible on
+either of the two most prominent, for \emph{different} reasons that share a cause: both encode the
+assumption that a router's decision is a choice of model made before generation. That assumption is
+so deeply built into their data formats and metrics that a verification router cannot be expressed
+in them at all, honestly or otherwise.
 
 RouterBench provides, for each of ${\sim}36{,}500$ prompts, one stored response per model, a
 quality score, and a cost. This is complete for a predictive router: read the prompt, choose a
@@ -214,10 +217,39 @@ canonical text) and carry no test cases or function-name constraints, so stored 
 arbitrary function names and cannot be run against canonical asserts. The \texttt{sample\_id} field
 suggests an index mapping, but it is not consistent enough to validate.
 
+\subsection{RouterArena: the submission format cannot express a cascade}
+
+RouterArena~\cite{routerarena} is an open leaderboard over 8{,}400 queries spanning nine domains,
+scoring routers on accuracy, cost, optimal-selection rate, latency, and robustness. A submission is
+a \textbf{prediction file}: for each query, the model the router would dispatch to. The harness
+then derives that submission's cost from the price of the named model.
+
+This is unusable for a cascade, and not as a matter of degree. A cascade that escalates has paid
+for the rejected attempt as well as the served one; the format has no field in which to say so.
+Naming only the model that ultimately served would under-report cost on exactly the queries the
+router found hard --- inflating its score by omitting the spend that verification incurs. We
+consider that misreporting rather than an approximation, and so make no submission.
+
+Two of the five metrics compound the mismatch. \emph{Robustness} is defined as the model-selection
+flip rate under prompt perturbation: a prompt classifier should be stable, but a verification
+router's selection is a function of the \emph{output}, which legitimately changes when the prompt
+does. Correct behaviour is scored as fragility. \emph{Latency} is measured as routing overhead;
+ours is a few tens of milliseconds, but escalation adds a full generation, which the metric cannot
+distinguish from routing slowness.
+
+\subsection{Consequences}
+
 We therefore invert the comparison: rather than evaluating our router on their data, we evaluate
-\emph{their metric} on ours (\S\ref{sec:results-aiq}). We suggest that a benchmark able to score
-verification routers must ship executable oracles with a visible/hidden split --- which, to our
-knowledge, none currently does.
+\emph{their metric} on ours (\S\ref{sec:results-aiq}). AIQ, the non-decreasing convex hull, and the
+Zero Router are computed exactly as RouterBench defines them, over a matrix we measured with real
+executable gates, and the artifact replays offline for anyone who wishes to recompute it.
+
+We suggest that a benchmark able to score verification routers needs two properties neither has:
+\textbf{executable oracles}, so a real gate has something to run against, and \textbf{a cost field
+the router itself populates}, so a policy that pays for more than one model per query can report
+what it actually spent. Both are straightforward to provide; the absence appears to be an artifact
+of the field's focus rather than a deliberate exclusion, and we would regard supplying them as the
+more useful contribution than placing on a leaderboard built for a different mechanism.
 
 \section{Evaluation}
 \label{sec:eval}
@@ -387,6 +419,8 @@ ICLR 2024, arXiv:2404.14618.
 arXiv:2403.12031, 2024.
 \bibitem{mbpp} J. Austin, et al. Program Synthesis with Large Language Models. arXiv:2108.07732,
 2021.
+\bibitem{routerarena} RouterArena: An Open Platform for Comprehensive Comparison of LLM Routers.
+arXiv:2510.00202, 2025.
 \end{thebibliography}
 
 % Machine-readable draft state, so a build can be gated on it rather than on someone remembering
