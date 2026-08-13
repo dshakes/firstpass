@@ -610,13 +610,37 @@ pub fn run_reference_router(
     sb: &dyn Sandbox,
     prices: &PriceTable,
     limits: &Limits,
+    checkpoint: Option<&std::path::Path>,
 ) -> Result<Vec<Submission>, String> {
     if solvers.is_empty() {
         return Err("need at least one rung".to_owned());
     }
+
+    // Resume whatever a previous attempt already paid for.
+    //
+    // This is not a nicety. The first version accumulated in memory and wrote once at the end; a
+    // transient HTTP 529 from the provider at task 898 of 974 destroyed every call before it —
+    // real money, for an upstream hiccup that had nothing to do with the run. `--coding-policy`
+    // has checkpointed per task for exactly this reason and I did not carry it across.
+    let mut done: std::collections::HashMap<String, Submission> = checkpoint
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| {
+            t.lines()
+                .filter_map(|l| serde_json::from_str::<Submission>(l).ok())
+                .map(|s| (s.id.clone(), s))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !done.is_empty() {
+        eprintln!("resuming: {} tasks already measured", done.len());
+    }
     let mut out = Vec::with_capacity(tasks.len());
 
     for task in tasks {
+        if let Some(prev) = done.remove(&task.id) {
+            out.push(prev);
+            continue;
+        }
         let mut attempts = Vec::new();
         let mut answer = String::new();
         let single = solvers.len() == 1;
@@ -703,6 +727,20 @@ pub fn run_reference_router(
         // Validate as we go: a router that cannot produce a valid submission should fail here,
         // not at scoring time after a whole run has been paid for.
         s.validate()?;
+        // Append before continuing, so an abort costs only the task in flight. Best-effort: a
+        // failure to checkpoint must not discard work that was already paid for.
+        if let Some(p) = checkpoint
+            && let Ok(line) = serde_json::to_string(&s)
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
         out.push(s);
     }
     Ok(out)
@@ -1047,8 +1085,15 @@ mod tests {
         // A model nobody priced.
         let bogus: Vec<(String, &dyn crate::coding::CandidateSolver)> =
             vec![("nosuchvendor/imaginary-model".to_owned(), &solver)];
-        let err = run_reference_router(&tasks, &bogus, &NeverRuns, &prices, &Limits::default())
-            .expect_err("an unpriced model must abort the run");
+        let err = run_reference_router(
+            &tasks,
+            &bogus,
+            &NeverRuns,
+            &prices,
+            &Limits::default(),
+            None,
+        )
+        .expect_err("an unpriced model must abort the run");
         assert!(
             err.contains("no price") || err.contains("$0.00"),
             "the error must name the cause: {err}"
@@ -1057,9 +1102,71 @@ mod tests {
         // ...and a priced one still works, so the guard is not simply refusing everything.
         let ok: Vec<(String, &dyn crate::coding::CandidateSolver)> =
             vec![("anthropic/claude-haiku-4-5".to_owned(), &solver)];
-        let subs = run_reference_router(&tasks, &ok, &NeverRuns, &prices, &Limits::default())
+        let subs = run_reference_router(&tasks, &ok, &NeverRuns, &prices, &Limits::default(), None)
             .expect("a priced model runs");
         assert!(subs[0].cost_usd > 0.0, "a real call must not cost nothing");
+    }
+
+    /// A resumed run must not re-pay for tasks a previous attempt already bought.
+    ///
+    /// Pinned because the absence of this cost real money: an HTTP 529 at task 898 of 974
+    /// destroyed every call before it, because the first version accumulated in memory and wrote
+    /// once at the end. The solver here panics if called, so the test fails loudly if a
+    /// checkpointed task is re-solved rather than reused.
+    #[test]
+    fn a_resumed_run_does_not_re_pay_for_checkpointed_tasks() {
+        struct NeverSolves;
+        impl crate::coding::CandidateSolver for NeverSolves {
+            fn solve(&self, t: &CodingTask) -> Result<crate::coding::Solution, String> {
+                panic!(
+                    "re-solved {} — a checkpointed task must be reused, not re-bought",
+                    t.id
+                )
+            }
+        }
+        struct NeverRuns;
+        impl Sandbox for NeverRuns {
+            fn runtime(&self) -> &str {
+                "never"
+            }
+            fn run(
+                &self,
+                _u: &ExecUnit,
+                _l: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                panic!("gate ran for a checkpointed task")
+            }
+        }
+
+        let dir = std::env::temp_dir().join("fp-vrb-resume-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let ckpt = dir.join("resume.jsonl");
+        let prior = sub(
+            "t1",
+            0.05,
+            vec![att("anthropic/claude-haiku-4-5", 0.05, GateVerdict::Pass)],
+        );
+        std::fs::write(&ckpt, serde_json::to_string(&prior).unwrap() + "\n").unwrap();
+
+        let solver = NeverSolves;
+        let rungs: Vec<(String, &dyn crate::coding::CandidateSolver)> =
+            vec![("anthropic/claude-haiku-4-5".to_owned(), &solver)];
+        let subs = run_reference_router(
+            &[task("t1")],
+            &rungs,
+            &NeverRuns,
+            &PriceTable::defaults(),
+            &Limits::default(),
+            Some(&ckpt),
+        )
+        .expect("the checkpointed task is reused");
+
+        assert_eq!(subs.len(), 1);
+        assert!(
+            (subs[0].cost_usd - 0.05).abs() < 1e-9,
+            "the resumed submission must carry the ORIGINAL cost, not a fresh one"
+        );
+        let _ = std::fs::remove_file(&ckpt);
     }
 
     /// Version skew must fail loudly rather than be interpreted optimistically.
