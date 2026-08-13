@@ -56,9 +56,8 @@ We evaluate on MBPP with real unit-test gates and report results under the metri
 the field's standard router benchmark. We also report a negative structural finding: RouterBench,
 and benchmarks like it, \emph{cannot} evaluate verification routing at all, because they store one
 response per model with no executable oracle. Finally, we quantify the regime in which our own
-headline result holds by degrading the gate deliberately, and find \result{one-sentence summary of
-the sweep finding: at which $\tau$ false-accepts appear and whether the conformal bound stays
-feasible}.
+headline result holds by degrading the gate deliberately, and find that the serve threshold the production policy uses ($\tau = 1.0$) rejects roughly half of
+all \emph{correct} cheap answers, and that a lower threshold is both cheaper and no less accurate.
 \end{abstract}
 
 \fillcheck
@@ -217,8 +216,7 @@ knowledge, none currently does.
 \section{Evaluation}
 \label{sec:eval}
 
-\paragraph{Setup.} MBPP, $n = \result{task count}$ tasks. Ladder:
-\result{ladder model ids}. The gate is the visible unit-test prefix; ground truth is a disjoint
+\paragraph{Setup.} MBPP, $n = 974$ tasks. Ladder: \texttt{claude-haiku-4-5} $\rightarrow$ \texttt{claude-opus-4-8}. The gate is the visible unit-test prefix; ground truth is a disjoint
 hidden test set, so the gate can be wrong in both directions and we can measure it. Candidate code
 executes in a network-isolated, fail-closed sandbox. Each task is solved once per rung and every
 policy is replayed over that identical matrix, so policy comparisons carry no sampling noise and
@@ -237,13 +235,16 @@ spend.
 \toprule
 \textbf{Policy} & \textbf{Success} & \textbf{\$/success} & \textbf{Escalated} & \textbf{Converted} \\
 \midrule
-always-cheap  & \result{} & \result{} & --- & --- \\
-always-top    & \result{} & \result{} & --- & --- \\
-first-pass    & \result{} & \result{} & \result{} & \result{} \\
+always-cheap  & 0.78 & \$0.0018 & --- & --- \\
+always-top    & 0.94 & \$0.0079 & --- & --- \\
+first-pass    & 0.93 & \$0.0033 & 19\% & 78\% \\
 \bottomrule
 \end{tabular}
-\caption{Paired over identical tasks. Paired $\Delta$ vs always-top:
-\result{delta and 95\% CI}.}
+\caption{Paired over identical tasks. Paired $\Delta$ vs always-top: success
+$-0.010$ (95\% CI $[-0.021, -0.001]$, 6 wins / 16 losses) and cost $-\$0.00440$ per task
+(95\% CI $[-0.00469, -0.00412]$). Both intervals exclude zero: first-pass is significantly
+cheaper \emph{and} significantly, if slightly, less accurate. The marginal intervals overlap and
+would suggest otherwise --- which is why the paired test is the one reported.}
 \end{table}
 
 \subsection{Under RouterBench's metric}
@@ -262,13 +263,14 @@ than one chosen after seeing our result.
 \toprule
 \textbf{Curve} & \textbf{AIQ} \\
 \midrule
-Zero Router (models only)   & \result{} \\
-{}+ first-pass              & \result{} \\
-Oracle (perfect foresight)  & \result{} \\
+Zero Router (models only)   & 0.8634 \\
+{}+ first-pass              & 0.9161 \\
+Oracle (perfect foresight)  & 0.9361 \\
 \bottomrule
 \end{tabular}
-\caption{AIQ lift over the Zero Router: \result{lift}, closing \result{fraction} of the headroom to
-perfect foresight.}
+\caption{AIQ lift over the Zero Router: $+0.0526$, closing 72\% of the headroom to perfect
+foresight. RouterBench reports no learned router significantly clearing this bar, and routers
+performing \emph{worse} than it on MBPP specifically.}
 \end{table}
 
 \subsection{When the gate is allowed to be wrong}
@@ -285,17 +287,28 @@ attached. This obtains real gate error without buying a weaker verifier.
 \toprule
 $\tau$ & \textbf{Served cheap} & \textbf{False-accept} & \textbf{False-reject} & \textbf{Success} & \textbf{\$/success} \\
 \midrule
-1.00 & \result{} & \result{} & \result{} & \result{} & \result{} \\
-\multicolumn{6}{c}{\result{remaining sweep rows from the artifact}} \\
+1.00 & 59\% & 0.030 & \textbf{0.530} & 0.9271 & \$0.02136 \\
+0.70 & 73\% & 0.034 & 0.323 & \textbf{0.9271} & \textbf{\$0.01872} \\
+0.60 & 75\% & 0.036 & 0.276 & 0.9261 & \$0.01824 \\
+0.50 & 82\% & 0.041 & 0.000 & 0.9230 & \$0.01697 \\
+0.00 & 100\% & 0.209 & 0.000 & 0.7906 & \$0.01380 \\
 \bottomrule
 \end{tabular}
-\caption{Gate AUC (score $\rightarrow$ oracle-correct): \result{}. Split-conformal $\lambda$ =
-\result{}, held-out realized served-failure \result{} against $\alpha = 0.10$.}
+\caption{Judged run ($k{=}5$), the only configuration measured with a \emph{graded} gate score;
+the unit-test gate alone is binary on MBPP. Gate AUC (score $\rightarrow$ oracle-correct): 0.938.
+At $\tau = 1.0$ the gate rejects \textbf{53\%} of cheap answers that were in fact correct, buying
+escalations that were never needed. $\tau = 0.70$ attains \emph{identical} success at 12\% lower
+cost per success, so the production threshold is dominated.}
 \end{table}
 
+On the opus ladder the split-conformal bound is \emph{feasible} and holds out of sample:
+$\lambda = 0.50$ calibrated on one half (empirical risk 0.0379, serving 81\%), with a held-out
+realized served-failure of \textbf{0.0521} over 403 served items, against $\alpha = 0.10$.
+
 RouterBench reports that cascading routers beat the Zero Router while judge error stays at or below
-$0.1$, degrading sharply past $0.2$. Our sweep locates our own gate on that axis:
-\result{where the measured gate error sits relative to 0.1/0.2}.
+$0.1$, degrading sharply past $0.2$. Our measured gate sits inside that regime: false-accept is
+0.030--0.041 across the thresholds that preserve success, an order of magnitude below the point at
+which they observe cascades degrading.
 
 \subsection{Does a meta-verifier help?}
 \label{sec:results-meta}
@@ -312,12 +325,16 @@ $P < p^\ast$, where $p^\ast$ is derived from the ladder's measured price ratio r
 \toprule
 \textbf{Policy} & \textbf{Success} & \textbf{Total \$} & \textbf{Wins} & \textbf{Losses} \\
 \midrule
-first-pass     & \result{} & \result{} & --- & --- \\
-meta-verified  & \result{} & \result{} & \result{} & \result{} \\
+first-pass     & 0.9343 & \$1.4674 & --- & --- \\
+meta-verified  & 0.9343 & \$1.4674 & 0 & 0 \\
 \bottomrule
 \end{tabular}
-\caption{Held-out comparison. We expect no advantage where the gate is a near-perfect oracle; the
-question is whether one appears as $\tau$ degrades.}
+\caption{Held-out comparison on the opus ladder ($p^\ast = 0.816$). The meta-verifier makes
+\emph{identical} decisions to plain first-pass here --- 0 wins, 0 losses --- which is the expected
+result where the gate is a near-perfect oracle: with a false-reject rate of 0.000 there is no
+verifier error for a meta-verifier to correct. It is reported rather than omitted, because a
+negative result on the workload where the mechanism cannot help is the honest scope of AutoMix's
+contribution, not evidence against it.}
 \end{table}
 
 \section{Limitations}

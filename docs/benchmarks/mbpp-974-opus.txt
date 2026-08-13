@@ -11,9 +11,16 @@
 # realistic ladder). No judge, so each rung's cost_usd is that rung's own model spend and the
 # ladder gradient is the real one — cheap:top is 0.18 here against 0.46 on the sonnet ladder.
 #
-# Headline: first-pass serves at statistically indistinguishable quality to always-top
-# (0.93 [0.92,0.95] vs 0.94 [0.93,0.96]) for 58% less per success ($0.0033 vs $0.0079), with 78%
-# of escalations converting a failure into a success. Under RouterBench's own metric the AIQ lift
+# Headline: first-pass costs 58% less per success than always-top ($0.0033 vs $0.0079) and gives
+# up a small but REAL amount of quality to get there. 78% of escalations convert a failure into a
+# success.
+#
+# On the quality claim, read the PAIRED row, not the marginal CIs. The marginals overlap
+# (0.93 [0.92,0.95] vs 0.94 [0.93,0.96]) and it is tempting to call that "indistinguishable" — but
+# these policies are replayed over the identical task matrix, so the marginal comparison asks the
+# wrong question and has far less power than the design holds. The paired difference is
+# -0.010 [-0.021, -0.001], which EXCLUDES zero: 6 tasks won, 16 lost. first-pass is about one
+# percentage point worse, significantly so, and 58% cheaper. State both. Under RouterBench's own metric the AIQ lift
 # over its Zero Router is +0.0526, i.e. 72% of the headroom to perfect foresight — the bar
 # RouterBench reports no learned router cleared, and on which it found routers doing WORSE than
 # the baseline on MBPP specifically.
