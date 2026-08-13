@@ -48,6 +48,7 @@ directory, which limits accidents but is **not** a security boundary. For untrus
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -112,31 +113,64 @@ _COUNTS = [
 ]
 
 
-# Signatures meaning the runner never ran, as distinct from running and failing.
+# Distinguishing "the runner never ran" from "the runner ran and the code failed".
 #
-# This distinction is the whole safety property. `python3 -m pytest` with pytest uninstalled exits
-# non-zero through a *present* interpreter, so there is no FileNotFoundError to catch — naive exit
-# code handling reports it as "tests failed". A broken gate would then fail every candidate,
-# escalate every request, and quietly bill the top rung forever while looking like it was working.
-_UNAVAILABLE = (
-    "no module named",
-    "command not found",
-    "not recognized as an internal or external command",
-    "executable file not found",
-    "no such file or directory",
-    "cannot find module",
-    "is not installed",
-)
+# This is the whole safety property, and it cuts BOTH ways.
+#
+# Miss it in one direction and a broken runner reports every candidate as a test failure:
+# `python3 -m pytest` with pytest uninstalled exits non-zero through a *present* interpreter, so
+# there is no FileNotFoundError to catch. Every request then escalates and the top rung is billed
+# forever while the gate looks healthy.
+#
+# Miss it in the other direction and it is worse. A candidate whose own code does `import requests`
+# produces "ModuleNotFoundError: No module named 'requests'" — a genuine FAILURE. Matching that as
+# "runner unavailable" abstains instead, and under `on_abstain = "fail_open"` the broken candidate
+# is SERVED. A gate that serves broken code is worse than no gate.
+#
+# So the module named in the error is compared against the runner's own tokens. Only the runner
+# going missing is infrastructure; anything the candidate imports is the candidate's problem.
 
 
-def runner_unavailable(output: str, returncode: int) -> str | None:
-    """Reason the runner could not run, or None if it genuinely ran."""
-    if returncode == 127:  # POSIX: command not found
+def _runner_tokens(cmd: list[str]) -> set[str]:
+    """Names that identify the runner itself, e.g. {"python3", "pytest"} for `python3 -m pytest`.
+
+    Flags and their values are skipped so `-q` or `--silent` cannot be mistaken for a package.
+    """
+    toks = set()
+    for part in cmd:
+        if part.startswith("-"):
+            continue
+        base = os.path.basename(part)
+        toks.add(base.lower())
+        # npx jest → also match a bare "jest"; python3 -m pytest → "pytest"
+        toks.add(base.split(".")[0].lower())
+    return toks
+
+
+def runner_unavailable(output: str, returncode: int, cmd: list[str]) -> str | None:
+    """Reason the runner could not run, or None if it genuinely ran and reported a result."""
+    if returncode == 127:  # POSIX: the shell could not find the command at all
         return "runner exited 127 (command not found)"
+
     low = output.lower()
-    for sig in _UNAVAILABLE:
-        if sig in low:
-            return f"runner unavailable: {sig!r} in output"
+    tokens = _runner_tokens(cmd)
+
+    # "No module named 'X'" / "Cannot find module 'X'" — infrastructure only if X IS the runner.
+    for pat in (r"no module named '?([\w.\-]+)'?", r"cannot find module '?([\w.\-/]+)'?"):
+        for m in re.finditer(pat, low):
+            missing = m.group(1).strip("'\"").split(".")[0].split("/")[-1]
+            if missing in tokens:
+                return f"runner unavailable: {missing!r} is not installed"
+
+    # "sh: jest: command not found" — only when the named command is the runner.
+    for m in re.finditer(r"([\w.\-]+): command not found", low):
+        if m.group(1) in tokens:
+            return f"runner unavailable: {m.group(1)!r} not found"
+    if "is not recognized as an internal or external command" in low:
+        return "runner unavailable: not recognised (Windows)"
+    if "executable file not found" in low:
+        return "runner unavailable: executable not found"
+
     return None
 
 
@@ -176,6 +210,16 @@ def main() -> None:
         help="run the command inside this container image with no network",
     )
     ap.add_argument(
+        "--workdir",
+        metavar="DIR",
+        help=(
+            "run inside DIR instead of a fresh temp dir. Needed with --docker when the daemon "
+            "cannot see the host's temp path (Docker-in-Docker, or a remote/Desktop daemon): the "
+            "bind mount then silently resolves to an empty directory and every candidate abstains. "
+            "Point this at a path the daemon shares."
+        ),
+    )
+    ap.add_argument(
         "--copy",
         action="append",
         default=[],
@@ -201,7 +245,15 @@ def main() -> None:
 
     code = extract_code(candidate, args.write)
 
-    with tempfile.TemporaryDirectory(prefix="firstpass-gate-") as workdir:
+    # An explicit --workdir is used as-is (the caller owns it); otherwise a temp dir that is
+    # cleaned up on exit.
+    ctx = (
+        contextlib.nullcontext(args.workdir)
+        if args.workdir
+        else tempfile.TemporaryDirectory(prefix="firstpass-gate-")
+    )
+    with ctx as workdir:
+        os.makedirs(workdir, exist_ok=True)
         target = os.path.join(workdir, args.write)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as fh:
@@ -251,7 +303,7 @@ def main() -> None:
         output = (proc.stdout or "") + (proc.stderr or "")
         ok = proc.returncode == 0
         if not ok:
-            why = runner_unavailable(output, proc.returncode)
+            why = runner_unavailable(output, proc.returncode, cmd)
             if why:
                 emit(ABSTAIN, reason=why)
         score = parse_score(output, ok)
@@ -290,14 +342,37 @@ def _selfcheck() -> None:
     # A broken runner must abstain, never fail. Found by running this for real: `python3 -m pytest`
     # with pytest uninstalled exits non-zero through a present interpreter, so there is no
     # FileNotFoundError, and naive exit-code handling reported a healthy candidate as "fail".
-    assert runner_unavailable("/usr/bin/python3: No module named pytest", 1)
-    assert runner_unavailable("", 127)
-    assert runner_unavailable("sh: jest: command not found", 127)
-    assert runner_unavailable("Error: Cannot find module 'jest'", 1)
-    # ...but a genuine test failure must NOT be mistaken for a broken runner.
-    assert runner_unavailable("2 failed, 3 passed", 1) is None
-    assert runner_unavailable("assert 5 == 4\nE  AssertionError", 1) is None
-    assert runner_unavailable("", 0) is None
+    pytest_cmd = ["python3", "-m", "pytest", "-q"]
+    jest_cmd = ["npx", "jest", "--silent"]
+
+    # The runner itself missing IS infrastructure — abstain.
+    assert runner_unavailable("/usr/bin/python3: No module named pytest", 1, pytest_cmd)
+    assert runner_unavailable("", 127, pytest_cmd)
+    assert runner_unavailable("sh: jest: command not found", 127, jest_cmd)
+    assert runner_unavailable("Error: Cannot find module 'jest'", 1, jest_cmd)
+
+    # A genuine test failure is NOT a broken runner.
+    assert runner_unavailable("2 failed, 3 passed", 1, pytest_cmd) is None
+    assert runner_unavailable("assert 5 == 4\nE  AssertionError", 1, pytest_cmd) is None
+    assert runner_unavailable("", 0, pytest_cmd) is None
+
+    # THE ONE THAT MATTERS: the candidate's own missing import is a FAILURE, not an abstain.
+    # Abstaining here would, under on_abstain = "fail_open", serve code that cannot even import.
+    assert (
+        runner_unavailable(
+            "ModuleNotFoundError: No module named 'requests'", 1, pytest_cmd
+        )
+        is None
+    ), "a candidate's missing import must fail, never abstain"
+    assert (
+        runner_unavailable("ModuleNotFoundError: No module named 'mathh'", 1, pytest_cmd)
+        is None
+    ), "a candidate's import typo must fail, never abstain"
+    assert (
+        runner_unavailable("Error: Cannot find module './helper'", 1, jest_cmd) is None
+    ), "a candidate's missing local require must fail, never abstain"
+    # A flag must never be mistaken for a package name.
+    assert runner_unavailable("No module named 'q'", 1, pytest_cmd) is None
     print("selfcheck OK")
 
 

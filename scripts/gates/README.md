@@ -84,6 +84,21 @@ on_abstain = "fail_closed"   # silence blocks serving — use when a wrong answe
 on_abstain = "fail_open"     # silence serves — use when availability matters more
 ```
 
+## Abstain vs fail: the distinction that decides correctness
+
+The wrapper compares the module named in an error against the **runner's own tokens**, and this
+cuts both ways:
+
+| output | verdict | why |
+|---|---|---|
+| `No module named 'pytest'` (runner is pytest) | `abstain` | infrastructure — the gate could not run |
+| `No module named 'requests'` (candidate's import) | **`fail`** | the candidate is broken |
+| `2 failed, 3 passed` | `fail` | the runner ran and reported |
+
+The second row is the one that matters. Treating a candidate's own missing import as "runner
+unavailable" would abstain, and under `on_abstain = "fail_open"` the proxy would then **serve code
+that cannot even import**. A gate that serves broken code is worse than no gate at all.
+
 ## Running untrusted code
 
 The gate executes model-generated code with your permissions. The temp directory limits accidents;
@@ -91,6 +106,15 @@ it is **not** a security boundary. For untrusted traffic, run it in a container 
 
 ```
 --docker python:3.12-alpine
+```
+
+**With a daemon that cannot see your temp path** — Docker-in-Docker, a remote daemon, or Docker
+Desktop with `/tmp` outside the shared paths — a bind mount of `/tmp/firstpass-gate-XXXX` resolves
+to an *empty* directory inside the container. The code is invisible, every run fails, and the gate
+abstains on everything. Point `--workdir` at a directory the daemon shares:
+
+```
+--docker python:3.12-alpine --workdir /shared/gate-run
 ```
 
 ## Checking your gate
