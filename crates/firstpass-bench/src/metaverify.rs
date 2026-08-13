@@ -123,9 +123,17 @@ impl MetaVerifier {
         } else {
             1.0
         };
-        // A dear ceiling (ratio → 0) demands strong evidence of failure before spending; a cheap
-        // one (ratio → 1) escalates on mild doubt.
-        let p_star = 1.0 - ratio;
+        // The threshold IS the cost ratio, and the derivation is worth writing out because an
+        // earlier version of this line had it inverted:
+        //
+        //     serve cheap  ⟺  c₀ + (1−p)·c₁ < c₁  ⟺  c₀ < p·c₁  ⟺  p > c₀/c₁ = ratio
+        //
+        // so `serve iff confidence ≥ ratio`, and escalation happens below it. A DEAR ceiling
+        // (ratio → 0) therefore escalates rarely — it demands near-certainty that the cheap answer
+        // is wrong before paying — while a cheap ceiling (ratio → 1) escalates on mild doubt.
+        // Writing `1.0 - ratio` inverts exactly this and makes an expensive ladder escalate almost
+        // every request.
+        let p_star = ratio;
 
         Self {
             posterior,
@@ -213,15 +221,29 @@ pub struct MetaStudy {
 /// The split is by index parity: deterministic, so the result reproduces without a recorded seed.
 #[must_use]
 pub fn study(matrix: &[Vec<RungOutcome>]) -> MetaStudy {
-    let calib: Vec<Vec<RungOutcome>> = matrix.iter().step_by(2).cloned().collect();
-    let valid: Vec<Vec<RungOutcome>> = matrix.iter().skip(1).step_by(2).cloned().collect();
+    let a: Vec<Vec<RungOutcome>> = matrix.iter().step_by(2).cloned().collect();
+    let b: Vec<Vec<RungOutcome>> = matrix.iter().skip(1).step_by(2).cloned().collect();
 
     let top_idx = matrix.first().map_or(0, |r| r.len().saturating_sub(1));
-    let mv = MetaVerifier::fit(&calib, mean_cost(matrix, 0), mean_cost(matrix, top_idx));
+    let (c0, c1) = (mean_cost(matrix, 0), mean_cost(matrix, top_idx));
+
+    // Cross-fitted, for the same reason `costaware::study` is: a single fixed split scores only
+    // half the matrix, and on real data the halves are not equivalent — the expensive escalating
+    // tasks concentrated in one of them, which made the other look cheap and manufactured a
+    // saving that was an artifact of the split. Each fold is scored by a verifier fitted on the
+    // other, so every task is scored exactly once and still out-of-sample.
+    let fit_for_b = MetaVerifier::fit(&a, c0, c1);
+    let fit_for_a = MetaVerifier::fit(&b, c0, c1);
+    let scored: Vec<(&Vec<RungOutcome>, &MetaVerifier)> = b
+        .iter()
+        .map(|r| (r, &fit_for_b))
+        .chain(a.iter().map(|r| (r, &fit_for_a)))
+        .collect();
+    let calibration_n = a.len();
 
     let (mut ms, mut mc, mut fs, mut fc) = (0usize, 0.0, 0usize, 0.0);
     let (mut wins, mut losses) = (0usize, 0usize);
-    for row in &valid {
+    for (row, mv) in &scored {
         let (m_ok, m_cost, _) = mv.serve(row);
         let (f_ok, f_cost, _) = first_pass(row);
         if m_ok {
@@ -238,11 +260,11 @@ pub fn study(matrix: &[Vec<RungOutcome>]) -> MetaStudy {
             _ => {}
         }
     }
-    let n = valid.len().max(1) as f64;
+    let n = scored.len().max(1) as f64;
     MetaStudy {
-        calibration_n: calib.len(),
-        validation_n: valid.len(),
-        p_star: mv.p_star(),
+        calibration_n,
+        validation_n: scored.len(),
+        p_star: fit_for_b.p_star(),
         meta_success: ms as f64 / n,
         meta_cost_usd: mc,
         first_pass_success: fs as f64 / n,
@@ -323,20 +345,30 @@ mod tests {
         }
     }
 
-    /// The whole point: where the gate says "pass" but that pass is historically unreliable, the
-    /// meta-verifier must escalate anyway. A policy that trusts the gate cannot do this.
+    /// The whole point: where the gate says "pass" but that pass is historically unreliable AND
+    /// the next rung is affordable, the meta-verifier escalates anyway. A policy that treats the
+    /// gate as authoritative cannot do this.
+    ///
+    /// The ladder here is deliberately shallow (2x). `p*` is a purely **cost-minimising**
+    /// threshold — it weighs the price of escalating against the probability it buys a correct
+    /// answer, and encodes no independent preference for quality. So on a 100x ladder the same
+    /// 20%-reliable pass is correctly SERVED: $0.05 per success against $1.01 for escalating.
+    /// An earlier version of this test asserted escalation on exactly that 100x ladder, which was
+    /// only satisfiable because `p*` was inverted at the time.
     #[test]
-    fn it_escalates_a_passing_gate_whose_passes_are_historically_wrong() {
+    fn it_escalates_an_unreliable_pass_when_the_next_rung_is_affordable() {
         // Calibration: full-pass cheap answers are wrong 4 times out of 5 in this bucket.
         let calib: Vec<Vec<RungOutcome>> = (0..5)
-            .map(|i| vec![o(1.0, i == 0, 0.01), o(1.0, true, 1.00)])
+            .map(|i| vec![o(1.0, i == 0, 0.01), o(1.0, true, 0.02)])
             .collect();
-        let mv = MetaVerifier::fit(&calib, 0.01, 1.00);
-        let passing_but_untrustworthy = vec![o(1.0, false, 0.01), o(1.0, true, 1.00)];
+        let mv = MetaVerifier::fit(&calib, 0.01, 0.02);
+        // p* = 0.01/0.02 = 0.5, and this bucket's measured reliability is 0.2 — below it.
+        assert!((mv.p_star() - 0.5).abs() < 1e-9);
+        let passing_but_untrustworthy = vec![o(1.0, false, 0.01), o(1.0, true, 0.02)];
         let (ok, _, rungs) = mv.serve(&passing_but_untrustworthy);
         assert_eq!(
             rungs, 2,
-            "a 20%-reliable pass must not be served just because the gate said pass"
+            "a 20%-reliable pass must not be served when the next rung costs only 2x"
         );
         assert!(ok, "escalating rescued the answer");
     }
@@ -383,29 +415,74 @@ mod tests {
         );
     }
 
-    /// Fitting and scoring must not share tasks. If they did, the rule could memorise which exact
-    /// tasks failed and report a success rate no live traffic would reproduce.
+    /// Cross-fitting scores every task exactly once, each by a verifier that never saw it — so
+    /// the scored set is the whole matrix while remaining out-of-sample. A single fixed split
+    /// scores only half, and on real data the halves are not equivalent (see `costaware::study`).
     #[test]
-    fn the_study_splits_calibration_from_validation() {
+    fn cross_fitting_scores_every_task_out_of_sample() {
         let matrix: Vec<Vec<RungOutcome>> = (0..11)
             .map(|i| vec![o(1.0, i % 3 == 0, 0.01), o(1.0, true, 1.00)])
             .collect();
         let s = study(&matrix);
-        assert_eq!(s.calibration_n + s.validation_n, matrix.len());
-        assert!(s.calibration_n > 0 && s.validation_n > 0);
+        assert_eq!(
+            s.validation_n,
+            matrix.len(),
+            "every task must be scored, not just one half"
+        );
+        assert!(s.calibration_n > 0 && s.calibration_n < matrix.len());
     }
 
-    /// A dearer ceiling must make the rule more reluctant to escalate. This is the property that
-    /// keeps `p*` a derived quantity rather than a tuned one.
+    /// A dearer ceiling must make the rule MORE reluctant to escalate.
+    ///
+    /// Escalation happens below `p*`, so "more reluctant" means a *lower* threshold. An earlier
+    /// version of this test asserted the opposite and so certified an inverted `p*` — the failure
+    /// mode where a test encodes the same mistake as the code it guards. The numeric expectations
+    /// below are pinned to the derivation (`p* = c₀/c₁`) rather than to whatever the code returns.
     #[test]
-    fn a_dearer_ceiling_raises_the_bar_for_spending() {
+    fn a_dearer_ceiling_makes_escalation_rarer() {
         let calib = vec![vec![o(1.0, true, 0.01), o(1.0, true, 1.00)]];
         let cheap_ceiling = MetaVerifier::fit(&calib, 0.01, 0.02).p_star();
         let dear_ceiling = MetaVerifier::fit(&calib, 0.01, 10.0).p_star();
+
         assert!(
-            dear_ceiling > cheap_ceiling,
-            "a dear ceiling ({dear_ceiling:.3}) must demand more doubt than a cheap one \
-             ({cheap_ceiling:.3}) before escalating"
+            (cheap_ceiling - 0.5).abs() < 1e-9,
+            "c₀/c₁ = 0.01/0.02 = 0.5, got {cheap_ceiling}"
+        );
+        assert!(
+            (dear_ceiling - 0.001).abs() < 1e-9,
+            "c₀/c₁ = 0.01/10.0 = 0.001, got {dear_ceiling}"
+        );
+        assert!(
+            dear_ceiling < cheap_ceiling,
+            "escalation happens below p*, so a dear ceiling ({dear_ceiling:.4}) must sit BELOW a \
+             cheap one ({cheap_ceiling:.4}) — it should escalate less, not more"
+        );
+    }
+
+    /// The behavioural consequence, asserted on `serve` rather than on the threshold, so the rule
+    /// cannot be inverted again without this failing.
+    #[test]
+    fn an_expensive_ceiling_does_not_escalate_a_merely_uncertain_answer() {
+        // Calibration: full-pass answers are right 70% of the time in this bucket.
+        let calib: Vec<Vec<RungOutcome>> = (0..10)
+            .map(|i| vec![o(1.0, i < 7, 0.01), o(1.0, true, 10.0)])
+            .collect();
+
+        // Dear ceiling (ratio 0.001): 70% confidence is far above it — serve, do not spend.
+        let dear = MetaVerifier::fit(&calib, 0.01, 10.0);
+        let (_, spent, rungs) = dear.serve(&[o(1.0, true, 0.01), o(1.0, true, 10.0)]);
+        assert_eq!(
+            rungs, 1,
+            "a 70%-reliable answer must not buy a 1000x ceiling"
+        );
+        assert!((spent - 0.01).abs() < 1e-9);
+
+        // Cheap ceiling (ratio 0.9): 70% is below it — escalating is worth it.
+        let cheap = MetaVerifier::fit(&calib, 0.009, 0.01);
+        let (_, _, rungs2) = cheap.serve(&[o(1.0, true, 0.009), o(1.0, true, 0.01)]);
+        assert_eq!(
+            rungs2, 2,
+            "when the ceiling is nearly free, mild doubt should escalate"
         );
     }
 }
