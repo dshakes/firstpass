@@ -14,6 +14,12 @@ permissions:
   pull-requests: write
   id-token: write
 
+# Label-triggered by design, so no `synchronize` here. This only guards against a
+# double-label starting two concurrent AI reviews of the same PR.
+concurrency:
+  group: sdlc-design-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   design-review:
     if: |
