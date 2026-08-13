@@ -568,10 +568,12 @@ pub struct LiveSolver {
     base_url: String,
     api_key: String,
     model: String,
+    /// Whether this rung speaks the OpenAI wire format rather than Anthropic.
+    openai: bool,
 }
 
 impl LiveSolver {
-    /// Build for a given candidate `model` (e.g. `"claude-haiku-4-5"`).
+    /// Build for a given candidate `model` (e.g. `"claude-haiku-4-5"`), against Anthropic.
     #[must_use]
     pub fn new(api_key: String, model: String) -> Self {
         Self {
@@ -579,6 +581,48 @@ impl LiveSolver {
             base_url: "https://api.anthropic.com".to_owned(),
             api_key,
             model,
+            openai: false,
+        }
+    }
+
+    /// Build from a **fully-qualified** ladder id (`"openai/gpt-4.1-mini"`), selecting the
+    /// provider, its base URL, and its key.
+    ///
+    /// The caller must pass the qualified id. An earlier version of this routing keyed off
+    /// `self.model`, which callers had already stripped to the bare name — so the OpenAI branch
+    /// could never be taken and every request would have gone to Anthropic wearing an OpenAI model
+    /// name. The provider is therefore decided here, once, where the prefix still exists.
+    ///
+    /// # Errors
+    /// A provider whose key is absent, rather than falling back to a provider that would silently
+    /// answer with a different vendor's model.
+    pub fn for_ladder_id(
+        qualified: &str,
+        anthropic_key: &str,
+        openai_key: Option<&str>,
+    ) -> Result<Self, String> {
+        let (provider, bare) = qualified
+            .split_once('/')
+            .map_or(("anthropic", qualified), |(p, r)| (p, r));
+        match provider {
+            "openai" => {
+                let key = openai_key.ok_or_else(|| {
+                    format!("{qualified} needs OPENAI_API_KEY — refusing to fall back to another provider")
+                })?;
+                Ok(Self {
+                    client: crate::live::live_client(),
+                    base_url: std::env::var("FIRSTPASS_OPENAI_BASE_URL")
+                        .unwrap_or_else(|_| "https://api.openai.com".to_owned()),
+                    api_key: key.to_owned(),
+                    model: bare.to_owned(),
+                    openai: true,
+                })
+            }
+            "anthropic" => Ok(Self::new(anthropic_key.to_owned(), bare.to_owned())),
+            other => Err(format!(
+                "unsupported provider `{other}` in ladder id `{qualified}` — the bench implements \
+                 anthropic and openai"
+            )),
         }
     }
 }
@@ -594,7 +638,16 @@ impl CandidateSolver for LiveSolver {
         // response must not be able to discard the ones already bought.
         let mut last = String::new();
         for max_tokens in [1024u32, 2048, 4096] {
-            match crate::live::anthropic_call(
+            // Provider is selected by the model id's prefix, so a ladder can mix vendors and the
+            // solver needs no per-provider branching of its own. An unprefixed id keeps the
+            // historical Anthropic behaviour rather than failing, so existing configs are
+            // unaffected.
+            let call = if self.openai {
+                crate::live::openai_call
+            } else {
+                crate::live::anthropic_call
+            };
+            match call(
                 &self.client,
                 &self.base_url,
                 &self.api_key,

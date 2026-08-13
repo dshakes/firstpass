@@ -106,6 +106,99 @@ impl LiveBackend {
 /// Returns `(text, input_tokens, output_tokens)`. Transient failures (transport errors, 5xx) are
 /// retried with backoff — over thousands of sequential calls, the odd blip is inevitable and must
 /// not abort a whole run. A hard 4xx (bad key/model) or a decode error fails immediately.
+/// One OpenAI chat-completions call, mirroring [`anthropic_call`]'s signature and contract so a
+/// solver can swap providers without changing its own logic.
+///
+/// Exists because provider diversity is a real evidential weakness, not a feature request: a
+/// routing result measured on a single vendor cannot distinguish "verified cascading works" from
+/// "this vendor's cheap tier happens to be good". The wire formats differ enough that the Anthropic
+/// path cannot simply be pointed at a different base URL — the request shape, the auth header, and
+/// the usage field names are all different.
+///
+/// Returns `(text, input_tokens, output_tokens)`.
+///
+/// # Errors
+/// Any transport or API failure, after the same retry budget the Anthropic path uses.
+pub(crate) fn openai_call(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    system: Option<&str>,
+    prompt: &str,
+    max_tokens: u32,
+) -> Result<(String, u64, u64), String> {
+    // OpenAI carries the system turn as a message rather than a top-level field.
+    let mut messages = Vec::new();
+    if let Some(sys) = system {
+        messages.push(serde_json::json!({"role": "system", "content": sys}));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": prompt}));
+    let body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_completion_tokens": max_tokens,
+    });
+
+    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let mut last = String::new();
+    for attempt in 0u32..6 {
+        let resp = match client
+            .post(&url)
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last = format!("request failed: {e}{}", error_chain(&e));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    400 * u64::from(attempt) + 200,
+                ));
+                continue;
+            }
+        };
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            last = format!(
+                "HTTP {status}: {}",
+                text.chars().take(400).collect::<String>()
+            );
+            // 4xx other than rate-limit is a config error and will not fix itself.
+            if status.is_client_error() && status.as_u16() != 429 {
+                return Err(last);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(
+                400 * u64::from(attempt) + 200,
+            ));
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => return Err(format!("unparseable response: {e}")),
+        };
+        let content = v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        // Absent usage is an error, not a zero: a silent zero would price the call at $0 and
+        // corrupt every cost figure downstream.
+        let (Some(in_tok), Some(out_tok)) = (
+            v["usage"]["prompt_tokens"].as_u64(),
+            v["usage"]["completion_tokens"].as_u64(),
+        ) else {
+            return Err(format!(
+                "response has no usage block — refusing to record a $0 call: {}",
+                text.chars().take(200).collect::<String>()
+            ));
+        };
+        return Ok((content, in_tok, out_tok));
+    }
+    Err(format!("openai_call gave up after 6 attempts: {last}"))
+}
+
 pub(crate) fn anthropic_call(
     client: &reqwest::blocking::Client,
     base_url: &str,

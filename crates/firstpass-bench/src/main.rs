@@ -283,13 +283,20 @@ fn main() {
                     "anthropic/claude-sonnet-5".to_owned(),
                 ]
             });
+        // Provider comes from the ladder id's prefix, so a ladder may mix vendors
+        // (e.g. openai/gpt-4.1-mini -> anthropic/claude-opus-4-8). Selection happens here, where
+        // the prefix still exists — stripping it first is what previously made the OpenAI branch
+        // unreachable.
+        let openai_key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
         let solvers: Vec<LiveSolver> = ladder
             .iter()
             .map(|m| {
-                LiveSolver::new(
-                    key.clone(),
-                    m.split_once('/').map_or(m.as_str(), |(_, r)| r).to_owned(),
-                )
+                LiveSolver::for_ladder_id(m, &key, openai_key.as_deref()).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                })
             })
             .collect();
         let rungs: Vec<Rung> = ladder
