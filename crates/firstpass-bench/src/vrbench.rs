@@ -649,9 +649,20 @@ pub fn run_reference_router(
             let sol = solver
                 .solve(&ct)
                 .map_err(|e| format!("{}: solver failed on {model}: {e}", task.id))?;
+            // NOT `get(..).map_or(0.0, ..)`. An unpriced model would then silently cost $0.00 —
+            // which is exactly what this benchmark's own spec §3 forbids ("no silent default,
+            // because a missing price would silently record a free model") and the same
+            // fabricated-cost failure the proxy's unpriced-rung validator exists to prevent. A
+            // reference implementation that violates its own spec teaches everyone who copies it
+            // to do the same. `cost_usd` returns a Result and is propagated.
             let cost = prices
-                .get(model)
-                .map_or(0.0, |p| p.cost(sol.in_tokens, sol.out_tokens));
+                .cost_usd(model, sol.in_tokens, sol.out_tokens)
+                .map_err(|e| {
+                    format!(
+                        "{}: {model} has no price — refusing to record a $0.00 call: {e}",
+                        task.id
+                    )
+                })?;
             answer = sol.code.clone();
 
             // A single-rung ladder is a baseline: it does not gate, and says so rather than
@@ -992,6 +1003,63 @@ mod tests {
             quality: 0.8,
         }];
         assert!(aiq_against(&one, 0.002, 0.9).is_none());
+    }
+
+    /// An unpriced model must abort the run, not cost $0.00.
+    ///
+    /// This benchmark's own spec §3 forbids a silent price default, and the first version of the
+    /// reference router shipped one — `get(..).map_or(0.0, ..)`. A reference implementation that
+    /// violates its own spec teaches everyone who copies it to do the same, and the resulting
+    /// submission would under-report cost to zero while passing every other validation.
+    #[test]
+    fn an_unpriced_model_aborts_rather_than_costing_nothing() {
+        struct Fixed;
+        impl crate::coding::CandidateSolver for Fixed {
+            fn solve(&self, _t: &CodingTask) -> Result<crate::coding::Solution, String> {
+                Ok(crate::coding::Solution {
+                    code: "def f(): pass".to_owned(),
+                    in_tokens: 100,
+                    out_tokens: 50,
+                })
+            }
+        }
+        struct NeverRuns;
+        impl Sandbox for NeverRuns {
+            fn runtime(&self) -> &str {
+                "never"
+            }
+            fn run(
+                &self,
+                _u: &ExecUnit,
+                _l: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                Ok(ExecOutcome::Completed {
+                    exit_code: 0,
+                    stdout: "FP_SCORE 1 1".to_owned(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let solver = Fixed;
+        let tasks = vec![task("t1")];
+        let prices = PriceTable::defaults();
+
+        // A model nobody priced.
+        let bogus: Vec<(String, &dyn crate::coding::CandidateSolver)> =
+            vec![("nosuchvendor/imaginary-model".to_owned(), &solver)];
+        let err = run_reference_router(&tasks, &bogus, &NeverRuns, &prices, &Limits::default())
+            .expect_err("an unpriced model must abort the run");
+        assert!(
+            err.contains("no price") || err.contains("$0.00"),
+            "the error must name the cause: {err}"
+        );
+
+        // ...and a priced one still works, so the guard is not simply refusing everything.
+        let ok: Vec<(String, &dyn crate::coding::CandidateSolver)> =
+            vec![("anthropic/claude-haiku-4-5".to_owned(), &solver)];
+        let subs = run_reference_router(&tasks, &ok, &NeverRuns, &prices, &Limits::default())
+            .expect("a priced model runs");
+        assert!(subs[0].cost_usd > 0.0, "a real call must not cost nothing");
     }
 
     /// Version skew must fail loudly rather than be interpreted optimistically.
