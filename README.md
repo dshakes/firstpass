@@ -69,6 +69,10 @@ ones that qualify them.
 
 > **Who decides a request needs the expensive model?** The gate — from the cheap model's *actual answer*. Never a classifier guessing from the prompt. Change what "good" means by editing a gate; there's nothing to retrain.
 
+<div align="center"><img src="assets/gate-wrapper.svg" alt="How a test suite becomes a Firstpass gate. The model's reply arrives as JSON on stdin; run-tests.py extracts the code from its Markdown fences, writes it to a temp directory with your test files, and runs your real command. Three outcomes: all tests pass, so the gate returns pass with score 1.0 and the answer is served; some tests fail, so it returns fail with the pass fraction as a graded score and the ladder escalates; or the runner itself is missing, so it returns abstain rather than a fabricated verdict." width="900"></div>
+
+<sub>Your existing test suite becomes the gate — `scripts/gates/run-tests.py` wraps pytest, jest or cargo test. → [Gates](https://dshakes.github.io/firstpass/guide/gates.html#wrapper)</sub>
+
 <sub>Live, animated walkthrough → [How it works](https://dshakes.github.io/firstpass/guide/how-it-works.html)</sub>
 
 ---

@@ -1,0 +1,105 @@
+# firstpass-bench --coding-policy · MBPP · haiku→opus · NO judge
+# date: 2026-08-13 · candidate: live Anthropic · sandbox: docker (runc tier)
+# dataset: mbpp-974.jsonl (974 rows, Muennighoff/mbpp full/test)
+# command: FIRSTPASS_CODING_DATASET=mbpp-974.jsonl \
+#          FIRSTPASS_CODING_LADDER=anthropic/claude-haiku-4-5,anthropic/claude-opus-4-8 \
+#          firstpass-bench --coding-policy
+# replay:  firstpass-bench --replay docs/benchmarks/mbpp-974-opus.checkpoint.jsonl
+#          (offline — no API key, no sandbox, no spend)
+#
+# This is the steep-ladder counterpart to mbpp-policy-974.txt (haiku→sonnet, the narrowest
+# realistic ladder). No judge, so each rung's cost_usd is that rung's own model spend and the
+# ladder gradient is the real one — cheap:top is 0.18 here against 0.46 on the sonnet ladder.
+#
+# Headline: first-pass serves at statistically indistinguishable quality to always-top
+# (0.93 [0.92,0.95] vs 0.94 [0.93,0.96]) for 58% less per success ($0.0033 vs $0.0079), with 78%
+# of escalations converting a failure into a success. Under RouterBench's own metric the AIQ lift
+# over its Zero Router is +0.0526, i.e. 72% of the headroom to perfect foresight — the bar
+# RouterBench reports no learned router cleared, and on which it found routers doing WORSE than
+# the baseline on MBPP specifically.
+## Routing policy on real coding tasks
+
+n = 974 tasks · ladder = anthropic/claude-haiku-4-5 → anthropic/claude-opus-4-8 · sandbox tier = replay
+
+| policy | success | 95% CI | total $ | $/success | served-failure | escalated | converted |
+|---|---|---|---|---|---|---|---|
+| always-cheap | 0.78 | [0.76, 0.81] | $1.3396 | $0.0018 | 0.22 | 0% | 0% |
+| always-top | 0.94 | [0.93, 0.96] | $7.2849 | $0.0079 | 0.06 | 0% | 0% |
+| first-pass | 0.93 | [0.92, 0.95] | $2.9961 | $0.0033 | 0.07 | 19% | 78% |
+
+Paired against always-top (same tasks, so the per-task difference is the test with the power this design actually has):
+
+| vs | Δ success | 95% CI | Δ $/task | 95% CI | fp wins | fp loses |
+|---|---|---|---|---|---|---|
+| always-top | -0.010 | [-0.021, -0.001] | -0.00440 | [-0.00469, -0.00412] | 6 | 16 |
+| always-cheap | +0.150 | [+0.127, +0.172] | +0.00170 | [+0.00143, +0.00200] | 146 | 0 |
+
+VERDICT: **TRADEOFF, MEASURED** — first-pass costs 58% less per success and is 1.0 points worse in quality (paired Δ -0.010, 95% CI [-0.021, -0.001], so the gap is real and not noise). It loses 16 tasks to always-top and wins 6. Whether that trade is worth taking is a product decision, not a benchmark one — but it is now a stated price rather than an unmeasured hope.
+
+
+## RouterBench metric (arXiv:2403.12031) on this matrix
+
+Cost domain: $0.00138 .. $0.00748 per task. AIQ is mean quality over that domain.
+
+| point | $/task | quality |
+|---|---|---|
+| anthropic/claude-haiku-4-5 | $0.00138 | 0.7834 |
+| anthropic/claude-opus-4-8 | $0.00748 | 0.9435 |
+| first-pass | $0.00308 | 0.9333 |
+| oracle | $0.00237 | 0.9497 |
+
+| curve | AIQ |
+|---|---|
+| Zero Router (models only) | 0.8634 |
+| + first-pass | 0.9161 |
+| oracle (perfect foresight) | 0.9361 |
+
+**AIQ lift over the Zero Router: +0.0526** — 72% of the headroom to perfect foresight.
+
+RouterBench reports that no learned router significantly beat the Zero Router, and that routers were worse than it on MBPP specifically. A non-positive lift here means first-pass does not beat that bar either, and should be reported as such.
+
+
+## Imperfect-gate sweep — serving below full-pass
+
+n = 974 tasks · signal = test gate only (binary on MBPP) · distinct levels = 3 · AUC (score → oracle-correct) = 0.941
+
+| τ | served cheap | escalated | false-accept | false-reject | success | served-fail | $/success |
+|---|---|---|---|---|---|---|---|
+| 1.00 | 81% | 19% | 0.032 | 0.000 | 0.9333 | 0.0667 | $0.00330 |
+| 0.50 | 83% | 17% | 0.059 | 0.000 | 0.9158 | 0.0842 | $0.00313 |
+| 0.00 | 100% | 0% | 0.217 | 0.000 | 0.7834 | 0.2166 | $0.00176 |
+
+### Split-conformal bound (α = 0.10, δ = 0.05)
+
+Calibrated λ = 0.5000 on the calibration half (risk 0.0379, serving 81% of it).
+Held-out realized served-failure at that λ: **0.0521** over 403 served items.
+The held-out rate is within α — the bound survived data it never saw.
+
+
+## Meta-verifier (AutoMix, arXiv:2310.12963) vs plain first-pass
+
+Fitted on 487 tasks, scored on 487 held-out tasks. Break-even p* = 0.816.
+
+| policy | success | total $ |
+|---|---|---|
+| first-pass | 0.9343 | $1.4674 |
+| meta-verified | 0.9343 | $1.4674 |
+
+Head to head on held-out tasks: **0 won, 0 lost**.
+
+On this matrix the meta-verifier does **not** beat treating the gate as authoritative — neither better nor cheaper. That is the expected result where the gate is a near-perfect oracle (unit tests), and it is reported rather than buried: the rule is worth shipping only on gates that actually err.
+
+
+## Cost-aware start rung — `start cheap ⟺ c₀ < p·c₁`
+
+Fitted on 487 tasks, scored on 974 held-out. Adverse-selection multiplier **1.19×** (mean top-rung cost among escalating tasks ÷ mean across all tasks; 1.00 = cost-neutral escalation, which is what the usual cascade cost model assumes).
+
+| policy | success | $/task | $/success | skipped cheap |
+|---|---|---|---|---|
+| always-top | 0.9435 | $0.00748 | $0.00793 | 100% |
+| first-pass | 0.9333 | $0.00308 | $0.00330 | 0% |
+| cost-aware (learned p) | 0.9343 | $0.00297 | $0.00318 | 3% |
+| cost-aware (ORACLE p — cheats) | 0.9333 | $0.00261 | $0.00279 | 19% |
+
+**Learned rule vs always-top: -60.3% cost/task at -0.0092 success.**
+
