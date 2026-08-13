@@ -124,6 +124,105 @@ fn main() {
         return;
     }
 
+    // VRBench reference participant: run the verified cascade over the task set and WRITE a
+    // submission. A ladder of one model yields a single-shot ungated submission, which is exactly
+    // an AIQ baseline — so baselines come from this same path rather than being asserted.
+    //   FIRSTPASS_CODING_LADDER=a,b firstpass-bench --vrbench-run tasks.jsonl out.jsonl
+    if let Some(i) = args.iter().position(|a| a == "--vrbench-run") {
+        let (Some(tasks_path), Some(out_path)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("usage: firstpass-bench --vrbench-run <tasks.jsonl> <out-submission.jsonl>");
+            std::process::exit(2);
+        };
+        let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        let openai_key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
+        let ladder: Vec<String> = std::env::var("FIRSTPASS_CODING_LADDER")
+            .unwrap_or_else(|_| "anthropic/claude-haiku-4-5,anthropic/claude-sonnet-5".to_owned())
+            .split(',')
+            .map(|m| m.trim().to_owned())
+            .collect();
+        let text = std::fs::read_to_string(tasks_path).unwrap_or_else(|e| {
+            eprintln!("cannot read {tasks_path}: {e}");
+            std::process::exit(1);
+        });
+        let tasks = firstpass_bench::vrbench::parse_tasks(&text).unwrap_or_else(|e| {
+            eprintln!("task file rejected: {e}");
+            std::process::exit(1);
+        });
+        let solvers: Vec<firstpass_bench::coding::LiveSolver> = ladder
+            .iter()
+            .map(|m| {
+                firstpass_bench::coding::LiveSolver::for_ladder_id(m, &key, openai_key.as_deref())
+                    .unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(2);
+                    })
+            })
+            .collect();
+        let refs: Vec<(String, &dyn firstpass_bench::coding::CandidateSolver)> = ladder
+            .iter()
+            .cloned()
+            .zip(
+                solvers
+                    .iter()
+                    .map(|s| s as &dyn firstpass_bench::coding::CandidateSolver),
+            )
+            .collect();
+        let sb = match establish_sandbox(&sandbox_image()) {
+            Ok(sb) => sb,
+            Err(e) => {
+                eprintln!("cannot run — sandbox not established: {e}");
+                std::process::exit(1);
+            }
+        };
+        eprintln!(
+            "running {} tasks over {} rung(s): {}",
+            tasks.len(),
+            ladder.len(),
+            ladder.join(" -> ")
+        );
+        let prices = firstpass_core::PriceTable::defaults();
+        let limits = firstpass_bench::sandbox::Limits::default();
+        match firstpass_bench::vrbench::run_reference_router(
+            &tasks,
+            &refs,
+            sb.as_ref(),
+            &prices,
+            &limits,
+        ) {
+            Ok(subs) => {
+                let mut out = String::new();
+                for s in &subs {
+                    match serde_json::to_string(s) {
+                        Ok(l) => {
+                            out.push_str(&l);
+                            out.push('\n');
+                        }
+                        Err(e) => {
+                            eprintln!("cannot serialise submission: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                if let Err(e) = std::fs::write(out_path, out) {
+                    eprintln!("cannot write {out_path}: {e}");
+                    std::process::exit(1);
+                }
+                let spend: f64 = subs.iter().map(|s| s.cost_usd).sum();
+                eprintln!(
+                    "wrote {} submissions to {out_path} (spend ${spend:.4})",
+                    subs.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("run failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // VRBench: score a THIRD-PARTY router's submission against the task set (specs/vrbench-v1.md).
     // Needs the sandbox (hidden cases execute untrusted model output) but no API key — the router
     // already made its calls; this only runs the oracle.
