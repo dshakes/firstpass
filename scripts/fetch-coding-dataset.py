@@ -31,6 +31,7 @@ Usage:
 import argparse
 import ast
 import json
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -252,7 +253,17 @@ def main() -> int:
                 # `json.loads` rejects it on the single quotes. `ast.literal_eval` reads that
                 # shape and, unlike `eval`, cannot execute anything from the dataset.
                 libs = ast.literal_eval(libs) if libs.strip() else []
-            outside = sorted(set(libs) - stdlib)
+            # The declared `libs` field is not the whole truth: a task's own TEST SUITE can import
+            # modules the field never lists. BigCodeBench/159 declares no third-party libs and its
+            # test imports numpy, which aborted a paid run 34 tasks in — correctly, since the
+            # harness refuses to score a missing module as a model failure. So scan the test
+            # source's imports too and take the union.
+            src_text = " ".join(
+                str(row.get(k) or "")
+                for k in ("test", "instruct_prompt", "prompt", "code", "canonical_solution")
+            )
+            imported = set(re.findall(r"^\s*(?:import|from)\s+([A-Za-z_][\w]*)", src_text, re.M))
+            outside = sorted((set(libs) | imported) - stdlib)
             if outside and not args.allow_third_party:
                 for lib in outside:
                     skipped_libs[lib] = skipped_libs.get(lib, 0) + 1
