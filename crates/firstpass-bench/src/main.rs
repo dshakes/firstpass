@@ -124,6 +124,55 @@ fn main() {
         return;
     }
 
+    // VRBench: score a THIRD-PARTY router's submission against the task set (specs/vrbench-v1.md).
+    // Needs the sandbox (hidden cases execute untrusted model output) but no API key — the router
+    // already made its calls; this only runs the oracle.
+    if let Some(i) = args.iter().position(|a| a == "--vrbench") {
+        let (Some(tasks_path), Some(sub_path)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("usage: firstpass-bench --vrbench <tasks.jsonl> <submission.jsonl>");
+            std::process::exit(2);
+        };
+        let read = |p: &str| {
+            std::fs::read_to_string(p).unwrap_or_else(|e| {
+                eprintln!("cannot read {p}: {e}");
+                std::process::exit(1);
+            })
+        };
+        let tasks = firstpass_bench::vrbench::parse_tasks(&read(tasks_path)).unwrap_or_else(|e| {
+            eprintln!("task file rejected: {e}");
+            std::process::exit(1);
+        });
+        // Validation happens before any scoring: a submission that under-reports cost is rejected
+        // outright rather than scored and caveated.
+        let subs =
+            firstpass_bench::vrbench::parse_submissions(&read(sub_path)).unwrap_or_else(|e| {
+                eprintln!("submission rejected: {e}");
+                std::process::exit(1);
+            });
+        let sb = match establish_sandbox(&sandbox_image()) {
+            Ok(sb) => sb,
+            Err(e) => {
+                eprintln!(
+                    "cannot score — sandbox not established: {e}\nhidden cases execute \
+                     model-generated code and will not be run on the host"
+                );
+                std::process::exit(1);
+            }
+        };
+        let limits = firstpass_bench::sandbox::Limits::default();
+        match firstpass_bench::vrbench::score_all(sb.as_ref(), &tasks, &subs, &limits) {
+            Ok(scored) => {
+                let rep = firstpass_bench::vrbench::report(&scored);
+                println!("{}", firstpass_bench::vrbench::render(&rep));
+            }
+            Err(e) => {
+                eprintln!("scoring failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args.iter().any(|a| a == "--ablation") {
         let n = std::env::var("FIRSTPASS_ABLATION_N")
             .ok()

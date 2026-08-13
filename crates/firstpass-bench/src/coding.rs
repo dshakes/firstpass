@@ -130,7 +130,7 @@ fn ratio(num: usize, den: usize) -> f64 {
 
 /// Build the Python runner that imports the solution, evals each case, and prints `FP_SCORE p n`.
 /// Cases are passed as JSON (stdlib) so arbitrary expression text needs no shell/Python escaping.
-fn build_runner(cases: &[String]) -> String {
+pub(crate) fn build_runner(cases: &[String]) -> String {
     let json = serde_json::to_string(cases).unwrap_or_else(|_| "[]".to_owned());
     format!(
         "import json\nfrom solution import *\nCASES = json.loads(r'''{json}''')\np = 0\nfor c in CASES:\n    try:\n        if eval(c):\n            p += 1\n    except Exception:\n        pass\nprint('FP_SCORE %d %d' % (p, len(CASES)))\n"
@@ -212,7 +212,7 @@ fn attribute_missing_module(sb: &dyn Sandbox, suite_src: &str, limits: &Limits) 
 }
 
 /// Parse `FP_SCORE p n` out of runner stdout.
-fn parse_score(stdout: &str) -> Option<(usize, usize)> {
+pub(crate) fn parse_score(stdout: &str) -> Option<(usize, usize)> {
     let line = stdout.lines().find(|l| l.starts_with("FP_SCORE "))?;
     let mut it = line.split_whitespace().skip(1);
     let p = it.next()?.parse().ok()?;

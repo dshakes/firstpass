@@ -317,6 +317,125 @@ pub fn render(r: &Report) -> String {
     s
 }
 
+// -- scoring: run the HIDDEN set against what the router served ---------------------------------
+
+use crate::sandbox::{ExecOutcome, ExecUnit, Limits, Sandbox};
+
+/// Run a task's **hidden** set against a served answer.
+///
+/// This is the step the router never participates in. It happens after the router has committed,
+/// in a network-free sandbox, because the answer is model-generated code from an untrusted source
+/// — a harness that executes it on the host is a remote-code-execution vector wearing an
+/// evaluation costume.
+///
+/// Returns whether the answer passed **every** hidden case. Partial credit is deliberately not
+/// reported here: the oracle is ground truth, and a partially-correct program is a wrong answer.
+///
+/// # Errors
+/// Sandbox failure — never a candidate failure, which is simply a `false`. The distinction matters:
+/// scoring an infrastructure fault as a failed task would silently understate every router.
+pub fn score_hidden(
+    sb: &dyn Sandbox,
+    task: &Task,
+    answer: &str,
+    limits: &Limits,
+) -> Result<bool, String> {
+    if task.hidden.kind != CheckKind::Pytest {
+        return Err(format!(
+            "{}: harness implements only the `pytest` check kind so far, task needs `{:?}` — \
+             refusing rather than skipping, because a skipped task is an inflated score",
+            task.id, task.hidden.kind
+        ));
+    }
+    let unit = ExecUnit {
+        files: vec![
+            ("solution.py".to_owned(), answer.to_owned()),
+            (
+                "fp_runner.py".to_owned(),
+                crate::coding::build_runner(&task.hidden.cases),
+            ),
+        ],
+        command: "python3 fp_runner.py".to_owned(),
+    };
+    match sb.run(&unit, limits) {
+        Ok(ExecOutcome::Completed { stdout, .. }) => {
+            let (passed, total) =
+                crate::coding::parse_score(&stdout).unwrap_or((0, task.hidden.cases.len()));
+            Ok(total > 0 && passed == total)
+        }
+        // A timeout or a crash is the candidate's failure, not the harness's.
+        Ok(_) => Ok(false),
+        Err(e) => Err(format!("{}: sandbox failed: {e}", task.id)),
+    }
+}
+
+/// Score a whole submission against the task set.
+///
+/// Every submitted task must exist in the task file and every task must be answered: a submission
+/// covering a subset would silently change the population a published number refers to.
+///
+/// # Errors
+/// Coverage mismatch, or any sandbox failure.
+pub fn score_all(
+    sb: &dyn Sandbox,
+    tasks: &[Task],
+    subs: &[Submission],
+    limits: &Limits,
+) -> Result<Vec<Scored>, String> {
+    use std::collections::HashMap;
+    let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+
+    if subs.len() != tasks.len() {
+        return Err(format!(
+            "submission covers {} of {} tasks — score the whole set or none, otherwise the \
+             reported population is not the benchmark",
+            subs.len(),
+            tasks.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(subs.len());
+    for s in subs {
+        let task = by_id
+            .get(s.id.as_str())
+            .ok_or_else(|| format!("submission names unknown task `{}`", s.id))?;
+        out.push(Scored {
+            id: s.id.clone(),
+            oracle_pass: score_hidden(sb, task, &s.answer, limits)?,
+            gate: s.served_verdict(),
+            cost_usd: s.cost_usd,
+            escalated: s.escalated(),
+        });
+    }
+    Ok(out)
+}
+
+/// Parse a task file, refusing any line the harness cannot faithfully score.
+///
+/// # Errors
+/// Malformed JSON, an unsupported format major, or an empty file.
+pub fn parse_tasks(text: &str) -> Result<Vec<Task>, String> {
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let t: Task = serde_json::from_str(line).map_err(|e| format!("line {}: {e}", i + 1))?;
+        if t.vrbench_version != VRBENCH_VERSION {
+            return Err(format!(
+                "line {}: vrbench_version {} not supported (this harness implements {})",
+                i + 1,
+                t.vrbench_version,
+                VRBENCH_VERSION
+            ));
+        }
+        out.push(t);
+    }
+    if out.is_empty() {
+        return Err("task file is empty".to_owned());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
