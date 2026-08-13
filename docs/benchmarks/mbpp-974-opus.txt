@@ -7,7 +7,13 @@
 # replay:  firstpass-bench --replay docs/benchmarks/mbpp-974-opus.checkpoint.jsonl
 #          (offline — no API key, no sandbox, no spend)
 #
-# This is the steep-ladder counterpart to mbpp-policy-974.txt (haiku→sonnet, the narrowest
+# REPLICATION of mbpp-policy-974-opus.txt (2026-08-03), measured independently 10 days later on
+# the same 974 rows. The two agree closely — always-cheap 0.77/$0.0018 vs 0.78/$0.0018, always-top
+# 0.95/$0.0079 vs 0.94/$0.0079 — which is the point of keeping both: the headline saving is
+# reproducible across runs, not an artifact of one measurement. Cite the 08-03 artifact as the
+# primary result; this one is corroboration.
+#
+# This is also the steep-ladder counterpart to mbpp-policy-974.txt (haiku→sonnet, the narrowest
 # realistic ladder). No judge, so each rung's cost_usd is that rung's own model spend and the
 # ladder gradient is the real one — cheap:top is 0.18 here against 0.46 on the sonnet ladder.
 #
