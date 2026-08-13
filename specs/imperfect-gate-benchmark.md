@@ -1,4 +1,29 @@
-# Spec — imperfect-gate live benchmark (Batch 1)
+# Spec — imperfect-gate live benchmark (Batch 1) — **SUPERSEDED**
+
+> **Status: superseded by `crates/firstpass-bench/src/sweep.rs`. Do not implement this as written.**
+>
+> This spec predates both the code-execution sandbox (ADR 0002) and the 974-task MBPP run. It
+> proposes *buying* gate error — a deliberately weak LLM judge, ~$3–8 per run — to obtain a real
+> false-accept/false-reject distribution and a feasible conformal bound.
+>
+> Those quantities turned out to be already present in measurements we had paid for.
+> `RungOutcome.gate_score` is the continuous fraction of visible test cases passed, not a boolean;
+> the production policy simply serves at the strictest point on that axis (`gate_full_pass`,
+> τ = 1.0). Sweeping τ downward manufactures a genuinely imperfect gate out of a perfect one, with
+> hidden-oracle ground truth attached, for **$0 and no new API calls**.
+>
+> The sweep also fixes a methodological flaw this spec would have inherited: `coding::summarize`
+> calibrates the conformal threshold and measures served-failure on the *same* outcomes, which is
+> in-sample. `sweep.rs` calibrates on one split and reports realized served-failure on a disjoint
+> one.
+>
+> Kept for the record because the reasoning below — why a perfect gate makes the guarantee
+> degenerate, and why ground truth must never reach the gate — is still correct and still the
+> motivation for the replacement.
+
+---
+
+## Original spec (historical)
 
 ## Why
 The n=200 live benchmark proved the cost/success/escalation thesis, but its gate is a *perfect*

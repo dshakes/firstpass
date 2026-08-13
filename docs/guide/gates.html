@@ -187,6 +187,26 @@ timeout_ms = 5000</code></pre></div>
 <div class="note info"><span class="nt">Why stdin, not argv</span> A candidate output is untrusted text. Passing it on the command line invites shell and argument injection. Firstpass hands it to your gate on stdin, so a malicious candidate can't smuggle itself into the command.</div>
 <div class="recap">The <b>subprocess</b> gate runs any executable — candidate on stdin, JSON verdict on stdout, non-zero exit or timeout = abstain — so your existing test suite becomes a first-class gate.</div>
 
+<h2 id="wrapper">The ready-made wrapper<a class="anchor" href="#wrapper" aria-label="Link to this section">#</a></h2>
+<div class="tldr">You do not have to implement the contract yourself. <code>scripts/gates/run-tests.py</code> wraps any test command into a valid gate.</div>
+<p>A bare <code>pytest</code> is <em>not</em> a gate: it does not read the candidate from stdin and does not print a verdict, so Firstpass records an <b>abstain</b> on every request — and a route with <code>on_abstain = "fail_open"</code> then serves everything unverified while looking healthy. The wrapper exists so nobody has to fall into that.</p>
+<pre class="lang-toml"><code>[[gate]]
+id  = "unit-tests"
+cmd = ["python3", "scripts/gates/run-tests.py",
+       "--write", "solution.py", "--copy", "tests/",
+       "--", "python3", "-m", "pytest", "-q"]</code></pre>
+<p>It extracts the code from the model's reply (Markdown fences included), writes it into a fresh temporary directory, copies in the files named by <code>--copy</code>, runs your command, and reports the verdict. Swap the command after <code>--</code> for <code>npx jest --silent</code> or <code>cargo test --quiet</code>; recipes for all three are in <code>scripts/gates/README.md</code>.</p>
+
+<h3 id="graded">The score is graded, and that matters</h3>
+<p>Where your runner reports counts, the score is the <b>pass fraction</b>, not a bare 1.0/0.0 — a candidate failing one of three tests scores <code>0.667</code>. Firstpass calibrates its serve threshold with split conformal <em>over that score</em>, and a strictly binary score leaves the calibration exactly two operating points. Measured on MBPP, where a generated function passes all of a task's asserts or none, the observed score set was <code>{0.0, 1.0}</code> and no threshold could separate a safe prefix. A graded score is what makes the guarantee reachable.</p>
+
+<div class="warn"><b>A broken runner abstains, never fails.</b> <code>python3 -m pytest</code> with pytest uninstalled exits non-zero through a <em>present</em> interpreter, so there is no "command not found" to catch — naive exit-code handling reports a perfectly good candidate as a test failure. A gate broken that way fails every candidate, escalates every request, and bills your top rung indefinitely while looking like it is working. The wrapper detects these signatures and abstains instead.</div>
+
+<h3 id="untrusted">Running untrusted code</h3>
+<p>The gate executes model-generated code with your permissions. The temp directory limits accidents; it is <b>not</b> a security boundary. For untrusted traffic, run it in a container with no network:</p>
+<pre class="lang-bash"><code>--docker python:3.12-alpine</code></pre>
+<div class="recap">Use <code>run-tests.py</code> rather than hand-rolling the contract: it grades the score from your runner's own pass counts, and it abstains when the runner is broken instead of silently failing every request.</div>
+
 <h2 id="judge">judge — native LLM<a class="anchor" href="#judge" aria-label="Link to this section">#</a></h2>
 <div class="tldr">The <code>judge</code> gate sends the candidate to a <b>different model</b> with a rubric and scores the output. Anti-gaming is structural, not a prompt trick: if the configured judge equals the candidate model, the gate abstains rather than let a model mark its own work. The candidate is fenced as untrusted data under a pinned system prompt.</div>
 <p>The <code>judge</code> gate uses a model to grade the candidate against a rubric. Its anti-gaming design is <strong>structural</strong>, not a prompt trick:</p>

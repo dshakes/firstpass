@@ -281,6 +281,95 @@ fn load_checkpoint(
         .collect()
 }
 
+/// Load a measured matrix from a checkpoint for **offline** replay — no API key, no sandbox, no
+/// spend. This is what makes a paid measurement a reusable asset rather than a one-shot receipt:
+/// every downstream study (threshold sweeps, new policies, a meta-verifier) re-reads the same
+/// rows instead of re-buying them.
+///
+/// Unlike [`load_checkpoint`], which is an optimisation and so swallows every error, this is a
+/// source of truth and reports them. File order is preserved, because that is measurement order
+/// and a study that reorders its own inputs is harder to compare against its predecessor.
+///
+/// A file may hold several ladders (the checkpoint is designed to tolerate that). Mixing them into
+/// one matrix would silently average two different experiments, so this refuses unless `ladder`
+/// names which one to read.
+///
+/// # Errors
+/// Unreadable file, no parseable rows, an unknown `ladder` filter, or several ladders present with
+/// no filter to choose between them.
+pub fn load_matrix(
+    path: &std::path::Path,
+    ladder: Option<&[String]>,
+) -> Result<(Vec<Vec<RungOutcome>>, Vec<String>), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read checkpoint {}: {e}", path.display()))?;
+
+    // A row that fails to parse is reported, not skipped: a partially-read matrix would produce a
+    // plausible study over a silently smaller n.
+    let mut rows = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: CheckpointRow = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "{}:{}: malformed checkpoint row: {e}",
+                path.display(),
+                i + 1
+            )
+        })?;
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        return Err(format!("checkpoint {} has no rows", path.display()));
+    }
+
+    let mut ladders: Vec<Vec<String>> = Vec::new();
+    for r in &rows {
+        if !ladders.contains(&r.ladder) {
+            ladders.push(r.ladder.clone());
+        }
+    }
+    let chosen = match ladder {
+        Some(want) => {
+            if !ladders.iter().any(|l| l == want) {
+                return Err(format!(
+                    "checkpoint {} holds no rows for ladder {want:?}; it has {ladders:?}",
+                    path.display()
+                ));
+            }
+            want.to_vec()
+        }
+        None if ladders.len() == 1 => ladders[0].clone(),
+        None => {
+            return Err(format!(
+                "checkpoint {} holds {} ladders {ladders:?}; pass one explicitly so two \
+                 experiments are not averaged into one",
+                path.display(),
+                ladders.len()
+            ));
+        }
+    };
+
+    let matrix: Vec<Vec<RungOutcome>> = rows
+        .into_iter()
+        .filter(|r| r.ladder == chosen)
+        .map(|r| r.rungs)
+        .collect();
+
+    // A row whose width disagrees with the ladder would index past its rungs and silently serve a
+    // fallback, so it is a hard error rather than a shrug.
+    if let Some(bad) = matrix.iter().find(|r| r.len() != chosen.len()) {
+        return Err(format!(
+            "checkpoint {} has a row with {} rungs but the ladder has {}",
+            path.display(),
+            bad.len(),
+            chosen.len()
+        ));
+    }
+    Ok((matrix, chosen))
+}
+
 /// Append one finished task. Best-effort by the same reasoning: a failure to checkpoint must not
 /// discard a measurement that was already paid for.
 fn append_checkpoint(
@@ -1184,5 +1273,153 @@ mod tests {
             "cost must include the failed cheap attempt, got {}",
             fp.total_cost_usd
         );
+    }
+
+    // --- load_matrix: a paid measurement re-read offline ------------------------------------
+
+    /// Write `lines` to a uniquely-named temp file and return its path. Dependency-free on
+    /// purpose: a test fixture is not worth a new crate in the tree.
+    fn tmp_checkpoint(tag: &str, lines: &[String]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("firstpass-load-matrix-{tag}.jsonl"));
+        std::fs::write(&p, lines.join("\n")).expect("write fixture");
+        p
+    }
+
+    fn row_json(task_id: &str, ladder: &[&str], rungs: &[RungOutcome]) -> String {
+        serde_json::to_string(&CheckpointRow {
+            task_id: task_id.to_owned(),
+            ladder: ladder.iter().map(|s| (*s).to_owned()).collect(),
+            rungs: rungs.to_vec(),
+        })
+        .expect("serialize fixture row")
+    }
+
+    /// The round trip the whole offline story rests on: what `measure_resumable` wrote is what
+    /// `load_matrix` reads back, in measurement order.
+    #[test]
+    fn load_matrix_round_trips_and_preserves_file_order() {
+        let p = tmp_checkpoint(
+            "order",
+            &[
+                row_json(
+                    "t1",
+                    &["cheap", "top"],
+                    &[o(true, true, 0.01), o(true, true, 0.1)],
+                ),
+                row_json(
+                    "t2",
+                    &["cheap", "top"],
+                    &[o(false, false, 0.02), o(true, true, 0.2)],
+                ),
+            ],
+        );
+        let (matrix, ladder) = load_matrix(&p, None).expect("loads");
+        assert_eq!(ladder, vec!["cheap".to_owned(), "top".to_owned()]);
+        assert_eq!(matrix.len(), 2);
+        // Order is measurement order, not sorted or hashed: row 0 is the one that passed its gate.
+        assert!(matrix[0][0].gate_full_pass, "first row must stay first");
+        assert!(!matrix[1][0].gate_full_pass);
+        assert!((matrix[1][0].cost_usd - 0.02).abs() < 1e-9);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Two ladders in one file is a supported checkpoint state. Averaging them would silently
+    /// merge two experiments, so an unfiltered load must refuse rather than pick one.
+    #[test]
+    fn load_matrix_refuses_to_merge_two_ladders() {
+        let p = tmp_checkpoint(
+            "twoladders",
+            &[
+                row_json(
+                    "t1",
+                    &["cheap", "top"],
+                    &[o(true, true, 0.01), o(true, true, 0.1)],
+                ),
+                row_json(
+                    "t2",
+                    &["cheap", "opus"],
+                    &[o(true, true, 0.01), o(true, true, 0.9)],
+                ),
+            ],
+        );
+        let err = load_matrix(&p, None).expect_err("must refuse an ambiguous file");
+        assert!(err.contains("ladders"), "got {err}");
+
+        // ...but naming one resolves it, and selects only that ladder's rows.
+        let want = vec!["cheap".to_owned(), "opus".to_owned()];
+        let (matrix, ladder) = load_matrix(&p, Some(&want)).expect("explicit ladder loads");
+        assert_eq!(ladder, want);
+        assert_eq!(matrix.len(), 1, "only the opus row");
+        assert!((matrix[0][1].cost_usd - 0.9).abs() < 1e-9);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A truncated write (the checkpoint is appended to during a live run that can be killed at
+    /// any moment) must fail loudly. Skipping the bad line would produce a plausible study over a
+    /// silently smaller n — the exact failure mode with no symptom.
+    #[test]
+    fn load_matrix_rejects_a_malformed_row_rather_than_shrinking_n() {
+        let p = tmp_checkpoint(
+            "malformed",
+            &[
+                row_json(
+                    "t1",
+                    &["cheap", "top"],
+                    &[o(true, true, 0.01), o(true, true, 0.1)],
+                ),
+                "{\"task_id\":\"t2\",\"ladder\":[\"cheap\"".to_owned(),
+            ],
+        );
+        let err = load_matrix(&p, None).expect_err("truncated line must fail the load");
+        assert!(err.contains("malformed"), "got {err}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A row narrower than its ladder would index past its rungs and quietly serve the fallback,
+    /// reporting a policy that never ran.
+    #[test]
+    fn load_matrix_rejects_a_row_whose_width_disagrees_with_the_ladder() {
+        let p = tmp_checkpoint(
+            "width",
+            &[row_json("t1", &["cheap", "top"], &[o(true, true, 0.01)])],
+        );
+        let err = load_matrix(&p, None).expect_err("width mismatch must fail");
+        assert!(err.contains("rungs"), "got {err}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// An empty file is not an empty experiment. Returning a zero-row matrix would render a study
+    /// reading n=0 with every rate at zero, which looks like a result.
+    #[test]
+    fn load_matrix_rejects_an_empty_checkpoint() {
+        let p = tmp_checkpoint("empty", &[]);
+        let err = load_matrix(&p, None).expect_err("empty file must fail");
+        assert!(err.contains("no rows"), "got {err}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// End to end: a checkpoint on disk replays into the same study a live run would have
+    /// produced. This is the property that lets a reviewer with no API key reproduce the paper.
+    #[test]
+    fn a_checkpoint_replays_into_the_same_study_without_any_backend() {
+        let matrix = vec![
+            vec![o(true, true, 0.01), o(true, true, 0.10)],
+            vec![o(false, false, 0.01), o(true, true, 0.10)],
+        ];
+        let p = tmp_checkpoint(
+            "e2e",
+            &[
+                row_json("t1", &["cheap", "top"], &matrix[0]),
+                row_json("t2", &["cheap", "top"], &matrix[1]),
+            ],
+        );
+        let (loaded, loaded_ladder) = load_matrix(&p, None).expect("loads");
+        let from_disk = replay(&loaded, &loaded_ladder, "offline");
+        let in_memory = replay(&matrix, &ladder(), "offline");
+        let a = from_disk.find("first-pass").expect("first-pass");
+        let b = in_memory.find("first-pass").expect("first-pass");
+        assert!((a.success_rate - b.success_rate).abs() < 1e-9);
+        assert!((a.total_cost_usd - b.total_cost_usd).abs() < 1e-9);
+        let _ = std::fs::remove_file(&p);
     }
 }

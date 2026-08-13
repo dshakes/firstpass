@@ -7,3 +7,9 @@ target/
 *.db-shm
 *.db-wal
 **/*.rs.bk
+
+# Paper build artifacts (the .tex is the source of truth).
+paper/main.pdf
+paper/*.aux
+paper/*.log
+paper/*.out

@@ -348,7 +348,62 @@ fn record_trace_metrics(trace: &Trace) {
     };
     metrics::counter!("firstpass_served_total", "served_from" => served_from).increment(1);
     if trace.final_.served_from == ServedFrom::Error {
-        metrics::counter!("firstpass_upstream_failures_total").increment(1);
+        // Labeled by the provider that actually failed — an undimensioned failure count says
+        // something broke but not which upstream, which is the first question during an incident.
+        // The last attempt is the one that gave up. `sum(...)` over the label reproduces the old
+        // undimensioned total, so existing queries keep their meaning.
+        let provider = trace
+            .attempts
+            .last()
+            .map_or_else(|| "unknown".to_owned(), |a| a.provider.clone());
+        metrics::counter!("firstpass_upstream_failures_total", "provider" => provider).increment(1);
+    }
+
+    // Per-attempt series: the breakdown the aggregates above cannot give. Label cardinality is
+    // bounded by the ladder (a handful of providers and rungs), not by traffic, so this is safe to
+    // emit on every request. Kept as separate metric names rather than labels on the existing
+    // totals, because the committed Grafana dashboard queries those totals unaggregated and
+    // dimensioning them in place would silently split every panel.
+    for a in &trace.attempts {
+        metrics::histogram!(
+            "firstpass_attempt_latency_ms",
+            "provider" => a.provider.clone(),
+            "rung" => a.rung.to_string()
+        )
+        .record(a.latency_ms as f64);
+        metrics::counter!(
+            "firstpass_attempt_total",
+            "provider" => a.provider.clone(),
+            "rung" => a.rung.to_string()
+        )
+        .increment(1);
+        metrics::gauge!(
+            "firstpass_attempt_cost_usd_total",
+            "provider" => a.provider.clone(),
+            "rung" => a.rung.to_string()
+        )
+        .increment(a.cost_usd);
+
+        // Per-gate: which gate is passing, failing, or abstaining, and what it costs to run.
+        // `firstpass evals` computes this from stored receipts after the fact; a live series is
+        // what lets the false-pass SLO alarm fire during the soak instead of afterwards.
+        for g in &a.gates {
+            let verdict = match g.verdict {
+                Verdict::Pass => "pass",
+                Verdict::Fail => "fail",
+                Verdict::Abstain => "abstain",
+            };
+            metrics::counter!(
+                "firstpass_gate_verdict_total",
+                "gate_id" => g.gate_id.clone(),
+                "verdict" => verdict
+            )
+            .increment(1);
+            metrics::histogram!("firstpass_gate_latency_ms", "gate_id" => g.gate_id.clone())
+                .record(g.ms as f64);
+            metrics::gauge!("firstpass_gate_cost_by_id_usd_total", "gate_id" => g.gate_id.clone())
+                .increment(g.cost_usd);
+        }
     }
     // The value signals: what was spent, what proof cost, and what routing saved vs always-top
     // (§9.1 counterfactual). Monotonic gauges because `metrics` counters are integer-only and
@@ -4712,6 +4767,71 @@ mod tests {
         assert!(
             body.contains("firstpass_served_total"),
             "metrics body missing served counter: {body}"
+        );
+    }
+
+    /// The observability GA item is about *dimensioning*, not about having series: an
+    /// undimensioned latency histogram cannot answer "which provider is slow" and an
+    /// undimensioned failure count cannot answer "which upstream is down", which are the first
+    /// two questions in an incident. These assert the labels reach the scrape payload, since a
+    /// label that never renders is indistinguishable from one that was never added.
+    #[tokio::test]
+    async fn metrics_are_dimensioned_by_provider_rung_and_gate() {
+        use tower::ServiceExt;
+
+        let (state, mut rx) = enforce_state(
+            &["anthropic/claude-haiku-4-5"],
+            &["non-empty"],
+            vec![(
+                "anthropic/claude-haiku-4-5",
+                Ok(model_resp("anthropic/claude-haiku-4-5", "hello")),
+            )],
+        );
+        let router = app(state).expect("prometheus recorder installs");
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(user_body()))
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(req).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+        rx.try_recv().expect("a trace was enqueued");
+
+        let metrics_req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let bytes = axum::body::to_bytes(
+            router.oneshot(metrics_req).await.unwrap().into_body(),
+            1 << 20,
+        )
+        .await
+        .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // Per-provider / per-rung cost and latency.
+        assert!(
+            body.contains(r#"firstpass_attempt_total{provider="anthropic",rung="0"}"#),
+            "attempt counter is not dimensioned by provider+rung: {body}"
+        );
+        assert!(
+            body.contains("firstpass_attempt_latency_ms")
+                && body.contains(r#"provider="anthropic""#),
+            "attempt latency is not dimensioned by provider: {body}"
+        );
+        assert!(
+            body.contains("firstpass_attempt_cost_usd_total"),
+            "per-attempt cost series missing: {body}"
+        );
+        // Per-gate verdicts — what the false-pass SLO alarm watches.
+        assert!(
+            body.contains(r#"firstpass_gate_verdict_total{gate_id="non-empty",verdict="pass"}"#),
+            "gate verdicts are not dimensioned by gate_id+verdict: {body}"
         );
     }
 
