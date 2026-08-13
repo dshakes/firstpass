@@ -29,8 +29,11 @@ ALLOW = {
 
 def main() -> int:
     tex = PAPER.read_text(encoding="utf-8")
-    # Strip comments — commented-out numbers are not claims.
-    tex = "\n".join(l.split("%")[0] for l in tex.splitlines())
+    # Strip comments — commented-out numbers are not claims. Split on an UNESCAPED `%` only:
+    # `\%` is a literal percent sign and appears in nearly every table cell ("59\%"), so a naive
+    # split truncated each row at its first percentage and silently exempted every number after it
+    # from verification. The check then reported all-clear while skipping most of the paper.
+    tex = "\n".join(re.split(r"(?<!\\)%", l)[0] for l in tex.splitlines())
     corpus = "\n".join(a.read_text(encoding="utf-8") for a in ARTIFACTS)
 
     # Any decimal with 3+ significant places is a measurement worth checking. Two-place numbers
