@@ -124,6 +124,10 @@ GA is an audit + soak + process stamp, not a code stamp (ADR 0003).
       `firstpass_upstream_failures_total{provider}`. Label cardinality is bounded by the ladder,
       not by traffic. The existing aggregate series are unchanged, so the committed dashboard's
       panels keep their meaning (`sum(...)` over a new label reproduces the old total).
+      False-pass SLO alarm and the rest of the soak's checks:
+      `docs/observability/firstpass-alerts.yml` (10 rules, every expression verified against a
+      series the proxy actually emits — an alert on a non-existent metric is permanently green and
+      reads as safety).
       **Not yet done:** dashboard *panels* for the new per-attempt and per-gate series — the
       dashboard gained the per-provider failure breakdown only.
 - [ ] 30-day soak on real agent traffic — calendar gate.

@@ -1,0 +1,155 @@
+# Prometheus alerting rules for a Firstpass deployment.
+#
+#   Load with:  rule_files: [ "firstpass-alerts.yml" ]
+#   Check with: promtool check rules firstpass-alerts.yml
+#
+# Why this file exists: docs/runbooks/soak.md asks an operator to grep logs and query traces for
+# thirty consecutive days. Nobody does that reliably. Every check in the runbook that CAN be
+# expressed as a metric is expressed here instead, so the soak fails loudly rather than quietly.
+#
+# Every expression below references a series that is actually emitted by the proxy (verified
+# against the emission sites in crates/firstpass-proxy/src/). An alert on a metric that is never
+# emitted is worse than no alert: it is permanently green and reads as safety.
+#
+# Thresholds marked TUNE are deployment-specific. Set them from your own config before the soak
+# starts, not after the first page.
+
+groups:
+  - name: firstpass-guarantee
+    rules:
+      # THE headline alarm (SPEC §M3). Everything else here is operational; this one is the
+      # product claim. `firstpass_realized_served_failure` is the measured rate at which a served
+      # answer was later judged wrong, and the whole point of the conformal threshold is to hold
+      # it at or below alpha. If this fires, the guarantee is not holding on live traffic.
+      - alert: FirstpassFalsePassSLOBreach
+        expr: firstpass_realized_served_failure > 0.10   # TUNE: your [escalation] alpha
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Served-failure rate above alpha — the guarantee is not holding"
+          description: >-
+            realized served-failure is {{ $value | humanizePercentage }}, above the configured
+            alpha. Either the gate has degraded or traffic has drifted away from the calibration
+            set. Check firstpass_serve_threshold: if adaptive conformal is enabled it should be
+            climbing in response. Re-calibrate with `firstpass calibrate` against recent receipts.
+
+      # A threshold pinned at its ceiling means adaptive conformal has run out of room: it is
+      # rejecting everything it can and STILL cannot hold alpha. The SLO alert above may not have
+      # fired yet, but the system has no headroom left.
+      - alert: FirstpassServeThresholdSaturated
+        expr: firstpass_serve_threshold >= 0.99
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Serve threshold pinned at maximum — no headroom left to hold the bound"
+
+  - name: firstpass-integrity
+    rules:
+      # Sev-1 in the runbook. Receipts are the audit record; if the writer dies the hash chain
+      # stops and the deployment silently loses the property it exists to provide.
+      - alert: FirstpassTracesDropped
+        expr: increase(firstpass_traces_dropped_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Receipts are being dropped — the audit chain has gaps"
+          description: >-
+            Any drop is a Sev-1. Check the log for
+            "trace writer: failed to load chain head, stopping" (store.rs) — that means the writer
+            thread is dead and traces have stopped entirely.
+
+      # Spilling means the store could not keep up and receipts went to the overflow path. Not
+      # data loss, but the chain is degraded and the backlog needs draining.
+      - alert: FirstpassReceiptsSpilling
+        expr: increase(firstpass_receipts_spilled_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Receipts spilling to overflow — the trace store is not keeping up"
+
+      # A tripped guardrail means a gate was auto-disabled for exceeding its error budget. From
+      # that moment every subsequent request is served WITHOUT that check while everything still
+      # looks healthy. The runbook calls for zero of these during a soak.
+      - alert: FirstpassGuardrailBreach
+        expr: increase(firstpass_guardrail_breaches_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A gate breached its error budget and may be auto-disabled"
+          description: >-
+            Requests may now be served unverified. Find the gate in the log
+            ("gate exceeded its error budget — auto-disabled (ALARM)") and investigate before
+            continuing the soak.
+
+  - name: firstpass-operational
+    rules:
+      # Now per-provider, so this names WHICH upstream is failing rather than just that something
+      # is. sum by (provider) reproduces the old undimensioned total.
+      - alert: FirstpassUpstreamFailures
+        expr: |
+          sum by (provider) (rate(firstpass_upstream_failures_total[5m]))
+            / clamp_min(sum by (provider) (rate(firstpass_attempt_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.provider }} failing above 5% of attempts"
+
+      # A gate that abstains constantly is not gating. This is the exact shape of a misconfigured
+      # gate wrapper — a command that does not implement the stdin/stdout contract abstains on
+      # every request, and with on_abstain = "fail_open" everything is then served unverified.
+      # See scripts/gates/README.md.
+      - alert: FirstpassGateAbstaining
+        expr: |
+          sum by (gate_id) (rate(firstpass_gate_verdict_total{verdict="abstain"}[15m]))
+            / clamp_min(sum by (gate_id) (rate(firstpass_gate_verdict_total[15m])), 0.001) > 0.20
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gate {{ $labels.gate_id }} is abstaining on >20% of requests"
+          description: >-
+            An abstaining gate is not verifying anything. Most often the gate command does not
+            implement the contract, or its runner is missing. Check it directly:
+            `echo '{"candidate":"..."}' | <your gate cmd>` should print a verdict.
+
+      # Escalation is what costs money. A sustained spike means the cheap rung stopped working for
+      # this traffic and the ladder is paying twice on most requests.
+      - alert: FirstpassEscalationRateHigh
+        expr: |
+          sum(rate(firstpass_escalations_total[15m]))
+            / clamp_min(sum(rate(firstpass_served_total[15m])), 0.001) > 0.50   # TUNE
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over half of requests are escalating — the cheap rung has stopped paying"
+
+      # Routing overhead is the one latency number Firstpass is responsible for. Escalation
+      # latency is a model call and belongs to the provider; this is the proxy's own cost.
+      - alert: FirstpassRoutingLatencyHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(firstpass_enforce_latency_ms_bucket[5m]))) > 250   # TUNE
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 enforce latency above 250ms"
+
+      # The deployment is meant to save money. If spend exceeds the counterfactual baseline, the
+      # ladder is costing more than not routing at all — which is exactly what a too-shallow price
+      # gradient produces, and is worth knowing within a day rather than at the invoice.
+      - alert: FirstpassCostAboveBaseline
+        expr: increase(firstpass_cost_usd_total[6h]) > increase(firstpass_baseline_usd_total[6h])
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Routed spend exceeds the always-top baseline — the ladder is not paying"
+          description: >-
+            Usually a ladder whose rungs are too close in price for escalation to pay for itself.
+            Compare rung prices and consider a steeper ladder or a higher serve threshold.
