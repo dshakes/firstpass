@@ -7,11 +7,17 @@ name: "sdlc · audit (Gemini)"
 
 on:
   pull_request:
-    types: [opened, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
   pull-requests: write
+
+# Same reasoning as sdlc-audit: `synchronize` above means this re-runs per push, and
+# cancel-in-progress keeps that bounded to the final commit of a burst.
+concurrency:
+  group: sdlc-audit-gemini-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   audit-gemini:

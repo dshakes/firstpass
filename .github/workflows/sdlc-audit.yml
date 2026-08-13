@@ -6,11 +6,18 @@ name: "sdlc · audit (Codex)"
 
 on:
   pull_request:
-    types: [opened, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
   pull-requests: write
+
+# Bounded cost: a burst of pushes cancels its own intermediate runs, so only the final
+# commit is audited. Without this, adding `synchronize` above would start one AI audit per
+# push.
+concurrency:
+  group: sdlc-audit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   audit:
