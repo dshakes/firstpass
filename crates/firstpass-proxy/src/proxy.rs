@@ -1499,8 +1499,20 @@ fn openai_tool_content_looks_like_error(message: &Value) -> bool {
     let Some(text) = message.get("content").and_then(Value::as_str) else {
         return false;
     };
+    // `chars().take(64)`, not `get(..64)`. Byte-slicing a UTF-8 string returns `None` when the
+    // boundary lands mid-character, and the `unwrap_or(head)` fallback then lowercases the ENTIRE
+    // string — unbounded work on attacker-influenced input, since a tool result can be a
+    // multi-megabyte log or code dump. One non-ASCII character in the first 64 bytes is enough to
+    // trigger it, which makes it far from a corner case on real agent traffic.
+    //
+    // Caught in review. The prefix bound was there to keep this cheap, and it silently stopped
+    // bounding anything the moment the text was not pure ASCII.
     let head = text.trim_start();
-    let lowered = head.get(..64).unwrap_or(head).to_ascii_lowercase();
+    let lowered: String = head
+        .chars()
+        .take(64)
+        .collect::<String>()
+        .to_ascii_lowercase();
     lowered.starts_with("error")
         || lowered.starts_with("exception")
         || lowered.starts_with("traceback")
@@ -3755,6 +3767,71 @@ mod tests {
         assert_eq!(
             s.tool_errors, 0,
             "clean output that mentions the word 'error' must not be scored as a failure"
+        );
+    }
+
+    /// **A non-ASCII prefix must not defeat the length bound.**
+    ///
+    /// Caught in review. `head.get(..64)` byte-slices a UTF-8 string and returns `None` when the
+    /// boundary lands mid-character; the fallback then lowercased the ENTIRE string. One accented
+    /// character or emoji in the first 64 bytes turned a bounded prefix check into unbounded work
+    /// over an attacker-influenced payload — and a tool result can be a multi-megabyte log.
+    ///
+    /// Asserts the bound holds AND that classification is unchanged, since silently bounding by
+    /// truncating away the signal would pass a performance test and break the feature.
+    #[test]
+    fn a_multibyte_character_does_not_defeat_the_prefix_bound() {
+        // 'é' is two bytes, placed so the 64-byte boundary splits it.
+        let padded = format!("{}é{}", "x".repeat(63), "y".repeat(200_000));
+        let msg = serde_json::json!({ "role": "tool", "content": padded });
+        assert!(
+            !openai_tool_content_looks_like_error(&msg),
+            "a huge non-error payload must not be classified as a failure"
+        );
+
+        // Correctness alone does not catch this: byte-slicing gets the ANSWER right and does
+        // unbounded work to get it. The defect is the work, so the work is what is measured. A
+        // mutation restoring `get(..64).unwrap_or(head)` survived a correctness-only assertion.
+        //
+        // Scaling, not a wall-clock threshold: a bounded scan is O(1) in payload size, so growing
+        // the payload 10x must not grow the time proportionally. Timing is noisy, hence the very
+        // loose 5x allowance — it still separates "constant" from "linear over 2MB".
+        let big = format!("{}é{}", "x".repeat(63), "y".repeat(2_000_000));
+        let small = format!("{}é{}", "x".repeat(63), "y".repeat(200_000));
+        let m_big = serde_json::json!({ "role": "tool", "content": big });
+        let m_small = serde_json::json!({ "role": "tool", "content": small });
+
+        let t = |m: &serde_json::Value| {
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                std::hint::black_box(openai_tool_content_looks_like_error(m));
+            }
+            start.elapsed()
+        };
+        let _warm = t(&m_small);
+        let small_t = t(&m_small);
+        let big_t = t(&m_big);
+        assert!(
+            big_t < small_t * 5 + std::time::Duration::from_millis(5),
+            "scanning a 10x larger payload took {big_t:?} vs {small_t:?} — the prefix bound is not \
+             holding, so work scales with attacker-controlled input size"
+        );
+
+        // And a real error still classifies, even when the tail is enormous and multi-byte.
+        let err = format!("Error: boom 💥{}", "z".repeat(200_000));
+        let msg2 = serde_json::json!({ "role": "tool", "content": err });
+        assert!(
+            openai_tool_content_looks_like_error(&msg2),
+            "bounding the scan must not cost the detection it exists to perform"
+        );
+
+        // An error marker sitting just past the 64-character window must NOT be found: that is the
+        // bound doing its job, and it is the deliberate under-count documented on the function.
+        let late = format!("{}Error: too late", "w".repeat(200));
+        let msg3 = serde_json::json!({ "role": "tool", "content": late });
+        assert!(
+            !openai_tool_content_looks_like_error(&msg3),
+            "the scan must stay bounded to the head of the message"
         );
     }
 

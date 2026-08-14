@@ -149,6 +149,27 @@ impl EProcessRiskControl {
     /// why a ceiling exists and what it trades.
     #[must_use]
     pub fn with_cap(alpha: f64, delta: f64, bet: f64, cap: f64, grid: &[f64]) -> Self {
+        // The betting factor on a failure is `1 + bet*(alpha - 1)`, which reaches zero at
+        // `bet = 1/(1 - alpha)` and goes negative beyond it. A zero factor annihilates the e-value
+        // permanently: no amount of subsequent evidence can revive a product that has hit exactly
+        // 0, so a single failure would silently retire that threshold forever. Clamping the bet
+        // just below the annihilating value keeps the process a strict supermartingale (which is
+        // what Ville's inequality needs) while leaving it able to recover.
+        //
+        // Flagged in review. Reachable through the public `with_cap` and by config, so it is a
+        // real input to validate rather than a theoretical corner.
+        // Bound the failure factor at 0.5 rather than merely above 0. Clamping at `0.99/(1-alpha)`
+        // technically avoids annihilation but leaves a factor of 0.01 — a single failure costs 100x
+        // and takes ~50 consecutive successes to undo, which is dead in practice if not in theory.
+        // The first version of this clamp did exactly that, and the recovery half of the test below
+        // failed: the controller never certified again. Half per failure is recoverable and still
+        // strictly decreasing, which is all the supermartingale property needs.
+        let max_bet = 0.5 / (1.0 - alpha).max(f64::EPSILON);
+        let bet = if bet.is_finite() {
+            bet.clamp(0.0, max_bet)
+        } else {
+            DEFAULT_BET.min(max_bet)
+        };
         let mut grid: Vec<f64> = grid.iter().copied().filter(|g| g.is_finite()).collect();
         grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         grid.dedup();
@@ -497,6 +518,39 @@ mod tests {
         assert!(
             capped <= 100,
             "a capped controller must drop a contradicted certification within ~tens of rounds, took {capped}"
+        );
+    }
+
+    /// **A large bet must not permanently annihilate a threshold.**
+    ///
+    /// Flagged in review. The failure factor is `1 + bet*(alpha - 1)`, which hits exactly zero at
+    /// `bet = 1/(1-alpha)` and goes negative past it. Zero is absorbing under multiplication: one
+    /// failure would retire that threshold forever, and no later evidence could revive it. The
+    /// controller would look like it was still learning while being permanently dead.
+    ///
+    /// `bet` is reachable through the public `with_cap` and through config, so it is validated
+    /// input, not a theoretical corner.
+    #[test]
+    fn an_oversized_bet_cannot_permanently_kill_a_threshold() {
+        let alpha = 0.20;
+        // bet = 5.0 is far past the annihilating 1/(1-0.2) = 1.25.
+        let mut e = EProcessRiskControl::with_cap(alpha, 0.05, 5.0, DEFAULT_CAP, &grid());
+        e.observe_served(0.9, false);
+        assert!(
+            e.e_values().iter().all(|v| *v > 0.0),
+            "a failure must shrink e-values, never zero them: {:?}",
+            e.e_values()
+        );
+
+        // And the process must still be able to recover and certify afterwards.
+        let mut rng = Lcg(7);
+        for _ in 0..4000 {
+            let score = 0.95 + rng.next_f64() * 0.05;
+            e.observe_served(score, correct_for(score, rng.next_f64()));
+        }
+        assert!(
+            e.certified_threshold().is_some(),
+            "a controller that took one early failure must still be able to certify later"
         );
     }
 
