@@ -11,7 +11,15 @@ use serde::{Deserialize, Serialize};
 
 /// Version of the feature-extraction contract. Bump on any change to how a feature is
 /// computed. Recorded per trace as `features@vN`.
-pub const FEATURE_VERSION: u32 = 1;
+/// Feature-extraction contract version.
+///
+/// **v2** added [`Features::difficulty_hint`] (trajectory signals read from the agent's own
+/// conversation). The bump is required even though the field is `#[serde(default)]` and old traces
+/// still deserialize: the version says *how a vector was computed*, and a v1 trace genuinely had no
+/// hint available. Leaving it at 1 would let a policy fitted on v2 traffic be replayed against v1
+/// traces as though the missing hints were real zeroes — silently mixing "no signal" with "not
+/// measured", which is the class of error the version field exists to prevent.
+pub const FEATURE_VERSION: u32 = 2;
 
 /// Coarse task classification. `Other` is the safe default when classification is uncertain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -32,6 +40,93 @@ pub enum TaskKind {
     /// Anything not confidently classified (the safe default).
     #[default]
     Other,
+}
+
+/// Raw counts read off an agent conversation, before they are collapsed into a
+/// [`DifficultyHint`].
+///
+/// Deliberately counts, not content: how many tool results failed, not what they said. A router
+/// needs to know a session is going badly; it does not need the stack trace, and [`Features`] is
+/// not a place raw prompt text may ever land.
+///
+/// Extraction lives in the proxy (it parses HTTP bodies, which is I/O-shaped); the *scoring* lives
+/// here so it stays deterministic, versioned, and testable without a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrajectorySignals {
+    /// Tool results in the recent window that reported an error.
+    pub tool_errors: u32,
+    /// Tool results in the recent window, total. Zero means "no tool activity to judge".
+    pub tool_results: u32,
+    /// Assistant turns in the conversation — a proxy for how long this has been going on.
+    pub assistant_turns: u32,
+    /// Repeated identical tool invocations: the agent trying the same thing again.
+    pub repeated_tool_calls: u32,
+}
+
+/// How hard an agent's own conversation looks. Ordinal, four levels, deliberately coarse.
+///
+/// Four levels rather than a continuous score, because this feeds
+/// `ContextBucket` and every extra distinction multiplies the bandit's state space — the arms then
+/// share less traffic and learn slower. A signal too fine to learn from is worse than a coarse one:
+/// it looks more informative and performs worse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[repr(u8)]
+pub enum DifficultyHint {
+    /// No usable signal: a single-shot request, a non-agent client, or an unparseable body.
+    #[default]
+    None = 0,
+    /// Some tool activity, nothing going wrong.
+    Low = 1,
+    /// Errors or repetition appearing.
+    Medium = 2,
+    /// Sustained failure: the agent is stuck.
+    High = 3,
+}
+
+impl DifficultyHint {
+    /// Score signals into a hint.
+    ///
+    /// The thresholds below are a **prior, not a finding**. They are a reasonable starting shape,
+    /// and the bandit is what actually learns whether a given bucket deserves a higher start rung —
+    /// so the job here is to separate genuinely different situations into different buckets, not to
+    /// be right about which is harder. Getting the cut points slightly wrong costs a little
+    /// learning rate; collapsing distinct situations into one bucket costs the signal entirely.
+    ///
+    /// No tool activity yields [`DifficultyHint::None`] rather than [`DifficultyHint::Low`]: a
+    /// request with no tools has told us nothing, and "nothing" must not be confused with "fine".
+    #[must_use]
+    pub fn score(s: TrajectorySignals) -> Self {
+        if s.tool_results == 0 && s.repeated_tool_calls == 0 {
+            return Self::None;
+        }
+        // Integer-ratio comparisons rather than float division: this feeds a hash bucket and a
+        // versioned audit field, so it must be bit-identical everywhere, and `a/b > 0.5` is not
+        // something to trust across platforms when `a*2 > b` says it exactly.
+        let e = s.tool_errors;
+        let n = s.tool_results;
+        let half_failing = n > 0 && e * 2 > n;
+        let any_failing = e > 0;
+        let stuck = s.repeated_tool_calls >= 2;
+        let deep = s.assistant_turns >= 8;
+
+        match (half_failing || stuck, any_failing, deep) {
+            // Most calls failing, or the same call retried repeatedly. Being deep on top of that is
+            // the clearest "stuck" signature there is.
+            (true, _, true) => Self::High,
+            (true, _, false) => Self::Medium,
+            // Some errors, and the conversation has been running a while.
+            (false, true, true) => Self::Medium,
+            (false, true, false) => Self::Low,
+            // Tools in use, nothing failing.
+            (false, false, _) => Self::Low,
+        }
+    }
+
+    /// The wire value stored in [`Features::difficulty_hint`].
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
 }
 
 /// The per-request feature vector (§9.2).
@@ -64,6 +159,20 @@ pub struct Features {
     pub repo_fingerprint: Option<String>,
     /// How many attempts have already failed in this session (drives session promotion, §8.4).
     pub session_failure_count: u32,
+    /// How hard the *agent's own conversation* looks, `0..=3` — see [`DifficultyHint`].
+    ///
+    /// Distinct from [`Features::session_failure_count`], and the distinction is the whole point.
+    /// That field counts **our gate's** failures: endogenous evidence, available only after we have
+    /// already paid for a failed attempt. This one reads **the agent's** failures out of the
+    /// transcript it sent us — failing tool calls, repeated identical actions, a long unproductive
+    /// exchange — which is evidence we get *before* spending anything, and which is present on turns
+    /// where our own gate would have passed.
+    ///
+    /// `0` means "no signal", which is what a single-shot request, a non-agent client, and an
+    /// unparseable body all produce. It is a routing *hint* and never a serving decision: it may
+    /// choose which rung to start on, never what is fit to serve. Only a gate decides that.
+    #[serde(default)]
+    pub difficulty_hint: u8,
     /// Hour-of-day bucket in UTC, `0..=23` (see [`hour_bucket`]).
     pub hour_bucket: u8,
 }
@@ -83,6 +192,7 @@ impl Features {
             has_images: false,
             repo_fingerprint: None,
             session_failure_count: 0,
+            difficulty_hint: DifficultyHint::None as u8,
             hour_bucket: 0,
         }
     }
@@ -130,6 +240,136 @@ pub fn hour_bucket(ts: jiff::Timestamp) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request with no tool activity must score `None`, not `Low`.
+    ///
+    /// "I have no evidence" and "I have evidence that things are fine" are different states, and
+    /// conflating them would make every single-shot request look like a healthy agent session —
+    /// polluting the bandit's healthiest bucket with traffic that carries no trajectory signal
+    /// whatsoever.
+    #[test]
+    fn absent_tool_activity_is_no_signal_not_a_good_signal() {
+        assert_eq!(
+            DifficultyHint::score(TrajectorySignals::default()),
+            DifficultyHint::None
+        );
+        // Turn depth alone is not evidence of difficulty: a long, smooth conversation is still
+        // smooth, and charging it a higher start rung would be a pure cost regression.
+        assert_eq!(
+            DifficultyHint::score(TrajectorySignals {
+                assistant_turns: 50,
+                ..Default::default()
+            }),
+            DifficultyHint::None
+        );
+    }
+
+    /// Clean tool use scores `Low`; a majority-failing window scores higher. This is the ordering
+    /// the whole feature rests on — if these two land in the same bucket, there is no signal.
+    #[test]
+    fn a_failing_window_outranks_a_clean_one() {
+        let clean = DifficultyHint::score(TrajectorySignals {
+            tool_results: 6,
+            tool_errors: 0,
+            assistant_turns: 4,
+            repeated_tool_calls: 0,
+        });
+        let failing = DifficultyHint::score(TrajectorySignals {
+            tool_results: 6,
+            tool_errors: 5,
+            assistant_turns: 4,
+            repeated_tool_calls: 0,
+        });
+        assert_eq!(clean, DifficultyHint::Low);
+        assert!(
+            failing > clean,
+            "5-of-6 failing must outrank 0-of-6: {failing:?} vs {clean:?}"
+        );
+    }
+
+    /// Repetition alone is a stuck signal, even with no reported errors.
+    ///
+    /// This is the case an error-count-only heuristic misses entirely: an agent re-running the same
+    /// command that "succeeds" each time while making no progress reports zero errors and is
+    /// obviously stuck. Switchyard's stage router reads exactly this, and it is why the feature
+    /// counts repeats separately rather than folding them into an error rate.
+    #[test]
+    fn repetition_is_a_stuck_signal_without_any_errors() {
+        let hint = DifficultyHint::score(TrajectorySignals {
+            tool_results: 4,
+            tool_errors: 0,
+            assistant_turns: 5,
+            repeated_tool_calls: 3,
+        });
+        assert!(
+            hint >= DifficultyHint::Medium,
+            "3 repeated calls with no errors must still read as difficulty, got {hint:?}"
+        );
+    }
+
+    /// Sustained failure deep into a conversation is the top bucket, and the depth matters: the
+    /// same failure rate early is recoverable, late it is a pattern.
+    #[test]
+    fn sustained_failure_deep_in_a_session_is_the_top_bucket() {
+        let deep = DifficultyHint::score(TrajectorySignals {
+            tool_results: 10,
+            tool_errors: 8,
+            assistant_turns: 12,
+            repeated_tool_calls: 2,
+        });
+        let shallow = DifficultyHint::score(TrajectorySignals {
+            tool_results: 10,
+            tool_errors: 8,
+            assistant_turns: 2,
+            repeated_tool_calls: 0,
+        });
+        assert_eq!(deep, DifficultyHint::High);
+        assert!(
+            shallow < deep,
+            "the same failure rate early must not score as high as late: {shallow:?} vs {deep:?}"
+        );
+    }
+
+    /// The hint is bounded. It indexes a bandit bucket, so an unbounded value would silently
+    /// fragment the state space; and it is a versioned audit field, where an out-of-range value is
+    /// a contract violation rather than a curiosity.
+    #[test]
+    fn the_hint_is_always_within_its_declared_range() {
+        for tool_results in 0..12u32 {
+            for tool_errors in 0..=tool_results {
+                for assistant_turns in [0u32, 1, 7, 8, 40] {
+                    for repeated_tool_calls in 0..4u32 {
+                        let h = DifficultyHint::score(TrajectorySignals {
+                            tool_errors,
+                            tool_results,
+                            assistant_turns,
+                            repeated_tool_calls,
+                        });
+                        assert!(h.as_u8() <= DifficultyHint::High.as_u8());
+                    }
+                }
+            }
+        }
+    }
+
+    /// A v1 trace, written before this field existed, must still deserialize — and must land on
+    /// `None` rather than any other level. Old receipts stay readable; that is a hard requirement
+    /// of a tamper-evident log, since an auditor cannot re-derive what will not parse.
+    #[test]
+    fn a_v1_trace_without_the_hint_still_deserializes() {
+        let v1 = r#"{"version":1,"task_kind":"other","prompt_token_bucket":3,
+                     "tool_count":0,"has_images":false,"session_failure_count":0,"hour_bucket":9}"#;
+        let f: Features = serde_json::from_str(v1).expect("a v1 trace must still parse");
+        assert_eq!(
+            f.version, 1,
+            "the stored version must be preserved, not rewritten"
+        );
+        assert_eq!(
+            f.difficulty_hint,
+            DifficultyHint::None as u8,
+            "a missing hint must read as no-signal"
+        );
+    }
 
     #[test]
     fn token_bucket_is_monotonic_and_coarse() {
