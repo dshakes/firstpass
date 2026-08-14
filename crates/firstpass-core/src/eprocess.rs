@@ -554,6 +554,33 @@ mod tests {
         );
     }
 
+    /// `delta = 0` means "zero error budget", and must certify NOTHING rather than everything.
+    ///
+    /// Review raised this as a possible false-certification path. It is already handled —
+    /// `crossing_level` returns infinity for a non-positive delta — but "already correct" is not a
+    /// reason to leave a fail-closed contract untested, and an infinity comparison is exactly the
+    /// kind of thing a later refactor breaks silently.
+    #[test]
+    fn a_zero_error_budget_certifies_nothing() {
+        for delta in [0.0, -0.1] {
+            let mut e = EProcessRiskControl::new(0.2, delta, DEFAULT_BET, &grid());
+            let mut rng = Lcg(3);
+            for _ in 0..5000 {
+                let score = 0.99;
+                e.observe_served(score, correct_for(score, rng.next_f64()));
+            }
+            assert!(
+                e.crossing_level().is_infinite(),
+                "delta={delta} must make the crossing level unreachable"
+            );
+            assert!(
+                e.certified_threshold().is_none(),
+                "delta={delta} is a zero error budget: nothing may ever be certified"
+            );
+            assert!(!e.should_serve(1.0), "and nothing may be served");
+        }
+    }
+
     /// Bonferroni: the crossing level must scale with grid size. Testing every threshold at the
     /// full `delta` is the multiple-testing trap — each e-process looks valid alone, while the
     /// family-wise false-certification rate quietly grows with the grid.

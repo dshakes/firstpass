@@ -1401,7 +1401,25 @@ fn trajectory_signals(body: &[u8]) -> TrajectorySignals {
     const WINDOW: usize = 12;
     let recent = &messages[messages.len().saturating_sub(WINDOW)..];
 
-    let mut s = TrajectorySignals::default();
+    // Conversation DEPTH is a whole-conversation property, so it is counted over every message
+    // rather than the window — unlike the error and repetition signals, which are deliberately
+    // windowed because a session that struggled and recovered is not struggling now.
+    //
+    // Counting depth inside the window made the `deep` threshold unreachable: a real agent
+    // conversation alternates assistant/user, so 12 messages hold at most ~6 assistant turns and a
+    // `>= 8` test could never fire. `DifficultyHint::High` was dead in production while its unit
+    // test — which built the struct directly — stayed green. Caught in review.
+    let assistant_turns = u32::try_from(
+        messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let mut s = TrajectorySignals {
+        assistant_turns,
+        ..Default::default()
+    };
     // Tool invocations seen, as (name, argument-fingerprint). Compared, never stored: the
     // fingerprint is a hash, so repetition is detectable without the arguments themselves ever
     // reaching a feature vector or a receipt.
@@ -1409,7 +1427,8 @@ fn trajectory_signals(body: &[u8]) -> TrajectorySignals {
 
     for m in recent {
         match m.get("role").and_then(Value::as_str) {
-            Some("assistant") => s.assistant_turns += 1,
+            // assistant_turns is counted over the whole conversation above, not here.
+            Some("assistant") => {}
             // OpenAI: a tool result is its own message, and an error is conventionally reported in
             // the content rather than a flag, so there is no `is_error` to read.
             Some("tool") => {
@@ -1527,8 +1546,18 @@ fn openai_tool_content_looks_like_error(message: &Value) -> bool {
     //
     // Caught in review. The prefix bound was there to keep this cheap, and it silently stopped
     // bounding anything the moment the text was not pure ASCII.
-    let head = text.trim_start();
-    let lowered: String = head
+    // Bound FIRST, then trim. `trim_start()` on the raw text scans every leading whitespace
+    // character before the bound applies, so a payload of millions of spaces is O(N) again — the
+    // same defect as the byte-slicing one, reintroduced one line earlier. Taking a bounded prefix
+    // and trimming THAT keeps the work constant whatever the input.
+    //
+    // 128 taken so up to 64 characters of leading whitespace can be trimmed and still leave a
+    // 64-character window for the marker itself. Flagged in review.
+    let lowered: String = text
+        .chars()
+        .take(128)
+        .collect::<String>()
+        .trim_start()
         .chars()
         .take(64)
         .collect::<String>()
@@ -3768,6 +3797,78 @@ mod tests {
             "both error-shaped tool outputs must count"
         );
         assert_eq!(s.assistant_turns, 2);
+    }
+
+    /// **Leading whitespace must not defeat the bound either.**
+    ///
+    /// Second-order version of the byte-slicing bug, and it survived that fix: `trim_start()` on the
+    /// raw text scans every leading whitespace character BEFORE any bound applies, so millions of
+    /// spaces is O(N) again — the defect reintroduced one line earlier than where it was fixed.
+    /// Bound first, trim the bounded prefix. Flagged in review.
+    #[test]
+    fn a_flood_of_leading_whitespace_does_not_defeat_the_bound() {
+        let flood = format!("{}Error: boom", " ".repeat(4_000_000));
+        let small = format!("{}Error: boom", " ".repeat(400_000));
+        let m_big = serde_json::json!({ "role": "tool", "content": flood });
+        let m_small = serde_json::json!({ "role": "tool", "content": small });
+
+        let t = |m: &serde_json::Value| {
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                std::hint::black_box(openai_tool_content_looks_like_error(m));
+            }
+            start.elapsed()
+        };
+        let _warm = t(&m_small);
+        let small_t = t(&m_small);
+        let big_t = t(&m_big);
+        assert!(
+            big_t < small_t * 5 + std::time::Duration::from_millis(5),
+            "10x the leading whitespace took {big_t:?} vs {small_t:?} — trimming is scanning the \
+             whole payload before the bound applies"
+        );
+
+        // Modest indentation must still be trimmed, or the bound would cost the detection.
+        let indented = serde_json::json!({ "role": "tool", "content": "   Error: boom" });
+        assert!(
+            openai_tool_content_looks_like_error(&indented),
+            "ordinary leading whitespace must still be trimmed"
+        );
+    }
+
+    /// **`deep` must be reachable from a real conversation, not just a hand-built struct.**
+    ///
+    /// Caught in review, and it is the most instructive bug in this feature. My unit tests set
+    /// `assistant_turns: 12` directly and passed, so `High` looked reachable. Through the actual
+    /// extractor it was not: a real agent conversation alternates assistant/user, so a 12-message
+    /// window contains at most ~6 assistant turns and the `>= 8` threshold could never fire. An
+    /// entire difficulty level was dead in production while its unit test was green — testing the
+    /// scorer in isolation cannot catch a bug that lives in the boundary between the two.
+    #[test]
+    fn a_long_real_conversation_can_actually_reach_the_deep_signal() {
+        // 40 alternating turns, all failing — an agent that is genuinely, deeply stuck.
+        let mut msgs = Vec::new();
+        for i in 0..40 {
+            msgs.push(format!(
+                r#"{{"role":"assistant","content":[{{"type":"tool_use","name":"b","input":{{"i":{i}}}}}]}}"#
+            ));
+            msgs.push(
+                r#"{"role":"user","content":[{"type":"tool_result","is_error":true}]}"#.to_owned(),
+            );
+        }
+        let body = format!(r#"{{"messages":[{}]}}"#, msgs.join(","));
+        let s = trajectory_signals(body.as_bytes());
+        assert!(
+            s.assistant_turns >= 8,
+            "a 40-turn failing conversation must register as deep, got {} assistant turns — the \
+             window is counting turns it cannot see",
+            s.assistant_turns
+        );
+        assert_eq!(
+            DifficultyHint::score(s),
+            DifficultyHint::High,
+            "the hardest possible conversation must reach the top bucket, or High is dead code"
+        );
     }
 
     /// OpenAI tool content may be an ARRAY of content parts, not just a string.
