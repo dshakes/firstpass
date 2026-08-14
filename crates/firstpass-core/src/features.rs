@@ -129,6 +129,18 @@ impl DifficultyHint {
     }
 }
 
+/// Whether a difficulty hint carries no signal, and so should be omitted from the wire form.
+///
+/// Used by [`Features::difficulty_hint`]'s `skip_serializing_if` to keep v1 traces byte-identical
+/// under re-serialization — see that field's note on the hash chain.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if requires a &T predicate"
+)]
+fn is_no_signal(hint: &u8) -> bool {
+    *hint == DifficultyHint::None as u8
+}
+
 /// The per-request feature vector (§9.2).
 ///
 /// Rolling per-bucket statistics (e.g. `prior_rung_clearance`) are intentionally **not**
@@ -171,7 +183,18 @@ pub struct Features {
     /// `0` means "no signal", which is what a single-shot request, a non-agent client, and an
     /// unparseable body all produce. It is a routing *hint* and never a serving decision: it may
     /// choose which rung to start on, never what is fit to serve. Only a gate decides that.
-    #[serde(default)]
+    ///
+    /// **`skip_serializing_if` is load-bearing for the hash chain, not a size optimisation.** A v1
+    /// trace's JSON has no such field; serde defaults it to `0` on read, and if re-serialization
+    /// emitted `"difficulty_hint":0` the canonical JSON would differ from the bytes that were
+    /// originally hashed. Every historical receipt would then re-derive to a different hash and
+    /// `firstpass verify` would report `TAMPERED` across the whole store — breaking invariant #1
+    /// ("the hash chain is re-derivable") on upgrade, with no tampering having occurred.
+    ///
+    /// Omitting the default is exactly right rather than merely convenient: a v1 trace *had* no
+    /// hint, and a receipt should say what was measured, not what a later version would have
+    /// defaulted to. A v2 request carrying a real hint serialises it normally.
+    #[serde(default, skip_serializing_if = "is_no_signal")]
     pub difficulty_hint: u8,
     /// Hour-of-day bucket in UTC, `0..=23` (see [`hour_bucket`]).
     pub hour_bucket: u8,
@@ -414,5 +437,67 @@ mod tests {
         let f = Features::new(TaskKind::CodeEdit);
         assert_eq!(f.version, FEATURE_VERSION);
         assert_eq!(f.task_kind, TaskKind::CodeEdit);
+    }
+}
+
+#[cfg(test)]
+mod v1_chain_regression {
+    use super::*;
+
+    /// A v1 trace's hash must be re-derivable after v2 adds a field.
+    ///
+    /// Reviewer flagged this as a blocking regression, and the mechanism is exactly right in shape:
+    /// v1 JSON has no `difficulty_hint`, serde defaults it to 0 on read, and if re-serialization
+    /// emits `"difficulty_hint":0` the canonical JSON differs from what was hashed — every historical
+    /// receipt reads as TAMPERED. That is invariant #1 in CLAUDE.md ("the hash chain is
+    /// re-derivable"), so it gets a test rather than an argument.
+    #[test]
+    fn a_v1_feature_vector_round_trips_to_its_original_canonical_json() {
+        let v1 = r#"{"version":1,"task_kind":"other","prompt_token_bucket":3,"tool_count":0,"has_images":false,"session_failure_count":0,"hour_bucket":9}"#;
+        let f: Features = serde_json::from_str(v1).expect("v1 must parse");
+        let reserialized = serde_json::to_string(&f).expect("must serialize");
+        assert!(
+            !reserialized.contains("difficulty_hint"),
+            "re-serializing a v1 vector must NOT emit the v2 field, or every historical receipt \
+             re-derives to a different hash and reads as TAMPERED: {reserialized}"
+        );
+    }
+
+    /// **The chain-level proof**, not just the serde-level one.
+    ///
+    /// The serde test above catches the field appearing; this catches what that would COST. A v1
+    /// receipt's hash was computed over v1 canonical JSON. If today's binary re-derives a different
+    /// hash from the same stored record, `firstpass verify` reports TAMPERED across the entire
+    /// history — the auditor sees fraud where there was only an upgrade, which is the single worst
+    /// failure this system can have.
+    #[test]
+    fn a_v1_receipt_hash_is_still_re_derivable_by_todays_binary() {
+        let v1 = r#"{"version":1,"task_kind":"other","prompt_token_bucket":3,"tool_count":0,"has_images":false,"session_failure_count":0,"hour_bucket":9}"#;
+        // What the v1 binary would have hashed: the canonical form of the v1 document itself.
+        let original: serde_json::Value = serde_json::from_str(v1).expect("v1 must parse");
+        let hash_then = crate::hashchain::record_hash(&original).expect("must hash");
+
+        // What today's binary derives after a round trip through the v2 struct.
+        let f: Features = serde_json::from_str(v1).expect("v1 must parse into v2 struct");
+        let hash_now = crate::hashchain::record_hash(&f).expect("must hash");
+
+        assert_eq!(
+            hash_then, hash_now,
+            "a v1 record must re-derive to its original hash; a mismatch is reported to the \
+             operator as TAMPERED, with no tampering having occurred"
+        );
+    }
+
+    /// ...and a v2 vector that actually carries a hint must still emit it, or the field is
+    /// unauditable — present in routing, absent from the receipt that is supposed to explain it.
+    #[test]
+    fn a_v2_vector_with_a_real_hint_still_serializes_it() {
+        let mut f = Features::new(TaskKind::CodeEdit);
+        f.difficulty_hint = DifficultyHint::High.as_u8();
+        let s = serde_json::to_string(&f).expect("must serialize");
+        assert!(
+            s.contains("\"difficulty_hint\":3"),
+            "a non-default hint must appear in the receipt: {s}"
+        );
     }
 }
