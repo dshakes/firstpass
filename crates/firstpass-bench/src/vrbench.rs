@@ -622,11 +622,24 @@ pub fn run_reference_router(
     // transient HTTP 529 from the provider at task 898 of 974 destroyed every call before it —
     // real money, for an upstream hiccup that had nothing to do with the run. `--coding-policy`
     // has checkpointed per task for exactly this reason and I did not carry it across.
+    //
+    // Keyed by task id AND ladder. A row is reused only if its attempts are a prefix of *this*
+    // ladder — which is what a cascade produces, rung by rung. Without that, pointing a second
+    // run with a different ladder at the same file would silently serve the first ladder's
+    // answers under the second ladder's name, and the contamination would be invisible in the
+    // results. `coding_policy::load_checkpoint` has always filtered by ladder; same reason.
     let mut done: std::collections::HashMap<String, Submission> = checkpoint
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|t| {
             t.lines()
                 .filter_map(|l| serde_json::from_str::<Submission>(l).ok())
+                .filter(|s| {
+                    s.attempts.len() <= solvers.len()
+                        && s.attempts
+                            .iter()
+                            .zip(solvers)
+                            .all(|(a, (model, _))| a.model == *model)
+                })
                 .map(|s| (s.id.clone(), s))
                 .collect()
         })
@@ -1167,6 +1180,60 @@ mod tests {
             "the resumed submission must carry the ORIGINAL cost, not a fresh one"
         );
         let _ = std::fs::remove_file(&ckpt);
+    }
+
+    /// A checkpoint row bought by a DIFFERENT ladder must not be reused.
+    ///
+    /// Reusing it would serve one ladder's answers under another ladder's name — a benchmark
+    /// result that is wrong in the direction of whichever ladder ran first, and invisible in the
+    /// output. The solver panics when called, so "the row was correctly ignored" is exactly the
+    /// panic this test expects; reuse would return quietly and fail the test.
+    #[test]
+    #[should_panic(expected = "re-solved t1")]
+    fn a_checkpoint_from_another_ladder_is_not_reused() {
+        struct NeverSolves;
+        impl crate::coding::CandidateSolver for NeverSolves {
+            fn solve(&self, t: &CodingTask) -> Result<crate::coding::Solution, String> {
+                panic!("re-solved {}", t.id)
+            }
+        }
+        struct NeverRuns;
+        impl Sandbox for NeverRuns {
+            fn runtime(&self) -> &str {
+                "never"
+            }
+            fn run(
+                &self,
+                _u: &ExecUnit,
+                _l: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                panic!("gate ran")
+            }
+        }
+
+        let dir = std::env::temp_dir().join("fp-vrb-ladder-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let ckpt = dir.join("other-ladder.jsonl");
+        // Bought by haiku...
+        let prior = sub(
+            "t1",
+            0.05,
+            vec![att("anthropic/claude-haiku-4-5", 0.05, GateVerdict::Pass)],
+        );
+        std::fs::write(&ckpt, serde_json::to_string(&prior).unwrap() + "\n").unwrap();
+
+        // ...resumed under sonnet.
+        let solver = NeverSolves;
+        let rungs: Vec<(String, &dyn crate::coding::CandidateSolver)> =
+            vec![("anthropic/claude-sonnet-4-5".to_owned(), &solver)];
+        let _ = run_reference_router(
+            &[task("t1")],
+            &rungs,
+            &NeverRuns,
+            &PriceTable::defaults(),
+            &Limits::default(),
+            Some(&ckpt),
+        );
     }
 
     /// Version skew must fail loudly rather than be interpreted optimistically.
