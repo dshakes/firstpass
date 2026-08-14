@@ -634,11 +634,23 @@ pub fn run_reference_router(
             t.lines()
                 .filter_map(|l| serde_json::from_str::<Submission>(l).ok())
                 .filter(|s| {
-                    s.attempts.len() <= solvers.len()
+                    let prefix = s.attempts.len() <= solvers.len()
                         && s.attempts
                             .iter()
                             .zip(solvers)
-                            .all(|(a, (model, _))| a.model == *model)
+                            .all(|(a, (model, _))| a.model == *model);
+                    // A prefix is not yet a finished task. A row stops early for one of two
+                    // reasons, and only one of them is terminal under a longer ladder: the gate
+                    // passed (done, whatever comes after), or the old ladder simply ran out
+                    // (not done — this ladder has rungs left to try). Reusing the second kind
+                    // would record an escalation the router never made and bank a served
+                    // failure it would have escaped.
+                    let terminal = s
+                        .attempts
+                        .last()
+                        .is_some_and(|a| matches!(a.gate_verdict, GateVerdict::Pass))
+                        || s.attempts.len() == solvers.len();
+                    prefix && terminal
                 })
                 .map(|s| (s.id.clone(), s))
                 .collect()
@@ -1226,6 +1238,62 @@ mod tests {
         let solver = NeverSolves;
         let rungs: Vec<(String, &dyn crate::coding::CandidateSolver)> =
             vec![("anthropic/claude-sonnet-4-5".to_owned(), &solver)];
+        let _ = run_reference_router(
+            &[task("t1")],
+            &rungs,
+            &NeverRuns,
+            &PriceTable::defaults(),
+            &Limits::default(),
+            Some(&ckpt),
+        );
+    }
+
+    /// A row that merely EXHAUSTED a shorter ladder is not a finished task under a longer one.
+    ///
+    /// Its last attempt failed the gate; the old ladder just had nothing left to escalate to.
+    /// This ladder does. Reusing it would bank a served failure the router would have escaped
+    /// and record an escalation it never made — the same contamination as a foreign ladder,
+    /// arriving through a matching prefix. The solver panics, so re-solving is the pass.
+    #[test]
+    #[should_panic(expected = "re-solved t1")]
+    fn an_exhausted_shorter_ladder_is_not_a_finished_task() {
+        struct NeverSolves;
+        impl crate::coding::CandidateSolver for NeverSolves {
+            fn solve(&self, t: &CodingTask) -> Result<crate::coding::Solution, String> {
+                panic!("re-solved {}", t.id)
+            }
+        }
+        struct NeverRuns;
+        impl Sandbox for NeverRuns {
+            fn runtime(&self) -> &str {
+                "never"
+            }
+            fn run(
+                &self,
+                _u: &ExecUnit,
+                _l: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                panic!("gate ran")
+            }
+        }
+
+        let dir = std::env::temp_dir().join("fp-vrb-exhausted-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let ckpt = dir.join("short-ladder.jsonl");
+        // Bought under a one-rung haiku ladder, and it FAILED that rung.
+        let prior = sub(
+            "t1",
+            0.05,
+            vec![att("anthropic/claude-haiku-4-5", 0.05, GateVerdict::Fail)],
+        );
+        std::fs::write(&ckpt, serde_json::to_string(&prior).unwrap() + "\n").unwrap();
+
+        // Resumed under haiku -> sonnet. The prefix matches, but sonnet was never tried.
+        let solver = NeverSolves;
+        let rungs: Vec<(String, &dyn crate::coding::CandidateSolver)> = vec![
+            ("anthropic/claude-haiku-4-5".to_owned(), &solver),
+            ("anthropic/claude-sonnet-4-5".to_owned(), &solver),
+        ];
         let _ = run_reference_router(
             &[task("t1")],
             &rungs,
