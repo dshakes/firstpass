@@ -17,6 +17,8 @@
 //! - [`cost`] — model pricing and the counterfactual baseline.
 //! - [`conformal`] — split-conformal risk control on the gate threshold (SPEC §10.1).
 //! - [`ltt`] — Learn-then-Test threshold calibration (RCPS, Angelopoulos et al. 2021).
+//! - [`eprocess`] — anytime-valid risk control: a bound that holds at *every* round, for the
+//!   continuously-recalibrated regime where the fixed-sample guarantees above do not compose.
 //! - [`error`] — the crate [`Error`] type.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -25,6 +27,7 @@
 pub mod config;
 pub mod conformal;
 pub mod cost;
+pub mod eprocess;
 pub mod error;
 pub mod features;
 pub mod guardrail;

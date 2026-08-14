@@ -1,19 +1,34 @@
 //! Recalibrate the serving threshold from real deferred feedback (SPEC §10.1, run against live
 //! traffic instead of a static benchmark suite) — the "learns your quality bar" loop.
 //!
-//! Two calibration methods are available:
+//! Three calibration methods are available:
 //! - **conformal** (default): split-conformal with Hoeffding bound — [`calibrate_from_store`].
 //! - **ltt**: Learn-then-Test / RCPS with exact-binomial fixed-sequence testing —
 //!   [`calibrate_from_store_ltt`].
+//! - **eprocess**: anytime-valid risk control — [`calibrate_from_store_eprocess`].
 //!
-//! Both enumerate stored traces, pair each trace that has a deferred outcome with the score of
-//! the attempt actually served, and hand the pairs to the respective core module. Neither feeds
+//! All three enumerate stored traces, pair each trace that has a deferred outcome with the score of
+//! the attempt actually served, and hand the pairs to the respective core module. None feeds
 //! back into the request hot path — that wiring is a deliberate follow-on once an operator has
 //! reviewed a report.
+//!
+//! ## Which one to run, and why there are three
+//!
+//! The first two are **fixed-sample**: they answer "given this calibration set, what threshold is
+//! safe?", and their guarantees are stated over that one set. That is the right question when an
+//! operator recalibrates deliberately, reviews the report, and adopts a threshold.
+//!
+//! It is the wrong question when calibration runs continuously. Re-running a fixed-sample method
+//! whenever more feedback lands, and adopting the winner each time, is optional stopping on a
+//! growing stream — each individual run is valid while the sequence of adoptions is not. `eprocess`
+//! exists for that regime: its bound holds at **every** round, so re-reading it as often as you like
+//! costs nothing in validity. It pays for that in conservatism, and
+//! [`firstpass_core::eprocess`] documents the trade rather than burying it.
 
 use std::path::Path;
 
 use firstpass_core::conformal::{self, ConformalResult};
+use firstpass_core::eprocess;
 use firstpass_core::ltt::{self, LttResult};
 use firstpass_core::{Attempt, DeferredVerdict, GateResult, Score, Trace, Verdict};
 
@@ -164,6 +179,110 @@ pub fn calibrate_pairs_ltt(
         n_pairs: pairs.len(),
         ltt: ltt::calibrate(pairs, alpha, delta, min_n),
     }
+}
+
+/// Report for `--method eprocess`: anytime-valid risk control.
+///
+/// Unlike [`CalibrationReport`] and [`LttReport`], which each summarise a **single** fixed-sample
+/// decision, this replays the stored feedback as the *stream it actually was* and reports what the
+/// controller would certify at the end of it. That difference is the point: the other two answer
+/// "given this calibration set, what threshold is safe?", while this answers "having watched this
+/// stream round by round, what is certified *now*?" — the question a continuously-recalibrating
+/// deployment is really asking.
+#[derive(Debug, Clone)]
+pub struct EProcessReport {
+    /// Pairs replayed.
+    pub n_pairs: usize,
+    /// Certified threshold and its evidence, or `None` if the stream never certified anything.
+    pub certification: Option<firstpass_core::eprocess::Certification>,
+    /// Target served-failure rate.
+    pub alpha: f64,
+    /// Family-wise error budget across the grid and all rounds.
+    pub delta: f64,
+    /// Evidence required per threshold (`n / delta`, the Bonferroni crossing level).
+    pub crossing_level: f64,
+    /// Realized served-failure over the replay, as a diagnostic — not the guarantee.
+    pub realized_served_failure: f64,
+}
+
+impl EProcessReport {
+    /// Render for `firstpass calibrate --method eprocess`. Mirrors [`LttReport::render`].
+    #[must_use]
+    pub fn render(&self) -> String {
+        let cert = match &self.certification {
+            Some(c) => format!(
+                "{:.4}  (e-value {:.1} >= {:.1}, first certified at round {})",
+                c.threshold, c.e_value, self.crossing_level, c.certified_at_round
+            ),
+            // Not an error, and deliberately not a number: an uncertified controller has proven
+            // nothing, and printing a threshold anyway is exactly the unproven claim this method
+            // exists to refuse.
+            None => "NONE — no threshold has earned a guarantee on this stream yet".to_owned(),
+        };
+        format!(
+            "method: eprocess (anytime-valid)\n\
+             pairs: {n_pairs}\n\
+             certified threshold: {cert}\n\
+             target alpha: {alpha:.4} (delta {delta:.4}, family-wise across grid AND rounds)\n\
+             realized served-failure: {realized:.4}\n\
+             guarantee: holds at EVERY round, no exchangeability assumed (Ville / e-process)\n",
+            n_pairs = self.n_pairs,
+            alpha = self.alpha,
+            delta = self.delta,
+            realized = self.realized_served_failure,
+        )
+    }
+}
+
+/// Replay `pairs` through an anytime-valid controller, in order.
+///
+/// Order matters here and nowhere else in this module: the other two methods sort or sweep, because
+/// exchangeability makes order irrelevant to them. This one consumes the sequence as a stream, which
+/// is what lets it stay valid when the stream is *not* exchangeable.
+#[must_use]
+pub fn calibrate_pairs_eprocess(pairs: &[(f64, bool)], alpha: f64, delta: f64) -> EProcessReport {
+    // Grid from the observed score support, as LTT does — a candidate per distinct score is enough,
+    // and a finer grid only inflates the Bonferroni correction without buying resolution.
+    let mut grid: Vec<f64> = pairs.iter().map(|&(s, _)| s).collect();
+    grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    grid.dedup();
+
+    let mut ctrl = eprocess::EProcessRiskControl::new(alpha, delta, eprocess::DEFAULT_BET, &grid);
+    for &(score, correct) in pairs {
+        ctrl.observe_served(score, correct);
+    }
+    EProcessReport {
+        n_pairs: pairs.len(),
+        certification: ctrl.certified_threshold(),
+        alpha,
+        delta,
+        crossing_level: ctrl.crossing_level(),
+        realized_served_failure: ctrl.realized_served_failure(),
+    }
+}
+
+/// Anytime-valid calibration from every trace in the store that has a deferred outcome.
+///
+/// Error handling and tenant scoping match [`calibrate_from_store`] exactly.
+///
+/// # Errors
+/// Returns [`StoreError`] if a stored trace's deferred verdicts cannot be read.
+pub fn calibrate_from_store_eprocess(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+    alpha: f64,
+    delta: f64,
+) -> Result<EProcessReport, StoreError> {
+    let db_path = db_path.as_ref();
+    let traces = store::load_tenant_traces(db_path, tenant).unwrap_or_default();
+    let mut pairs = Vec::with_capacity(traces.len());
+    for trace in &traces {
+        let deferred = store::load_deferred(db_path, &trace.trace_id.to_string())?;
+        if let Some(pair) = trace_pair(trace, &deferred) {
+            pairs.push(pair);
+        }
+    }
+    Ok(calibrate_pairs_eprocess(&pairs, alpha, delta))
 }
 
 /// Calibrate an LTT threshold from every trace in the store that has a deferred outcome.
@@ -452,6 +571,56 @@ mod tests {
         assert!(
             !report.ltt.feasible,
             "too few pairs must be infeasible with LTT"
+        );
+    }
+
+    /// An uncertified stream must render as NONE, never as a number.
+    ///
+    /// The failure this guards is a quiet one: printing some default threshold when nothing has been
+    /// proven reads exactly like a calibrated result to whoever runs the command. Too few pairs to
+    /// certify must look like too few pairs to certify.
+    #[test]
+    fn eprocess_reports_no_threshold_when_nothing_is_certified() {
+        let pairs: Vec<(f64, bool)> = vec![(0.9, true), (0.8, true)];
+        let report = calibrate_pairs_eprocess(&pairs, 0.10, 0.05);
+        assert!(
+            report.certification.is_none(),
+            "two pairs cannot certify anything at delta=0.05"
+        );
+        let rendered = report.render();
+        assert!(
+            rendered.contains("NONE"),
+            "an uncertified stream must say so plainly, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("anytime-valid"),
+            "the report must name the guarantee it provides, got: {rendered}"
+        );
+    }
+
+    /// Enough clean evidence must certify, and the rendered threshold must be the certified one.
+    /// The pairing with the test above is the contract: silent when unproven, specific when proven.
+    #[test]
+    fn eprocess_certifies_and_renders_the_threshold_on_a_clean_stream() {
+        let mut pairs: Vec<(f64, bool)> = Vec::new();
+        for i in 0..2000 {
+            // Deterministic 5% failure rate, well under alpha — no RNG, so this is reproducible.
+            pairs.push((0.9, i % 20 != 0));
+        }
+        let report = calibrate_pairs_eprocess(&pairs, 0.20, 0.05);
+        let cert = report
+            .certification
+            .as_ref()
+            .expect("2000 clean pairs must certify");
+        assert!(
+            cert.e_value >= report.crossing_level,
+            "a certified threshold must meet the Bonferroni crossing level: {} < {}",
+            cert.e_value,
+            report.crossing_level
+        );
+        assert!(
+            report.render().contains(&format!("{:.4}", cert.threshold)),
+            "the rendered report must show the certified threshold"
         );
     }
 
