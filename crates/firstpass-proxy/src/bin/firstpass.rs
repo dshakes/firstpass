@@ -3,7 +3,9 @@
 //! `base_url` swap and offboarding is one `unset`.
 
 use firstpass_core::RoutingMode;
-use firstpass_proxy::calibrate::{calibrate_from_store, calibrate_from_store_ltt};
+use firstpass_proxy::calibrate::{
+    calibrate_from_store, calibrate_from_store_eprocess, calibrate_from_store_ltt,
+};
 use firstpass_proxy::ope::{CandidatePolicy, ips_from_store, ope_from_store};
 use firstpass_proxy::{ProxyConfig, cli, run, store};
 
@@ -46,9 +48,10 @@ USAGE:
                                   propensity that offline RL needs
     firstpass verify [--file F] [--json]
                                    independently re-derive the receipt hash chain; exit 1 if broken
-    firstpass calibrate [--alpha A] [--delta D] [--min-n N] [--method conformal|ltt]
+    firstpass calibrate [--alpha A] [--delta D] [--min-n N] [--method conformal|ltt|eprocess]
                                    recalibrate the serving threshold from deferred feedback
-                                   (default method: conformal; ltt = Learn-then-Test / RCPS)
+                                   (default method: conformal; ltt = Learn-then-Test / RCPS;
+                                    eprocess = anytime-valid, holds at every round under drift)
     firstpass ope --config <candidate.toml> [--db <path>] [--tenant <id>]
                                    evaluate a candidate policy against logged traffic before enforcing
     firstpass ope --start-rung N [--db <path>] [--tenant <id>]
@@ -652,6 +655,10 @@ fn cmd_calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Infeasible is a valid finding (not enough clean feedback yet, or a weak gate) — the
     // report says `feasible: false`. Only a store read error bubbles up as non-zero exit.
     match method {
+        "eprocess" => {
+            let report = calibrate_from_store_eprocess(&config.db_path, &tenant, alpha, delta)?;
+            print!("{}", report.render());
+        }
         "ltt" => {
             let report = calibrate_from_store_ltt(&config.db_path, &tenant, alpha, delta, min_n)?;
             print!("{}", report.render());

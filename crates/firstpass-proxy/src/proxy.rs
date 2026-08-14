@@ -18,6 +18,7 @@ use firstpass_core::{
     Attempt, DeferredVerdict, Dialect, FEATURE_VERSION, Features, FinalOutcome, GENESIS_HASH, Mode,
     ModelRef, PolicyRef, ProbeRegime, ProbeSignal, RequestInfo, RoutingMode, Score, ServedFrom,
     TaskKind, Trace, Verdict,
+    features::{DifficultyHint, TrajectorySignals},
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -1374,6 +1375,198 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// Build the routing/telemetry feature vector from request headers + body (best-effort;
 /// malformed fields fall back to safe defaults — this must never fail a request).
+/// Read trajectory signals off the inbound conversation, for both wire dialects.
+///
+/// Anthropic puts tool results in `content` blocks (`type: "tool_result"`, `is_error: true`);
+/// OpenAI uses `role: "tool"` messages and an assistant `tool_calls` array. Both shapes are walked
+/// here because a router that only understands one of them silently reports "no signal" for half
+/// its traffic — which looks identical to a healthy session and is the worst possible failure for a
+/// feature whose whole job is spotting unhealthy ones.
+///
+/// Never fails. A malformed, truncated, or unfamiliar body yields
+/// [`TrajectorySignals::default`] — "no signal", the same as a single-shot request. The extract
+/// path must never reject a request the upstream would have served.
+fn trajectory_signals(body: &[u8]) -> TrajectorySignals {
+    let Ok(json) = serde_json::from_slice::<Value>(body) else {
+        return TrajectorySignals::default();
+    };
+    let Some(messages) = json.get("messages").and_then(Value::as_array) else {
+        return TrajectorySignals::default();
+    };
+
+    // Only the recent window counts. A session that struggled an hour ago and recovered is not
+    // hard now, and letting ancient failures accumulate forever would ratchet every long
+    // conversation to maximum difficulty and pin it at the top rung — a cost regression dressed up
+    // as a signal. `affinity.rs` bounds its own failure window for the same reason.
+    const WINDOW: usize = 12;
+    let recent = &messages[messages.len().saturating_sub(WINDOW)..];
+
+    // Conversation DEPTH is a whole-conversation property, so it is counted over every message
+    // rather than the window — unlike the error and repetition signals, which are deliberately
+    // windowed because a session that struggled and recovered is not struggling now.
+    //
+    // Counting depth inside the window made the `deep` threshold unreachable: a real agent
+    // conversation alternates assistant/user, so 12 messages hold at most ~6 assistant turns and a
+    // `>= 8` test could never fire. `DifficultyHint::High` was dead in production while its unit
+    // test — which built the struct directly — stayed green. Caught in review.
+    let assistant_turns = u32::try_from(
+        messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let mut s = TrajectorySignals {
+        assistant_turns,
+        ..Default::default()
+    };
+    // Tool invocations seen, as (name, argument-fingerprint). Compared, never stored: the
+    // fingerprint is a hash, so repetition is detectable without the arguments themselves ever
+    // reaching a feature vector or a receipt.
+    let mut seen: Vec<u64> = Vec::new();
+
+    for m in recent {
+        match m.get("role").and_then(Value::as_str) {
+            // assistant_turns is counted over the whole conversation above, not here.
+            Some("assistant") => {}
+            // OpenAI: a tool result is its own message, and an error is conventionally reported in
+            // the content rather than a flag, so there is no `is_error` to read.
+            Some("tool") => {
+                s.tool_results += 1;
+                if openai_tool_content_looks_like_error(m) {
+                    s.tool_errors += 1;
+                }
+            }
+            _ => {}
+        }
+
+        // Anthropic: tool_result blocks carry an explicit `is_error` flag — unambiguous, no
+        // string-sniffing needed. tool_use blocks are where repetition is visible.
+        if let Some(blocks) = m.get("content").and_then(Value::as_array) {
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str) {
+                    Some("tool_result") => {
+                        s.tool_results += 1;
+                        if b.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                            s.tool_errors += 1;
+                        }
+                    }
+                    Some("tool_use") => {
+                        let fp = tool_call_fingerprint(
+                            b.get("name").and_then(Value::as_str).unwrap_or_default(),
+                            b.get("input"),
+                        );
+                        if seen.contains(&fp) {
+                            s.repeated_tool_calls += 1;
+                        } else {
+                            seen.push(fp);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // OpenAI: repetition lives in the assistant's `tool_calls` array.
+        if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+            for c in calls {
+                let f = c.get("function");
+                let fp = tool_call_fingerprint(
+                    f.and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    f.and_then(|f| f.get("arguments")),
+                );
+                if seen.contains(&fp) {
+                    s.repeated_tool_calls += 1;
+                } else {
+                    seen.push(fp);
+                }
+            }
+        }
+    }
+    s
+}
+
+/// Stable hash of a tool call's identity, for spotting repeats.
+///
+/// Hashed rather than retained: the point is "was this exact call made before", which equality of
+/// a digest answers without any argument text being held, logged, or featurised.
+fn tool_call_fingerprint(name: &str, args: Option<&Value>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    // `to_string` on a serde_json::Value with sorted keys would be ideal; serde_json preserves
+    // input order by default, so two logically-identical calls with different key order hash
+    // differently. That direction is safe: it under-reports repetition rather than inventing it,
+    // and an agent retrying a call almost always re-emits it byte-identically.
+    if let Some(a) = args {
+        a.to_string().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Whether an OpenAI `role: "tool"` message looks like a failure.
+///
+/// OpenAI has no `is_error` flag on tool messages, so this is a heuristic where the Anthropic path
+/// has a fact. It is deliberately narrow — anchored prefixes, not a substring search for "error" —
+/// because a tool that *succeeds* while returning text about errors (a linter, a log reader, a test
+/// runner reporting zero failures) must not be counted as failing. Under-counting yields a lower
+/// difficulty hint, which costs a little routing signal; over-counting would push healthy sessions
+/// to expensive rungs, which costs money.
+fn openai_tool_content_looks_like_error(message: &Value) -> bool {
+    // Content is either a bare string or an array of content parts. Both are valid OpenAI, and
+    // reading only the string form silently misses every error from a client that uses the array
+    // form — the same half-blindness as walking one dialect, one level down. Flagged in review.
+    let content = message.get("content");
+    // Both forms borrow from `message`, so a plain `Option<&str>` covers them without the
+    // deferred-initialization dance an owned binding would need. Only the FIRST text part is read:
+    // these are anchored-prefix checks, and an error announces itself at the start of the output
+    // rather than in part three.
+    let text: &str = match content.and_then(Value::as_str) {
+        Some(t) => t,
+        None => {
+            let Some(t) = content.and_then(Value::as_array).and_then(|parts| {
+                parts
+                    .iter()
+                    .find_map(|p| p.get("text").and_then(Value::as_str))
+            }) else {
+                return false;
+            };
+            t
+        }
+    };
+    // `chars().take(64)`, not `get(..64)`. Byte-slicing a UTF-8 string returns `None` when the
+    // boundary lands mid-character, and the `unwrap_or(head)` fallback then lowercases the ENTIRE
+    // string — unbounded work on attacker-influenced input, since a tool result can be a
+    // multi-megabyte log or code dump. One non-ASCII character in the first 64 bytes is enough to
+    // trigger it, which makes it far from a corner case on real agent traffic.
+    //
+    // Caught in review. The prefix bound was there to keep this cheap, and it silently stopped
+    // bounding anything the moment the text was not pure ASCII.
+    // Bound FIRST, then trim. `trim_start()` on the raw text scans every leading whitespace
+    // character before the bound applies, so a payload of millions of spaces is O(N) again — the
+    // same defect as the byte-slicing one, reintroduced one line earlier. Taking a bounded prefix
+    // and trimming THAT keeps the work constant whatever the input.
+    //
+    // 128 taken so up to 64 characters of leading whitespace can be trimmed and still leave a
+    // 64-character window for the marker itself. Flagged in review.
+    let lowered: String = text
+        .chars()
+        .take(128)
+        .collect::<String>()
+        .trim_start()
+        .chars()
+        .take(64)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    lowered.starts_with("error")
+        || lowered.starts_with("exception")
+        || lowered.starts_with("traceback")
+        || lowered.starts_with("failed")
+        || lowered.starts_with("fatal")
+}
+
 fn extract_features(headers: &HeaderMap, body: &[u8]) -> Features {
     let (_model, tool_count, has_images) = request_features(body);
     let mut f = Features::new(TaskKind::Other);
@@ -1385,6 +1578,10 @@ fn extract_features(headers: &HeaderMap, body: &[u8]) -> Features {
     // monotonic proxy that never exposes the exact prompt (matches the privacy contract).
     f.prompt_token_bucket = token_bucket(body.len() as u64);
     f.hour_bucket = hour_bucket(jiff::Timestamp::now());
+    // Costs one more walk over a body that is already parsed and warm in cache, and it is the only
+    // difficulty signal available BEFORE any token is spent. Scoring lives in core so it stays
+    // deterministic and version-stamped; only the wire-format walking happens here.
+    f.difficulty_hint = DifficultyHint::score(trajectory_signals(body)).as_u8();
     f
 }
 
@@ -2786,6 +2983,10 @@ fn extract_openai_features(headers: &HeaderMap, body: &[u8]) -> Features {
     f.has_images = has_images;
     f.prompt_token_bucket = token_bucket(body.len() as u64);
     f.hour_bucket = hour_bucket(jiff::Timestamp::now());
+    // Costs one more walk over a body that is already parsed and warm in cache, and it is the only
+    // difficulty signal available BEFORE any token is spent. Scoring lives in core so it stays
+    // deterministic and version-stamped; only the wire-format walking happens here.
+    f.difficulty_hint = DifficultyHint::score(trajectory_signals(body)).as_u8();
     f
 }
 
@@ -3550,6 +3751,368 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+
+    /// Anthropic tool failures must be seen. `is_error: true` is an explicit fact on the wire, so
+    /// missing it would be inexcusable — and it is the primary signal on the dialect that carries
+    /// most agent traffic.
+    #[test]
+    fn anthropic_tool_errors_are_extracted() {
+        let body = br#"{"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","name":"bash","input":{"cmd":"a"}}]},
+            {"role":"user","content":[{"type":"tool_result","is_error":true,"content":"boom"}]},
+            {"role":"assistant","content":[{"type":"tool_use","name":"bash","input":{"cmd":"b"}}]},
+            {"role":"user","content":[{"type":"tool_result","is_error":true,"content":"boom"}]}
+        ]}"#;
+        let s = trajectory_signals(body);
+        assert_eq!(
+            s.tool_errors, 2,
+            "both failing tool_results must be counted"
+        );
+        assert_eq!(s.tool_results, 2);
+        assert_eq!(s.assistant_turns, 2);
+        assert!(
+            DifficultyHint::score(s) >= DifficultyHint::Medium,
+            "an all-failing window must not read as an easy session"
+        );
+    }
+
+    /// OpenAI's shape is completely different — `role: "tool"` messages and `tool_calls` arrays,
+    /// with no `is_error` flag anywhere. A router that only walks Anthropic's shape reports "no
+    /// signal" for every OpenAI request, which is indistinguishable from a healthy session. That
+    /// silent half-blindness is the failure this test exists to prevent.
+    #[test]
+    fn openai_tool_errors_are_extracted_from_a_different_shape() {
+        let body = br#"{"messages":[
+            {"role":"assistant","tool_calls":[{"function":{"name":"run","arguments":"{\"x\":1}"}}]},
+            {"role":"tool","content":"Error: command not found"},
+            {"role":"assistant","tool_calls":[{"function":{"name":"run","arguments":"{\"x\":2}"}}]},
+            {"role":"tool","content":"Traceback (most recent call last): ..."}
+        ]}"#;
+        let s = trajectory_signals(body);
+        assert_eq!(s.tool_results, 2, "role:tool messages are tool results");
+        assert_eq!(
+            s.tool_errors, 2,
+            "both error-shaped tool outputs must count"
+        );
+        assert_eq!(s.assistant_turns, 2);
+    }
+
+    /// **Leading whitespace must not defeat the bound either.**
+    ///
+    /// Second-order version of the byte-slicing bug, and it survived that fix: `trim_start()` on the
+    /// raw text scans every leading whitespace character BEFORE any bound applies, so millions of
+    /// spaces is O(N) again — the defect reintroduced one line earlier than where it was fixed.
+    /// Bound first, trim the bounded prefix. Flagged in review.
+    #[test]
+    fn a_flood_of_leading_whitespace_does_not_defeat_the_bound() {
+        let flood = format!("{}Error: boom", " ".repeat(4_000_000));
+        let small = format!("{}Error: boom", " ".repeat(400_000));
+        let m_big = serde_json::json!({ "role": "tool", "content": flood });
+        let m_small = serde_json::json!({ "role": "tool", "content": small });
+
+        let t = |m: &serde_json::Value| {
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                std::hint::black_box(openai_tool_content_looks_like_error(m));
+            }
+            start.elapsed()
+        };
+        let _warm = t(&m_small);
+        let small_t = t(&m_small);
+        let big_t = t(&m_big);
+        assert!(
+            big_t < small_t * 5 + std::time::Duration::from_millis(5),
+            "10x the leading whitespace took {big_t:?} vs {small_t:?} — trimming is scanning the \
+             whole payload before the bound applies"
+        );
+
+        // Modest indentation must still be trimmed, or the bound would cost the detection.
+        let indented = serde_json::json!({ "role": "tool", "content": "   Error: boom" });
+        assert!(
+            openai_tool_content_looks_like_error(&indented),
+            "ordinary leading whitespace must still be trimmed"
+        );
+    }
+
+    /// **`deep` must be reachable from a real conversation, not just a hand-built struct.**
+    ///
+    /// Caught in review, and it is the most instructive bug in this feature. My unit tests set
+    /// `assistant_turns: 12` directly and passed, so `High` looked reachable. Through the actual
+    /// extractor it was not: a real agent conversation alternates assistant/user, so a 12-message
+    /// window contains at most ~6 assistant turns and the `>= 8` threshold could never fire. An
+    /// entire difficulty level was dead in production while its unit test was green — testing the
+    /// scorer in isolation cannot catch a bug that lives in the boundary between the two.
+    #[test]
+    fn a_long_real_conversation_can_actually_reach_the_deep_signal() {
+        // 40 alternating turns, all failing — an agent that is genuinely, deeply stuck.
+        let mut msgs = Vec::new();
+        for i in 0..40 {
+            msgs.push(format!(
+                r#"{{"role":"assistant","content":[{{"type":"tool_use","name":"b","input":{{"i":{i}}}}}]}}"#
+            ));
+            msgs.push(
+                r#"{"role":"user","content":[{"type":"tool_result","is_error":true}]}"#.to_owned(),
+            );
+        }
+        let body = format!(r#"{{"messages":[{}]}}"#, msgs.join(","));
+        let s = trajectory_signals(body.as_bytes());
+        assert!(
+            s.assistant_turns >= 8,
+            "a 40-turn failing conversation must register as deep, got {} assistant turns — the \
+             window is counting turns it cannot see",
+            s.assistant_turns
+        );
+        assert_eq!(
+            DifficultyHint::score(s),
+            DifficultyHint::High,
+            "the hardest possible conversation must reach the top bucket, or High is dead code"
+        );
+    }
+
+    /// OpenAI tool content may be an ARRAY of content parts, not just a string.
+    ///
+    /// Both forms are valid OpenAI. Reading only the string form silently misses every error from a
+    /// client using the array form — the same half-blindness as walking one dialect, one level down,
+    /// and equally invisible because "no signal" and "healthy" look identical downstream. Flagged in
+    /// review.
+    #[test]
+    fn openai_array_form_tool_content_is_read() {
+        let arr = serde_json::json!({
+            "role": "tool",
+            "content": [{"type": "text", "text": "Error: command not found"}]
+        });
+        assert!(
+            openai_tool_content_looks_like_error(&arr),
+            "an error in array-form content must be detected"
+        );
+
+        let clean = serde_json::json!({
+            "role": "tool",
+            "content": [{"type": "text", "text": "All 42 tests passed"}]
+        });
+        assert!(
+            !openai_tool_content_looks_like_error(&clean),
+            "clean array-form content must not be a failure"
+        );
+
+        // Degenerate array shapes must be inert rather than panicking or guessing.
+        for weird in [
+            serde_json::json!({"role": "tool", "content": []}),
+            serde_json::json!({"role": "tool", "content": [{"type": "image"}]}),
+            serde_json::json!({"role": "tool", "content": [null, 42]}),
+        ] {
+            assert!(!openai_tool_content_looks_like_error(&weird));
+        }
+
+        // And the whole path still works end to end: an array-form error must raise the hint.
+        let body = br#"{"messages":[
+            {"role":"tool","content":[{"type":"text","text":"Error: boom"}]},
+            {"role":"tool","content":[{"type":"text","text":"Error: boom again"}]},
+            {"role":"tool","content":[{"type":"text","text":"Error: still broken"}]}
+        ]}"#;
+        let s = trajectory_signals(body);
+        assert_eq!(s.tool_errors, 3, "array-form errors must reach the signals");
+        assert!(DifficultyHint::score(s) >= DifficultyHint::Medium);
+    }
+
+    /// A tool that succeeds while *talking about* errors must not be counted as failing.
+    ///
+    /// This is the over-counting direction, and it is the expensive one: a linter reporting "0
+    /// errors", a test runner printing a summary, or a log reader would each push a healthy session
+    /// toward an expensive rung on every turn. Hence anchored prefixes, not a substring search.
+    #[test]
+    fn tool_output_merely_mentioning_errors_is_not_counted_as_failure() {
+        let body = br#"{"messages":[
+            {"role":"tool","content":"0 errors, 0 warnings"},
+            {"role":"tool","content":"All 42 tests passed (no failures)"},
+            {"role":"tool","content":"lint: checked 12 files for errors"}
+        ]}"#;
+        let s = trajectory_signals(body);
+        assert_eq!(s.tool_results, 3);
+        assert_eq!(
+            s.tool_errors, 0,
+            "clean output that mentions the word 'error' must not be scored as a failure"
+        );
+    }
+
+    /// **A non-ASCII prefix must not defeat the length bound.**
+    ///
+    /// Caught in review. `head.get(..64)` byte-slices a UTF-8 string and returns `None` when the
+    /// boundary lands mid-character; the fallback then lowercased the ENTIRE string. One accented
+    /// character or emoji in the first 64 bytes turned a bounded prefix check into unbounded work
+    /// over an attacker-influenced payload — and a tool result can be a multi-megabyte log.
+    ///
+    /// Asserts the bound holds AND that classification is unchanged, since silently bounding by
+    /// truncating away the signal would pass a performance test and break the feature.
+    #[test]
+    fn a_multibyte_character_does_not_defeat_the_prefix_bound() {
+        // 'é' is two bytes, placed so the 64-byte boundary splits it.
+        let padded = format!("{}é{}", "x".repeat(63), "y".repeat(200_000));
+        let msg = serde_json::json!({ "role": "tool", "content": padded });
+        assert!(
+            !openai_tool_content_looks_like_error(&msg),
+            "a huge non-error payload must not be classified as a failure"
+        );
+
+        // Correctness alone does not catch this: byte-slicing gets the ANSWER right and does
+        // unbounded work to get it. The defect is the work, so the work is what is measured. A
+        // mutation restoring `get(..64).unwrap_or(head)` survived a correctness-only assertion.
+        //
+        // Scaling, not a wall-clock threshold: a bounded scan is O(1) in payload size, so growing
+        // the payload 10x must not grow the time proportionally. Timing is noisy, hence the very
+        // loose 5x allowance — it still separates "constant" from "linear over 2MB".
+        let big = format!("{}é{}", "x".repeat(63), "y".repeat(2_000_000));
+        let small = format!("{}é{}", "x".repeat(63), "y".repeat(200_000));
+        let m_big = serde_json::json!({ "role": "tool", "content": big });
+        let m_small = serde_json::json!({ "role": "tool", "content": small });
+
+        let t = |m: &serde_json::Value| {
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                std::hint::black_box(openai_tool_content_looks_like_error(m));
+            }
+            start.elapsed()
+        };
+        let _warm = t(&m_small);
+        let small_t = t(&m_small);
+        let big_t = t(&m_big);
+        assert!(
+            big_t < small_t * 5 + std::time::Duration::from_millis(5),
+            "scanning a 10x larger payload took {big_t:?} vs {small_t:?} — the prefix bound is not \
+             holding, so work scales with attacker-controlled input size"
+        );
+
+        // And a real error still classifies, even when the tail is enormous and multi-byte.
+        let err = format!("Error: boom 💥{}", "z".repeat(200_000));
+        let msg2 = serde_json::json!({ "role": "tool", "content": err });
+        assert!(
+            openai_tool_content_looks_like_error(&msg2),
+            "bounding the scan must not cost the detection it exists to perform"
+        );
+
+        // An error marker sitting just past the 64-character window must NOT be found: that is the
+        // bound doing its job, and it is the deliberate under-count documented on the function.
+        let late = format!("{}Error: too late", "w".repeat(200));
+        let msg3 = serde_json::json!({ "role": "tool", "content": late });
+        assert!(
+            !openai_tool_content_looks_like_error(&msg3),
+            "the scan must stay bounded to the head of the message"
+        );
+    }
+
+    /// Repeated identical calls are the signal an error count cannot see: an agent re-running the
+    /// same command that keeps "succeeding" without progress reports zero errors and is stuck.
+    #[test]
+    fn identical_repeated_tool_calls_are_detected() {
+        let body = br#"{"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","name":"ls","input":{"p":"/x"}}]},
+            {"role":"assistant","content":[{"type":"tool_use","name":"ls","input":{"p":"/x"}}]},
+            {"role":"assistant","content":[{"type":"tool_use","name":"ls","input":{"p":"/x"}}]},
+            {"role":"user","content":[{"type":"tool_result","content":"ok"}]}
+        ]}"#;
+        let s = trajectory_signals(body);
+        assert_eq!(
+            s.repeated_tool_calls, 2,
+            "three identical calls are two repeats"
+        );
+        // Distinct calls must NOT be flagged, or every busy agent looks stuck.
+        let distinct = br#"{"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","name":"ls","input":{"p":"/x"}}]},
+            {"role":"assistant","content":[{"type":"tool_use","name":"ls","input":{"p":"/y"}}]}
+        ]}"#;
+        assert_eq!(trajectory_signals(distinct).repeated_tool_calls, 0);
+    }
+
+    /// Extraction must never fail a request. Everything here is a body some client will eventually
+    /// send, and every one of them must yield "no signal" rather than an error or a panic.
+    #[test]
+    fn malformed_bodies_yield_no_signal_and_never_panic() {
+        for body in [
+            &b""[..],
+            b"not json at all",
+            b"{}",
+            br#"{"messages":"not-an-array"}"#,
+            br#"{"messages":[{"role":"assistant","content":"plain text"}]}"#,
+            br#"{"messages":[null,42,"x"]}"#,
+        ] {
+            let s = trajectory_signals(body);
+            assert_eq!(
+                DifficultyHint::score(s),
+                DifficultyHint::None,
+                "a body with no usable trajectory must score None, not a difficulty level"
+            );
+        }
+
+        // A `tool_result` block missing `is_error` is NOT malformed input — it is a tool call that
+        // reported no failure, which is real evidence of a healthy session and correctly scores
+        // Low. This assertion started life in the loop above expecting None; the code was right and
+        // the expectation was wrong. Kept as its own case so the distinction is explicit rather
+        // than rediscovered.
+        let quiet_success = br#"{"messages":[{"content":[{"type":"tool_result"}]}]}"#;
+        let s = trajectory_signals(quiet_success);
+        assert_eq!(s.tool_results, 1);
+        assert_eq!(s.tool_errors, 0);
+        assert_eq!(
+            DifficultyHint::score(s),
+            DifficultyHint::Low,
+            "a tool result that reported no error is evidence of health, not absence of evidence"
+        );
+    }
+
+    /// Only the recent window counts. Without a bound, a long conversation accumulates ancient
+    /// failures forever and ratchets to maximum difficulty permanently — pinning it to the top rung
+    /// long after it recovered, which is a cost regression wearing the costume of a signal.
+    #[test]
+    fn only_the_recent_window_counts_so_old_failures_do_not_ratchet() {
+        let mut msgs = String::from("{\"messages\":[");
+        // 30 old failures...
+        for _ in 0..30 {
+            msgs.push_str(r#"{"role":"user","content":[{"type":"tool_result","is_error":true}]},"#);
+        }
+        // ...then a clean recent stretch.
+        for i in 0..12 {
+            msgs.push_str(&format!(
+                r#"{{"role":"user","content":[{{"type":"tool_result","is_error":false,"content":"ok{i}"}}]}}{}"#,
+                if i == 11 { "" } else { "," }
+            ));
+        }
+        msgs.push_str("]}");
+        let s = trajectory_signals(msgs.as_bytes());
+        assert_eq!(
+            s.tool_errors, 0,
+            "failures outside the window must not count; a recovered session is not a hard one"
+        );
+        assert!(s.tool_results > 0, "the recent clean results must be seen");
+    }
+
+    /// End-to-end through the real extractor: the hint must reach `Features`, and a non-agent
+    /// request must be byte-identical to its pre-feature behaviour (hint 0).
+    #[test]
+    fn the_hint_reaches_the_feature_vector_for_both_dialects() {
+        let hard = br#"{"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","name":"b","input":{"c":1}}]},
+            {"role":"user","content":[{"type":"tool_result","is_error":true}]},
+            {"role":"assistant","content":[{"type":"tool_use","name":"b","input":{"c":1}}]},
+            {"role":"user","content":[{"type":"tool_result","is_error":true}]},
+            {"role":"assistant","content":[{"type":"tool_use","name":"b","input":{"c":1}}]},
+            {"role":"user","content":[{"type":"tool_result","is_error":true}]}
+        ]}"#;
+        let h = HeaderMap::new();
+        assert!(
+            extract_features(&h, hard).difficulty_hint > 0,
+            "a visibly struggling Anthropic conversation must carry a non-zero hint"
+        );
+        assert!(
+            extract_openai_features(&h, hard).difficulty_hint > 0,
+            "the OpenAI extractor must populate the hint too, not silently leave it zero"
+        );
+        let plain = br#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        assert_eq!(
+            extract_features(&h, plain).difficulty_hint,
+            0,
+            "a single-shot request must be unchanged by this feature"
+        );
+    }
 
     fn test_config() -> ProxyConfig {
         ProxyConfig::from_lookup(|_| None).unwrap()
