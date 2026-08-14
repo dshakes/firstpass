@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod ablation;
+pub mod agentic;
 pub mod coding;
 pub mod coding_policy;
 pub mod costaware;
