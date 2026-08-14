@@ -8,6 +8,7 @@
 //!   firstpass-bench --coding       # coding-with-tests benchmark, MOCK solver in the sandbox (no spend)
 //!   firstpass-bench --coding-live  # coding-with-tests with a LIVE candidate model (needs ANTHROPIC_API_KEY)
 //!   firstpass-bench --replay <checkpoint.jsonl>  # re-study a paid run offline: no key, no sandbox, no spend
+//!   firstpass-bench --multiturn-selfcheck  # prove the multi-turn harness + pre-registered bar work, no spend
 
 use firstpass_bench::coding::{
     CandidateSolver, CodingReport, GeneratedSolver, Judge, LiveJudge, LiveSolver, coding_suite,
@@ -33,6 +34,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let json = args.iter().any(|a| a == "--json");
     let live = args.iter().any(|a| a == "--live");
+
+    // Prove the multi-turn harness and its pre-registered bar are wired and can BOTH pass and fail
+    // (ADR 0012). Runs on synthetic fixtures — no key, no sandbox, no spend — so it verifies the
+    // apparatus, never the feature. A real number needs paid provider calls, which is the
+    // operator's spending decision to make, not a benchmark's to trigger.
+    if args.iter().any(|a| a == "--multiturn-selfcheck") {
+        multiturn_selfcheck(json);
+        return;
+    }
 
     // Operator's isolation proof surface (ADR 0002 §D3): establish the sandbox and run the isolation
     // probes against the REAL runtime. Fails closed — a breach or missing runtime exits non-zero.
@@ -654,5 +664,112 @@ fn print_coding(r: &CodingReport) {
             "  {:<22} score={:.2} oracle={}",
             o.id, o.gate_score, o.oracle_correct
         );
+    }
+}
+
+/// `--multiturn-selfcheck`: prove the multi-turn harness and its pre-registered bar are correctly
+/// wired, using synthetic fixtures.
+///
+/// This verifies the **apparatus**, not the feature. Two arms are run deliberately: one where the
+/// trajectory signal is genuinely informative (must SHIP) and one where it is misleading (must be
+/// KILLED). A harness that can only ever return one verdict proves nothing, and the arm that must
+/// fail is the one that makes the arm that passes worth reading.
+///
+/// Exits non-zero if either arm returns the wrong verdict, so CI catches a harness that has quietly
+/// stopped discriminating.
+fn multiturn_selfcheck(json: bool) {
+    use firstpass_bench::coding_policy::RungOutcome;
+    use firstpass_bench::multiturn::{MultiTurnTask, PreRegistered, Turn, evaluate};
+    use firstpass_core::features::TrajectorySignals;
+
+    let rung = |cost: f64, pass: bool, correct: bool| RungOutcome {
+        gate_score: if pass { 1.0 } else { 0.0 },
+        gate_full_pass: pass,
+        oracle_correct: correct,
+        cost_usd: cost,
+        judge_score: None,
+    };
+    let stuck = TrajectorySignals {
+        tool_errors: 8,
+        tool_results: 10,
+        assistant_turns: 12,
+        repeated_tool_calls: 3,
+    };
+    let healthy = TrajectorySignals {
+        tool_errors: 0,
+        tool_results: 4,
+        assistant_turns: 2,
+        repeated_tool_calls: 0,
+    };
+
+    // Arm A — the signal predicts difficulty: struggling conversations really do precede turns the
+    // cheap rung cannot handle.
+    let informative: Vec<MultiTurnTask> = (0..40)
+        .map(|i| MultiTurnTask {
+            id: format!("informative-{i}"),
+            turns: vec![
+                Turn {
+                    signals: healthy,
+                    rungs: vec![rung(0.001, true, true), rung(0.010, true, true)],
+                },
+                Turn {
+                    signals: stuck,
+                    rungs: vec![rung(0.001, false, false), rung(0.010, true, true)],
+                },
+            ],
+        })
+        .collect();
+
+    // Arm B — the signal is noise: every turn is easy, but half the conversations look stuck.
+    // Acting on it buys the expensive rung for nothing.
+    let misleading: Vec<MultiTurnTask> = (0..40)
+        .map(|i| MultiTurnTask {
+            id: format!("misleading-{i}"),
+            turns: vec![
+                Turn {
+                    signals: stuck,
+                    rungs: vec![rung(0.001, true, true), rung(0.010, true, true)],
+                },
+                Turn {
+                    signals: healthy,
+                    rungs: vec![rung(0.001, true, true), rung(0.010, true, true)],
+                },
+            ],
+        })
+        .collect();
+
+    let a = evaluate(&informative, PreRegistered::default());
+    let b = evaluate(&misleading, PreRegistered::default());
+
+    if json {
+        let doc = serde_json::json!({
+            "informative_arm": a,
+            "misleading_arm": b,
+            "harness_ok": a.ships && !b.ships,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+    } else {
+        println!("# Multi-turn harness self-check (synthetic fixtures, no spend)\n");
+        println!("This proves the APPARATUS works. It does not measure the feature — that needs");
+        println!("paid provider calls against a real multi-turn workload.\n");
+        println!("Informative signal (must SHIP): {}", a.verdict);
+        println!("Misleading signal (must be KILLED): {}", b.verdict);
+        println!(
+            "\nHarness discriminates: {}",
+            if a.ships && !b.ships {
+                "YES — the bar can both pass and fail"
+            } else {
+                "NO — the criterion is not discriminating, treat every result as suspect"
+            }
+        );
+    }
+
+    if !a.ships || b.ships {
+        eprintln!(
+            "multiturn-selfcheck FAILED: informative_ships={} misleading_ships={} \
+             (expected true/false)",
+            a.ships, b.ships
+        );
+        std::process::exit(1);
     }
 }
