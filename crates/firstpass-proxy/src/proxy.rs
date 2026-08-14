@@ -1519,23 +1519,21 @@ fn openai_tool_content_looks_like_error(message: &Value) -> bool {
     // reading only the string form silently misses every error from a client that uses the array
     // form — the same half-blindness as walking one dialect, one level down. Flagged in review.
     let content = message.get("content");
-    let owned;
+    // Both forms borrow from `message`, so a plain `Option<&str>` covers them without the
+    // deferred-initialization dance an owned binding would need. Only the FIRST text part is read:
+    // these are anchored-prefix checks, and an error announces itself at the start of the output
+    // rather than in part three.
     let text: &str = match content.and_then(Value::as_str) {
         Some(t) => t,
         None => {
-            let Some(parts) = content.and_then(Value::as_array) else {
+            let Some(t) = content.and_then(Value::as_array).and_then(|parts| {
+                parts
+                    .iter()
+                    .find_map(|p| p.get("text").and_then(Value::as_str))
+            }) else {
                 return false;
             };
-            // Only the FIRST text part matters: these are anchored-prefix checks, and an error
-            // announces itself at the start of the output rather than in part three.
-            let Some(first) = parts
-                .iter()
-                .find_map(|p| p.get("text").and_then(Value::as_str))
-            else {
-                return false;
-            };
-            owned = first;
-            owned
+            t
         }
     };
     // `chars().take(64)`, not `get(..64)`. Byte-slicing a UTF-8 string returns `None` when the
