@@ -1496,8 +1496,28 @@ fn tool_call_fingerprint(name: &str, args: Option<&Value>) -> u64 {
 /// difficulty hint, which costs a little routing signal; over-counting would push healthy sessions
 /// to expensive rungs, which costs money.
 fn openai_tool_content_looks_like_error(message: &Value) -> bool {
-    let Some(text) = message.get("content").and_then(Value::as_str) else {
-        return false;
+    // Content is either a bare string or an array of content parts. Both are valid OpenAI, and
+    // reading only the string form silently misses every error from a client that uses the array
+    // form — the same half-blindness as walking one dialect, one level down. Flagged in review.
+    let content = message.get("content");
+    let owned;
+    let text: &str = match content.and_then(Value::as_str) {
+        Some(t) => t,
+        None => {
+            let Some(parts) = content.and_then(Value::as_array) else {
+                return false;
+            };
+            // Only the FIRST text part matters: these are anchored-prefix checks, and an error
+            // announces itself at the start of the output rather than in part three.
+            let Some(first) = parts
+                .iter()
+                .find_map(|p| p.get("text").and_then(Value::as_str))
+            else {
+                return false;
+            };
+            owned = first;
+            owned
+        }
     };
     // `chars().take(64)`, not `get(..64)`. Byte-slicing a UTF-8 string returns `None` when the
     // boundary lands mid-character, and the `unwrap_or(head)` fallback then lowercases the ENTIRE
@@ -3748,6 +3768,52 @@ mod tests {
             "both error-shaped tool outputs must count"
         );
         assert_eq!(s.assistant_turns, 2);
+    }
+
+    /// OpenAI tool content may be an ARRAY of content parts, not just a string.
+    ///
+    /// Both forms are valid OpenAI. Reading only the string form silently misses every error from a
+    /// client using the array form — the same half-blindness as walking one dialect, one level down,
+    /// and equally invisible because "no signal" and "healthy" look identical downstream. Flagged in
+    /// review.
+    #[test]
+    fn openai_array_form_tool_content_is_read() {
+        let arr = serde_json::json!({
+            "role": "tool",
+            "content": [{"type": "text", "text": "Error: command not found"}]
+        });
+        assert!(
+            openai_tool_content_looks_like_error(&arr),
+            "an error in array-form content must be detected"
+        );
+
+        let clean = serde_json::json!({
+            "role": "tool",
+            "content": [{"type": "text", "text": "All 42 tests passed"}]
+        });
+        assert!(
+            !openai_tool_content_looks_like_error(&clean),
+            "clean array-form content must not be a failure"
+        );
+
+        // Degenerate array shapes must be inert rather than panicking or guessing.
+        for weird in [
+            serde_json::json!({"role": "tool", "content": []}),
+            serde_json::json!({"role": "tool", "content": [{"type": "image"}]}),
+            serde_json::json!({"role": "tool", "content": [null, 42]}),
+        ] {
+            assert!(!openai_tool_content_looks_like_error(&weird));
+        }
+
+        // And the whole path still works end to end: an array-form error must raise the hint.
+        let body = br#"{"messages":[
+            {"role":"tool","content":[{"type":"text","text":"Error: boom"}]},
+            {"role":"tool","content":[{"type":"text","text":"Error: boom again"}]},
+            {"role":"tool","content":[{"type":"text","text":"Error: still broken"}]}
+        ]}"#;
+        let s = trajectory_signals(body);
+        assert_eq!(s.tool_errors, 3, "array-form errors must reach the signals");
+        assert!(DifficultyHint::score(s) >= DifficultyHint::Medium);
     }
 
     /// A tool that succeeds while *talking about* errors must not be counted as failing.

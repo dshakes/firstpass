@@ -104,7 +104,15 @@ impl DifficultyHint {
         // something to trust across platforms when `a*2 > b` says it exactly.
         let e = s.tool_errors;
         let n = s.tool_results;
-        let half_failing = n > 0 && e * 2 > n;
+        // `e > n / 2`, not `e * 2 > n`: the multiplication overflows for `e > u32::MAX/2`, which
+        // panics in debug builds. Unreachable through the proxy (its window caps the counts), but
+        // this is public API in an I/O-free crate — anyone may call it with any values, and
+        // "unreachable through the one caller I was thinking about" is not a bound.
+        //
+        // Integer division truncates, so `e > n/2` is very slightly stricter than a true majority
+        // at odd `n` (n=5 needs e>2, i.e. 3 of 5 — which IS the majority). Same semantics, no
+        // overflow. Flagged in review.
+        let half_failing = n > 0 && e > n / 2;
         let any_failing = e > 0;
         let stuck = s.repeated_tool_calls >= 2;
         let deep = s.assistant_turns >= 8;
@@ -350,6 +358,39 @@ mod tests {
         assert!(
             shallow < deep,
             "the same failure rate early must not score as high as late: {shallow:?} vs {deep:?}"
+        );
+    }
+
+    /// Extreme counts must not panic. `score` is public API in an I/O-free crate, so it is callable
+    /// with any values — the proxy's window is one caller's bound, not the function's. `e * 2`
+    /// overflowed for `e > u32::MAX/2` and panicked in debug. Flagged in review.
+    #[test]
+    fn extreme_counts_do_not_overflow() {
+        let h = DifficultyHint::score(TrajectorySignals {
+            tool_errors: u32::MAX,
+            tool_results: u32::MAX,
+            assistant_turns: u32::MAX,
+            repeated_tool_calls: u32::MAX,
+        });
+        assert_eq!(h, DifficultyHint::High, "all-failing at any scale is High");
+
+        // And the majority semantics are unchanged at ordinary sizes: 3-of-5 is a majority, 2-of-5
+        // is not. Integer division must not have shifted the cut point.
+        assert!(
+            DifficultyHint::score(TrajectorySignals {
+                tool_errors: 3,
+                tool_results: 5,
+                ..Default::default()
+            }) >= DifficultyHint::Medium
+        );
+        assert_eq!(
+            DifficultyHint::score(TrajectorySignals {
+                tool_errors: 2,
+                tool_results: 5,
+                ..Default::default()
+            }),
+            DifficultyHint::Low,
+            "2 of 5 is not a majority and must stay Low"
         );
     }
 
