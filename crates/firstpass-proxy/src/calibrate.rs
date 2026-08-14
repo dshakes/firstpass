@@ -241,9 +241,28 @@ impl EProcessReport {
 /// is what lets it stay valid when the stream is *not* exchangeable.
 #[must_use]
 pub fn calibrate_pairs_eprocess(pairs: &[(f64, bool)], alpha: f64, delta: f64) -> EProcessReport {
-    // Grid from the observed score support, as LTT does — a candidate per distinct score is enough,
-    // and a finer grid only inflates the Bonferroni correction without buying resolution.
-    let mut grid: Vec<f64> = pairs.iter().map(|&(s, _)| s).collect();
+    // Grid from the observed score support, as LTT does — but QUANTISED, which LTT does not need to
+    // be and this does.
+    //
+    // The Bonferroni crossing level is `n/delta`, so evidence required per threshold grows linearly
+    // in the number of distinct scores. LTT can take one candidate per distinct score for free
+    // because its exact-binomial test does not pay per candidate; here, a judge emitting
+    // full-precision floats over 10k traces yields ~10k distinct scores and a crossing level of
+    // 200,000 — a threshold that would essentially never certify, and the failure is silent: the
+    // report just says "nothing certified" and looks like insufficient data rather than a
+    // self-inflicted power collapse.
+    //
+    // Quantising to 2dp bounds the grid at 101 points regardless of store size. Resolution finer
+    // than 0.01 on a gate score is not information anyone acts on, and the statistical power bought
+    // back is worth far more than the granularity given up.
+    //
+    // Caught in review after I documented this exact hazard in the module doc and then failed to
+    // guard it — the grid is data-derived, so it looked bounded while being bounded by the data.
+    const GRID_QUANTUM: f64 = 100.0;
+    let mut grid: Vec<f64> = pairs
+        .iter()
+        .map(|&(s, _)| (s * GRID_QUANTUM).round() / GRID_QUANTUM)
+        .collect();
     grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     grid.dedup();
 
@@ -571,6 +590,44 @@ mod tests {
         assert!(
             !report.ltt.feasible,
             "too few pairs must be infeasible with LTT"
+        );
+    }
+
+    /// **The grid must stay bounded no matter how many distinct scores the store holds.**
+    ///
+    /// Caught in review. The Bonferroni crossing level is `n/delta`, so evidence required per
+    /// threshold grows linearly in grid size: a judge emitting full-precision floats over 10k traces
+    /// gives ~10k candidates and a crossing level of 200,000. Nothing would ever certify, and the
+    /// report would say "no threshold certified" — indistinguishable from honest insufficient data,
+    /// which is what makes it dangerous rather than merely wasteful.
+    ///
+    /// Asserts both halves: the grid is bounded, AND a clean stream at that scale still certifies.
+    /// Bounding it while destroying certification would pass a size check and fail the user.
+    #[test]
+    fn a_high_precision_score_distribution_does_not_collapse_statistical_power() {
+        // 4000 pairs, each with a distinct full-precision score in a tight band — exactly what a
+        // continuous judge emits, and previously ~4000 grid points.
+        let pairs: Vec<(f64, bool)> = (0..4000)
+            .map(|i| {
+                let score = 0.90 + f64::from(i) * 1e-7;
+                (score, i % 20 != 0) // 5% failure rate, well under alpha
+            })
+            .collect();
+        let report = calibrate_pairs_eprocess(&pairs, 0.20, 0.05);
+
+        // 2dp quantisation over a 0.9..0.9004 band collapses to a handful of points; the hard
+        // requirement is that it cannot scale with the store.
+        assert!(
+            report.crossing_level <= 101.0 / 0.05,
+            "the grid must be bounded by quantisation, not by the data: crossing level {} implies \
+             {} grid points",
+            report.crossing_level,
+            report.crossing_level * 0.05
+        );
+        assert!(
+            report.certification.is_some(),
+            "4000 clean pairs must still certify — bounding the grid must not cost the power it \
+             was meant to protect"
         );
     }
 

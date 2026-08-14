@@ -78,6 +78,17 @@ keeps its existing behaviour. Serving on an uncertified threshold would be preci
 unproven-claim failure the module exists to prevent, so "I have not proven anything yet" must never
 render as a number.
 
+**The grid must be quantised, and that is not a detail.** The crossing level is `n/δ`, so evidence
+required per threshold grows *linearly* in the number of distinct candidate scores. Deriving the
+grid from the observed score support — which is what LTT does, for free, because its exact-binomial
+test does not pay per candidate — means a judge emitting full-precision floats over 10k traces
+produces ~10k candidates and a crossing level of **200,000**. Nothing would ever certify, and the
+report would say "no threshold certified", which is indistinguishable from honest insufficient data.
+A silent power collapse that reads as a normal result is worse than a crash. Scores are quantised to
+2dp, bounding the grid at 101 points regardless of store size; resolution finer than 0.01 on a gate
+score is not information anyone acts on. Caught in review, after this ADR's own text warned about
+Bonferroni cost and the implementation then took the unbounded path anyway.
+
 **Not yet on the hot path.** Like `conformal` and `ltt`, this is offline-only for now: an operator
 runs it, reads the report, and decides. Wiring it to serving is a deliberate follow-on.
 
