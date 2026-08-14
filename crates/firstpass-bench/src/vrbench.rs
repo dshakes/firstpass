@@ -610,13 +610,62 @@ pub fn run_reference_router(
     sb: &dyn Sandbox,
     prices: &PriceTable,
     limits: &Limits,
+    checkpoint: Option<&std::path::Path>,
 ) -> Result<Vec<Submission>, String> {
     if solvers.is_empty() {
         return Err("need at least one rung".to_owned());
     }
+
+    // Resume whatever a previous attempt already paid for.
+    //
+    // This is not a nicety. The first version accumulated in memory and wrote once at the end; a
+    // transient HTTP 529 from the provider at task 898 of 974 destroyed every call before it —
+    // real money, for an upstream hiccup that had nothing to do with the run. `--coding-policy`
+    // has checkpointed per task for exactly this reason and I did not carry it across.
+    //
+    // Keyed by task id AND ladder. A row is reused only if its attempts are a prefix of *this*
+    // ladder — which is what a cascade produces, rung by rung. Without that, pointing a second
+    // run with a different ladder at the same file would silently serve the first ladder's
+    // answers under the second ladder's name, and the contamination would be invisible in the
+    // results. `coding_policy::load_checkpoint` has always filtered by ladder; same reason.
+    let mut done: std::collections::HashMap<String, Submission> = checkpoint
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| {
+            t.lines()
+                .filter_map(|l| serde_json::from_str::<Submission>(l).ok())
+                .filter(|s| {
+                    let prefix = s.attempts.len() <= solvers.len()
+                        && s.attempts
+                            .iter()
+                            .zip(solvers)
+                            .all(|(a, (model, _))| a.model == *model);
+                    // A prefix is not yet a finished task. A row stops early for one of two
+                    // reasons, and only one of them is terminal under a longer ladder: the gate
+                    // passed (done, whatever comes after), or the old ladder simply ran out
+                    // (not done — this ladder has rungs left to try). Reusing the second kind
+                    // would record an escalation the router never made and bank a served
+                    // failure it would have escaped.
+                    let terminal = s
+                        .attempts
+                        .last()
+                        .is_some_and(|a| matches!(a.gate_verdict, GateVerdict::Pass))
+                        || s.attempts.len() == solvers.len();
+                    prefix && terminal
+                })
+                .map(|s| (s.id.clone(), s))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !done.is_empty() {
+        eprintln!("resuming: {} tasks already measured", done.len());
+    }
     let mut out = Vec::with_capacity(tasks.len());
 
     for task in tasks {
+        if let Some(prev) = done.remove(&task.id) {
+            out.push(prev);
+            continue;
+        }
         let mut attempts = Vec::new();
         let mut answer = String::new();
         let single = solvers.len() == 1;
@@ -703,6 +752,20 @@ pub fn run_reference_router(
         // Validate as we go: a router that cannot produce a valid submission should fail here,
         // not at scoring time after a whole run has been paid for.
         s.validate()?;
+        // Append before continuing, so an abort costs only the task in flight. Best-effort: a
+        // failure to checkpoint must not discard work that was already paid for.
+        if let Some(p) = checkpoint
+            && let Ok(line) = serde_json::to_string(&s)
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
         out.push(s);
     }
     Ok(out)
@@ -1047,8 +1110,15 @@ mod tests {
         // A model nobody priced.
         let bogus: Vec<(String, &dyn crate::coding::CandidateSolver)> =
             vec![("nosuchvendor/imaginary-model".to_owned(), &solver)];
-        let err = run_reference_router(&tasks, &bogus, &NeverRuns, &prices, &Limits::default())
-            .expect_err("an unpriced model must abort the run");
+        let err = run_reference_router(
+            &tasks,
+            &bogus,
+            &NeverRuns,
+            &prices,
+            &Limits::default(),
+            None,
+        )
+        .expect_err("an unpriced model must abort the run");
         assert!(
             err.contains("no price") || err.contains("$0.00"),
             "the error must name the cause: {err}"
@@ -1057,9 +1127,181 @@ mod tests {
         // ...and a priced one still works, so the guard is not simply refusing everything.
         let ok: Vec<(String, &dyn crate::coding::CandidateSolver)> =
             vec![("anthropic/claude-haiku-4-5".to_owned(), &solver)];
-        let subs = run_reference_router(&tasks, &ok, &NeverRuns, &prices, &Limits::default())
+        let subs = run_reference_router(&tasks, &ok, &NeverRuns, &prices, &Limits::default(), None)
             .expect("a priced model runs");
         assert!(subs[0].cost_usd > 0.0, "a real call must not cost nothing");
+    }
+
+    /// A resumed run must not re-pay for tasks a previous attempt already bought.
+    ///
+    /// Pinned because the absence of this cost real money: an HTTP 529 at task 898 of 974
+    /// destroyed every call before it, because the first version accumulated in memory and wrote
+    /// once at the end. The solver here panics if called, so the test fails loudly if a
+    /// checkpointed task is re-solved rather than reused.
+    #[test]
+    fn a_resumed_run_does_not_re_pay_for_checkpointed_tasks() {
+        struct NeverSolves;
+        impl crate::coding::CandidateSolver for NeverSolves {
+            fn solve(&self, t: &CodingTask) -> Result<crate::coding::Solution, String> {
+                panic!(
+                    "re-solved {} — a checkpointed task must be reused, not re-bought",
+                    t.id
+                )
+            }
+        }
+        struct NeverRuns;
+        impl Sandbox for NeverRuns {
+            fn runtime(&self) -> &str {
+                "never"
+            }
+            fn run(
+                &self,
+                _u: &ExecUnit,
+                _l: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                panic!("gate ran for a checkpointed task")
+            }
+        }
+
+        let dir = std::env::temp_dir().join("fp-vrb-resume-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let ckpt = dir.join("resume.jsonl");
+        let prior = sub(
+            "t1",
+            0.05,
+            vec![att("anthropic/claude-haiku-4-5", 0.05, GateVerdict::Pass)],
+        );
+        std::fs::write(&ckpt, serde_json::to_string(&prior).unwrap() + "\n").unwrap();
+
+        let solver = NeverSolves;
+        let rungs: Vec<(String, &dyn crate::coding::CandidateSolver)> =
+            vec![("anthropic/claude-haiku-4-5".to_owned(), &solver)];
+        let subs = run_reference_router(
+            &[task("t1")],
+            &rungs,
+            &NeverRuns,
+            &PriceTable::defaults(),
+            &Limits::default(),
+            Some(&ckpt),
+        )
+        .expect("the checkpointed task is reused");
+
+        assert_eq!(subs.len(), 1);
+        assert!(
+            (subs[0].cost_usd - 0.05).abs() < 1e-9,
+            "the resumed submission must carry the ORIGINAL cost, not a fresh one"
+        );
+        let _ = std::fs::remove_file(&ckpt);
+    }
+
+    /// A checkpoint row bought by a DIFFERENT ladder must not be reused.
+    ///
+    /// Reusing it would serve one ladder's answers under another ladder's name — a benchmark
+    /// result that is wrong in the direction of whichever ladder ran first, and invisible in the
+    /// output. The solver panics when called, so "the row was correctly ignored" is exactly the
+    /// panic this test expects; reuse would return quietly and fail the test.
+    #[test]
+    #[should_panic(expected = "re-solved t1")]
+    fn a_checkpoint_from_another_ladder_is_not_reused() {
+        struct NeverSolves;
+        impl crate::coding::CandidateSolver for NeverSolves {
+            fn solve(&self, t: &CodingTask) -> Result<crate::coding::Solution, String> {
+                panic!("re-solved {}", t.id)
+            }
+        }
+        struct NeverRuns;
+        impl Sandbox for NeverRuns {
+            fn runtime(&self) -> &str {
+                "never"
+            }
+            fn run(
+                &self,
+                _u: &ExecUnit,
+                _l: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                panic!("gate ran")
+            }
+        }
+
+        let dir = std::env::temp_dir().join("fp-vrb-ladder-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let ckpt = dir.join("other-ladder.jsonl");
+        // Bought by haiku...
+        let prior = sub(
+            "t1",
+            0.05,
+            vec![att("anthropic/claude-haiku-4-5", 0.05, GateVerdict::Pass)],
+        );
+        std::fs::write(&ckpt, serde_json::to_string(&prior).unwrap() + "\n").unwrap();
+
+        // ...resumed under sonnet.
+        let solver = NeverSolves;
+        let rungs: Vec<(String, &dyn crate::coding::CandidateSolver)> =
+            vec![("anthropic/claude-sonnet-4-5".to_owned(), &solver)];
+        let _ = run_reference_router(
+            &[task("t1")],
+            &rungs,
+            &NeverRuns,
+            &PriceTable::defaults(),
+            &Limits::default(),
+            Some(&ckpt),
+        );
+    }
+
+    /// A row that merely EXHAUSTED a shorter ladder is not a finished task under a longer one.
+    ///
+    /// Its last attempt failed the gate; the old ladder just had nothing left to escalate to.
+    /// This ladder does. Reusing it would bank a served failure the router would have escaped
+    /// and record an escalation it never made — the same contamination as a foreign ladder,
+    /// arriving through a matching prefix. The solver panics, so re-solving is the pass.
+    #[test]
+    #[should_panic(expected = "re-solved t1")]
+    fn an_exhausted_shorter_ladder_is_not_a_finished_task() {
+        struct NeverSolves;
+        impl crate::coding::CandidateSolver for NeverSolves {
+            fn solve(&self, t: &CodingTask) -> Result<crate::coding::Solution, String> {
+                panic!("re-solved {}", t.id)
+            }
+        }
+        struct NeverRuns;
+        impl Sandbox for NeverRuns {
+            fn runtime(&self) -> &str {
+                "never"
+            }
+            fn run(
+                &self,
+                _u: &ExecUnit,
+                _l: &Limits,
+            ) -> Result<ExecOutcome, crate::sandbox::SandboxError> {
+                panic!("gate ran")
+            }
+        }
+
+        let dir = std::env::temp_dir().join("fp-vrb-exhausted-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let ckpt = dir.join("short-ladder.jsonl");
+        // Bought under a one-rung haiku ladder, and it FAILED that rung.
+        let prior = sub(
+            "t1",
+            0.05,
+            vec![att("anthropic/claude-haiku-4-5", 0.05, GateVerdict::Fail)],
+        );
+        std::fs::write(&ckpt, serde_json::to_string(&prior).unwrap() + "\n").unwrap();
+
+        // Resumed under haiku -> sonnet. The prefix matches, but sonnet was never tried.
+        let solver = NeverSolves;
+        let rungs: Vec<(String, &dyn crate::coding::CandidateSolver)> = vec![
+            ("anthropic/claude-haiku-4-5".to_owned(), &solver),
+            ("anthropic/claude-sonnet-4-5".to_owned(), &solver),
+        ];
+        let _ = run_reference_router(
+            &[task("t1")],
+            &rungs,
+            &NeverRuns,
+            &PriceTable::defaults(),
+            &Limits::default(),
+            Some(&ckpt),
+        );
     }
 
     /// Version skew must fail loudly rather than be interpreted optimistically.

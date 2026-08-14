@@ -190,6 +190,9 @@ fn main() {
             sb.as_ref(),
             &prices,
             &limits,
+            // The output file IS the checkpoint: an interrupted run resumes from what it already
+            // wrote, so an upstream 529 costs the task in flight rather than the whole run.
+            Some(std::path::Path::new(out_path)),
         ) {
             Ok(subs) => {
                 let mut out = String::new();
