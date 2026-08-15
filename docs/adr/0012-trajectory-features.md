@@ -152,3 +152,24 @@ where retries are expensive. Agentic SWE-bench measures exactly that and is repo
    cheap rung fails, so every recorded tool result is a failure. Not yet fixed: it needs the loop to
    record successful tool calls too, which changes what a "turn" means. Recorded here rather than
    quietly left as a gap.
+
+### SWE-bench: attempted, and it produced no usable evidence
+
+The workload chosen to escape MBPP's limits delivered the right shape and the wrong solver.
+
+`firstpass-bench --swe-agentic`, 22 SWE-bench Verified instances, 176 turns, 352 model calls, $8.69.
+Depth reached 7 (MBPP capped at 2) and **88% of turns had the two policies deciding differently**
+(MBPP: 20%) — exactly the regime this workload was chosen for.
+
+But **1 model call in 352 resolved its issue**, and only 1 of 22 instances resolved at all. The
+harness printed `SHIPS: 9.3% cheaper per success`; that ratio divides by a single success and means
+nothing. It is recorded in `docs/benchmarks/swebench-22-agentic.txt` labelled as unusable rather than
+deleted, because a benchmark that keeps only its readable runs is not a benchmark.
+
+The cause is the solver, not the router: it gets a problem statement and must emit a diff with **no
+repository access** — it cannot read the file it is patching or run a test. Real SWE-bench agents
+explore, edit, and iterate. Fixing that is a genuine agent loop, not a wiring change.
+
+**Net position after both runs: the feature does not ship.** MBPP refuted it on good data; SWE-bench
+abstained. `difficulty_hint` remains extracted, traced, and default-off — correct, tested, and free
+when the hint is `None`, which it is for all non-agent traffic.

@@ -1,0 +1,86 @@
+# Agentic SWE-bench — repository-scale multi-turn repair
+
+instances: 22
+turns:     176
+max depth: 7  (MBPP capped at 2; `High` needs >= 8)
+spend:     $8.69 of $25.00
+
+**stopped early** — numbers cover only what was bought.
+
+| policy | success | $/success |
+|---|---|---|
+| baseline (always start cheap) | 0.006 | $8.69373 |
+| trajectory-informed start | 0.006 | $7.88582 |
+
+paired quality delta: +0.0000  CI [0.0000, 0.0000]
+cost improvement:     +9.3%
+
+## Pre-registered verdict
+
+SHIPS: 9.3% cheaper per success, paired quality CI [0.0000, 0.0000] clears the bar
+
+---
+
+# READ THIS BEFORE THE NUMBER ABOVE
+
+**The `SHIPS` verdict is not usable evidence. Do not cite it.**
+
+The success rate is **0.006** — one oracle-resolved outcome across **352 model calls** and 22
+instances. "9.3% cheaper per success" is a ratio whose denominator is a single success. That is not
+a measurement of routing; it is division by approximately zero.
+
+| | value |
+|---|---|
+| instances | 22 of 30 (stopped early) |
+| turns | 176 |
+| model calls | 352 |
+| **calls that resolved the issue (oracle)** | **1** |
+| calls that passed the gate | 5 |
+| **instances with any resolution** | **1 / 22** |
+| spend | $8.69 of $25.00 |
+
+## Why success was near-zero — a harness limitation, not a finding
+
+The solver receives a problem statement and is asked to emit a unified diff. It has **no repository
+access**: it cannot list files, read the code it is patching, or run a targeted test. Real SWE-bench
+agents explore the tree, read the relevant module, edit it, and iterate against test output. This one
+guesses a diff from prose.
+
+A ~4.5% gate-pass rate and ~0.3% resolution rate is what that design predicts. Nothing here bears on
+whether trajectory routing works, because there is almost no successful routing outcome to attribute
+to either policy.
+
+## What the run DOES establish
+
+The workload shape is right, which was the reason to build it:
+
+| | MBPP | SWE-bench (this run) |
+|---|---|---|
+| max conversation depth | 2 | **7** |
+| turns where the policies decide differently | 20% | **88%** |
+| turns per instance | ~1.3 | 8 |
+
+So the harness reaches the regime MBPP structurally could not. What it lacks is a solver strong
+enough to produce successes to measure. Those are separable problems, and the second one is now the
+blocker.
+
+## Also stopped early, and why
+
+`django__django-10097` failed with `Broken pipe (os error 32)` while streaming inputs to the
+container — infrastructure, not model behaviour. The per-instance checkpoint meant the 21 instances
+already bought were kept; the run resumes from them.
+
+Sonnet returned **empty responses** on a substantial minority of calls even after escalating the
+token budget (4096 → 8192). Those score as failed candidates, which is accurate — a model that
+returned nothing did not return a patch — but it depresses sonnet's measured performance and should
+not be read as sonnet being weak at repair.
+
+## Conclusion
+
+**Neither benchmark supports shipping the trajectory feature.**
+
+- **MBPP**: good data, 254 differing turns, tight CI — refuted at **−3.4%**.
+- **SWE-bench**: right workload, no usable success signal — **no evidence either way**.
+
+The feature stays default-off. A real answer needs an agentic solver with file access and test
+execution, which is materially more work than wiring the evaluator.
