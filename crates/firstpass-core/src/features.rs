@@ -13,13 +13,22 @@ use serde::{Deserialize, Serialize};
 /// computed. Recorded per trace as `features@vN`.
 /// Feature-extraction contract version.
 ///
+/// **v3** changed how `difficulty_hint` is COMPUTED: the `deep` threshold moved from
+/// `assistant_turns >= 8` to `>= 5`, because 8 was unreachable in every workload measured (MBPP
+/// capped observed depth at 2; agentic SWE-bench at 7 against an 8-turn cap), leaving
+/// `DifficultyHint::High` as dead code. Same field, same range, different meaning — a v2 hint of
+/// `Medium` and a v3 hint of `Medium` are not the same measurement, so replaying a v3-fitted policy
+/// against v2 traces would silently compare incomparable numbers. That is precisely what this
+/// constant exists to prevent, and the rule applies to a threshold change exactly as it applies to a
+/// new field. Flagged in review after I changed the semantics and left the version alone.
+///
 /// **v2** added [`Features::difficulty_hint`] (trajectory signals read from the agent's own
 /// conversation). The bump is required even though the field is `#[serde(default)]` and old traces
 /// still deserialize: the version says *how a vector was computed*, and a v1 trace genuinely had no
 /// hint available. Leaving it at 1 would let a policy fitted on v2 traffic be replayed against v1
 /// traces as though the missing hints were real zeroes — silently mixing "no signal" with "not
 /// measured", which is the class of error the version field exists to prevent.
-pub const FEATURE_VERSION: u32 = 2;
+pub const FEATURE_VERSION: u32 = 3;
 
 /// Coarse task classification. `Other` is the safe default when classification is uncertain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -115,7 +124,17 @@ impl DifficultyHint {
         let half_failing = n > 0 && e > n / 2;
         let any_failing = e > 0;
         let stuck = s.repeated_tool_calls >= 2;
-        let deep = s.assistant_turns >= 8;
+        // `>= 5`, not `>= 8`. The original threshold was unreachable in every workload actually
+        // measured: MBPP capped observed depth at 2 (its retry loop ends when the cheap rung
+        // passes), and agentic SWE-bench at 7 against an 8-turn cap — an off-by-one that made
+        // `High` dead code in both. A level that never fires is worse than no level: it looks like
+        // coverage while contributing nothing, and the bandit can never learn an arm it is never
+        // given.
+        //
+        // Five turns is where a repair session is meaningfully long rather than merely underway,
+        // and it is reachable under both caps. Verified through the real extractors, not by
+        // constructing the struct directly — the mistake that hid this in the first place.
+        let deep = s.assistant_turns >= 5;
 
         match (half_failing || stuck, any_failing, deep) {
             // Most calls failing, or the same call retried repeatedly. Being deep on top of that is

@@ -198,6 +198,7 @@ pub(crate) async fn spawn_proxy(
         guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
         traces,
         adaptive: None,
+        eprocess: None,
         promoter: None,
         verified_cache: None,
         bandit: None,

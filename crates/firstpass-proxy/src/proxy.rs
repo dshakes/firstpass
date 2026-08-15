@@ -62,6 +62,11 @@ pub struct AppState {
     /// `serve_threshold` from config (default). When present, `/v1/feedback` nudges it live and the
     /// enforce path reads its current value per request — the reactive, self-tuning loop.
     pub adaptive: Option<Arc<std::sync::Mutex<firstpass_core::conformal::AdaptiveConformal>>>,
+    /// Anytime-valid risk control (ADR 0011). When present AND it has certified a threshold, it
+    /// takes precedence over `adaptive`, because its bound holds at the round it is read rather
+    /// than in the long-run average. `None`, or certified-nothing, leaves existing behaviour
+    /// untouched.
+    pub eprocess: Option<Arc<std::sync::Mutex<firstpass_core::eprocess::EProcessRiskControl>>>,
     /// Optional UCB1 start-rung bandit (predict-to-start, verify-to-serve). `None` (default) =
     /// start every request at rung 0, byte-identical to today. When present, `handle_enforce`
     /// queries it for a predicted start rung per request and feeds back gate verdicts for online
@@ -838,6 +843,52 @@ async fn feedback(
                 metrics::gauge!("firstpass_serve_threshold").set(g.threshold());
                 metrics::gauge!("firstpass_realized_served_failure")
                     .set(g.realized_served_failure());
+            }
+
+            // The same outcome also feeds the anytime-valid controller (ADR 0011). It needs the
+            // served SCORE as well as correctness, because it maintains one e-process per candidate
+            // threshold and only those that WOULD have served this item may be updated — a
+            // threshold strict enough to have escalated has learned nothing from it.
+            //
+            // Absent a score there is nothing to attribute the outcome to, so the update is skipped
+            // rather than guessed. Guessing would corrupt every threshold at once.
+            // The score MUST be the one the router actually served on, read back from the stored
+            // trace — never the optional `score` on the feedback payload. Two reasons, both fatal:
+            //
+            // 1. `score` is optional and normally absent. A CI runner reports `verdict: "pass"` and
+            //    nothing else, so keying on it left the controller permanently inert while the
+            //    metrics happily reported zero rounds — a guarantee that never engages, which is
+            //    worse than one that engages wrongly because nothing looks broken.
+            // 2. A client-supplied number is not the served score. Attributing an outcome to the
+            //    wrong threshold updates e-processes that never served the item, which is exactly
+            //    the condition Ville's inequality needs to hold. That breaks type-I control rather
+            //    than merely degrading it.
+            //
+            // `calibrate::trace_pair` has always derived it this way for offline calibration; the
+            // live path now agrees with it, so online and offline calibrate against the same
+            // definition of "the score".
+            if let (Some(e), Some(correct)) = (state.eprocess.as_ref(), feedback_signal) {
+                let db_s = state.config.db_path.clone();
+                let (tenant_s, tid_s) = (tenant.clone(), trace_id.clone());
+                let served = tokio::task::spawn_blocking(move || {
+                    store::load_trace_view(&db_s, &tenant_s, &tid_s)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| {
+                            let rung = t.final_.served_rung?;
+                            let a = t.attempts.iter().find(|a| a.rung == rung)?;
+                            Some(crate::calibrate::gate_score(&a.gates, a.verdict))
+                        })
+                })
+                .await
+                .ok()
+                .flatten();
+                // No served attempt means there is nothing to attribute the outcome to. Skipping is
+                // the only safe move: a guessed score corrupts every threshold at once.
+                if let (Some(sc), Ok(mut g)) = (served, e.lock()) {
+                    g.observe_served(sc, correct);
+                    metrics::counter!("firstpass_eprocess_rounds_total").increment(1);
+                }
             }
 
             // Which route produced the decision this outcome is about. Read from the trace
@@ -1690,10 +1741,34 @@ async fn enforce_pipeline_inner(
         };
     // Online adaptive conformal: serve against the LIVE-tracked threshold (updated by /v1/feedback).
     // Falls back to the fixed config threshold when adaptive is off or its lock is poisoned.
-    let serve_threshold = state
-        .adaptive
+    // Threshold precedence: e-process > ACI > fixed config.
+    //
+    // The e-process wins when it has certified something, because it is the only one of the three
+    // whose guarantee holds AT THIS ROUND (ADR 0011). ACI promises a long-run average; split
+    // conformal assumes exchangeability and a single calibration. Both are valid claims and neither
+    // is the claim an operator reading a threshold right now actually needs.
+    //
+    // It FAILS CLOSED by omission rather than by refusing: before anything is certified,
+    // `certified_threshold()` is `None` and the chain falls through to whatever the deployment was
+    // already doing. Serving on an uncertified threshold would be exactly the unproven-claim
+    // failure the module exists to prevent, and inventing a number there would be worse than
+    // having none.
+    let certified = state
+        .eprocess
         .as_ref()
-        .and_then(|a| a.lock().ok().map(|g| g.threshold()))
+        .and_then(|e| e.lock().ok().and_then(|g| g.certified_threshold()));
+    if let Some(c) = &certified {
+        metrics::gauge!("firstpass_eprocess_certified_threshold").set(c.threshold);
+        metrics::gauge!("firstpass_eprocess_e_value").set(c.e_value);
+    }
+    let serve_threshold = certified
+        .map(|c| c.threshold)
+        .or_else(|| {
+            state
+                .adaptive
+                .as_ref()
+                .and_then(|a| a.lock().ok().map(|g| g.threshold()))
+        })
         .or(serve_threshold);
 
     // Apply routing-mode preset overrides on top of config values.
@@ -4309,6 +4384,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -4489,6 +4565,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -4902,6 +4979,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -5072,6 +5150,15 @@ mod tests {
 
     /// Persist one trace to a fresh temp DB and return (state, db_path, trace_id).
     async fn feedback_state() -> (AppState, std::path::PathBuf, String) {
+        feedback_state_with(false).await
+    }
+
+    /// As [`feedback_state`], but `served` marks the attempt as the one actually served.
+    ///
+    /// The default fixture is an ERROR trace (`served_rung: None`) — nothing was served, so there is
+    /// no score to attribute a later verdict to. That is correct for the tests that use it and wrong
+    /// for anything exercising the served-score path, which is most of risk control.
+    async fn feedback_state_with(served: bool) -> (AppState, std::path::PathBuf, String) {
         let db = std::env::temp_dir().join(format!("firstpass-feedback-{}.db", Uuid::now_v7()));
         let (tx, handle) = crate::store::open(&db).unwrap();
 
@@ -5095,6 +5182,9 @@ mod tests {
             verdict: Verdict::Pass,
         });
         let trace_id = trace.trace_id.to_string();
+        if served {
+            trace.final_.served_rung = Some(0);
+        }
         tx.try_send(trace).unwrap();
         drop(tx);
         handle.await.unwrap();
@@ -5115,6 +5205,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -5123,6 +5214,58 @@ mod tests {
             spill: None,
         };
         (state, db, trace_id)
+    }
+
+    /// **The e-process must advance on an ORDINARY feedback call — one with no `score` field.**
+    ///
+    /// Caught in review. The live update keyed on the feedback payload's optional `score`, which a
+    /// real client (a CI runner reporting `verdict: "pass"`) does not send. The controller was
+    /// therefore never updated: permanently inert, with `firstpass_eprocess_rounds_total` sitting at
+    /// zero and nothing else looking wrong. A guarantee that never engages is worse than one that
+    /// engages imperfectly, because there is no symptom to notice.
+    ///
+    /// The second half of the bug was subtler and worse: a client-supplied score is not the score
+    /// the router served on, so trusting it would update e-processes for thresholds that never
+    /// served the item — the precise condition Ville's inequality relies on. That breaks type-I
+    /// control rather than degrading it. The score now comes from the stored trace's served
+    /// attempt, matching what `calibrate::trace_pair` has always done offline.
+    #[tokio::test]
+    async fn feedback_without_a_score_still_advances_the_eprocess() {
+        use firstpass_core::eprocess::{DEFAULT_BET, EProcessRiskControl};
+        let (mut state, _db, trace_id) = feedback_state_with(true).await;
+        let grid: Vec<f64> = (0..=20).map(|i| f64::from(i) / 20.0).collect();
+        let ep = Arc::new(std::sync::Mutex::new(EProcessRiskControl::new(
+            0.2,
+            0.05,
+            DEFAULT_BET,
+            &grid,
+        )));
+        state.eprocess = Some(ep.clone());
+        assert_eq!(ep.lock().unwrap().rounds(), 0);
+
+        // Deliberately NO "score" field — exactly what a CI runner sends.
+        let body = Bytes::from(
+            serde_json::json!({
+                "trace_id": trace_id, "gate_id": "tests", "verdict": "pass", "reporter": "ci"
+            })
+            .to_string(),
+        );
+        let resp = feedback(
+            State(state.clone()),
+            Extension(TenantId("default".to_owned())),
+            body,
+        )
+        .await
+        .into_response();
+        // 202 Accepted: the verdict is recorded for later calibration, not acted on inline.
+        assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
+
+        assert_eq!(
+            ep.lock().unwrap().rounds(),
+            1,
+            "a scoreless feedback call must still advance the controller — keying on the optional \
+             payload score left it permanently inert"
+        );
     }
 
     #[tokio::test]
@@ -5434,6 +5577,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -5804,6 +5948,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -6175,6 +6320,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -6294,6 +6440,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -6571,6 +6718,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -6662,6 +6810,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,

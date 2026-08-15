@@ -39,6 +39,16 @@ fn main() {
     // (ADR 0012). Runs on synthetic fixtures — no key, no sandbox, no spend — so it verifies the
     // apparatus, never the feature. A real number needs paid provider calls, which is the
     // operator's spending decision to make, not a benchmark's to trigger.
+    if args.iter().any(|a| a == "--swe-agentic") {
+        swe_agentic(json);
+        return;
+    }
+
+    if args.iter().any(|a| a == "--agentic-multiturn") {
+        agentic_multiturn(json);
+        return;
+    }
+
     if args.iter().any(|a| a == "--multiturn-selfcheck") {
         multiturn_selfcheck(json);
         return;
@@ -771,5 +781,375 @@ fn multiturn_selfcheck(json: bool) {
             a.ships, b.ships
         );
         std::process::exit(1);
+    }
+}
+
+/// `--agentic-multiturn`: run MBPP as real multi-turn agentic conversations and score the
+/// trajectory-informed router against the pre-registered bar (ADR 0012).
+///
+/// This SPENDS REAL MONEY. Every turn is a paid model call, so:
+/// - `FIRSTPASS_AGENTIC_BUDGET_USD` is a hard ceiling, checked before each task; the run stops
+///   cleanly rather than overshooting, and what was already bought is kept.
+/// - Every finished task is checkpointed immediately, and a resumed run skips it. A crash at task
+///   900 of 974 must not destroy the first 899 — that has happened here before.
+fn agentic_multiturn(json: bool) {
+    use firstpass_bench::agentic::{AgenticRung, RecordedTask, run_task};
+    use firstpass_bench::multiturn::{PreRegistered, evaluate};
+    use std::io::Write as _;
+
+    let Ok(dataset) = std::env::var("FIRSTPASS_CODING_DATASET") else {
+        eprintln!("--agentic-multiturn needs FIRSTPASS_CODING_DATASET=<path.jsonl>");
+        std::process::exit(2);
+    };
+    let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") else {
+        eprintln!("--agentic-multiturn needs ANTHROPIC_API_KEY (this run costs real money)");
+        std::process::exit(2);
+    };
+    let budget: f64 = std::env::var("FIRSTPASS_AGENTIC_BUDGET_USD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5.0);
+    let limit: usize = std::env::var("FIRSTPASS_AGENTIC_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(974);
+    let max_turns: usize = std::env::var("FIRSTPASS_AGENTIC_TURNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let ckpt_path = std::env::var("FIRSTPASS_AGENTIC_CHECKPOINT")
+        .unwrap_or_else(|_| "agentic-multiturn.checkpoint.jsonl".to_owned());
+
+    let tasks = match load_coding_dataset(&dataset) {
+        Ok(mut t) => {
+            t.truncate(limit);
+            t
+        }
+        Err(e) => {
+            eprintln!("cannot load {dataset}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let sb = match establish_sandbox(&sandbox_image()) {
+        Ok(sb) => sb,
+        Err(e) => {
+            eprintln!("sandbox FAILED (candidate code must NOT run): {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Per-million prices from the core table, converted to per-token.
+    let rungs = vec![
+        AgenticRung {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            bare: "claude-haiku-4-5".to_owned(),
+            in_price: 1.0 / 1_000_000.0,
+            out_price: 5.0 / 1_000_000.0,
+        },
+        AgenticRung {
+            model: "anthropic/claude-sonnet-5".to_owned(),
+            bare: "claude-sonnet-5".to_owned(),
+            in_price: 3.0 / 1_000_000.0,
+            out_price: 15.0 / 1_000_000.0,
+        },
+    ];
+
+    // Resume: anything already bought is not bought again.
+    let mut done: Vec<RecordedTask> = std::fs::read_to_string(&ckpt_path)
+        .map(|t| {
+            t.lines()
+                .filter_map(|l| serde_json::from_str::<RecordedTask>(l).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let already: std::collections::HashSet<String> = done.iter().map(|t| t.id.clone()).collect();
+    if !already.is_empty() {
+        eprintln!(
+            "resuming: {} tasks already recorded in {ckpt_path}",
+            already.len()
+        );
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .unwrap_or_default();
+    let limits = firstpass_bench::sandbox::Limits::default();
+    let mut spent = 0.0f64;
+    let mut stopped_early = false;
+
+    for (i, task) in tasks.iter().enumerate() {
+        if already.contains(&task.id) {
+            continue;
+        }
+        if spent >= budget {
+            eprintln!(
+                "BUDGET REACHED: ${spent:.2} of ${budget:.2} after {i} tasks — stopping cleanly. \
+                 Re-run with a higher FIRSTPASS_AGENTIC_BUDGET_USD to continue from the checkpoint."
+            );
+            stopped_early = true;
+            break;
+        }
+        let call = |bare: &str, msgs: &serde_json::Value, budget: u32| {
+            firstpass_bench::live::anthropic_call_messages(
+                &client,
+                "https://api.anthropic.com",
+                &api_key,
+                bare,
+                Some("You are a Python coding assistant. Output ONLY code, no prose."),
+                msgs,
+                budget,
+            )
+        };
+        match run_task(task, &rungs, sb.as_ref(), &limits, max_turns, &call) {
+            Ok(run) => {
+                spent += run.spent_usd;
+                // Append BEFORE anything else can fail: a task that was paid for is recorded.
+                if let (Ok(line), Ok(mut f)) = (
+                    serde_json::to_string(&run.recorded),
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&ckpt_path),
+                ) {
+                    let _ = writeln!(f, "{line}");
+                }
+                done.push(run.recorded);
+                if i % 25 == 0 {
+                    eprintln!("[{i}/{}] spent ${spent:.2} of ${budget:.2}", tasks.len());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "task {} failed: {e} — stopping (spent ${spent:.2})",
+                    task.id
+                );
+                stopped_early = true;
+                break;
+            }
+        }
+    }
+
+    let mt: Vec<_> = done.iter().map(RecordedTask::to_multiturn).collect();
+    let result = evaluate(&mt, PreRegistered::default());
+
+    if json {
+        let doc = serde_json::json!({
+            "tasks": done.len(),
+            "spent_usd": spent,
+            "stopped_early": stopped_early,
+            "result": result,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+    } else {
+        println!("# Agentic multi-turn MBPP — real trajectories, real spend\n");
+        println!("tasks recorded: {}", done.len());
+        println!("turns scored:   {}", result.n_turns);
+        println!("spend this run: ${spent:.2} of ${budget:.2}");
+        if stopped_early {
+            println!("**stopped early** — the numbers below cover only what was bought.");
+        }
+        println!("\n| policy | success | $/success |");
+        println!("|---|---|---|");
+        println!(
+            "| baseline (always start cheap) | {:.3} | ${:.5} |",
+            result.baseline_success, result.baseline_cost_per_success
+        );
+        println!(
+            "| trajectory-informed start | {:.3} | ${:.5} |",
+            result.trajectory_success, result.trajectory_cost_per_success
+        );
+        println!(
+            "\npaired quality delta: {:+.4}  CI [{:.4}, {:.4}]",
+            result.delta_success, result.delta_success_ci.lo, result.delta_success_ci.hi
+        );
+        println!(
+            "cost improvement:     {:+.1}%",
+            result.cost_improvement * 100.0
+        );
+        println!("\n## Pre-registered verdict\n\n{}", result.verdict);
+    }
+}
+
+/// `--swe-agentic`: run SWE-bench instances as real multi-turn repair sessions and score the
+/// trajectory-informed router against the pre-registered bar (ADR 0012).
+///
+/// This is the workload MBPP could not provide. There, conversation depth capped at 2 and two of
+/// four difficulty levels never fired; a repository task genuinely runs long, so the full hint range
+/// is reachable and the trajectory signal has something to be a signal about.
+///
+/// SPENDS REAL MONEY and needs multi-GB eval images pulled in advance (no network at eval time).
+fn swe_agentic(json: bool) {
+    use firstpass_bench::agentic::RecordedTask;
+    use firstpass_bench::multiturn::{PreRegistered, evaluate};
+    use firstpass_bench::swe_agentic::{SweRung, run_instance};
+    use firstpass_bench::swebench::{SweLimits, load_swebench_jsonl};
+    use std::io::Write as _;
+
+    let Ok(dataset) = std::env::var("FIRSTPASS_SWE_DATASET") else {
+        eprintln!("--swe-agentic needs FIRSTPASS_SWE_DATASET=<path.jsonl>");
+        eprintln!("  scripts/fetch-coding-dataset.py --dataset swebench --limit N --out swe.jsonl");
+        std::process::exit(2);
+    };
+    let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") else {
+        eprintln!("--swe-agentic needs ANTHROPIC_API_KEY (this run costs real money)");
+        std::process::exit(2);
+    };
+    let budget: f64 = std::env::var("FIRSTPASS_SWE_BUDGET_USD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10.0);
+    let max_turns: usize = std::env::var("FIRSTPASS_SWE_TURNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let limit: usize = std::env::var("FIRSTPASS_SWE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let ckpt_path = std::env::var("FIRSTPASS_SWE_CHECKPOINT")
+        .unwrap_or_else(|_| "swe-agentic.checkpoint.jsonl".to_owned());
+
+    let mut instances = match load_swebench_jsonl(&dataset) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("cannot load {dataset}: {e}");
+            std::process::exit(1);
+        }
+    };
+    instances.truncate(limit);
+
+    let rungs = vec![
+        SweRung {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            bare: "claude-haiku-4-5".to_owned(),
+            in_price: 1.0 / 1_000_000.0,
+            out_price: 5.0 / 1_000_000.0,
+        },
+        SweRung {
+            model: "anthropic/claude-sonnet-5".to_owned(),
+            bare: "claude-sonnet-5".to_owned(),
+            in_price: 3.0 / 1_000_000.0,
+            out_price: 15.0 / 1_000_000.0,
+        },
+    ];
+
+    let mut done: Vec<RecordedTask> = std::fs::read_to_string(&ckpt_path)
+        .map(|t| {
+            t.lines()
+                .filter_map(|l| serde_json::from_str::<RecordedTask>(l).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let already: std::collections::HashSet<String> = done.iter().map(|t| t.id.clone()).collect();
+    if !already.is_empty() {
+        eprintln!("resuming: {} instances already recorded", already.len());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .unwrap_or_default();
+    let limits = SweLimits::default();
+    let mut spent = 0.0f64;
+    let mut stopped_early = false;
+
+    for (i, inst) in instances.iter().enumerate() {
+        if already.contains(&inst.instance_id) {
+            continue;
+        }
+        if spent >= budget {
+            eprintln!(
+                "BUDGET REACHED: ${spent:.2} of ${budget:.2} after {i} instances — stopping."
+            );
+            stopped_early = true;
+            break;
+        }
+        let call = |bare: &str, msgs: &serde_json::Value, tokens: u32| {
+            firstpass_bench::live::anthropic_call_messages(
+                &client,
+                "https://api.anthropic.com",
+                &api_key,
+                bare,
+                Some("You are an expert software engineer. Output ONLY a unified diff."),
+                msgs,
+                tokens,
+            )
+        };
+        eprintln!(
+            "[{i}/{}] {} (spent ${spent:.2})",
+            instances.len(),
+            inst.instance_id
+        );
+        match run_instance(inst, &rungs, &limits, max_turns, &call) {
+            Ok(run) => {
+                spent += run.spent_usd;
+                if let (Ok(line), Ok(mut f)) = (
+                    serde_json::to_string(&run.recorded),
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&ckpt_path),
+                ) {
+                    let _ = writeln!(f, "{line}");
+                }
+                done.push(run.recorded);
+            }
+            Err(e) => {
+                eprintln!(
+                    "instance {} failed: {e} — stopping (spent ${spent:.2})",
+                    inst.instance_id
+                );
+                stopped_early = true;
+                break;
+            }
+        }
+    }
+
+    let mt: Vec<_> = done.iter().map(RecordedTask::to_multiturn).collect();
+    let result = evaluate(&mt, PreRegistered::default());
+    let depths: Vec<u32> = done
+        .iter()
+        .flat_map(|t| t.turns.iter().map(|x| x.assistant_turns))
+        .collect();
+    let max_depth = depths.iter().copied().max().unwrap_or(0);
+
+    if json {
+        let doc = serde_json::json!({
+            "instances": done.len(),
+            "spent_usd": spent,
+            "stopped_early": stopped_early,
+            "max_depth": max_depth,
+            "result": result,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+    } else {
+        println!("# Agentic SWE-bench — repository-scale multi-turn repair\n");
+        println!("instances: {}", done.len());
+        println!("turns:     {}", result.n_turns);
+        println!("max depth: {max_depth}  (MBPP capped at 2; `High` needs >= 8)");
+        println!("spend:     ${spent:.2} of ${budget:.2}");
+        if stopped_early {
+            println!("\n**stopped early** — numbers cover only what was bought.");
+        }
+        println!("\n| policy | success | $/success |");
+        println!("|---|---|---|");
+        println!(
+            "| baseline (always start cheap) | {:.3} | ${:.5} |",
+            result.baseline_success, result.baseline_cost_per_success
+        );
+        println!(
+            "| trajectory-informed start | {:.3} | ${:.5} |",
+            result.trajectory_success, result.trajectory_cost_per_success
+        );
+        println!(
+            "\npaired quality delta: {:+.4}  CI [{:.4}, {:.4}]",
+            result.delta_success, result.delta_success_ci.lo, result.delta_success_ci.hi
+        );
+        println!(
+            "cost improvement:     {:+.1}%",
+            result.cost_improvement * 100.0
+        );
+        println!("\n## Pre-registered verdict\n\n{}", result.verdict);
     }
 }

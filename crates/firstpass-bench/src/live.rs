@@ -208,10 +208,36 @@ pub(crate) fn anthropic_call(
     prompt: &str,
     max_tokens: u32,
 ) -> Result<(String, u64, u64), String> {
+    anthropic_call_messages(
+        client,
+        base_url,
+        api_key,
+        model,
+        system,
+        &serde_json::json!([{ "role": "user", "content": prompt }]),
+        max_tokens,
+    )
+}
+
+/// As [`anthropic_call`], but takes a full **messages array** rather than a single prompt.
+///
+/// A multi-turn agentic run needs to send the accumulated conversation — prior assistant code, the
+/// tool results that came back, the retry — so the model sees what it already tried. Wrapping the
+/// existing call rather than writing a second HTTP path keeps one implementation of the retry and
+/// backoff behaviour, which is the part that is easy to get subtly wrong twice.
+pub fn anthropic_call_messages(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    system: Option<&str>,
+    messages: &serde_json::Value,
+    max_tokens: u32,
+) -> Result<(String, u64, u64), String> {
     let mut body = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
-        "messages": [{ "role": "user", "content": prompt }],
+        "messages": messages,
     });
     if let Some(sys) = system {
         body["system"] = serde_json::json!(sys);

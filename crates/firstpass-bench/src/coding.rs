@@ -227,7 +227,7 @@ pub(crate) fn parse_score(stdout: &str) -> Option<(usize, usize)> {
 /// Only for an *environment* failure (`FP_ENVERR`): the sandbox image is missing a library the
 /// task needs, so the result would say nothing about the candidate. Scoring that as a failure
 /// would silently invent gate error, so it aborts the run instead.
-fn suite_score(
+pub(crate) fn suite_score(
     sb: &dyn Sandbox,
     task: &CodingTask,
     code: &str,

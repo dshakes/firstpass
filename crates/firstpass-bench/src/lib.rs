@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod ablation;
+pub mod agentic;
 pub mod coding;
 pub mod coding_policy;
 pub mod costaware;
@@ -26,6 +27,7 @@ pub mod routerbench;
 pub mod sandbox;
 pub mod sim;
 pub mod stats;
+pub mod swe_agentic;
 pub mod swebench;
 pub mod sweep;
 pub mod vrbench;

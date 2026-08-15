@@ -60,6 +60,7 @@ async fn spawn_proxy(upstream: &str) -> (String, std::path::PathBuf) {
         guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
         traces,
         adaptive: None,
+        eprocess: None,
         bandit: None,
         promoter: None,
         verified_cache: None,

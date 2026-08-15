@@ -537,6 +537,9 @@ pub struct Escalation {
     /// distribution shift. `None` (default) uses the fixed `serve_threshold` above — byte-identical.
     #[serde(default)]
     pub adaptive: Option<AdaptiveConfig>,
+    /// Anytime-valid risk control (ADR 0011). Takes precedence over `adaptive` once it certifies.
+    #[serde(default)]
+    pub eprocess: Option<EProcessConfig>,
     /// Route tool-calling / multimodal requests through enforce (ADR 0005). **Default `true`**:
     /// agent traffic — the target workload — is gated out of the box. A per-request fidelity
     /// guard still applies: structured content only routes when every ladder rung's provider
@@ -634,6 +637,38 @@ fn default_predictor_lr() -> f64 {
 
 fn default_predictor_l2() -> f64 {
     1e-4
+}
+
+/// Config for anytime-valid risk control ([`crate::eprocess::EProcessRiskControl`], ADR 0011).
+///
+/// Opt-in and additive. Absent, the router behaves exactly as before. Present, the certified
+/// threshold takes precedence over `[escalation.adaptive]` **once something is certified** — before
+/// that it contributes nothing, because a controller that has proven nothing must not hand out a
+/// number.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EProcessConfig {
+    /// Target served-failure rate the bound holds to.
+    pub alpha: f64,
+    /// Family-wise error budget, across every grid threshold and every round jointly.
+    pub delta: f64,
+    /// Betting fraction. Clamped internally so a large value cannot annihilate a threshold.
+    #[serde(default = "default_bet")]
+    pub bet: f64,
+    /// Candidate thresholds. Kept small on purpose: the Bonferroni crossing level is `n/delta`, so
+    /// evidence required per threshold grows linearly in grid size.
+    #[serde(default = "default_grid")]
+    pub grid: Vec<f64>,
+}
+
+fn default_bet() -> f64 {
+    0.5
+}
+
+/// A 21-point grid over `[0,1]`. Fine enough to pick a useful threshold, coarse enough that the
+/// Bonferroni correction stays affordable.
+fn default_grid() -> Vec<f64> {
+    (0..=20).map(|i| f64::from(i) / 20.0).collect()
 }
 
 /// Config for online/adaptive conformal serving ([`crate::conformal::AdaptiveConformal`]).
@@ -852,6 +887,7 @@ impl Default for Escalation {
             speculation: 0,
             serve_threshold: None,
             adaptive: None,
+            eprocess: None,
             enforce_structured: default_enforce_structured(),
             speculation_band: None,
             bandit: None,
