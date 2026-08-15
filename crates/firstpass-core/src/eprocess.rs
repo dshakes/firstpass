@@ -554,6 +554,40 @@ mod tests {
         );
     }
 
+    /// **Precedence contract with ACI**, verified at the source rather than trusted in prose.
+    ///
+    /// `proxy.rs` prefers the e-process threshold over `AdaptiveConformal`'s whenever one is
+    /// certified, and falls through otherwise. That is only safe because an uncertified controller
+    /// returns `None` rather than a default — if it ever returned a number before earning it, the
+    /// router would silently serve on an unproven threshold and outrank a method that at least has
+    /// a long-run guarantee.
+    #[test]
+    fn an_uncertified_controller_yields_nothing_for_the_router_to_prefer() {
+        let mut e = EProcessRiskControl::new(0.2, 0.05, DEFAULT_BET, &grid());
+        // Some evidence, but nowhere near the crossing level.
+        for _ in 0..10 {
+            e.observe_served(0.95, true);
+        }
+        assert!(
+            e.certified_threshold().is_none(),
+            "ten rounds must not certify at delta=0.05 over a 21-point grid"
+        );
+        // ...and once it HAS earned it, the router gets a real threshold to prefer.
+        let mut rng = Lcg(11);
+        for _ in 0..4000 {
+            let score = 0.95 + rng.next_f64() * 0.05;
+            e.observe_served(score, correct_for(score, rng.next_f64()));
+        }
+        let c = e
+            .certified_threshold()
+            .expect("sustained clean evidence must certify");
+        assert!(
+            (0.0..=1.0).contains(&c.threshold),
+            "a certified threshold must be servable: {}",
+            c.threshold
+        );
+    }
+
     /// `delta = 0` means "zero error budget", and must certify NOTHING rather than everything.
     ///
     /// Review raised this as a possible false-certification path. It is already handled —

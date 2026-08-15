@@ -62,6 +62,11 @@ pub struct AppState {
     /// `serve_threshold` from config (default). When present, `/v1/feedback` nudges it live and the
     /// enforce path reads its current value per request — the reactive, self-tuning loop.
     pub adaptive: Option<Arc<std::sync::Mutex<firstpass_core::conformal::AdaptiveConformal>>>,
+    /// Anytime-valid risk control (ADR 0011). When present AND it has certified a threshold, it
+    /// takes precedence over `adaptive`, because its bound holds at the round it is read rather
+    /// than in the long-run average. `None`, or certified-nothing, leaves existing behaviour
+    /// untouched.
+    pub eprocess: Option<Arc<std::sync::Mutex<firstpass_core::eprocess::EProcessRiskControl>>>,
     /// Optional UCB1 start-rung bandit (predict-to-start, verify-to-serve). `None` (default) =
     /// start every request at rung 0, byte-identical to today. When present, `handle_enforce`
     /// queries it for a predicted start rung per request and feeds back gate verdicts for online
@@ -838,6 +843,21 @@ async fn feedback(
                 metrics::gauge!("firstpass_serve_threshold").set(g.threshold());
                 metrics::gauge!("firstpass_realized_served_failure")
                     .set(g.realized_served_failure());
+            }
+
+            // The same outcome also feeds the anytime-valid controller (ADR 0011). It needs the
+            // served SCORE as well as correctness, because it maintains one e-process per candidate
+            // threshold and only those that WOULD have served this item may be updated — a
+            // threshold strict enough to have escalated has learned nothing from it.
+            //
+            // Absent a score there is nothing to attribute the outcome to, so the update is skipped
+            // rather than guessed. Guessing would corrupt every threshold at once.
+            if let (Some(e), Some(correct), Some(score)) =
+                (state.eprocess.as_ref(), feedback_signal, score)
+                && let Ok(mut g) = e.lock()
+            {
+                g.observe_served(score.value(), correct);
+                metrics::counter!("firstpass_eprocess_rounds_total").increment(1);
             }
 
             // Which route produced the decision this outcome is about. Read from the trace
@@ -1690,10 +1710,34 @@ async fn enforce_pipeline_inner(
         };
     // Online adaptive conformal: serve against the LIVE-tracked threshold (updated by /v1/feedback).
     // Falls back to the fixed config threshold when adaptive is off or its lock is poisoned.
-    let serve_threshold = state
-        .adaptive
+    // Threshold precedence: e-process > ACI > fixed config.
+    //
+    // The e-process wins when it has certified something, because it is the only one of the three
+    // whose guarantee holds AT THIS ROUND (ADR 0011). ACI promises a long-run average; split
+    // conformal assumes exchangeability and a single calibration. Both are valid claims and neither
+    // is the claim an operator reading a threshold right now actually needs.
+    //
+    // It FAILS CLOSED by omission rather than by refusing: before anything is certified,
+    // `certified_threshold()` is `None` and the chain falls through to whatever the deployment was
+    // already doing. Serving on an uncertified threshold would be exactly the unproven-claim
+    // failure the module exists to prevent, and inventing a number there would be worse than
+    // having none.
+    let certified = state
+        .eprocess
         .as_ref()
-        .and_then(|a| a.lock().ok().map(|g| g.threshold()))
+        .and_then(|e| e.lock().ok().and_then(|g| g.certified_threshold()));
+    if let Some(c) = &certified {
+        metrics::gauge!("firstpass_eprocess_certified_threshold").set(c.threshold);
+        metrics::gauge!("firstpass_eprocess_e_value").set(c.e_value);
+    }
+    let serve_threshold = certified
+        .map(|c| c.threshold)
+        .or_else(|| {
+            state
+                .adaptive
+                .as_ref()
+                .and_then(|a| a.lock().ok().map(|g| g.threshold()))
+        })
         .or(serve_threshold);
 
     // Apply routing-mode preset overrides on top of config values.
@@ -4309,6 +4353,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -4489,6 +4534,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -4902,6 +4948,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -5115,6 +5162,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -5434,6 +5482,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -5804,6 +5853,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -6175,6 +6225,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -6294,6 +6345,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -6571,6 +6623,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,
@@ -6662,6 +6715,7 @@ mod tests {
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
+            eprocess: None,
             bandit: None,
             promoter: None,
             verified_cache: None,

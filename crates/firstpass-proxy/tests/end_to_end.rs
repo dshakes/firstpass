@@ -200,6 +200,7 @@ async fn spawn_proxy_with(
         guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
         traces,
         adaptive: None,
+        eprocess: None,
         bandit: None,
         promoter,
         verified_cache,

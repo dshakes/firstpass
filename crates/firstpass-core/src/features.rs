@@ -115,7 +115,17 @@ impl DifficultyHint {
         let half_failing = n > 0 && e > n / 2;
         let any_failing = e > 0;
         let stuck = s.repeated_tool_calls >= 2;
-        let deep = s.assistant_turns >= 8;
+        // `>= 5`, not `>= 8`. The original threshold was unreachable in every workload actually
+        // measured: MBPP capped observed depth at 2 (its retry loop ends when the cheap rung
+        // passes), and agentic SWE-bench at 7 against an 8-turn cap — an off-by-one that made
+        // `High` dead code in both. A level that never fires is worse than no level: it looks like
+        // coverage while contributing nothing, and the bandit can never learn an arm it is never
+        // given.
+        //
+        // Five turns is where a repair session is meaningfully long rather than merely underway,
+        // and it is reachable under both caps. Verified through the real extractors, not by
+        // constructing the struct directly — the mistake that hid this in the first place.
+        let deep = s.assistant_turns >= 5;
 
         match (half_failing || stuck, any_failing, deep) {
             // Most calls failing, or the same call retried repeatedly. Being deep on top of that is

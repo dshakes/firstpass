@@ -339,6 +339,7 @@ async fn spawn(toml: &str, db: &Path) -> Result<(String, tokio::task::JoinHandle
         guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
         traces,
         adaptive: None,
+        eprocess: None,
         promoter: None,
         verified_cache: None,
         bandit: None,

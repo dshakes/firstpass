@@ -77,6 +77,21 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         });
     let tenant_rate_limiter = crate::proxy::build_tenant_rate_limiter(&config);
 
+    // Anytime-valid risk control (opt-in, ADR 0011). Absent => None => existing behaviour,
+    // byte-identical. Present, it still contributes nothing until it certifies something, so
+    // enabling it cannot change serving until the evidence exists.
+    let eprocess = config
+        .routing
+        .as_ref()
+        .and_then(|r| r.escalation.eprocess.as_ref())
+        .map(|e| {
+            Arc::new(std::sync::Mutex::new(
+                firstpass_core::eprocess::EProcessRiskControl::new(
+                    e.alpha, e.delta, e.bet, &e.grid,
+                ),
+            ))
+        });
+
     // Session promotion (opt-in): in-memory and per-process by design. A promotion is a statement
     // about a live conversation, so it should not outlive the process that observed it — and a
     // stale pin restored from disk would start a fresh session on an expensive rung for reasons
@@ -170,6 +185,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
         traces,
         adaptive,
+        eprocess,
         verified_cache,
         promoter,
         bandit,
