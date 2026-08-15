@@ -96,15 +96,22 @@ fn signals_from(history: &[Attempt]) -> TrajectorySignals {
 /// Prior patches appear as assistant turns and their real test output as user turns. The model sees
 /// what it tried and exactly how it failed, which is what makes the trajectory genuine rather than
 /// a description of one.
-fn build_messages(instance: &SweInstance, history: &[Attempt]) -> serde_json::Value {
+fn build_messages(
+    instance: &SweInstance,
+    history: &[Attempt],
+    findings: &str,
+) -> serde_json::Value {
     let mut msgs = vec![serde_json::json!({
         "role": "user",
         "content": format!(
-            "Repository: {}\nCommit: {}\n\n## Problem\n\n{}\n\n\
+            "Repository: {}\nCommit: {}\n\n## Problem\n\n{}\n\n## Code you inspected\n\n{}\n\n\
              Produce a unified diff that fixes this. Output ONLY the diff, starting with \
              `diff --git` or `---`. No prose, no fences. Paths must be relative to the repository \
-             root.",
-            instance.repo, instance.base_commit, instance.problem_statement,
+             root, and context lines must match the code above exactly.",
+            instance.repo,
+            instance.base_commit,
+            instance.problem_statement,
+            if findings.is_empty() { "(no exploration performed)" } else { findings },
         ),
     })];
     for a in history {
@@ -147,6 +154,65 @@ pub struct InstanceRun {
 /// then scores a failed candidate rather than aborting — the policy `LiveSolver` learned the hard
 /// way and [`crate::agentic`] relearned. Anything else (auth, 4xx) aborts, because more tokens
 /// cannot fix it.
+/// How many read-only exploration steps the model may take before writing a patch.
+///
+/// Each step is a paid model call plus a container run, so this is a real cost knob. Four is enough
+/// to `ls` the package, `grep` the symbol, and `read` the function twice — the minimum sequence a
+/// human would perform — without letting a confused model wander an entire repository at $0.02 a
+/// look.
+const MAX_EXPLORE_STEPS: usize = 4;
+
+/// Let the model read the repository before it patches it.
+///
+/// Returns a transcript of `command -> output` pairs to prepend to the patch prompt. Exploration is
+/// **best-effort**: a malformed command or a container hiccup is reported back to the model as text
+/// and the loop continues, because a failed `ls` is not a reason to abandon a paid instance.
+fn explore_phase(
+    instance: &SweInstance,
+    limits: &SweLimits,
+    bare_model: &str,
+    call: &ModelCall<'_>,
+    spent: &mut f64,
+    in_price: f64,
+    out_price: f64,
+) -> String {
+    let mut transcript = String::new();
+    for _ in 0..MAX_EXPLORE_STEPS {
+        let prompt = format!(
+            "Repository: {}\n\n## Problem\n\n{}\n\n## What you have found so far\n\n{}\n\n\
+             You may inspect the repository with ONE command per turn:\n\
+               ls <dir>                    list a directory\n\
+               grep <pattern> <dir>        search file contents (fixed string, shows line numbers)\n\
+               read <file> <start> <end>   read a line range\n\n\
+             Output ONLY the command, or the single word DONE when you have seen enough to write \
+             the patch. No prose.",
+            instance.repo,
+            instance.problem_statement,
+            if transcript.is_empty() {
+                "(nothing yet)"
+            } else {
+                &transcript
+            },
+        );
+        let msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
+        let Ok((text, in_tok, out_tok)) = call(bare_model, &msgs, 512) else {
+            break;
+        };
+        *spent += in_tok as f64 * in_price + out_tok as f64 * out_price;
+        let line = text.trim().lines().next().unwrap_or("").trim().to_owned();
+        if line.is_empty() || line.eq_ignore_ascii_case("done") {
+            break;
+        }
+        let result = match crate::swe_explore::parse_cmd(&line) {
+            Ok(cmd) => crate::swe_explore::run_explore(instance, &cmd, limits)
+                .unwrap_or_else(|e| format!("(command failed: {e})")),
+            Err(e) => format!("(invalid command: {e})"),
+        };
+        transcript.push_str(&format!("$ {line}\n{result}\n\n"));
+    }
+    transcript
+}
+
 pub fn run_instance(
     instance: &SweInstance,
     rungs: &[SweRung],
@@ -158,10 +224,29 @@ pub fn run_instance(
     let mut turns: Vec<RecordedTurn> = Vec::new();
     let mut spent = 0.0f64;
 
+    // Read the code before patching it. Done ONCE per instance on the cheapest rung, not per turn
+    // and not per rung: the repository does not change between attempts, so re-exploring would pay
+    // for the same answer repeatedly. Using the cheap model keeps a phase that is pure input-
+    // gathering from costing frontier-model rates.
+    //
+    // This is what the first SWE-bench run lacked, and why it resolved 1 issue in 352 calls: the
+    // solver was writing diffs for files it had never opened.
+    let findings = rungs.first().map_or_else(String::new, |r| {
+        explore_phase(
+            instance,
+            limits,
+            &r.bare,
+            call,
+            &mut spent,
+            r.in_price,
+            r.out_price,
+        )
+    });
+
     for _turn in 0..max_turns {
         // Computed BEFORE the turn is served: a routing decision may not see its own outcome.
         let sig = signals_from(&history);
-        let msgs = build_messages(instance, &history);
+        let msgs = build_messages(instance, &history, &findings);
 
         let mut recorded_rungs = Vec::new();
         let mut cheapest: Option<Attempt> = None;
@@ -326,7 +411,7 @@ mod tests {
             applied: false,
             feedback: "The patch did not apply. Check the paths and context lines.".into(),
         };
-        let msgs = build_messages(&inst, std::slice::from_ref(&did_not_apply));
+        let msgs = build_messages(&inst, std::slice::from_ref(&did_not_apply), "");
         let text = msgs.to_string();
         assert!(
             text.contains("did not apply"),
@@ -336,6 +421,42 @@ mod tests {
             text.contains("Error:"),
             "the failure must read as an error, which is what the extractor keys on"
         );
+    }
+
+    /// **What the model read must reach the prompt it writes the patch from.**
+    ///
+    /// This is the wiring-bug class that has bitten this feature repeatedly: a signal that is
+    /// extracted, recorded, and then silently dropped before the only consumer that matters. The
+    /// exploration phase is pure cost if its findings do not appear in the patch prompt — and the
+    /// symptom would be indistinguishable from "the model is bad at patching".
+    #[test]
+    fn exploration_findings_reach_the_patch_prompt() {
+        let inst = SweInstance {
+            instance_id: "x__y-1".into(),
+            repo: "x/y".into(),
+            base_commit: "abc".into(),
+            problem_statement: "boom".into(),
+            test_patch: String::new(),
+            fail_to_pass: vec!["t::a".into()],
+            pass_to_pass: vec![],
+            image: "img".into(),
+        };
+        let findings = "$ read src/mod.py 10 20\n10: def separability_matrix(x):\n";
+        let msgs = build_messages(&inst, &[], findings);
+        let text = msgs.to_string();
+        assert!(
+            text.contains("separability_matrix"),
+            "the code the model read must appear in the patch prompt: {text}"
+        );
+        assert!(
+            text.contains("Code you inspected"),
+            "and it must be labelled so the model knows what it is looking at"
+        );
+
+        // With no exploration, the prompt says so plainly rather than showing an empty section —
+        // an empty heading reads as "there was nothing to find", which is a different claim.
+        let empty = build_messages(&inst, &[], "").to_string();
+        assert!(empty.contains("no exploration performed"), "{empty}");
     }
 
     /// Fenced diffs are a formatting slip, not a failed patch.

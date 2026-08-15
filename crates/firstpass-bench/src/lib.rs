@@ -28,6 +28,7 @@ pub mod sandbox;
 pub mod sim;
 pub mod stats;
 pub mod swe_agentic;
+pub mod swe_explore;
 pub mod swebench;
 pub mod sweep;
 pub mod vrbench;
