@@ -108,3 +108,47 @@ Zeroing the hint inside the bandit key initially **survived** — the wiring was
 feature could have been extracted, traced, and exported while being silently ignored by its only
 consumer, with the telemetry insisting it worked. `the_difficulty_hint_reaches_the_bandit_key` now
 covers it.
+
+---
+
+## Addendum, 2026-08-14: measured, and refuted on MBPP
+
+The pre-registered bar was run at full scale. **The feature did not clear it.**
+
+`firstpass-bench --agentic-multiturn`, 974 MBPP tasks, 1228 turns, $8.05 of real spend, genuine
+multi-turn trajectories (model writes code -> sandbox runs visible tests -> real failures return as
+real error text -> model retries):
+
+| policy | success | $/success |
+|---|---|---|
+| baseline (always start cheap) | 0.895 | $0.00529 |
+| trajectory-informed start | 0.897 | **$0.00547** |
+
+**−3.4% cost improvement against a required +5%.** Quality was fine (+0.0024, CI [−0.0008,
++0.0065]). Verdict: `KILLED`. Full artifact and caveats in
+`docs/benchmarks/mbpp-974-agentic-multiturn.txt`.
+
+**Status change: the feature remains default-off and does not ship on this evidence.** The
+extraction, the audit-contract bump, and the bandit wiring stay — they are correct, tested, and cost
+nothing when the hint is `None`, which it is for all non-agent traffic. What is withdrawn is any
+claim that acting on the hint pays.
+
+### Why, and why that is informative rather than embarrassing
+
+MBPP retries are cheap. Starting higher when the conversation looks troubled skips a cheap rung that
+would usually have passed, and the savings on genuinely hard tasks do not cover it. This is the
+real-data version of the −66.7% regression the harness caught in its own synthetic check.
+
+The finding is workload-specific, and the boundary is the interesting part: the trade should invert
+where retries are expensive. Agentic SWE-bench measures exactly that and is reported separately.
+
+### Two corrections to this ADR's original claims
+
+1. **`deep >= 8` was unreachable.** Observed depth capped at 2 on MBPP and 7 on agentic SWE-bench
+   (8-turn cap) — `High` was dead code in every workload measured. A level that never fires looks
+   like coverage while contributing nothing, and the bandit can never learn an arm it is never
+   given. Lowered to `>= 5`.
+2. **`Low` also never fires** in either harness, because the retry loop only continues when the
+   cheap rung fails, so every recorded tool result is a failure. Not yet fixed: it needs the loop to
+   record successful tool calls too, which changes what a "turn" means. Recorded here rather than
+   quietly left as a gap.

@@ -1,0 +1,81 @@
+# Agentic multi-turn MBPP — real trajectories, real spend
+
+tasks recorded: 974
+turns scored:   1228
+spend this run: $8.05 of $45.00
+
+| policy | success | $/success |
+|---|---|---|
+| baseline (always start cheap) | 0.895 | $0.00529 |
+| trajectory-informed start | 0.897 | $0.00547 |
+
+paired quality delta: +0.0024  CI [-0.0008, 0.0065]
+cost improvement:     -3.4%
+
+## Pre-registered verdict
+
+KILLED: cost improvement -3.4% below the pre-registered 5.0% — quality was fine, the feature simply did not pay
+
+---
+
+## Provenance and how to read this
+
+Produced by `firstpass-bench --agentic-multiturn` against real Anthropic models and a real
+sandbox. Every trajectory is observed from a conversation that actually happened: the model wrote
+code, the sandbox ran the visible tests, real failures returned as real error text, and the model
+retried. Nothing here is simulated.
+
+- ladder: `anthropic/claude-haiku-4-5` -> `anthropic/claude-sonnet-5`
+- 974 tasks, 1228 turns, max_turns=3, $8.05
+- checkpoint: `mbpp-974-agentic-multiturn.checkpoint.jsonl` (re-scorable offline, no spend)
+- sandbox: default OCI runtime, NOT gVisor (see caveat below)
+
+## The result
+
+**KILLED.** The trajectory-informed start rung cost **3.4% MORE** per success than always starting
+cheap, against a pre-registered requirement of 5% cheaper. Quality was fine (+0.0024, CI
+[-0.0008, +0.0065] — indistinguishable from zero), so this is not a quality failure. The feature
+simply did not pay.
+
+Per ADR 0012's own terms, it does not ship on this evidence and stays default-off.
+
+## Why the result is coherent rather than noise
+
+MBPP retries are cheap. Starting higher on a conversation that looks troubled skips a cheap rung
+that would often have passed anyway, and the savings on the genuinely hard tasks cannot cover it.
+This is the same mechanism that showed up as -66.7% in the harness's own synthetic check when the
+hint was mapped naively to a rung; here it is the milder, real-data version of the same trade.
+
+## What this run can and cannot establish
+
+**Can**: 254 turns actually differed between the two policies — enough for the paired CI to carry
+real information. The pre-registration written before the run predicted the verdict would be
+uninterpretable; that prediction was too pessimistic and is corrected here.
+
+**Cannot**: only two of four difficulty levels ever fired.
+
+| level | share of turns |
+|---|---|
+| None | 79.3% |
+| Low | 0.0% |
+| Medium | 20.7% |
+| High | 0.0% |
+
+`Low` never occurs because the retry loop only continues when the cheap rung FAILS, so every
+recorded tool result is a failure. `High` never occurred because observed depth capped at 2 while
+the threshold was >= 8 — an off-by-one against the turn cap, since fixed (threshold lowered to 5
+after this run; see ADR 0012 addendum).
+
+So: the feature is refuted **on this workload**, with the mechanism only half-exercised. The
+workload where it should pay — long sessions where retries are expensive — is agentic SWE-bench,
+which is measured separately.
+
+## Caveats, stated rather than buried
+
+1. **gVisor absent.** The sandbox fell back to the default OCI runtime (shared-kernel, weaker
+   isolation) because `runsc` is not installed on the run host. Acceptable for running code these
+   models generated against a known dataset; a deviation from ADR 0002's posture nonetheless.
+2. **arm64 host.** Not relevant for MBPP (no per-instance images), noted for comparability with the
+   SWE-bench run, which ran x86 images under emulation.
+3. **Single provider.** Anthropic only. The cross-provider replication in `mbpp-974-openai.txt`
+   covers the core cascade result, not this feature.

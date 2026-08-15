@@ -51,3 +51,21 @@ exists but is not wired to the CLI; wiring it is the prerequisite for a real ans
 
 Reporting this run's number regardless, labelled for what it is, because a benchmark that only
 publishes its favourable configurations is not evidence.
+
+---
+
+## Post-run correction, 2026-08-14
+
+Written before the run, this document predicted that **neither** verdict would be interpretable.
+Half of that was wrong and is corrected here rather than left to age quietly.
+
+**Wrong**: it predicted a degenerate CI resting on a handful of turns. In the event **254 turns
+differed** between the two policies — enough for the paired CI to carry real information. The
+measured CI ([−0.0008, +0.0065]) is tight and meaningful, not an artifact of the policies agreeing.
+
+**Right**: only two of four difficulty levels ever fired (`None` 79.3%, `Medium` 20.7%), and
+observed depth capped at 2. The mechanism was half-exercised, exactly as predicted.
+
+**The verdict**: `KILLED` at −3.4% cost improvement. Because the CI turned out informative, this is
+a real refutation on this workload — stronger evidence than this document anticipated, in the
+direction of *not* shipping the feature. See `mbpp-974-agentic-multiturn.txt`.
