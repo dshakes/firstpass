@@ -173,3 +173,40 @@ explore, edit, and iterate. Fixing that is a genuine agent loop, not a wiring ch
 **Net position after both runs: the feature does not ship.** MBPP refuted it on good data; SWE-bench
 abstained. `difficulty_hint` remains extracted, traced, and default-off — correct, tested, and free
 when the hint is `None`, which it is for all non-agent traffic.
+
+### Third measurement: SWE-bench with repository access — KILLED on quality
+
+The previous SWE-bench run abstained because the solver could not see the code it was patching.
+`swe_explore.rs` fixed that: three read-only verbs (`ls`, `grep`, `read`) inside the same
+fail-closed container, four steps, on the cheapest rung.
+
+**30 instances, 180 calls, $3.36.** Verdict: **`KILLED`** — paired quality CI lower bound
+**−0.0333**, breaching the −0.01 regression limit. The trajectory-informed start rung **served more
+failures** than always starting cheap.
+
+This one counts. The previous run's 1-success-in-352 made every ratio meaningless; 19 gate-passes
+give the paired CI enough signal to discriminate. Full artifact:
+`docs/benchmarks/swebench-30-fileaccess.txt`.
+
+**Final standing across three measurements:**
+
+| workload | verdict |
+|---|---|
+| MBPP 974 | KILLED — −3.4% cost |
+| SWE-bench 22 (no file access) | no usable evidence |
+| SWE-bench 30 (file access) | KILLED — quality CI −0.0333 |
+
+Two refutations and one abstention, on two workloads with opposite retry economics. **The feature
+does not ship**, and the evidence is now strong enough that carrying the acting logic is a live
+question rather than a formality — the extraction is free and traced, but nothing justifies acting
+on the hint.
+
+**A secondary finding worth more than the primary one.** Repository access lifted gate-pass from
+0.3% to **10.6%** (35×) while cutting cost per instance 4× — but resolution barely moved (0.3% →
+0.6%). Reading the code fixes *patch formation*; it does not fix *reasoning about the bug*. The
+diagnosis behind the exploration work was half right, and the measurement says which half. That
+harness improvement stands on its own regardless of the routing verdict.
+
+**Caveat on this run specifically:** `FIRSTPASS_SWE_TURNS=3` capped observed depth at 2, so the
+`deep` signal (>= 5) never engaged. The kill rests on `Medium`-level turns; `High` remains
+unexercised in every workload measured to date.
