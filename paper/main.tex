@@ -536,6 +536,15 @@ gate rejects a correct answer and the next rung then fails. On MBPP the first co
 never occurred. \S\ref{sec:results-sweep} is the honest boundary of that claim, not a footnote to
 it.
 
+\textbf{Anytime-valid control is verified, not yet field-proven.} The e-process construction of
+\S\ref{sec:anytime} is implemented on the serving path and its guarantee is established by seeded
+simulation --- including an adversarial non-exchangeable stream where split conformal's realized rate
+breaches $\alpha$ and the e-process does not --- but it has not yet certified a threshold against
+live production traffic, which requires accumulated deferred feedback that we do not have. The
+implementation fails closed until it certifies, so an operator enabling it inherits their prior
+behaviour rather than an untested one; the claim we make is about the bound, not about field
+experience with it.
+
 \textbf{Ladder sensitivity.} Cost savings depend on the price of the top rung, which is chosen by
 the operator. We report savings against more than one ceiling for this reason.
 
