@@ -96,15 +96,22 @@ fn signals_from(history: &[Attempt]) -> TrajectorySignals {
 /// Prior patches appear as assistant turns and their real test output as user turns. The model sees
 /// what it tried and exactly how it failed, which is what makes the trajectory genuine rather than
 /// a description of one.
-fn build_messages(instance: &SweInstance, history: &[Attempt]) -> serde_json::Value {
+fn build_messages(
+    instance: &SweInstance,
+    history: &[Attempt],
+    findings: &str,
+) -> serde_json::Value {
     let mut msgs = vec![serde_json::json!({
         "role": "user",
         "content": format!(
-            "Repository: {}\nCommit: {}\n\n## Problem\n\n{}\n\n\
+            "Repository: {}\nCommit: {}\n\n## Problem\n\n{}\n\n## Code you inspected\n\n{}\n\n\
              Produce a unified diff that fixes this. Output ONLY the diff, starting with \
              `diff --git` or `---`. No prose, no fences. Paths must be relative to the repository \
-             root.",
-            instance.repo, instance.base_commit, instance.problem_statement,
+             root, and context lines must match the code above exactly.",
+            instance.repo,
+            instance.base_commit,
+            instance.problem_statement,
+            if findings.is_empty() { "(no exploration performed)" } else { findings },
         ),
     })];
     for a in history {
@@ -147,6 +154,65 @@ pub struct InstanceRun {
 /// then scores a failed candidate rather than aborting — the policy `LiveSolver` learned the hard
 /// way and [`crate::agentic`] relearned. Anything else (auth, 4xx) aborts, because more tokens
 /// cannot fix it.
+/// How many read-only exploration steps the model may take before writing a patch.
+///
+/// Each step is a paid model call plus a container run, so this is a real cost knob. Four is enough
+/// to `ls` the package, `grep` the symbol, and `read` the function twice — the minimum sequence a
+/// human would perform — without letting a confused model wander an entire repository at $0.02 a
+/// look.
+const MAX_EXPLORE_STEPS: usize = 4;
+
+/// Let the model read the repository before it patches it.
+///
+/// Returns a transcript of `command -> output` pairs to prepend to the patch prompt. Exploration is
+/// **best-effort**: a malformed command or a container hiccup is reported back to the model as text
+/// and the loop continues, because a failed `ls` is not a reason to abandon a paid instance.
+fn explore_phase(
+    instance: &SweInstance,
+    limits: &SweLimits,
+    bare_model: &str,
+    call: &ModelCall<'_>,
+    spent: &mut f64,
+    in_price: f64,
+    out_price: f64,
+) -> String {
+    let mut transcript = String::new();
+    for _ in 0..MAX_EXPLORE_STEPS {
+        let prompt = format!(
+            "Repository: {}\n\n## Problem\n\n{}\n\n## What you have found so far\n\n{}\n\n\
+             You may inspect the repository with ONE command per turn:\n\
+               ls <dir>                    list a directory\n\
+               grep <pattern> <dir>        search file contents (fixed string, shows line numbers)\n\
+               read <file> <start> <end>   read a line range\n\n\
+             Output ONLY the command, or the single word DONE when you have seen enough to write \
+             the patch. No prose.",
+            instance.repo,
+            instance.problem_statement,
+            if transcript.is_empty() {
+                "(nothing yet)"
+            } else {
+                &transcript
+            },
+        );
+        let msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
+        let Ok((text, in_tok, out_tok)) = call(bare_model, &msgs, 512) else {
+            break;
+        };
+        *spent += in_tok as f64 * in_price + out_tok as f64 * out_price;
+        let line = text.trim().lines().next().unwrap_or("").trim().to_owned();
+        if line.is_empty() || line.eq_ignore_ascii_case("done") {
+            break;
+        }
+        let result = match crate::swe_explore::parse_cmd(&line) {
+            Ok(cmd) => crate::swe_explore::run_explore(instance, &cmd, limits)
+                .unwrap_or_else(|e| format!("(command failed: {e})")),
+            Err(e) => format!("(invalid command: {e})"),
+        };
+        transcript.push_str(&format!("$ {line}\n{result}\n\n"));
+    }
+    transcript
+}
+
 pub fn run_instance(
     instance: &SweInstance,
     rungs: &[SweRung],
@@ -158,10 +224,39 @@ pub fn run_instance(
     let mut turns: Vec<RecordedTurn> = Vec::new();
     let mut spent = 0.0f64;
 
+    // Read the code before patching it. Done ONCE per instance on the cheapest rung, not per turn
+    // and not per rung: the repository does not change between attempts, so re-exploring would pay
+    // for the same answer repeatedly. Using the cheap model keeps a phase that is pure input-
+    // gathering from costing frontier-model rates.
+    //
+    // This is what the first SWE-bench run lacked, and why it resolved 1 issue in 352 calls: the
+    // solver was writing diffs for files it had never opened.
+    let before_explore = spent;
+    let findings = rungs.first().map_or_else(String::new, |r| {
+        explore_phase(
+            instance,
+            limits,
+            &r.bare,
+            call,
+            &mut spent,
+            r.in_price,
+            r.out_price,
+        )
+    });
+
+    // Snapshot the exploration cost HERE, immediately after the phase that incurred it.
+    //
+    // The first version computed `spent - explore_start` inside the turn loop, AFTER the rungs had
+    // run — so it captured exploration plus that turn's model calls and added them a second time.
+    // The recorded cost for the trajectory arm was inflated, not merely misattributed. Flagged in
+    // review; the fix for a missing cost introduced a double-counted one.
+    let explore_cost = spent - before_explore;
+    let mut explore_cost_recorded = false;
+
     for _turn in 0..max_turns {
         // Computed BEFORE the turn is served: a routing decision may not see its own outcome.
         let sig = signals_from(&history);
-        let msgs = build_messages(instance, &history);
+        let msgs = build_messages(instance, &history, &findings);
 
         let mut recorded_rungs = Vec::new();
         let mut cheapest: Option<Attempt> = None;
@@ -229,6 +324,18 @@ pub fn run_instance(
                     },
                 });
             }
+        }
+
+        // Exploration is paid ONCE, before the first turn, and must appear in the recorded cost or
+        // every offline replay understates the policy that paid for it. It is attributed to the
+        // first turn's cheapest rung, which is exactly who spent it.
+        //
+        // Measured on the 30-instance run: $3.36 recorded against $3.57 actually spent. A 6% gap,
+        // landing entirely on the trajectory policy since the baseline never explores — so it
+        // flattered the arm under test in the published number. Flagged in review.
+        if !explore_cost_recorded && let Some(first) = recorded_rungs.first_mut() {
+            first.cost_usd += explore_cost;
+            explore_cost_recorded = true;
         }
 
         turns.push(RecordedTurn {
@@ -326,7 +433,7 @@ mod tests {
             applied: false,
             feedback: "The patch did not apply. Check the paths and context lines.".into(),
         };
-        let msgs = build_messages(&inst, std::slice::from_ref(&did_not_apply));
+        let msgs = build_messages(&inst, std::slice::from_ref(&did_not_apply), "");
         let text = msgs.to_string();
         assert!(
             text.contains("did not apply"),
@@ -336,6 +443,105 @@ mod tests {
             text.contains("Error:"),
             "the failure must read as an error, which is what the extractor keys on"
         );
+    }
+
+    /// **Recorded cost must equal what was actually spent — no gap, no double-count.**
+    ///
+    /// This assertion has now caught the accounting twice in opposite directions. First the
+    /// exploration cost was MISSING from the checkpoint ($3.36 recorded vs $3.57 spent on the
+    /// 30-instance run, understating the arm that paid it). The fix for that then DOUBLE-COUNTED
+    /// the first turn's model calls, because the delta was read after the rung loop rather than
+    /// immediately after exploration.
+    ///
+    /// Both errors land entirely on the trajectory arm, since the baseline never explores — one
+    /// flattering it, one penalising it. Neither is acceptable in a number used to accept or reject
+    /// a feature, so the invariant is asserted rather than reasoned about.
+    /// Needs Docker: `run_instance` evaluates every candidate patch in a real container. Ignored by
+    /// default so CI without a daemon stays green, matching `sandbox::tests::real_*`. Run with:
+    ///   cargo test -p firstpass-bench --lib recorded_cost -- --ignored
+    ///
+    /// It passed locally and failed on the macOS runner, which has no Docker — the test was
+    /// portable only by accident of my machine.
+    #[test]
+    #[ignore = "needs a running Docker daemon"]
+    fn recorded_cost_equals_actual_spend() {
+        // Every call bills exactly 1000 in + 1000 out at unit prices, so each is $0.002.
+        const PER_CALL: f64 = 0.002;
+        let call =
+            |_b: &str, _m: &serde_json::Value, _t: u32| Ok(("DONE".to_owned(), 1000u64, 1000u64));
+        let task = SweInstance {
+            instance_id: "t".into(),
+            repo: "r".into(),
+            base_commit: "c".into(),
+            problem_statement: "p".into(),
+            test_patch: String::new(),
+            fail_to_pass: vec!["t::a".into()],
+            pass_to_pass: vec![],
+            image: "img".into(),
+        };
+        let rungs = vec![SweRung {
+            model: "m".into(),
+            bare: "m".into(),
+            in_price: 1e-6,
+            out_price: 1e-6,
+        }];
+        let run = run_instance(&task, &rungs, &SweLimits::default(), 1, &call)
+            .expect("the loop must complete");
+
+        let recorded: f64 = run
+            .recorded
+            .turns
+            .iter()
+            .flat_map(|t| t.rungs.iter().map(|r| r.cost_usd))
+            .sum();
+        assert!(
+            (recorded - run.spent_usd).abs() < 1e-9,
+            "recorded ${recorded:.6} must equal spent ${:.6} — a gap understates the policy that \
+             paid, a surplus penalises it, and both land on the trajectory arm",
+            run.spent_usd
+        );
+        // Sanity: the fixture must actually have spent something, or the equality is vacuous.
+        assert!(
+            run.spent_usd >= PER_CALL,
+            "the fixture must incur real cost, got ${:.6}",
+            run.spent_usd
+        );
+    }
+
+    /// **What the model read must reach the prompt it writes the patch from.**
+    ///
+    /// This is the wiring-bug class that has bitten this feature repeatedly: a signal that is
+    /// extracted, recorded, and then silently dropped before the only consumer that matters. The
+    /// exploration phase is pure cost if its findings do not appear in the patch prompt — and the
+    /// symptom would be indistinguishable from "the model is bad at patching".
+    #[test]
+    fn exploration_findings_reach_the_patch_prompt() {
+        let inst = SweInstance {
+            instance_id: "x__y-1".into(),
+            repo: "x/y".into(),
+            base_commit: "abc".into(),
+            problem_statement: "boom".into(),
+            test_patch: String::new(),
+            fail_to_pass: vec!["t::a".into()],
+            pass_to_pass: vec![],
+            image: "img".into(),
+        };
+        let findings = "$ read src/mod.py 10 20\n10: def separability_matrix(x):\n";
+        let msgs = build_messages(&inst, &[], findings);
+        let text = msgs.to_string();
+        assert!(
+            text.contains("separability_matrix"),
+            "the code the model read must appear in the patch prompt: {text}"
+        );
+        assert!(
+            text.contains("Code you inspected"),
+            "and it must be labelled so the model knows what it is looking at"
+        );
+
+        // With no exploration, the prompt says so plainly rather than showing an empty section —
+        // an empty heading reads as "there was nothing to find", which is a different claim.
+        let empty = build_messages(&inst, &[], "").to_string();
+        assert!(empty.contains("no exploration performed"), "{empty}");
     }
 
     /// Fenced diffs are a formatting slip, not a failed patch.

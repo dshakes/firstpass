@@ -1,0 +1,106 @@
+# Agentic SWE-bench — repository-scale multi-turn repair
+
+instances: 30
+turns:     90
+max depth: 2  (MBPP capped at 2; `High` needs >= 8)
+spend:     $3.57 of $12.00
+
+| policy | success | $/success |
+|---|---|---|
+| baseline (always start cheap) | 0.011 | $2.95829 |
+| trajectory-informed start | 0.000 | $inf |
+
+paired quality delta: -0.0111  CI [-0.0333, 0.0000]
+cost improvement:     +0.0%
+
+## Pre-registered verdict
+
+KILLED: paired quality CI lower bound -0.0333 breaches the 0.0100 regression limit — cheaper is worthless if it serves more failures
+
+---
+
+# What this run establishes
+
+Second agentic SWE-bench run, this time with **repository read access** (`swe_explore.rs`): before
+writing a patch the model may `ls`, `grep`, and `read` inside the same fail-closed container, up to
+four steps, on the cheapest rung.
+
+It exists because the first run resolved **1 issue in 352 model calls** and the diagnosis was that
+the solver was writing diffs for files it had never opened. That diagnosis turns out to be **half
+right**, and the run says which half.
+
+## File access fixed patch formation, not reasoning
+
+| metric | no file access | with file access |
+|---|---|---|
+| **gate-pass** (patch applies AND targeted tests move) | 1/352 = 0.3% | **19/180 = 10.6%** |
+| **resolved** (oracle: all F2P pass, all P2P still pass) | 1/352 = 0.3% | 1/180 = 0.6% |
+| instances resolved | 1/22 | 1/30 |
+| cost per instance | ~$0.40 | **$0.11** |
+
+**A 35× improvement in gate-pass and essentially none in resolution.** Reading the code solved a
+formatting-and-context problem — the diffs now apply and move the right tests. It did not solve the
+reasoning problem of actually fixing an astropy or django bug, which three turns of
+haiku→sonnet does not reach.
+
+Cost fell 4× because exploration runs once per instance on the cheap rung, and a model that has read
+the function writes a shorter patch than one guessing at context.
+
+## The routing verdict: KILLED, and this time the number means something
+
+Paired quality CI lower bound **−0.0333**, breaching the −0.01 regression limit. The trajectory-
+informed start rung **served more failures** than always starting cheap.
+
+Unlike the previous SWE-bench run — where 1 success in 352 calls made every ratio meaningless — 19
+gate-passes give the paired CI enough signal to discriminate. This is a real refutation rather than
+an artifact of a near-zero denominator.
+
+## Caveats, stated rather than buried
+
+1. **`max depth: 2`.** Run with `FIRSTPASS_SWE_TURNS=3`, so the `deep` signal (>= 5) never engaged.
+   The kill rests entirely on `Medium`-level turns; `High` was not exercised.
+2. **Resolution is still ~0.6%.** These are real astropy/django bugs and this is still a weak agent:
+   no test execution between turns, no iterative narrowing, a 4-step exploration budget. A
+   state-of-the-art SWE-bench agent does far more. What this harness now measures well is *gate*
+   behaviour, not frontier repair capability.
+3. **Sonnet returned empty responses** on a minority of calls even after escalating the token
+   budget. Those score as failed candidates — accurate, but it depresses sonnet's measured
+   performance and should not be read as sonnet being weak at repair.
+4. **arm64 host, x86 images under emulation**; gVisor absent, so the default OCI runtime was used.
+
+## Standing after three measurements
+
+| workload | verdict |
+|---|---|
+| MBPP 974 (1228 turns, $8.05) | **KILLED** — −3.4% cost |
+| SWE-bench 22 (no file access, $8.69) | no usable evidence — 1 success total |
+| SWE-bench 30 (file access, $3.36) | **KILLED** — quality CI −0.0333 |
+
+Two genuine refutations and one abstention. The trajectory feature does not ship.
+
+---
+
+## Correction: the checkpoint under-records cost by ~6%
+
+Found in review after this run was published. Exploration is paid before the first turn and was
+counted toward the live budget but never written into the checkpoint, so:
+
+- **recorded in `swebench-30-fileaccess.checkpoint.jsonl`: $3.36**
+- **actually spent: $3.57**
+
+The ~$0.21 gap is exploration, and it lands **entirely on the trajectory arm** — the baseline never
+explores. The published cost figures therefore flatter the arm under test by roughly 6%.
+
+**The verdict is unaffected, and the reason matters.** This run was `KILLED` on the **quality** leg
+(paired CI lower bound −0.0333), not on cost. A correction that makes the killed arm look *more*
+expensive cannot rescue it; it can only strengthen the refutation.
+
+The `gate-pass 0.3% → 10.6%` and `resolved 0.3% → 0.6%` figures are unaffected — those are counts,
+not costs.
+
+Fixed in the harness (`swe_agentic.rs`), with `recorded_cost_equals_actual_spend` asserting the
+invariant. The fix itself then double-counted the first turn's model calls, which the same test
+caught: it is mutation-checked in **both** directions, because an accounting error that flatters and
+one that penalises are equally disqualifying in a number used to accept or reject a feature. The
+checkpoint above is left as-recorded rather than retro-edited — a benchmark artifact that gets
+rewritten after the fact is not an artifact.
