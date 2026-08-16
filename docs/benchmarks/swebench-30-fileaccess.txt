@@ -77,3 +77,30 @@ an artifact of a near-zero denominator.
 | SWE-bench 30 (file access, $3.36) | **KILLED** — quality CI −0.0333 |
 
 Two genuine refutations and one abstention. The trajectory feature does not ship.
+
+---
+
+## Correction: the checkpoint under-records cost by ~6%
+
+Found in review after this run was published. Exploration is paid before the first turn and was
+counted toward the live budget but never written into the checkpoint, so:
+
+- **recorded in `swebench-30-fileaccess.checkpoint.jsonl`: $3.36**
+- **actually spent: $3.57**
+
+The ~$0.21 gap is exploration, and it lands **entirely on the trajectory arm** — the baseline never
+explores. The published cost figures therefore flatter the arm under test by roughly 6%.
+
+**The verdict is unaffected, and the reason matters.** This run was `KILLED` on the **quality** leg
+(paired CI lower bound −0.0333), not on cost. A correction that makes the killed arm look *more*
+expensive cannot rescue it; it can only strengthen the refutation.
+
+The `gate-pass 0.3% → 10.6%` and `resolved 0.3% → 0.6%` figures are unaffected — those are counts,
+not costs.
+
+Fixed in the harness (`swe_agentic.rs`), with `recorded_cost_equals_actual_spend` asserting the
+invariant. The fix itself then double-counted the first turn's model calls, which the same test
+caught: it is mutation-checked in **both** directions, because an accounting error that flatters and
+one that penalises are equally disqualifying in a number used to accept or reject a feature. The
+checkpoint above is left as-recorded rather than retro-edited — a benchmark artifact that gets
+rewritten after the fact is not an artifact.

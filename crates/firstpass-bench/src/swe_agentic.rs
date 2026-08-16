@@ -231,7 +231,7 @@ pub fn run_instance(
     //
     // This is what the first SWE-bench run lacked, and why it resolved 1 issue in 352 calls: the
     // solver was writing diffs for files it had never opened.
-    let explore_start = spent;
+    let before_explore = spent;
     let findings = rungs.first().map_or_else(String::new, |r| {
         explore_phase(
             instance,
@@ -243,6 +243,15 @@ pub fn run_instance(
             r.out_price,
         )
     });
+
+    // Snapshot the exploration cost HERE, immediately after the phase that incurred it.
+    //
+    // The first version computed `spent - explore_start` inside the turn loop, AFTER the rungs had
+    // run — so it captured exploration plus that turn's model calls and added them a second time.
+    // The recorded cost for the trajectory arm was inflated, not merely misattributed. Flagged in
+    // review; the fix for a missing cost introduced a double-counted one.
+    let explore_cost = spent - before_explore;
+    let mut explore_cost_recorded = false;
 
     for _turn in 0..max_turns {
         // Computed BEFORE the turn is served: a routing decision may not see its own outcome.
@@ -324,10 +333,9 @@ pub fn run_instance(
         // Measured on the 30-instance run: $3.36 recorded against $3.57 actually spent. A 6% gap,
         // landing entirely on the trajectory policy since the baseline never explores — so it
         // flattered the arm under test in the published number. Flagged in review.
-        if turns.is_empty()
-            && let Some(first) = recorded_rungs.first_mut()
-        {
-            first.cost_usd += spent - explore_start;
+        if !explore_cost_recorded && let Some(first) = recorded_rungs.first_mut() {
+            first.cost_usd += explore_cost;
+            explore_cost_recorded = true;
         }
 
         turns.push(RecordedTurn {
@@ -434,6 +442,62 @@ mod tests {
         assert!(
             text.contains("Error:"),
             "the failure must read as an error, which is what the extractor keys on"
+        );
+    }
+
+    /// **Recorded cost must equal what was actually spent — no gap, no double-count.**
+    ///
+    /// This assertion has now caught the accounting twice in opposite directions. First the
+    /// exploration cost was MISSING from the checkpoint ($3.36 recorded vs $3.57 spent on the
+    /// 30-instance run, understating the arm that paid it). The fix for that then DOUBLE-COUNTED
+    /// the first turn's model calls, because the delta was read after the rung loop rather than
+    /// immediately after exploration.
+    ///
+    /// Both errors land entirely on the trajectory arm, since the baseline never explores — one
+    /// flattering it, one penalising it. Neither is acceptable in a number used to accept or reject
+    /// a feature, so the invariant is asserted rather than reasoned about.
+    #[test]
+    fn recorded_cost_equals_actual_spend() {
+        // Every call bills exactly 1000 in + 1000 out at unit prices, so each is $0.002.
+        const PER_CALL: f64 = 0.002;
+        let call =
+            |_b: &str, _m: &serde_json::Value, _t: u32| Ok(("DONE".to_owned(), 1000u64, 1000u64));
+        let task = SweInstance {
+            instance_id: "t".into(),
+            repo: "r".into(),
+            base_commit: "c".into(),
+            problem_statement: "p".into(),
+            test_patch: String::new(),
+            fail_to_pass: vec!["t::a".into()],
+            pass_to_pass: vec![],
+            image: "img".into(),
+        };
+        let rungs = vec![SweRung {
+            model: "m".into(),
+            bare: "m".into(),
+            in_price: 1e-6,
+            out_price: 1e-6,
+        }];
+        let run = run_instance(&task, &rungs, &SweLimits::default(), 1, &call)
+            .expect("the loop must complete");
+
+        let recorded: f64 = run
+            .recorded
+            .turns
+            .iter()
+            .flat_map(|t| t.rungs.iter().map(|r| r.cost_usd))
+            .sum();
+        assert!(
+            (recorded - run.spent_usd).abs() < 1e-9,
+            "recorded ${recorded:.6} must equal spent ${:.6} — a gap understates the policy that \
+             paid, a surplus penalises it, and both land on the trajectory arm",
+            run.spent_usd
+        );
+        // Sanity: the fixture must actually have spent something, or the equality is vacuous.
+        assert!(
+            run.spent_usd >= PER_CALL,
+            "the fixture must incur real cost, got ${:.6}",
+            run.spent_usd
         );
     }
 
