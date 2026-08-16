@@ -178,6 +178,67 @@ conservative, so it never under-covers.
 Critically, calibration and evaluation must not share data. We calibrate on one split and report
 realized served-failure on a disjoint split.
 
+\subsection{Anytime-valid risk control under continuous recalibration}
+\label{sec:anytime}
+
+The guarantee above is a \emph{fixed-sample} one: it holds for a threshold chosen once, on an
+exchangeable calibration set. That is the right claim when an operator recalibrates deliberately,
+reads a report, and adopts a threshold. It is the wrong claim for how the system is actually
+deployed.
+
+A serving proxy accumulates deferred feedback continuously. Re-running a fixed-sample procedure
+whenever more data arrives, and adopting the winning threshold each time, is optional stopping on a
+growing stream: every individual run is valid while the \emph{sequence of adoptions} is not. The
+adaptive-conformal alternative \cite{gibbs2021adaptive} tracks a shifting target but promises only
+that the \emph{long-run average} converges to $\alpha$, which permits arbitrarily long excursions
+above it. An operator holding an error budget needs the bound to hold at the round they are on.
+
+We close this with an \textbf{e-process} per candidate threshold on a Bonferroni grid, following
+Conformal Selective Acting \cite{khosravi2026csa}. For a served item with score $g(y)$ and observed
+correctness $c$, every threshold $\lambda \leq g(y)$ --- that is, every threshold that \emph{would
+have served} this item --- is updated by the betting factor
+\[
+E_\lambda \leftarrow E_\lambda \cdot \bigl(1 + \beta\,(\alpha - \mathbb{1}[\neg c])\bigr),
+\]
+whose expectation under $H_0\!:\ \mathrm{risk}(\lambda) > \alpha$ is at most $1$. Each $E_\lambda$ is
+therefore a non-negative supermartingale, and Ville's inequality bounds it at \emph{all} stopping
+times simultaneously:
+\[
+\Pr\bigl(\exists t : E_\lambda^{(t)} \geq n/\delta\bigr) \leq \delta/n .
+\]
+The existential quantifier over $t$ is the whole point: it is what makes the bound survive optional
+stopping, so re-reading the certified threshold as often as the serving path likes costs nothing in
+validity. Thresholds that never serve are never updated, which matters --- attributing an outcome to
+a threshold that would have escalated instead would break exactly the property the inequality needs.
+
+Three implementation choices are load-bearing and were each forced by a failure we observed:
+
+\begin{itemize}
+  \item \textbf{Certification is evaluated live, not latched.} Recording ``this threshold crossed''
+  permanently reintroduces the fixed-sample failure inside the online method: under a regime change
+  the system keeps serving at a threshold the new regime does not justify. Our first implementation
+  latched, and the regime-change test caught realized failure well above the target $\alpha$.
+  \item \textbf{E-values are capped.} Truncating a supermartingale from above preserves type-I
+  control, but without a ceiling a long clean stretch banks unbounded surplus that a later shift must
+  burn off before de-certifying --- the bound holds asymptotically while realized failure sits above
+  $\alpha$ for thousands of rounds.
+  \item \textbf{The grid is quantised.} The crossing level is $n/\delta$, so evidence required per
+  threshold grows linearly in the number of distinct candidate scores. Deriving the grid from the
+  observed score support --- which the fixed-sample method can do for free --- yields $\sim$10k
+  candidates on a realistic store and a crossing level of 200{,}000, at which nothing ever certifies.
+  The failure is silent: the report reads ``no threshold certified,'' indistinguishable from honest
+  insufficient data.
+\end{itemize}
+
+The system \textbf{fails closed by omission}: before anything is certified, the controller returns no
+threshold and the caller retains its prior behaviour. Enabling anytime-valid control therefore cannot
+change serving until the evidence exists.
+
+Anytime validity is not free. At equal $\alpha$ this serves less traffic than adaptive conformal,
+because it will not lower the threshold until evidence has accumulated and the Bonferroni correction
+makes each threshold individually harder to certify. That is the trade on offer: an average versus a
+per-round promise. Neither dominates, and an operator selects the regime.
+
 \subsection{Auditability}
 \label{sec:audit}
 
@@ -375,6 +436,90 @@ negative result on the workload where the mechanism cannot help is the honest sc
 contribution, not evidence against it.}
 \end{table}
 
+\subsection{A negative result: trajectory-informed start rungs do not pay}
+\label{sec:trajectory}
+
+Contemporary agent routers read signals already present in the conversation --- failing tool
+results, repeated unproductive work, prolonged exploration --- to choose a model per turn without an
+additional inference call. NVIDIA's NeMo Switchyard ships this as its \texttt{stage\_router}. The
+appeal is real: a verified cascade only learns a session is hard \emph{after} paying for a failed
+attempt, whereas a transcript reveals difficulty before any tokens are spent.
+
+We implemented it, pre-registered a bar, and it failed. We report this because the technique is
+being deployed without published evidence, and a negative result on it is more useful than another
+confirmation of our own thesis.
+
+\paragraph{The pre-registered criterion.} Fixed before any measurement: the trajectory-informed
+start rung must improve \$/success by at least $5\%$ \emph{and} the paired quality confidence
+interval's \emph{lower bound} must not breach a $-0.01$ regression limit. The bound rather than the
+point estimate, because on noisy data a mean that lands positive is not evidence of no harm --- the
+claim is about the worst case the data still supports.
+
+\paragraph{Three measurements.}
+
+\begin{center}
+\begin{tabular}{llr}
+\toprule
+Workload & Verdict & Result \\
+\midrule
+MBPP, 974 tasks, 1228 turns & \textsc{killed} & $-3.4\%$ cost \\
+SWE-bench, 22 instances, no file access & abstained & no usable signal \\
+SWE-bench, 30 instances, with file access & \textsc{killed} & quality CI $-0.0333$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+On MBPP the feature made routing \emph{more} expensive ($\$0.00547$ vs $\$0.00529$ per success)
+while quality was statistically indistinguishable ($+0.0024$, CI $[-0.0008, +0.0065]$). The
+mechanism is legible: MBPP retries are cheap, so starting higher on a troubled-looking conversation
+skips a cheap rung that would usually have passed, and savings on genuinely hard tasks cannot cover
+it. Of $1228$ turns, $254$ had the two policies making different decisions --- enough for the paired
+interval to carry information.
+
+The second measurement produced \emph{no usable evidence} and we label it as such: with one resolved
+issue in $352$ model calls, every cost-per-success ratio divides by approximately zero. We report it
+rather than discarding it, because a benchmark that retains only its legible runs is not a benchmark.
+
+The third measurement is the informative one. Giving the agent read-only repository access
+(\S\ref{sec:filesaccess}) raised the gate-pass rate from $0.3\%$ to $10.6\%$, which supplied enough
+successful outcomes for the paired interval to discriminate. It rejected the feature on the quality
+leg: the trajectory-informed policy \emph{served more failures}.
+
+\paragraph{Scope of the claim.} We refute the technique on these two workloads, which have opposite
+retry economics; we do not refute it universally. Two of four difficulty levels never fired in
+either harness --- \texttt{Low} because our retry loop only continues on failure, so every recorded
+tool result is a failure, and \texttt{High} because observed conversation depth never reached the
+threshold. A workload with genuinely long agent sessions and expensive retries remains the setting
+where the technique could pay, and we have not measured one.
+
+\subsection{Repository access: what it fixes and what it does not}
+\label{sec:filesaccess}
+
+The second SWE-bench measurement failed because the solver emitted patches for files it had never
+opened. We added three read-only verbs (\texttt{ls}, \texttt{grep}, \texttt{read}) executed inside
+the same fail-closed container as the evaluator: the model selects among typed questions rather than
+naming a command, so the attack surface is bounded by the verb set and not by the sandbox alone.
+
+The effect separates two problems that are easily conflated:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+& Without file access & With file access \\
+\midrule
+Gate-pass (patch applies, targeted tests move) & $0.3\%$ & $\mathbf{10.6\%}$ \\
+Resolved (all \textsc{fail\_to\_pass} pass) & $0.3\%$ & $0.6\%$ \\
+Cost per instance & ${\sim}\$0.40$ & $\mathbf{\$0.11}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Reading the code fixes \emph{patch formation} --- a formatting and context problem --- by a factor of
+$35$, and barely moves \emph{resolution}, which is a reasoning problem. Cost falls because
+exploration runs once per instance on the cheapest rung, and a model that has read the function emits
+a shorter patch than one guessing at context. The resulting harness measures gate behaviour well; it
+does not measure frontier repair capability, and we do not claim it does.
+
 \section{Limitations}
 
 \textbf{Verification needs something to verify against.} This approach is strongest where
@@ -421,6 +566,17 @@ arXiv:2403.12031, 2024.
 2021.
 \bibitem{routerarena} RouterArena: An Open Platform for Comprehensive Comparison of LLM Routers.
 arXiv:2510.00202, 2025.
+\bibitem{gibbs2021adaptive} I. Gibbs, E. Cand\`es. Adaptive Conformal Inference Under Distribution
+Shift. NeurIPS, 2021.
+
+\bibitem{khosravi2026csa} H. Khosravi, X. Huo. Conformal Selective Acting: Anytime-Valid Risk Control
+for RLVR-Trained LLMs. arXiv:2605.20270, 2026.
+
+\bibitem{ville1939} J. Ville. \'Etude Critique de la Notion de Collectif. Gauthier-Villars, 1939.
+
+\bibitem{swebench} C. E. Jimenez, J. Yang, et al. SWE-bench: Can Language Models Resolve Real-World
+GitHub Issues? ICLR, 2024.
+
 \end{thebibliography}
 
 % Machine-readable draft state, so a build can be gated on it rather than on someone remembering

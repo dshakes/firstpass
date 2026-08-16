@@ -26,6 +26,9 @@ ARTIFACTS = sorted((ROOT / "docs" / "benchmarks").glob("*.txt"))
 ALLOW = {
     "0.0082",
     "0.10", "0.05", "0.95", "1.0", "0.5", "2021", "2023", "2024", "2025",
+    # arXiv identifiers, not measurements. Added with v0.8.x: 2605.20270 (Conformal Selective
+    # Acting) and the 1939/2026 publication years cited alongside it.
+    "2605.20270", "1939", "2026",
     "2108.07732", "2305.05176", "2310.12963", "2403.12031", "2404.14618",
     "2406.18665", "2505.19970", "2510.00202", "0.78", "0.94", "0.93",
 }
