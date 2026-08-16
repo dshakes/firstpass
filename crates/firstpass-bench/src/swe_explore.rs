@@ -143,10 +143,21 @@ impl ExploreCmd {
                 if *start > MAX_LINE {
                     return Err(format!("start line {start} is beyond any real file"));
                 }
-                // Line numbers in the output, so a patch the model writes afterwards can cite them.
+                // `awk` with the REAL line number, not `sed | cat -n`.
+                //
+                // The previous form printed a constant `{start}:` prefix on every line, so `read f
+                // 100 200` labelled all 101 lines "100:" — actively misleading for the one job this
+                // verb has, which is giving the model accurate line references to cite in a patch.
+                // Caught in review; the unit tests only asserted the generated shell string, never
+                // ran it, so a wrong-but-well-formed command passed.
+                //
+                // `./` prefix rather than `--`: it makes an option-looking filename an operand for
+                // any tool (BSD awk and sed both reject `--`, and this must also run outside the
+                // container for local checks), and `safe_path` has already refused absolute paths
+                // and traversal.
                 Ok(format!(
-                    "sed -n '{start},{end}p' -- {} 2>&1 | cat -n | sed 's/^/{start}:/'",
-                    shell_quote(file)
+                    "awk 'NR>={start} && NR<={end} {{ printf \"%d:%s\\n\", NR, $0 }}' {} 2>&1",
+                    shell_quote(&format!("./{file}"))
                 ))
             }
         }
@@ -346,6 +357,57 @@ mod tests {
         assert!(subst.starts_with("grep -rnF -e '$(whoami)`id`'"), "{subst}");
     }
 
+    /// **The generated command must be EXECUTED, not just inspected.**
+    ///
+    /// Every other test here asserts the shell string. That is how a wrong-but-well-formed command
+    /// shipped: `sed -n '100,200p' | cat -n | sed 's/^/100:/'` looks plausible and labels all 101
+    /// lines "100:", destroying the line references this verb exists to provide. Reviewer caught it;
+    /// no string assertion could have.
+    ///
+    /// Runs `sh` on the host against a temp file — no Docker, so it works in CI — because the
+    /// question is whether the command text is *correct*, not whether the container works.
+    #[test]
+    fn the_read_command_actually_emits_real_line_numbers() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join("fp-swe-explore-read");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lines.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 1..=10 {
+            writeln!(f, "line{i}").unwrap();
+        }
+        drop(f);
+
+        let script = ExploreCmd::Read {
+            file: "lines.txt".into(),
+            start: 3,
+            end: 5,
+        }
+        .to_shell()
+        .unwrap();
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(&dir)
+            .output()
+            .expect("sh must run");
+        let text = String::from_utf8_lossy(&out.stdout);
+
+        assert!(
+            text.contains("3:line3") && text.contains("4:line4") && text.contains("5:line5"),
+            "each line must carry its OWN number, got:\n{text}\nfrom: {script}"
+        );
+        assert!(
+            !text.contains("3:line4"),
+            "a constant prefix on every line is the bug this test exists for:\n{text}"
+        );
+        assert!(
+            !text.contains("line2") && !text.contains("line6"),
+            "the range must be respected:\n{text}"
+        );
+    }
+
     /// **Quoting is not enough: a path that looks like a CLI OPTION must not be parsed as one.**
     ///
     /// `--version` or `-rf` is perfectly safe as shell syntax and still gets consumed as an option
@@ -382,9 +444,11 @@ mod tests {
         }
         .to_shell()
         .unwrap();
+        // `read` uses a `./` prefix rather than `--`: it makes an option-looking filename an
+        // operand for any tool, including the BSD awk/sed that reject `--` outright.
         assert!(
-            read.contains("-- '-n'"),
-            "sed must terminate options: {read}"
+            read.contains("'./-n'"),
+            "an option-looking filename must be made an operand: {read}"
         );
     }
 
@@ -510,7 +574,11 @@ mod tests {
             // File redirection specifically, not every `>`: `2>&1` is stderr capture and is fine,
             // while `> file` or `>> file` would be a write. Checking for a bare `>` failed here on
             // exactly that distinction — worth encoding precisely rather than loosening.
-            let writes = sh.replace("2>&1", "");
+            // Strip constructs that legitimately contain `>`: stderr capture, and awk's `>=`
+            // comparison. What must not survive is redirection INTO a file. Sharpened twice now —
+            // first for `2>&1`, then for `>=` — because "contains a greater-than sign" is a proxy
+            // for "writes" and the proxy keeps catching syntax that is not a write.
+            let writes = sh.replace("2>&1", "").replace(">=", "");
             assert!(
                 !writes.contains('>'),
                 "read-only verb {cmd:?} redirects to a file: {sh}"
