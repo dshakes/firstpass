@@ -456,7 +456,14 @@ mod tests {
     /// Both errors land entirely on the trajectory arm, since the baseline never explores — one
     /// flattering it, one penalising it. Neither is acceptable in a number used to accept or reject
     /// a feature, so the invariant is asserted rather than reasoned about.
+    /// Needs Docker: `run_instance` evaluates every candidate patch in a real container. Ignored by
+    /// default so CI without a daemon stays green, matching `sandbox::tests::real_*`. Run with:
+    ///   cargo test -p firstpass-bench --lib recorded_cost -- --ignored
+    ///
+    /// It passed locally and failed on the macOS runner, which has no Docker — the test was
+    /// portable only by accident of my machine.
     #[test]
+    #[ignore = "needs a running Docker daemon"]
     fn recorded_cost_equals_actual_spend() {
         // Every call bills exactly 1000 in + 1000 out at unit prices, so each is $0.002.
         const PER_CALL: f64 = 0.002;
