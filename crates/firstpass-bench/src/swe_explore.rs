@@ -86,6 +86,11 @@ fn safe_path(p: &str) -> Result<(), String> {
 
 /// Single-quote a value for `sh -c`, so no argument can break out into shell syntax.
 ///
+/// Quoting alone is **not sufficient**, which is why every command template also carries a `--`
+/// terminator (and `grep` an explicit `-e`). A path like `--version` or `-rf` is perfectly safe as
+/// *shell syntax* and still gets parsed as an *option* by the tool receiving it — a second
+/// injection surface one layer down from the shell. Flagged in review.
+///
 /// The model supplies grep patterns, which are the one place arbitrary text reaches a command line.
 /// POSIX single quotes suppress every metacharacter; the only escape needed is for the quote itself.
 fn shell_quote(s: &str) -> String {
@@ -103,7 +108,7 @@ impl ExploreCmd {
                 safe_path(dir)?;
                 // `-p` marks directories with a trailing slash so the model can navigate without a
                 // second call to find out what is a directory.
-                Ok(format!("ls -p {} 2>&1 | head -200", shell_quote(dir)))
+                Ok(format!("ls -p -- {} 2>&1 | head -200", shell_quote(dir)))
             }
             Self::Grep { pattern, dir } => {
                 safe_path(dir)?;
@@ -114,7 +119,7 @@ impl ExploreCmd {
                 // regex would either error or match unexpectedly. `-n` gives line numbers, which is
                 // what makes the follow-up `read` precise.
                 Ok(format!(
-                    "grep -rnF {} {} 2>&1 | head -100",
+                    "grep -rnF -e {} -- {} 2>&1 | head -100",
                     shell_quote(pattern),
                     shell_quote(dir)
                 ))
@@ -129,9 +134,18 @@ impl ExploreCmd {
                         "range {start}..{end} exceeds the {MAX_READ_LINES}-line limit"
                     ));
                 }
+                // A width check alone does not catch a SATURATED range: `read f 18446744073709551615`
+                // saturates to start == end, width 0, which passes. No file has a line
+                // 18446744073709551615, so an absurd start is refused on its own terms. Caught by
+                // the test written for the overflow fix — the fix removed the panic and left the
+                // nonsense.
+                const MAX_LINE: usize = 10_000_000;
+                if *start > MAX_LINE {
+                    return Err(format!("start line {start} is beyond any real file"));
+                }
                 // Line numbers in the output, so a patch the model writes afterwards can cite them.
                 Ok(format!(
-                    "sed -n '{start},{end}p' {} 2>&1 | cat -n | sed 's/^/{start}:/'",
+                    "sed -n '{start},{end}p' -- {} 2>&1 | cat -n | sed 's/^/{start}:/'",
                     shell_quote(file)
                 ))
             }
@@ -183,7 +197,11 @@ pub fn parse_cmd(line: &str) -> Result<ExploreCmd, String> {
                 .map_err(|_| "read start line must be a number".to_owned())?;
             let end: usize = parts
                 .next()
-                .map_or(Ok(start + 120), str::parse)
+                // `saturating_add`: `start` is parsed from model output, so `read f 18446744073709551615`
+                // would overflow and panic in debug. The range check below then rejects the
+                // saturated value, which is the correct outcome — a nonsense range is refused, not
+                // crashed on. Flagged in review.
+                .map_or(Ok(start.saturating_add(120)), str::parse)
                 .map_err(|_| "read end line must be a number".to_owned())?;
             Ok(ExploreCmd::Read {
                 file,
@@ -233,6 +251,21 @@ pub fn run_explore(
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| format!("docker run failed for {}: {e}", instance.instance_id))?;
+
+    // A non-zero exit is an INFRASTRUCTURE failure, and it must never be reported to the model as
+    // "(no output)". That phrasing means "the path does not exist" — a false fact the model will
+    // then reason from, wasting paid turns chasing a file it was wrongly told is absent. Docker
+    // writes the real cause to stderr, so that is what gets surfaced. Flagged in review.
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim();
+        return Err(format!(
+            "exploration container failed for {} (exit {:?}): {}",
+            instance.instance_id,
+            out.status.code(),
+            if err.is_empty() { "(no stderr)" } else { err }
+        ));
+    }
 
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     if text.trim().is_empty() {
@@ -310,7 +343,49 @@ mod tests {
         }
         .to_shell()
         .unwrap();
-        assert!(subst.starts_with("grep -rnF '$(whoami)`id`'"), "{subst}");
+        assert!(subst.starts_with("grep -rnF -e '$(whoami)`id`'"), "{subst}");
+    }
+
+    /// **Quoting is not enough: a path that looks like a CLI OPTION must not be parsed as one.**
+    ///
+    /// `--version` or `-rf` is perfectly safe as shell syntax and still gets consumed as an option
+    /// by the tool receiving it — an injection surface one layer below the shell. Every template
+    /// carries a `--` terminator (and `grep` an explicit `-e`) so a model-supplied value is always
+    /// an operand. Flagged in review.
+    #[test]
+    fn option_like_arguments_are_treated_as_operands() {
+        let ls = ExploreCmd::Ls {
+            dir: "--version".into(),
+        }
+        .to_shell()
+        .unwrap();
+        assert!(
+            ls.contains("-- '--version'"),
+            "ls must terminate options: {ls}"
+        );
+
+        let grep = ExploreCmd::Grep {
+            pattern: "-rf".into(),
+            dir: "-x".into(),
+        }
+        .to_shell()
+        .unwrap();
+        assert!(
+            grep.contains("-e '-rf'") && grep.contains("-- '-x'"),
+            "grep must take the pattern via -e and terminate options before the path: {grep}"
+        );
+
+        let read = ExploreCmd::Read {
+            file: "-n".into(),
+            start: 1,
+            end: 5,
+        }
+        .to_shell()
+        .unwrap();
+        assert!(
+            read.contains("-- '-n'"),
+            "sed must terminate options: {read}"
+        );
     }
 
     /// A read must be bounded. Without a cap, one call could pull an entire file into the next
@@ -386,6 +461,26 @@ mod tests {
             err.contains("ls"),
             "the error must list the legal verbs: {err}"
         );
+    }
+
+    /// **A model-supplied line number must not be able to panic the harness.**
+    ///
+    /// `read <file> <huge>` overflowed `start + 120` and panicked in debug builds. Every argument
+    /// here is parsed from model output, so "no sensible model would send that" is not a bound —
+    /// a confused model, or a hostile one, sends exactly that. Flagged in review.
+    #[test]
+    fn an_absurd_line_number_is_refused_rather_than_panicking() {
+        let cmd = parse_cmd(&format!("read f.py {}", usize::MAX))
+            .expect("parsing a huge start line must not panic");
+        // Saturation makes the range absurd, and the range check then refuses it — refused, not
+        // crashed, which is the whole point.
+        assert!(
+            cmd.to_shell().is_err(),
+            "a saturated range must be rejected by the width check"
+        );
+        // The explicit two-argument form must be equally safe.
+        let cmd2 = parse_cmd(&format!("read f.py 1 {}", usize::MAX)).expect("must not panic");
+        assert!(cmd2.to_shell().is_err());
     }
 
     /// There is no verb that writes, executes arbitrary code, or reaches the network. This asserts
