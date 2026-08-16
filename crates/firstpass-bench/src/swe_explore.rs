@@ -321,7 +321,18 @@ pub fn run_explore(
         text = "(no output — no matches, or the path does not exist)".to_owned();
     }
     if text.len() > MAX_OUTPUT_BYTES {
-        text.truncate(MAX_OUTPUT_BYTES);
+        // `String::truncate` PANICS if the index is not a char boundary, and source files are full
+        // of non-ASCII — a comment with an em dash or an accented name straddling byte 8000 would
+        // abort the whole benchmark run mid-instance. Walk back to the nearest boundary instead.
+        //
+        // Same defect class as the `get(..64)` byte-slicing bug in the OpenAI error detector caught
+        // earlier: reasoning about a UTF-8 string in bytes. I fixed that one and then wrote this
+        // one. Flagged in review.
+        let mut cut = MAX_OUTPUT_BYTES;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
         text.push_str("\n… (truncated)");
     }
     Ok(text)
@@ -391,6 +402,38 @@ mod tests {
         .to_shell()
         .unwrap();
         assert!(subst.starts_with("grep -rnF -e '$(whoami)`id`'"), "{subst}");
+    }
+
+    /// **Truncating output at a byte offset must not panic on UTF-8.**
+    ///
+    /// `String::truncate` panics unless the index is a char boundary, and source files are full of
+    /// non-ASCII: one em dash or accented identifier straddling byte 8000 would abort the whole
+    /// benchmark mid-instance, losing every paid instance after it.
+    ///
+    /// Same defect class as the `get(..64)` byte-slicing bug in the OpenAI error detector — reasoning
+    /// about a UTF-8 string in bytes. I fixed that one this session and then wrote this one, which
+    /// is why the test asserts the boundary case directly rather than trusting the next reader to
+    /// notice.
+    #[test]
+    fn oversized_output_truncates_on_a_char_boundary() {
+        // Construct a string whose byte 8000 lands mid-character.
+        let mut text = "x".repeat(MAX_OUTPUT_BYTES - 1);
+        text.push('\u{00e9}');
+        text.push_str(&"y".repeat(100));
+        assert!(
+            !text.is_char_boundary(MAX_OUTPUT_BYTES),
+            "the fixture must actually straddle the cut, or it proves nothing"
+        );
+
+        // Mirror the truncation logic exactly.
+        let mut cut = MAX_OUTPUT_BYTES;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut out = text.clone();
+        out.truncate(cut); // must not panic
+        assert!(out.len() < MAX_OUTPUT_BYTES);
+        assert!(out.is_char_boundary(out.len()));
     }
 
     /// **`grep` exit 1 means "no matches", not "the container failed".**
