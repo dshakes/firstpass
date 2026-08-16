@@ -231,6 +231,7 @@ pub fn run_instance(
     //
     // This is what the first SWE-bench run lacked, and why it resolved 1 issue in 352 calls: the
     // solver was writing diffs for files it had never opened.
+    let explore_start = spent;
     let findings = rungs.first().map_or_else(String::new, |r| {
         explore_phase(
             instance,
@@ -314,6 +315,19 @@ pub fn run_instance(
                     },
                 });
             }
+        }
+
+        // Exploration is paid ONCE, before the first turn, and must appear in the recorded cost or
+        // every offline replay understates the policy that paid for it. It is attributed to the
+        // first turn's cheapest rung, which is exactly who spent it.
+        //
+        // Measured on the 30-instance run: $3.36 recorded against $3.57 actually spent. A 6% gap,
+        // landing entirely on the trajectory policy since the baseline never explores — so it
+        // flattered the arm under test in the published number. Flagged in review.
+        if turns.is_empty()
+            && let Some(first) = recorded_rungs.first_mut()
+        {
+            first.cost_usd += spent - explore_start;
         }
 
         turns.push(RecordedTurn {

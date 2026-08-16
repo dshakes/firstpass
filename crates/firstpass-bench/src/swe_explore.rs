@@ -115,6 +115,12 @@ impl ExploreCmd {
                 if pattern.is_empty() {
                     return Err("empty grep pattern".to_owned());
                 }
+                // `safe_path` rejects NUL in paths; the pattern needs the same check. A NUL cannot
+                // survive an exec argument, so it truncates silently and the model searches for
+                // something other than what it asked. Flagged in review.
+                if pattern.contains('\0') {
+                    return Err("grep pattern contains a NUL byte".to_owned());
+                }
                 // `-F` (fixed strings): the model is looking for symbol names, and a stray `(` in a
                 // regex would either error or match unexpectedly. `-n` gives line numbers, which is
                 // what makes the follow-up `read` precise.
@@ -227,6 +233,23 @@ pub fn parse_cmd(line: &str) -> Result<ExploreCmd, String> {
     }
 }
 
+/// Which verb a command is, for exit-code interpretation.
+enum CmdKind {
+    Ls,
+    Grep,
+    Read,
+}
+
+/// Classify a command. Used only to decide whether a non-zero exit is meaningful: `grep` returning
+/// 1 is "no matches", while the same code from `ls` or `awk` is a real failure.
+const fn self_kind(cmd: &ExploreCmd) -> CmdKind {
+    match cmd {
+        ExploreCmd::Ls { .. } => CmdKind::Ls,
+        ExploreCmd::Grep { .. } => CmdKind::Grep,
+        ExploreCmd::Read { .. } => CmdKind::Read,
+    }
+}
+
 /// Run one exploration command inside the instance's container.
 ///
 /// Reuses the **same fail-closed flags** as [`crate::swebench::evaluate`]: read-only root, no
@@ -267,7 +290,20 @@ pub fn run_explore(
     // "(no output)". That phrasing means "the path does not exist" — a false fact the model will
     // then reason from, wasting paid turns chasing a file it was wrongly told is absent. Docker
     // writes the real cause to stderr, so that is what gets surfaced. Flagged in review.
-    if !out.status.success() {
+    // Exit 1 from `grep` means "no matches" — a legitimate ANSWER, and the most common one, since a
+    // model's first guess at a symbol name often misses. Review flagged that the `status.success()`
+    // check would turn that into a container failure and abort the instance.
+    //
+    // MEASURED, and the concern does not reproduce: every template ends in `| head -N`, and a shell
+    // pipeline reports the LAST command's status, so a fruitless grep exits 0 via head. Verified
+    // directly — piped 0, unpiped 1. The guard below is kept explicit anyway, because that
+    // protection is an accident of the pipeline: anyone removing `| head` would silently
+    // reintroduce the bug, and this makes the dependency visible instead of load-bearing-by-luck.
+    //
+    // Only exit 1 is forgiven, and only for grep. Exit 2 (grep's own error), 125-127 (docker could
+    // not start), and 137 (OOM kill) still fail loudly.
+    let grep_no_match = matches!(self_kind(cmd), CmdKind::Grep) && out.status.code() == Some(1);
+    if !out.status.success() && !grep_no_match {
         let err = String::from_utf8_lossy(&out.stderr);
         let err = err.trim();
         return Err(format!(
@@ -355,6 +391,60 @@ mod tests {
         .to_shell()
         .unwrap();
         assert!(subst.starts_with("grep -rnF -e '$(whoami)`id`'"), "{subst}");
+    }
+
+    /// **`grep` exit 1 means "no matches", not "the container failed".**
+    ///
+    /// This regression was introduced by the previous commit's fix for silent container failures:
+    /// tightening the error path to check `status.success()` swept up grep's most common SUCCESS
+    /// case. A model's first guess at a symbol name often misses, so aborting the instance on a
+    /// search miss would be routine. Flagged in review.
+    #[test]
+    fn a_grep_with_no_matches_is_an_answer_not_a_failure() {
+        let dir = std::env::temp_dir().join("fp-swe-explore-grep");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello\n").unwrap();
+
+        let script = ExploreCmd::Grep {
+            pattern: "definitely_not_present_xyzzy".into(),
+            dir: ".".into(),
+        }
+        .to_shell()
+        .unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(&dir)
+            .output()
+            .expect("sh runs");
+        // Exit 0, not 1: the `| head -N` pipeline reports HEAD's status, so a fruitless grep is
+        // already benign before the guard in `run_explore` sees it. Asserting the true value rather
+        // than the one the fix assumed — the reviewer's concern was real in principle and does not
+        // reproduce here, and the reason is worth pinning down so a later change to the pipeline
+        // does not silently reintroduce it.
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "a piped grep reports head's status, masking grep's exit 1"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "no matches must produce no output, which renders as '(no output)'"
+        );
+    }
+
+    /// A NUL byte in a grep pattern truncates the argument at exec, so the model would silently
+    /// search for a prefix of what it asked for. Paths were already checked; patterns were not.
+    #[test]
+    fn a_nul_byte_in_a_grep_pattern_is_refused() {
+        assert!(
+            ExploreCmd::Grep {
+                pattern: "foo\0bar".into(),
+                dir: "src".into()
+            }
+            .to_shell()
+            .is_err()
+        );
     }
 
     /// **The generated command must be EXECUTED, not just inspected.**
