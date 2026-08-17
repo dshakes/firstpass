@@ -65,18 +65,6 @@ use firstpass_core::{Features, PriceTable, TaskKind, Verdict};
 /// included if operators run overlapping routes for the same context.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContextBucket {
-    /// How hard the agent's own conversation looks (`Features::difficulty_hint`, `0..=3`).
-    ///
-    /// This is the third dimension, and it is why the other two stay coarse. Every dimension
-    /// multiplies the arm count, and arms that never accumulate traffic never learn — a bandit with
-    /// a beautifully descriptive key and four samples per arm is worse than one with a crude key and
-    /// four hundred. The hint is capped at four ordinal levels for exactly this reason, and the
-    /// three trajectory signals behind it are collapsed into this single number before they reach
-    /// here rather than each becoming a dimension of its own.
-    ///
-    /// Zero for every non-agent request, so a deployment seeing no agent traffic keys exactly as it
-    /// did before this field existed and its learned statistics remain valid.
-    pub difficulty_hint: u8,
     /// Coarse task classification from the request feature vector.
     pub task_kind: TaskKind,
     /// `features.prompt_token_bucket / 2` — halved for denser arms.
@@ -88,7 +76,6 @@ impl ContextBucket {
     #[must_use]
     pub fn from_features(f: &Features) -> Self {
         Self {
-            difficulty_hint: f.difficulty_hint,
             task_kind: f.task_kind,
             prompt_bucket_coarse: f.prompt_token_bucket / 2,
         }
@@ -457,42 +444,37 @@ mod tests {
         TaskKind, Trace,
     };
 
-    /// The trajectory hint must actually reach the bandit's key.
+    /// **Routing must be INDEPENDENT of the trajectory hint.**
     ///
-    /// Written because a mutation exposed that nothing covered this wiring: hard-coding
-    /// `difficulty_hint: 0` in `from_features` left every other test green. The feature would have
-    /// been extracted, stamped into the audit trace, exported in receipts — and silently ignored by
-    /// the one consumer that is supposed to act on it. A signal that reaches everything except the
-    /// decision is worse than no signal, because the telemetry says it is working.
+    /// This test previously asserted the opposite: that the hint reached the bandit's key. It was
+    /// written to catch a wiring bug, and it did. The hint has since been measured three times
+    /// (ADR 0012) — MBPP killed it at −3.4%, agentic SWE-bench killed it on the quality leg, and a
+    /// third run abstained — so the acting logic is gone and this asserts its absence.
+    ///
+    /// Two requests differing ONLY in trajectory difficulty must now share an arm, which is what
+    /// makes the bandit's learned statistics dense again. The hint is still extracted and recorded
+    /// in the audit trace: it costs nothing, it is informative, and a future workload with
+    /// expensive retries may yet justify acting on it. What is withdrawn is the claim that acting
+    /// on it pays.
     #[test]
-    fn the_difficulty_hint_reaches_the_bandit_key() {
+    fn the_trajectory_hint_does_not_affect_routing() {
         let mut easy = Features::new(TaskKind::CodeEdit);
         easy.prompt_token_bucket = 6;
         let mut hard = easy.clone();
         hard.difficulty_hint = 3;
 
-        let (b_easy, b_hard) = (
+        assert_eq!(
             ContextBucket::from_features(&easy),
             ContextBucket::from_features(&hard),
+            "the hint is refuted as a routing signal — requests differing only in it must share an \
+             arm, or the bandit is re-fragmented by a dimension that measured negative"
         );
-        assert_eq!(
-            b_hard.difficulty_hint, 3,
-            "the hint must be carried through"
-        );
-        assert_ne!(
-            b_easy, b_hard,
-            "identical requests differing ONLY in trajectory difficulty must key to different \
-             arms, or the bandit can never learn a different start rung for them"
-        );
-        // ...and the rest of the key must be untouched, so this is a new dimension rather than a
-        // reinterpretation of the existing ones.
-        assert_eq!(b_easy.task_kind, b_hard.task_kind);
-        assert_eq!(b_easy.prompt_bucket_coarse, b_hard.prompt_bucket_coarse);
+        // ...and the hint is still present on the feature vector, for the trace and for future study.
+        assert_eq!(hard.difficulty_hint, 3);
     }
 
     fn ctx_code() -> ContextBucket {
         ContextBucket {
-            difficulty_hint: 0,
             task_kind: TaskKind::CodeEdit,
             prompt_bucket_coarse: 3,
         }
@@ -500,7 +482,6 @@ mod tests {
 
     fn ctx_chat() -> ContextBucket {
         ContextBucket {
-            difficulty_hint: 0,
             task_kind: TaskKind::Chat,
             prompt_bucket_coarse: 3,
         }
@@ -878,7 +859,6 @@ mod tests {
         let sizes: Vec<u64> = (0..5)
             .map(|b| {
                 ContextBucket {
-                    difficulty_hint: 0,
                     task_kind: TaskKind::CodeEdit,
                     prompt_bucket_coarse: b,
                 }
@@ -891,7 +871,6 @@ mod tests {
         );
         // And bounded, so a pathological bucket cannot price a request absurdly.
         let huge = ContextBucket {
-            difficulty_hint: 0,
             task_kind: TaskKind::CodeEdit,
             prompt_bucket_coarse: u32::MAX,
         };
@@ -918,12 +897,10 @@ mod tests {
         let mut small = StartRungBandit::new(4, 0.0);
         let mut large = StartRungBandit::new(4, 0.0);
         let c_small = ContextBucket {
-            difficulty_hint: 0,
             task_kind: TaskKind::CodeEdit,
             prompt_bucket_coarse: 1,
         };
         let c_large = ContextBucket {
-            difficulty_hint: 0,
             task_kind: TaskKind::CodeEdit,
             prompt_bucket_coarse: 8,
         };
