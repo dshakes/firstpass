@@ -1,6 +1,16 @@
 # ADR 0012 — Trajectory features: routing on the agent's own conversation, before spending anything
 
-Status: **accepted — implemented and wired; not yet validated against a pre-registered bar** · 2026-08-14
+Status: **SUPERSEDED BY MEASUREMENT — extraction retained, acting logic removed** · 2026-08-14,
+revised 2026-08-16
+
+> The decision below was implemented, measured three times against its own pre-registered bar, and
+> **refuted twice with one abstention**. The routing behaviour it proposes no longer exists: the hint
+> does not key `ContextBucket` (PR #214). Extraction, scoring, the `FEATURE_VERSION` bump and the
+> audit-trace field are retained — they cost nothing and record the data a future test would need.
+>
+> Read the addenda at the end before acting on anything in the body. The body is kept intact rather
+> than rewritten, because the reasoning that motivated a refuted feature is the part worth having
+> when someone proposes it again.
 
 Bumps `FEATURE_VERSION` 1 → 2. Related: `crates/firstpass-core/src/features.rs`,
 `crates/firstpass-proxy/src/{proxy,bandit,affinity}.rs`, SPEC §8.4/§9.2.
@@ -231,6 +241,26 @@ option an operator might reasonably enable.
 A side benefit worth naming: removing the dimension makes the bandit's arms **denser**. The hint
 multiplied the arm count by up to 4×, and arms that never accumulate traffic never learn. Requests
 differing only in trajectory difficulty now share statistics again.
+
+### A cost claim in this ADR that was wrong
+
+The Decision section argues extraction is nearly free because `request_features` "already parses the
+body and walks `messages`", so this "adds one more pass over data already deserialized and warm in
+cache."
+
+**That is true of the walk and false of the parse.** `trajectory_signals` performs its own
+`serde_json::from_slice::<Value>(body)` — a second full deserialization of every request body, not a
+second pass over an existing `Value`. Raised in review, and correct: the retained extraction costs
+more than this ADR claims, and it now buys nothing on the routing path since the acting logic was
+removed.
+
+It is still worth keeping, but for a narrower reason than "free": the hint is recorded in every
+receipt, so the data to re-test the hypothesis on an expensive-retry workload accumulates without a
+second measurement campaign. That is a real benefit with a real price, rather than a free one.
+
+Reusing the `Value` that `request_features` already deserialized would remove the duplicate parse
+outright. Recorded rather than done here, because it is a change to the shared extraction path and
+belongs in its own diff with its own before/after measurement — not in a documentation PR.
 
 ### A correction to the plan for this change
 

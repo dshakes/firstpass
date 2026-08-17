@@ -1137,6 +1137,53 @@ impl Config {
                 )));
             }
         }
+        // An out-of-range e-process grid must be REJECTED, not silently filtered.
+        // `EProcessRiskControl::new` drops non-finite entries so a bad grid cannot panic, but
+        // dropping is the wrong contract for config: an operator who writes a grid of `[2.0, 3.0]`
+        // gets an empty grid, which certifies nothing, and the report then reads "no threshold
+        // certified" — indistinguishable from insufficient data. Same failure shape as the
+        // Bonferroni collapse in ADR 0011, arriving through a typo instead. Flagged in review.
+        if let Some(ep) = &config.escalation.eprocess {
+            if !ep.alpha.is_finite() || ep.alpha <= 0.0 || ep.alpha >= 1.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.eprocess.alpha must be finite and in (0, 1), got {}",
+                    ep.alpha
+                )));
+            }
+            if !ep.delta.is_finite() || ep.delta <= 0.0 || ep.delta >= 1.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.eprocess.delta must be finite and in (0, 1), got {}",
+                    ep.delta
+                )));
+            }
+            // `bet` completes the set. The runtime clamps it to a safe range so it cannot
+            // annihilate a threshold, but clamping is not validation: `bet = 0.0` clamps to 0.0,
+            // the betting factor becomes exactly 1 on every update, the e-value never moves, and
+            // NOTHING can ever certify. Silent and permanent — the same "reads as insufficient
+            // data" failure as an empty grid. I validated alpha, delta and grid and left this one,
+            // which review caught.
+            if !ep.bet.is_finite() || ep.bet <= 0.0 || ep.bet > 1.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.eprocess.bet must be finite and in (0, 1], got {}",
+                    ep.bet
+                )));
+            }
+            if ep.grid.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "escalation.eprocess.grid must not be empty — an empty grid certifies nothing"
+                        .to_owned(),
+                ));
+            }
+            if let Some(bad) = ep
+                .grid
+                .iter()
+                .find(|g| !g.is_finite() || **g < 0.0 || **g > 1.0)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.eprocess.grid values must be finite and in [0, 1], got {bad}"
+                )));
+            }
+        }
         if let Some(exp) = &config.escalation.exploration
             && (!exp.epsilon.is_finite() || exp.epsilon <= 0.0 || exp.epsilon > 0.5)
         {
@@ -1607,6 +1654,53 @@ project = "my-gcp-project"
         assert!((exp.epsilon - 0.1).abs() < 1e-12);
         // Absent => None (deterministic policy, byte-identical behavior).
         assert!(Config::parse("").unwrap().escalation.exploration.is_none());
+    }
+
+    /// An out-of-range e-process grid must be REJECTED at parse, not silently filtered.
+    ///
+    /// `EProcessRiskControl::new` drops non-finite entries so a bad grid cannot panic — correct for
+    /// a library, wrong for config. An operator who writes `grid = [2.0, 3.0]` would otherwise get
+    /// an empty grid, certify nothing, and read "no threshold certified" in the report:
+    /// indistinguishable from insufficient data. The same silent-collapse shape as the Bonferroni
+    /// failure in ADR 0011, arriving through a typo. Flagged in review.
+    #[test]
+    fn an_out_of_range_eprocess_grid_is_rejected_not_filtered() {
+        let good = "[escalation.eprocess]\nalpha = 0.1\ndelta = 0.05\ngrid = [0.0, 0.5, 1.0]\n";
+        assert!(Config::parse(good).is_ok(), "a valid grid must parse");
+
+        for bad in [
+            "[escalation.eprocess]\nalpha = 0.1\ndelta = 0.05\ngrid = [2.0]\n",
+            "[escalation.eprocess]\nalpha = 0.1\ndelta = 0.05\ngrid = [-0.5, 0.5]\n",
+            "[escalation.eprocess]\nalpha = 0.1\ndelta = 0.05\ngrid = []\n",
+        ] {
+            assert!(
+                matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
+                "must reject: {bad}"
+            );
+        }
+    }
+
+    /// `alpha` and `delta` are probabilities. Zero or one makes the guarantee vacuous or
+    /// unreachable — `delta = 0` in particular means the crossing level is infinite and nothing can
+    /// ever certify, which is a silent no-op rather than an error at runtime.
+    #[test]
+    fn degenerate_eprocess_alpha_or_delta_is_rejected() {
+        for bad in [
+            "[escalation.eprocess]\nalpha = 0.0\ndelta = 0.05\n",
+            "[escalation.eprocess]\nalpha = 1.0\ndelta = 0.05\n",
+            "[escalation.eprocess]\nalpha = 0.1\ndelta = 0.0\n",
+            "[escalation.eprocess]\nalpha = 0.1\ndelta = 1.0\n",
+            // bet = 0 clamps to 0 at runtime: the betting factor is always 1, the e-value never
+            // moves, and nothing can ever certify. Silent, permanent, and indistinguishable from
+            // insufficient data.
+            "[escalation.eprocess]\nalpha = 0.1\ndelta = 0.05\nbet = 0.0\n",
+            "[escalation.eprocess]\nalpha = 0.1\ndelta = 0.05\nbet = 1.5\n",
+        ] {
+            assert!(
+                matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
+                "must reject: {bad}"
+            );
+        }
     }
 
     #[test]

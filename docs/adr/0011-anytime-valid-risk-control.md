@@ -1,6 +1,6 @@
 # ADR 0011 — Anytime-valid risk control: a bound that holds at every round, not on average
 
-Status: **accepted — implemented, offline; not yet wired to the serving hot path** · 2026-08-14
+Status: **accepted — LIVE on the serving hot path since v0.8.0** · 2026-08-14, revised 2026-08-16
 
 Supersedes nothing. Adds a fourth calibration regime alongside `conformal`, `ltt`, and ACI.
 Related: [ADR 0008](0008-elastic-verification.md) (conformal guarantee over verify/skip),
@@ -89,8 +89,37 @@ A silent power collapse that reads as a normal result is worse than a crash. Sco
 score is not information anyone acts on. Caught in review, after this ADR's own text warned about
 Bonferroni cost and the implementation then took the unbounded path anyway.
 
-**Not yet on the hot path.** Like `conformal` and `ltt`, this is offline-only for now: an operator
-runs it, reads the report, and decides. Wiring it to serving is a deliberate follow-on.
+**On the hot path since v0.8.0.** Threshold precedence is **e-process > ACI > fixed config**: the
+e-process wins whenever it has certified something, because it is the only one of the three whose
+bound holds at the round it is read. It **fails closed by omission** — before anything is certified
+`certified_threshold()` returns `None` and the caller keeps its existing behaviour, so enabling it
+cannot change serving until the evidence exists. `/v1/feedback` closes the loop, using the score of
+the attempt actually served (read back from the stored trace, never the optional payload field —
+only thresholds that *would have served* an item may be updated, which is the condition Ville's
+inequality needs).
+
+**One controller per process, not per tenant.** `AppState.eprocess` is a single
+`Arc<Mutex<EProcessRiskControl>>`, so deferred feedback from every tenant updates the same
+e-processes. Raised in review, and the mechanism is real: the guarantee is over *one* stream, and
+pooling tenants with different quality distributions means the certified threshold reflects a
+mixture nobody is actually served from. A tenant with a strict gate drags the shared threshold up;
+one with a loose gate drags it down.
+
+Two things bound the severity. It is **pre-existing, not introduced here** —
+`AdaptiveConformal` has had the identical shape since it was wired into live serving, so this
+describes the calibration layer generally rather than the e-process specifically. And multi-tenancy
+is itself **experimental and default-off** (`tenant_auth.rs`, ADR 0004 §D7: not yet independently
+reviewed, not to be relied on as a hard isolation boundary). A single-tenant deployment — which is
+every deployment today — has one distribution and is unaffected.
+
+The fix, when tenancy graduates, is to key both controllers by tenant, at the cost of slower
+certification per tenant: the Bonferroni crossing level does not shrink because the traffic is
+split. Recorded here rather than patched now, because doing it properly is a change to the tenancy
+model and not to this ADR's mechanism.
+
+**Verified, not field-proven.** It has never certified a threshold against production traffic; that
+requires accumulated deferred feedback. `firstpass_eprocess_rounds_total` is the signal that the loop
+is turning. The paper states this limitation explicitly rather than leaving it to be discovered.
 
 ## Evidence
 

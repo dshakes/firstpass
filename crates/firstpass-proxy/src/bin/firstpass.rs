@@ -642,6 +642,16 @@ fn cmd_calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let alpha = flag("--alpha", 0.1);
     let delta = flag("--delta", 0.05);
     let min_n = flag("--min-n", 30.0) as usize;
+    // The CLI must not accept what the config parser rejects. Both are probabilities, and a
+    // degenerate value does not error at runtime — it produces `feasible: false` or an infinite
+    // crossing level, which an operator reads as "my data is insufficient" rather than "my flag is
+    // wrong". Flagged in review, after the same gap was closed in `Config::parse`.
+    for (name, v) in [("--alpha", alpha), ("--delta", delta)] {
+        if !v.is_finite() || v <= 0.0 || v >= 1.0 {
+            eprintln!("{name} must be finite and in (0, 1), got {v}");
+            std::process::exit(2);
+        }
+    }
     let method = args
         .iter()
         .position(|a| a == "--method")
