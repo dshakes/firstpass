@@ -1156,6 +1156,18 @@ impl Config {
                     ep.delta
                 )));
             }
+            // `bet` completes the set. The runtime clamps it to a safe range so it cannot
+            // annihilate a threshold, but clamping is not validation: `bet = 0.0` clamps to 0.0,
+            // the betting factor becomes exactly 1 on every update, the e-value never moves, and
+            // NOTHING can ever certify. Silent and permanent — the same "reads as insufficient
+            // data" failure as an empty grid. I validated alpha, delta and grid and left this one,
+            // which review caught.
+            if !ep.bet.is_finite() || ep.bet <= 0.0 || ep.bet > 1.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.eprocess.bet must be finite and in (0, 1], got {}",
+                    ep.bet
+                )));
+            }
             if ep.grid.is_empty() {
                 return Err(Error::InvalidConfig(
                     "escalation.eprocess.grid must not be empty — an empty grid certifies nothing"
@@ -1678,6 +1690,11 @@ project = "my-gcp-project"
             "[escalation.eprocess]\nalpha = 1.0\ndelta = 0.05\n",
             "[escalation.eprocess]\nalpha = 0.1\ndelta = 0.0\n",
             "[escalation.eprocess]\nalpha = 0.1\ndelta = 1.0\n",
+            // bet = 0 clamps to 0 at runtime: the betting factor is always 1, the e-value never
+            // moves, and nothing can ever certify. Silent, permanent, and indistinguishable from
+            // insufficient data.
+            "[escalation.eprocess]\nalpha = 0.1\ndelta = 0.05\nbet = 0.0\n",
+            "[escalation.eprocess]\nalpha = 0.1\ndelta = 0.05\nbet = 1.5\n",
         ] {
             assert!(
                 matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
