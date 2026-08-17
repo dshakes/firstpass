@@ -98,6 +98,25 @@ the attempt actually served (read back from the stored trace, never the optional
 only thresholds that *would have served* an item may be updated, which is the condition Ville's
 inequality needs).
 
+**One controller per process, not per tenant.** `AppState.eprocess` is a single
+`Arc<Mutex<EProcessRiskControl>>`, so deferred feedback from every tenant updates the same
+e-processes. Raised in review, and the mechanism is real: the guarantee is over *one* stream, and
+pooling tenants with different quality distributions means the certified threshold reflects a
+mixture nobody is actually served from. A tenant with a strict gate drags the shared threshold up;
+one with a loose gate drags it down.
+
+Two things bound the severity. It is **pre-existing, not introduced here** —
+`AdaptiveConformal` has had the identical shape since it was wired into live serving, so this
+describes the calibration layer generally rather than the e-process specifically. And multi-tenancy
+is itself **experimental and default-off** (`tenant_auth.rs`, ADR 0004 §D7: not yet independently
+reviewed, not to be relied on as a hard isolation boundary). A single-tenant deployment — which is
+every deployment today — has one distribution and is unaffected.
+
+The fix, when tenancy graduates, is to key both controllers by tenant, at the cost of slower
+certification per tenant: the Bonferroni crossing level does not shrink because the traffic is
+split. Recorded here rather than patched now, because doing it properly is a change to the tenancy
+model and not to this ADR's mechanism.
+
 **Verified, not field-proven.** It has never certified a threshold against production traffic; that
 requires accumulated deferred feedback. `firstpass_eprocess_rounds_total` is the signal that the loop
 is turning. The paper states this limitation explicitly rather than leaving it to be discovered.

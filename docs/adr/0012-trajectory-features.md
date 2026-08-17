@@ -242,6 +242,26 @@ A side benefit worth naming: removing the dimension makes the bandit's arms **de
 multiplied the arm count by up to 4×, and arms that never accumulate traffic never learn. Requests
 differing only in trajectory difficulty now share statistics again.
 
+### A cost claim in this ADR that was wrong
+
+The Decision section argues extraction is nearly free because `request_features` "already parses the
+body and walks `messages`", so this "adds one more pass over data already deserialized and warm in
+cache."
+
+**That is true of the walk and false of the parse.** `trajectory_signals` performs its own
+`serde_json::from_slice::<Value>(body)` — a second full deserialization of every request body, not a
+second pass over an existing `Value`. Raised in review, and correct: the retained extraction costs
+more than this ADR claims, and it now buys nothing on the routing path since the acting logic was
+removed.
+
+It is still worth keeping, but for a narrower reason than "free": the hint is recorded in every
+receipt, so the data to re-test the hypothesis on an expensive-retry workload accumulates without a
+second measurement campaign. That is a real benefit with a real price, rather than a free one.
+
+Reusing the `Value` that `request_features` already deserialized would remove the duplicate parse
+outright. Recorded rather than done here, because it is a change to the shared extraction path and
+belongs in its own diff with its own before/after measurement — not in a documentation PR.
+
 ### A correction to the plan for this change
 
 The intent was also to delete `DifficultyHint::Low`, recorded above as never firing. **That was
