@@ -210,3 +210,33 @@ harness improvement stands on its own regardless of the routing verdict.
 **Caveat on this run specifically:** `FIRSTPASS_SWE_TURNS=3` capped observed depth at 2, so the
 `deep` signal (>= 5) never engaged. The kill rests on `Medium`-level turns; `High` remains
 unexercised in every workload measured to date.
+
+---
+
+## Addendum, 2026-08-16: the acting logic is removed
+
+After three measurements the hint no longer keys `ContextBucket`, so **routing is independent of
+it**. `the_trajectory_hint_does_not_affect_routing` asserts that; it is the same test that once
+asserted the opposite, inverted rather than deleted so the history is legible.
+
+**What stays.** Extraction, scoring, the `FEATURE_VERSION` bump, and the audit-trace field. It costs
+nothing when the hint is `None` (all non-agent traffic), it is deterministic and privacy-preserving,
+and it is recorded in every receipt. A workload with genuinely expensive retries and long sessions
+may yet justify acting on it, and the data to test that will already be there.
+
+**What goes.** The claim that acting on it pays, and the code that acted. Carrying a default-off
+decision path for a hypothesis refuted on two workloads is worse than deleting it: it looks like an
+option an operator might reasonably enable.
+
+A side benefit worth naming: removing the dimension makes the bandit's arms **denser**. The hint
+multiplied the arm count by up to 4×, and arms that never accumulate traffic never learn. Requests
+differing only in trajectory difficulty now share statistics again.
+
+### A correction to the plan for this change
+
+The intent was also to delete `DifficultyHint::Low`, recorded above as never firing. **That was
+wrong, and checking before deleting is why it survived.** `Low` is unreachable in the *benchmark
+harnesses* — their retry loops only continue on failure, so every recorded tool result is a failure —
+but through the **proxy extractor** an agent with successful tool calls scores `Low` normally. The
+level is dead in the bench and live in the product. The earlier note in this ADR conflated the two,
+and is corrected here rather than acted on.
