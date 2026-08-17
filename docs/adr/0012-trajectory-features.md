@@ -1,6 +1,16 @@
 # ADR 0012 — Trajectory features: routing on the agent's own conversation, before spending anything
 
-Status: **accepted — implemented and wired; not yet validated against a pre-registered bar** · 2026-08-14
+Status: **SUPERSEDED BY MEASUREMENT — extraction retained, acting logic removed** · 2026-08-14,
+revised 2026-08-16
+
+> The decision below was implemented, measured three times against its own pre-registered bar, and
+> **refuted twice with one abstention**. The routing behaviour it proposes no longer exists: the hint
+> does not key `ContextBucket` (PR #214). Extraction, scoring, the `FEATURE_VERSION` bump and the
+> audit-trace field are retained — they cost nothing and record the data a future test would need.
+>
+> Read the addenda at the end before acting on anything in the body. The body is kept intact rather
+> than rewritten, because the reasoning that motivated a refuted feature is the part worth having
+> when someone proposes it again.
 
 Bumps `FEATURE_VERSION` 1 → 2. Related: `crates/firstpass-core/src/features.rs`,
 `crates/firstpass-proxy/src/{proxy,bandit,affinity}.rs`, SPEC §8.4/§9.2.
