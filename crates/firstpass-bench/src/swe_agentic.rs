@@ -183,11 +183,19 @@ fn explore_phase(
              You may inspect the repository with ONE command per turn:\n\
                ls <dir>                    list a directory\n\
                grep <pattern> <dir>        search file contents (fixed string, shows line numbers)\n\
-               read <file> <start> <end>   read a line range\n\n\
+               read <file> <start> <end>   read a line range\n\
+               test <pytest-node-id>       run a test and read its real output\n\n\
+             The failing test for this issue is:\n  {}\n\n\
+             Run it first — the traceback tells you which file and line to look at, which is \
+             faster than guessing from the problem statement.\n\n\
              Output ONLY the command, or the single word DONE when you have seen enough to write \
              the patch. No prose.",
             instance.repo,
             instance.problem_statement,
+            instance
+                .fail_to_pass
+                .first()
+                .map_or("(none listed)", String::as_str),
             if transcript.is_empty() {
                 "(nothing yet)"
             } else {
