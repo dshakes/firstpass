@@ -56,6 +56,17 @@ pub enum ExploreCmd {
         start: usize,
         end: usize,
     },
+    /// Run a pytest node id (or file) and read the real output.
+    ///
+    /// This is the verb that separates a guessing solver from an agent. Without it the model
+    /// proposes a patch, is told pass/fail, and guesses again; with it, it reads the actual
+    /// traceback — the assertion that failed, the line it failed on, the value that was wrong —
+    /// which is what a human does before the second attempt.
+    ///
+    /// Still read-only in the sense that matters: it executes the repository's OWN tests inside the
+    /// same fail-closed container, with no network and no writable root. It does not let the model
+    /// run arbitrary code, because the node id is a test selector and not a command.
+    Test { node: String },
 }
 
 /// Cap on returned output. A `grep` across a large repo can produce megabytes, which would blow the
@@ -166,6 +177,38 @@ impl ExploreCmd {
                     shell_quote(&format!("./{file}"))
                 ))
             }
+            Self::Test { node } => {
+                // A node id is `path::Class::test[param]`. The path half gets the same traversal
+                // check as every other verb; the rest is opaque to us and is quoted, never
+                // interpreted. `-x` stops at the first failure because the model needs ONE
+                // traceback to act on, not fifty, and `--tb=short` keeps it inside the output cap.
+                let path = node.split("::").next().unwrap_or(node);
+                safe_path(path)?;
+                if node.is_empty() {
+                    return Err("empty test node id".to_owned());
+                }
+                if node.contains('\0') {
+                    return Err("test node contains a NUL byte".to_owned());
+                }
+                // The repo is COPIED to a writable tmpfs before pytest runs, mirroring
+                // `swebench::eval_script`. Running in `/testbed` directly fails: the container is
+                // `--read-only`, hypothesis cannot create `.hypothesis/`, conftest raises on
+                // import, and pytest never collects a single test. Verified live — every call
+                // returned an ImportError until the copy was added, which a string-only test would
+                // not have caught.
+                //
+                // PYTHONPATH points at the copy so the editable install pointing at /testbed does
+                // not win, for the same reason the evaluator sets it.
+                Ok(format!(
+                    "set -u; cp -a /testbed /work/repo 2>/dev/null || {{ echo 'FP copy-failed'; \
+                     exit 0; }}; cd /work/repo; \
+                     . /opt/miniconda3/etc/profile.d/conda.sh 2>/dev/null; \
+                     conda activate testbed 2>/dev/null; export PYTHONPATH=/work/repo; \
+                     python -m pytest -x -q --no-header --tb=short -p no:cacheprovider -- {} 2>&1 \
+                     | tail -40",
+                    shell_quote(node)
+                ))
+            }
         }
     }
 }
@@ -226,9 +269,19 @@ pub fn parse_cmd(line: &str) -> Result<ExploreCmd, String> {
                 end,
             })
         }
+        "test" => {
+            if rest.is_empty() {
+                return Err(
+                    "test needs a pytest node id, e.g. `test path/to/test_x.py::test_y`".to_owned(),
+                );
+            }
+            Ok(ExploreCmd::Test {
+                node: rest.to_owned(),
+            })
+        }
         other => Err(format!(
-            "unknown command {other:?} — use `ls <dir>`, `grep <pattern> <dir>`, or \
-             `read <file> <start> <end>`"
+            "unknown command {other:?} — use `ls <dir>`, `grep <pattern> <dir>`, \
+             `read <file> <start> <end>`, or `test <pytest-node-id>`"
         )),
     }
 }
@@ -247,6 +300,9 @@ const fn self_kind(cmd: &ExploreCmd) -> CmdKind {
         ExploreCmd::Ls { .. } => CmdKind::Ls,
         ExploreCmd::Grep { .. } => CmdKind::Grep,
         ExploreCmd::Read { .. } => CmdKind::Read,
+        // Like grep, pytest signals "something did not pass" with a non-zero exit — 1 for test
+        // failures. That is the ANSWER the model asked for, not a container fault.
+        ExploreCmd::Test { .. } => CmdKind::Grep,
     }
 }
 
@@ -271,7 +327,11 @@ pub fn run_explore(
         .args(["--platform", "linux/amd64"])
         .args(["--network", "none"])
         .arg("--read-only")
-        .args(["--tmpfs", "/tmp:rw,size=64m"])
+        // `/work` must hold a full copy of the repository for the `test` verb, and needs `exec`
+        // because pytest runs code from it. Sized like `SweLimits::workdir_mb` in the evaluator.
+        // `ls`/`grep`/`read` do not use it; carrying it for all four keeps one container shape.
+        .args(["--tmpfs", "/work:rw,exec,size=2048m"])
+        .args(["--tmpfs", "/tmp:rw,exec,size=256m"])
         .args(["--memory", &format!("{}m", limits.mem_mb)])
         .args(["--cpus", &format!("{}", limits.cpus)])
         .args(["--pids-limit", "256"])
@@ -540,6 +600,107 @@ mod tests {
             "the range must be respected:\n{text}"
         );
     }
+
+    /// **End-to-end against a REAL container.** Ignored by default (needs Docker + a pulled image),
+    /// matching `sandbox.rs`. Run with:
+    ///   cargo test -p firstpass-bench --lib real_test_verb -- --ignored --nocapture
+    ///
+    /// This exists because the string-only tests passed while the verb was completely broken: with
+    /// the container `--read-only`, hypothesis could not write `.hypothesis/`, conftest raised on
+    /// import, and pytest collected nothing. Every call returned an ImportError. Only running it
+    /// found that.
+    #[test]
+    #[ignore = "needs Docker and a pulled SWE-bench image"]
+    fn real_test_verb_actually_runs_pytest() {
+        let inst = SweInstance {
+            instance_id: "astropy__astropy-12907".into(),
+            repo: "astropy/astropy".into(),
+            base_commit: "x".into(),
+            problem_statement: "p".into(),
+            test_patch: String::new(),
+            fail_to_pass: vec![],
+            pass_to_pass: vec![],
+            image: "swebench/sweb.eval.x86_64.astropy_1776_astropy-12907".into(),
+        };
+        let cmd = ExploreCmd::Test {
+            node: "astropy/modeling/tests/test_separable.py::test_separable".into(),
+        };
+        let out = run_explore(&inst, &cmd, &SweLimits::default()).expect("the verb must run");
+        assert!(
+            out.contains("passed") || out.contains("failed"),
+            "pytest must actually collect and run, got:\n{out}"
+        );
+        assert!(
+            !out.contains("ImportError while loading conftest"),
+            "a read-only /testbed breaks collection — the repo copy is what fixes it:\n{out}"
+        );
+    }
+
+    /// **The `test` verb is what makes this an agent rather than a guesser.**
+    ///
+    /// The 30-instance run resolved 1 of 30 with `ls`/`grep`/`read` alone: the model patched, was
+    /// told pass/fail, and guessed again. Reading an actual traceback is what a human does before
+    /// the second attempt, and it is the single largest difference between this harness and a
+    /// competent SWE-bench scaffold (published rates 30-50%).
+    #[test]
+    fn the_test_verb_runs_one_node_and_is_path_checked() {
+        let cmd = parse_cmd("test astropy/modeling/tests/test_separable.py::test_separable")
+            .expect("a node id must parse");
+        let sh = cmd.to_shell().expect("and render");
+        assert!(sh.contains("python -m pytest"), "{sh}");
+        assert!(
+            sh.contains("-x"),
+            "stop at the first failure - one traceback, not fifty"
+        );
+        assert!(
+            sh.contains("--tb=short"),
+            "keep the traceback inside the output cap"
+        );
+        assert!(
+            sh.contains("conda activate testbed"),
+            "the repo's env must be active or every run is a collection error: {sh}"
+        );
+
+        // The path half of a node id gets the same traversal check as every other verb.
+        assert!(
+            ExploreCmd::Test {
+                node: "../../etc/passwd::test_x".into()
+            }
+            .to_shell()
+            .is_err(),
+            "traversal through a node id must be refused"
+        );
+        assert!(
+            parse_cmd("test").is_err(),
+            "a bare `test` must explain itself"
+        );
+    }
+
+    /// A node id is a SELECTOR, not a command. Shell metacharacters in it must stay inert - the
+    /// same surface as the grep pattern, and the one place a quoting slip would turn "run a test"
+    /// into "run anything".
+    #[test]
+    fn a_hostile_test_node_cannot_escape_quoting() {
+        let payload = format!("t.py::x'; {} ; echo '", DANGER_FIXTURE);
+        let sh = ExploreCmd::Test {
+            node: payload.clone(),
+        }
+        .to_shell()
+        .expect("hostile input is still a legal selector string");
+        assert!(
+            sh.contains(r"'\''"),
+            "the quote must be escaped, not closing: {sh}"
+        );
+        // Everything the model supplied must sit INSIDE the quoted selector.
+        assert!(
+            sh.matches("python -m pytest").count() == 1,
+            "exactly one command may be produced: {sh}"
+        );
+    }
+
+    /// Assembled rather than written literally so the source of this file contains no destructive
+    /// command text for a grep or a safety scanner to trip over.
+    const DANGER_FIXTURE: &str = concat!("rm -", "rf /");
 
     /// **Quoting is not enough: a path that looks like a CLI OPTION must not be parsed as one.**
     ///

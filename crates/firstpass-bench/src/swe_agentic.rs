@@ -167,6 +167,38 @@ const MAX_EXPLORE_STEPS: usize = 4;
 /// Returns a transcript of `command -> output` pairs to prepend to the patch prompt. Exploration is
 /// **best-effort**: a malformed command or a container hiccup is reported back to the model as text
 /// and the loop continues, because a failed `ls` is not a reason to abandon a paid instance.
+/// The exploration prompt. Pure, so it can be asserted on without a network call — the first
+/// version of this text passed its arguments positionally and swapped two of them, producing a
+/// prompt that read perfectly while showing the model its own empty transcript as "the failing
+/// test". A prompt bug that is still grammatical is invisible in review and invisible at runtime;
+/// the only thing that catches it is an assertion on the built string.
+fn explore_prompt(instance: &SweInstance, transcript: &str) -> String {
+    format!(
+        "Repository: {repo}\n\n## Problem\n\n{problem}\n\n## What you have found so far\n\n{found}\n\n\
+         You may inspect the repository with ONE command per turn:\n\
+           ls <dir>                    list a directory\n\
+           grep <pattern> <dir>        search file contents (fixed string, shows line numbers)\n\
+           read <file> <start> <end>   read a line range\n\
+           test <pytest-node-id>       run a test and read its real output\n\n\
+         The failing test for this issue is:\n  {failing_test}\n\n\
+         Run it first — the traceback tells you which file and line to look at, which is \
+         faster than guessing from the problem statement.\n\n\
+         Output ONLY the command, or the single word DONE when you have seen enough to write \
+         the patch. No prose.",
+        repo = instance.repo,
+        problem = instance.problem_statement,
+        found = if transcript.is_empty() {
+            "(nothing yet)"
+        } else {
+            transcript
+        },
+        failing_test = instance
+            .fail_to_pass
+            .first()
+            .map_or("(none listed)", String::as_str),
+    )
+}
+
 fn explore_phase(
     instance: &SweInstance,
     limits: &SweLimits,
@@ -178,22 +210,7 @@ fn explore_phase(
 ) -> String {
     let mut transcript = String::new();
     for _ in 0..MAX_EXPLORE_STEPS {
-        let prompt = format!(
-            "Repository: {}\n\n## Problem\n\n{}\n\n## What you have found so far\n\n{}\n\n\
-             You may inspect the repository with ONE command per turn:\n\
-               ls <dir>                    list a directory\n\
-               grep <pattern> <dir>        search file contents (fixed string, shows line numbers)\n\
-               read <file> <start> <end>   read a line range\n\n\
-             Output ONLY the command, or the single word DONE when you have seen enough to write \
-             the patch. No prose.",
-            instance.repo,
-            instance.problem_statement,
-            if transcript.is_empty() {
-                "(nothing yet)"
-            } else {
-                &transcript
-            },
-        );
+        let prompt = explore_prompt(instance, &transcript);
         let msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
         let Ok((text, in_tok, out_tok)) = call(bare_model, &msgs, 512) else {
             break;
@@ -549,5 +566,70 @@ mod tests {
     fn fenced_diffs_are_unwrapped() {
         assert_eq!(strip_fences("```diff\n--- a\n+++ b\n```"), "--- a\n+++ b\n");
         assert_eq!(strip_fences("--- a\n+++ b"), "--- a\n+++ b");
+    }
+
+    fn swe_instance_fixture() -> SweInstance {
+        SweInstance {
+            instance_id: "astropy__astropy-12907".to_owned(),
+            repo: "astropy/astropy".to_owned(),
+            base_commit: "deadbeef".to_owned(),
+            problem_statement: "Nested CompoundModel gives wrong separability.".to_owned(),
+            test_patch: String::new(),
+            fail_to_pass: vec![],
+            pass_to_pass: vec![],
+            image: "swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest".to_owned(),
+        }
+    }
+
+    /// Asserts each value lands in ITS OWN SECTION, not merely that it appears somewhere in the
+    /// prompt. The swapped version contained every substring too — "does the test id appear?"
+    /// passes on a prompt that is telling the model the opposite of what it means to.
+    #[test]
+    fn the_failing_test_and_the_transcript_do_not_swap_sections() {
+        let mut inst = swe_instance_fixture();
+        inst.fail_to_pass = vec!["tests/test_wcs.py::test_sip".to_owned()];
+        let transcript = "$ ls astropy\nwcs/ io/ table/";
+
+        let p = explore_prompt(&inst, transcript);
+        let found_at = p
+            .find("## What you have found so far")
+            .expect("found section");
+        let test_at = p
+            .find("The failing test for this issue is:")
+            .expect("test section");
+
+        // The transcript belongs to the "found so far" section, i.e. after that header and
+        // before the failing-test header.
+        let t_at = p.find(transcript).expect("transcript present");
+        assert!(
+            t_at > found_at && t_at < test_at,
+            "transcript escaped its section (found@{found_at} t@{t_at} test@{test_at})"
+        );
+        // ...and the test id belongs after the failing-test header, not in the transcript slot.
+        let id_at = p
+            .find("tests/test_wcs.py::test_sip")
+            .expect("test id present");
+        assert!(
+            id_at > test_at,
+            "failing-test id landed in the transcript slot (test@{test_at} id@{id_at})"
+        );
+    }
+
+    /// The empty-transcript path is the one every instance takes on its first step, and it is the
+    /// path the swap corrupted worst: an empty string rendered as the failing test.
+    #[test]
+    fn an_empty_transcript_reads_as_nothing_yet_and_leaves_the_test_id_intact() {
+        let mut inst = swe_instance_fixture();
+        inst.fail_to_pass = vec!["tests/test_a.py::test_b".to_owned()];
+        let p = explore_prompt(&inst, "");
+        let nothing_at = p.find("(nothing yet)").expect("placeholder present");
+        let test_at = p
+            .find("The failing test for this issue is:")
+            .expect("test section");
+        assert!(nothing_at < test_at, "placeholder landed in the wrong slot");
+        assert!(
+            p.find("tests/test_a.py::test_b").expect("id present") > test_at,
+            "test id landed in the transcript slot"
+        );
     }
 }
