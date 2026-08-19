@@ -500,7 +500,39 @@ pub fn parse_anthropic(v: &serde_json::Value) -> Result<(String, u64, u64), Stri
                 .join("")
         })
         .filter(|s| !s.is_empty())
-        .ok_or("no text content in response")?;
+        .ok_or_else(|| {
+            // A response with no text is TWO different failures wearing one message, and the
+            // difference is the whole diagnosis. `stop_reason == "max_tokens"` with zero text
+            // means the model spent its entire output budget thinking and was cut off before
+            // writing anything — an operator misconfiguration (max_tokens too low), not a model
+            // that declined to answer. Reported identically, it degrades into "scored as a failed
+            // candidate" and reads as a measurement instead of a broken run. That is exactly how a
+            // dead top rung produced 0/54 gate passes while looking like an ordinary bad result.
+            //
+            // The "no text content" substring is load-bearing: the retry ladders in `agentic` and
+            // `swe_agentic` match on it to decide an empty response is retryable. Keep it.
+            let stop = v
+                .get("stop_reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let out = v
+                .pointer("/usage/output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let thinking = v
+                .pointer("/usage/output_tokens_details/thinking_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if stop == "max_tokens" {
+                format!(
+                    "no text content in response: TRUNCATED before any text \
+                     (stop_reason=max_tokens, output_tokens={out}, thinking_tokens={thinking}) \
+                     — the reasoning budget consumed all of max_tokens; raise it"
+                )
+            } else {
+                format!("no text content in response (stop_reason={stop}, output_tokens={out})")
+            }
+        })?;
     let usage = v.get("usage").ok_or("no usage in response")?;
     let in_tokens = usage
         .get("input_tokens")
@@ -843,6 +875,59 @@ mod tests {
             suite
                 .iter()
                 .all(|t| t.prompt.is_some() && t.expected.is_some())
+        );
+    }
+
+    /// The failure that produced a $1.05 run of 0/54 gate passes. A thinking-only response is a
+    /// misconfigured budget, not a model declining to answer, and the two must not read alike.
+    #[test]
+    fn a_truncated_thinking_only_response_is_diagnosed_as_truncation() {
+        let v = serde_json::json!({
+            "content": [{ "type": "thinking", "thinking": "..." }],
+            "stop_reason": "max_tokens",
+            "usage": {
+                "input_tokens": 900,
+                "output_tokens": 600,
+                "output_tokens_details": { "thinking_tokens": 599 }
+            }
+        });
+        let err = parse_anthropic(&v).expect_err("thinking-only must not parse as success");
+        assert!(
+            err.contains("TRUNCATED"),
+            "must name truncation, got: {err}"
+        );
+        assert!(
+            err.contains("thinking_tokens=599"),
+            "must show the evidence, got: {err}"
+        );
+        // Load-bearing: the retry ladders key off this substring to decide it is retryable.
+        assert!(
+            err.contains("no text content"),
+            "retry ladders match on this, got: {err}"
+        );
+    }
+
+    /// The other arm: a genuinely empty response is NOT truncation, and saying so would send an
+    /// operator chasing a budget that is already big enough.
+    #[test]
+    fn an_empty_end_turn_response_is_not_reported_as_truncation() {
+        let v = serde_json::json!({
+            "content": [],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 10, "output_tokens": 0 }
+        });
+        let err = parse_anthropic(&v).expect_err("empty content must not parse as success");
+        assert!(
+            !err.contains("TRUNCATED"),
+            "must not blame truncation, got: {err}"
+        );
+        assert!(
+            err.contains("stop_reason=end_turn"),
+            "must report the real reason, got: {err}"
+        );
+        assert!(
+            err.contains("no text content"),
+            "retry ladders match on this, got: {err}"
         );
     }
 }
