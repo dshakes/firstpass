@@ -1093,9 +1093,12 @@ fn swe_agentic(json: bool) {
             instances.len(),
             inst.instance_id
         );
-        match run_instance(inst, &rungs, &limits, max_turns, &call) {
+        // Charged whether the instance succeeds or fails: a failed instance still burned
+        // provider tokens, and skipping it must not make that spend invisible to the cap.
+        let mut inst_spent = 0.0f64;
+        match run_instance(inst, &rungs, &limits, max_turns, &call, &mut inst_spent) {
             Ok(run) => {
-                spent += run.spent_usd;
+                spent += inst_spent;
                 if let (Ok(line), Ok(mut f)) = (
                     serde_json::to_string(&run.recorded),
                     std::fs::OpenOptions::new()
@@ -1118,6 +1121,7 @@ fn swe_agentic(json: bool) {
                 // outage or a misconfiguration and continuing just burns money. Isolated
                 // failures are counted and reported, because a silently shortened sample is the
                 // dishonest version of this fix.
+                spent += inst_spent;
                 consecutive_failures += 1;
                 skipped.push((inst.instance_id.clone(), e.to_string()));
                 eprintln!(
