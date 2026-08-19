@@ -388,6 +388,17 @@ pub fn run_instance(
     })
 }
 
+/// Whether a run should stop after `consecutive` back-to-back instance failures.
+///
+/// Split out of `main` so the rule is testable: it decides how much of a sample actually gets
+/// measured, and the subtle half is the RESET. A counter that never resets turns three unrelated
+/// failures spread across fifty instances into a truncated benchmark, which is indistinguishable
+/// in the output from a provider outage.
+#[must_use]
+pub fn should_stop_after_failures(consecutive: usize, max_consecutive: usize) -> bool {
+    max_consecutive > 0 && consecutive >= max_consecutive
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +652,42 @@ mod tests {
             p.find("tests/test_a.py::test_b").expect("id present") > test_at,
             "test id landed in the transcript slot"
         );
+    }
+
+    #[test]
+    fn isolated_failures_do_not_stop_a_run_but_a_streak_does() {
+        // The state machine as main drives it: += 1 on failure, = 0 on success.
+        let max = 3;
+        let mut consecutive = 0;
+        let mut stopped = false;
+        // fail, fail, succeed, fail, fail, succeed -> four failures, never three in a row.
+        for ok in [false, false, true, false, false, true] {
+            if ok {
+                consecutive = 0;
+            } else {
+                consecutive += 1;
+                if should_stop_after_failures(consecutive, max) {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        assert!(!stopped, "scattered failures must not truncate the sample");
+
+        // Three back-to-back is an outage, not an awkward instance.
+        let mut consecutive = 0;
+        let mut stopped = false;
+        for ok in [true, false, false, false, true] {
+            if ok {
+                consecutive = 0;
+            } else {
+                consecutive += 1;
+                if should_stop_after_failures(consecutive, max) {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        assert!(stopped, "a failure streak must stop the run");
     }
 }
