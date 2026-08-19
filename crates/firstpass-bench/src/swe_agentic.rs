@@ -236,10 +236,18 @@ pub fn run_instance(
     limits: &SweLimits,
     max_turns: usize,
     call: &ModelCall<'_>,
+    // Written as cost is incurred, so it is accurate even when this returns `Err`.
+    spent_out: &mut f64,
 ) -> Result<InstanceRun, String> {
     let mut history: Vec<Attempt> = Vec::new();
     let mut turns: Vec<RecordedTurn> = Vec::new();
-    let mut spent = 0.0f64;
+    // Accumulates into the CALLER's counter as cost is incurred, not at the end. On the error
+    // paths `run_instance` returns `Err` via `?`, which discards everything local — so a local
+    // total meant every failed instance silently spent money the budget never saw. That was
+    // survivable while a failure aborted the run; once failures are skipped and the run
+    // continues, the leak compounds per failure and `[budget]` stops being enforceable. Writing
+    // through the reference means a future error path cannot forget to report its spend.
+    let spent = spent_out;
 
     // Read the code before patching it. Done ONCE per instance on the cheapest rung, not per turn
     // and not per rung: the repository does not change between attempts, so re-exploring would pay
@@ -248,14 +256,14 @@ pub fn run_instance(
     //
     // This is what the first SWE-bench run lacked, and why it resolved 1 issue in 352 calls: the
     // solver was writing diffs for files it had never opened.
-    let before_explore = spent;
+    let before_explore = *spent;
     let findings = rungs.first().map_or_else(String::new, |r| {
         explore_phase(
             instance,
             limits,
             &r.bare,
             call,
-            &mut spent,
+            spent,
             r.in_price,
             r.out_price,
         )
@@ -267,7 +275,7 @@ pub fn run_instance(
     // run — so it captured exploration plus that turn's model calls and added them a second time.
     // The recorded cost for the trajectory arm was inflated, not merely misattributed. Flagged in
     // review; the fix for a missing cost introduced a double-counted one.
-    let explore_cost = spent - before_explore;
+    let explore_cost = *spent - before_explore;
     let mut explore_cost_recorded = false;
 
     for _turn in 0..max_turns {
@@ -312,7 +320,7 @@ pub fn run_instance(
                     (String::new(), 0, 0)
                 }
             };
-            spent += in_tok as f64 * rung.in_price + out_tok as f64 * rung.out_price;
+            *spent += in_tok as f64 * rung.in_price + out_tok as f64 * rung.out_price;
             let cost = in_tok as f64 * rung.in_price + out_tok as f64 * rung.out_price;
             let patch = strip_fences(&text);
 
@@ -384,8 +392,19 @@ pub fn run_instance(
             id: instance.instance_id.clone(),
             turns,
         },
-        spent_usd: spent,
+        spent_usd: *spent,
     })
+}
+
+/// Whether a run should stop after `consecutive` back-to-back instance failures.
+///
+/// Split out of `main` so the rule is testable: it decides how much of a sample actually gets
+/// measured, and the subtle half is the RESET. A counter that never resets turns three unrelated
+/// failures spread across fifty instances into a truncated benchmark, which is indistinguishable
+/// in the output from a provider outage.
+#[must_use]
+pub fn should_stop_after_failures(consecutive: usize, max_consecutive: usize) -> bool {
+    max_consecutive > 0 && consecutive >= max_consecutive
 }
 
 #[cfg(test)]
@@ -512,7 +531,8 @@ mod tests {
             in_price: 1e-6,
             out_price: 1e-6,
         }];
-        let run = run_instance(&task, &rungs, &SweLimits::default(), 1, &call)
+        let mut spent = 0.0f64;
+        let run = run_instance(&task, &rungs, &SweLimits::default(), 1, &call, &mut spent)
             .expect("the loop must complete");
 
         let recorded: f64 = run
@@ -640,6 +660,88 @@ mod tests {
         assert!(
             p.find("tests/test_a.py::test_b").expect("id present") > test_at,
             "test id landed in the transcript slot"
+        );
+    }
+
+    #[test]
+    fn isolated_failures_do_not_stop_a_run_but_a_streak_does() {
+        // The state machine as main drives it: += 1 on failure, = 0 on success.
+        let max = 3;
+        let mut consecutive = 0;
+        let mut stopped = false;
+        // fail, fail, succeed, fail, fail, succeed -> four failures, never three in a row.
+        for ok in [false, false, true, false, false, true] {
+            if ok {
+                consecutive = 0;
+            } else {
+                consecutive += 1;
+                if should_stop_after_failures(consecutive, max) {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        assert!(!stopped, "scattered failures must not truncate the sample");
+
+        // Three back-to-back is an outage, not an awkward instance.
+        let mut consecutive = 0;
+        let mut stopped = false;
+        for ok in [true, false, false, false, true] {
+            if ok {
+                consecutive = 0;
+            } else {
+                consecutive += 1;
+                if should_stop_after_failures(consecutive, max) {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        assert!(stopped, "a failure streak must stop the run");
+    }
+
+    /// The leak a reviewer caught on the resilience PR: `run_instance` returned `Err` via `?`,
+    /// which discarded its local spend, so `main` never charged it. Harmless while a failure
+    /// aborted the run; once failures are SKIPPED and the run continues, every failed instance
+    /// spends money the budget cap cannot see, and `[budget]` stops being enforceable.
+    ///
+    /// Bills two calls, then fails the third. The caller's counter must reflect what was spent
+    /// before the failure, not zero.
+    #[test]
+    #[ignore = "needs a running Docker daemon"]
+    fn a_failed_instance_still_charges_what_it_spent() {
+        use std::cell::Cell;
+        let task = SweInstance {
+            instance_id: "t".into(),
+            repo: "r".into(),
+            base_commit: "c".into(),
+            problem_statement: "p".into(),
+            test_patch: String::new(),
+            fail_to_pass: vec!["t::a".into()],
+            pass_to_pass: vec![],
+            image: "alpine:latest".into(),
+        };
+        let rungs = [SweRung {
+            model: "m".into(),
+            bare: "m".into(),
+            in_price: 1e-6,
+            out_price: 1e-6,
+        }];
+        let n = Cell::new(0u32);
+        let call = |_b: &str, _m: &serde_json::Value, _t: u32| {
+            n.set(n.get() + 1);
+            if n.get() >= 3 {
+                Err("simulated provider timeout".to_owned())
+            } else {
+                Ok(("DONE".to_owned(), 1000u64, 1000u64))
+            }
+        };
+        let mut spent = 0.0f64;
+        let out = run_instance(&task, &rungs, &SweLimits::default(), 1, &call, &mut spent);
+        assert!(out.is_err(), "the third call must fail the instance");
+        assert!(
+            spent > 0.0,
+            "a failed instance must still charge what it spent; got ${spent}"
         );
     }
 }

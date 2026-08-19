@@ -982,7 +982,7 @@ fn agentic_multiturn(json: bool) {
 fn swe_agentic(json: bool) {
     use firstpass_bench::agentic::RecordedTask;
     use firstpass_bench::multiturn::{PreRegistered, evaluate};
-    use firstpass_bench::swe_agentic::{SweRung, run_instance};
+    use firstpass_bench::swe_agentic::{SweRung, run_instance, should_stop_after_failures};
     use firstpass_bench::swebench::{SweLimits, load_swebench_jsonl};
     use std::io::Write as _;
 
@@ -1047,9 +1047,21 @@ fn swe_agentic(json: bool) {
     }
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        // 300s was survivable while the token ladder topped out at 8192. Raising it to 32768
+        // (see swe_agentic, the truncated-thinking fix) made the deadline reachable: at roughly
+        // 60 output tokens/sec a full 32768-token response needs ~9 minutes, so a thinking-heavy
+        // instance timed out deterministically and — because one failure aborted the run — wedged
+        // the whole benchmark at instance 13. A cap that is smaller than the output it must carry
+        // is not a safety limit, it is a guaranteed failure.
+        .timeout(std::time::Duration::from_secs(900))
         .build()
         .unwrap_or_default();
+    /// Enough consecutive failures to mean the provider is down or the config is wrong, rather
+    /// than one awkward instance. Isolated failures are skipped; a run of them stops the harness.
+    const MAX_CONSECUTIVE_FAILURES: usize = 3;
+    let mut consecutive_failures = 0usize;
+    let mut skipped: Vec<(String, String)> = Vec::new();
+
     let limits = SweLimits::default();
     let mut spent = 0.0f64;
     let mut stopped_early = false;
@@ -1081,9 +1093,12 @@ fn swe_agentic(json: bool) {
             instances.len(),
             inst.instance_id
         );
-        match run_instance(inst, &rungs, &limits, max_turns, &call) {
+        // Charged whether the instance succeeds or fails: a failed instance still burned
+        // provider tokens, and skipping it must not make that spend invisible to the cap.
+        let mut inst_spent = 0.0f64;
+        match run_instance(inst, &rungs, &limits, max_turns, &call, &mut inst_spent) {
             Ok(run) => {
-                spent += run.spent_usd;
+                spent += inst_spent;
                 if let (Ok(line), Ok(mut f)) = (
                     serde_json::to_string(&run.recorded),
                     std::fs::OpenOptions::new()
@@ -1093,15 +1108,36 @@ fn swe_agentic(json: bool) {
                 ) {
                     let _ = writeln!(f, "{line}");
                 }
+                consecutive_failures = 0;
                 done.push(run.recorded);
             }
             Err(e) => {
+                // Skip the instance, do not abort the benchmark. One instance timed out
+                // deterministically and killed a 50-instance run twice at instance 13 — the
+                // second time spending $0.00 before dying, so the retry bought nothing. A single
+                // poison-pill instance must not decide how much of the sample gets measured.
+                //
+                // Consecutive failures still stop the run: if everything is failing, that is an
+                // outage or a misconfiguration and continuing just burns money. Isolated
+                // failures are counted and reported, because a silently shortened sample is the
+                // dishonest version of this fix.
+                spent += inst_spent;
+                consecutive_failures += 1;
+                skipped.push((inst.instance_id.clone(), e.to_string()));
                 eprintln!(
-                    "instance {} failed: {e} — stopping (spent ${spent:.2})",
-                    inst.instance_id
+                    "instance {} failed: {e} — SKIPPING ({consecutive_failures} in a row, \
+                     {} skipped total, spent ${spent:.2})",
+                    inst.instance_id,
+                    skipped.len()
                 );
-                stopped_early = true;
-                break;
+                if should_stop_after_failures(consecutive_failures, MAX_CONSECUTIVE_FAILURES) {
+                    eprintln!(
+                        "{consecutive_failures} consecutive failures — stopping (spent ${spent:.2})"
+                    );
+                    stopped_early = true;
+                    break;
+                }
+                continue;
             }
         }
     }
@@ -1119,6 +1155,10 @@ fn swe_agentic(json: bool) {
             "instances": done.len(),
             "spent_usd": spent,
             "stopped_early": stopped_early,
+            "skipped": skipped
+                .iter()
+                .map(|(id, e)| serde_json::json!({ "instance_id": id, "error": e }))
+                .collect::<Vec<_>>(),
             "max_depth": max_depth,
             "result": result,
         });
@@ -1131,6 +1171,20 @@ fn swe_agentic(json: bool) {
         println!("spend:     ${spent:.2} of ${budget:.2}");
         if stopped_early {
             println!("\n**stopped early** — numbers cover only what was bought.");
+        }
+        if !skipped.is_empty() {
+            // Disclose the shortened sample. An unreported skip turns "50 instances" into
+            // "however many happened to succeed" while the header still claims 50, which is the
+            // dishonest failure mode this whole harness exists to avoid.
+            println!(
+                "\n**{} instance(s) skipped** after repeated provider failures — the sample below \
+                 is smaller than requested, and these are not counted as failures because they \
+                 were never measured:",
+                skipped.len()
+            );
+            for (id, e) in &skipped {
+                println!("- `{id}`: {e}");
+            }
         }
         println!("\n| policy | success | $/success |");
         println!("|---|---|---|");
