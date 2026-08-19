@@ -281,7 +281,17 @@ pub fn run_instance(
         for rung in rungs {
             let mut last = String::new();
             let mut got: Option<(String, u64, u64)> = None;
-            for budget in [4096u32, 8192] {
+            // Raised from [4096, 8192] after a 50-instance run recorded 0 gate passes in 54
+            // rungs (p=0.002 against the 10.6% baseline): claude-sonnet-5 emits `thinking` blocks
+            // by default, and on repo-scale prompts — especially once `test` output joined the
+            // context — the reasoning consumed the entire budget, so the top rung returned no
+            // patch on essentially every instance and could never pass a gate.
+            //
+            // A higher cap is close to free and strictly better economically: you are billed for
+            // tokens generated, not for the cap, and a truncated response means paying for the
+            // thinking and throwing it away. The ceiling still exists — it is a runaway guard,
+            // not a target.
+            for budget in [8192u32, 32768] {
                 match call(&rung.bare, &msgs, budget) {
                     Ok(v) => {
                         got = Some(v);
