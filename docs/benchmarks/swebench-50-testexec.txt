@@ -1,0 +1,79 @@
+# Agentic SWE-bench — does letting the agent RUN tests pay?
+
+instances: 50 (30 paired against the file-access run + 20 fresh)
+turns:     3 per instance, 300 rungs total
+spend:     $14.51
+skips:     0
+
+## VERDICT: NO. Test execution did not pay, and the gate-pass regression is real.
+
+| | without test exec | with test exec | |
+|---|---|---|---|
+| gate passes (paired 30) | 19/180 = 10.6% | **5/180 = 2.8%** | Fisher p = **0.005** |
+| resolved (paired 30) | 1/30 | 2/30 | Fisher p = **1.00** |
+| cost (paired 30) | $3.36 | $10.09 | **3.0x** |
+| $/resolved (paired 30) | $3.36 | $5.04 | worse |
+
+Pre-registered bar: >=5% cost improvement AND no quality regression. Cost got 3x WORSE and the
+only statistically significant movement was gate-pass going DOWN. The feature fails its bar on
+every axis that was specified in advance. It is not a close call and it is not rescued by the
+resolution count moving 1 -> 2, which at p=1.00 is indistinguishable from noise.
+
+## Full results
+
+| set | n | resolved | gate-pass | $ | $/instance |
+|---|---|---|---|---|---|
+| ALL 50 | 50 | 2 (4.0%) | 12/300 = 4.0% | $14.51 | $0.290 |
+| shared 30, with | 30 | 2 | 5/180 = 2.8% | $10.09 | $0.336 |
+| shared 30, without | 30 | 1 | 19/180 = 10.6% | $3.36 | $0.112 |
+| fresh 20, with | 20 | 0 | 7/120 = 5.8% | $4.42 | $0.221 |
+
+## What CANNOT be concluded from this, and why
+
+**The $/resolved number is not usable.** $7.25 across all 50 rests on TWO resolutions. The exact
+95% CI on a 4% rate over n=50 is [0.5%, 13.7%], so $/resolved spans roughly $2 to $59. Quoting
+$7.25 as a cost-per-resolved figure would be presenting an interval two orders of magnitude wide
+as a point estimate. Anyone who needs an industry-comparable number needs a resolve rate high
+enough to produce double-digit resolutions.
+
+**The solver, not the router, is the binding constraint.** 4% resolution against a SWE-bench
+Verified state of the art of roughly 30-70%. This measures a weak agent, and no amount of
+sampling changes that. Cascade routing cannot be evaluated for cost-per-resolved on a solver
+that resolves almost nothing.
+
+**The fresh 20 have no baseline and cannot confirm the paired finding.** They ran only the
+test-exec arm, so their 5.8% gate-pass is an absolute level on a django-heavy sample, not a
+comparison. The paired 30 remain the only controlled evidence.
+
+**Gate-pass regression: mechanism unresolved.** A patch never produced and a patch produced and
+rejected both record as "no gate pass". Three instances hit the no-patch path -- far too few to
+explain 14 lost passes -- but the `test` verb also consumes one of only four exploration steps
+and injects up to 40 lines of traceback. "Better discrimination" (18 false positives fell to 3)
+and "fewer patches produced" stay confounded, because the checkpoint does not record WHY a rung
+failed. Resolving it needs a failure-reason field. The flattering interpretation is not adopted.
+
+## Run integrity
+
+Three harness bugs were found and fixed before these numbers were trusted, and the first was
+found only because a run produced 0/54 gate passes:
+
+- **Truncated thinking (#218).** claude-sonnet-5 emits thinking blocks by default; on repo-scale
+  prompts the reasoning consumed the whole max_tokens budget and the top rung returned no text at
+  all. It scored as an ordinary failed candidate, so a dead escalation rung read as a bad result.
+- **Timeout smaller than the ladder (#219).** Raising max_tokens to 32768 made a 300s client
+  timeout unreachable-by-construction; one instance then killed the whole run, twice.
+- **Spend leak on the error path (#219, caught in review).** A failed instance discarded its
+  accumulated cost, so `[budget]` could not see money already spent -- harmless until failures
+  became skippable, at which point the cap stops being enforceable.
+
+A residual, unfixed: two responses used the full 32768-token budget on thinking alone and still
+produced no text. Raising the cap further is not viable (65536 tokens needs ~18 min against a
+900s timeout); the fix is retrying with thinking disabled. Incidence was 3/50.
+
+## Recommendation
+
+Do not enable test execution on this evidence. Either revert it or keep it behind a default-off
+flag with this file cited. The mechanism may still be sound -- an agent that reads a real
+traceback SHOULD patch better -- but it must be re-measured on a solver strong enough for
+resolution to be the measured quantity, with a failure-reason field to separate "no patch" from
+"bad patch". On this workload, as implemented, it costs 3x and measurably lowers gate-pass.
