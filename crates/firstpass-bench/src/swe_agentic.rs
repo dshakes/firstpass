@@ -339,6 +339,9 @@ pub fn run_instance(
                 model: rung.model.clone(),
                 gate_pass,
                 oracle_correct: outcome.resolved,
+                // The taxonomy: distinguishes "would not apply" from "applied and failed tests".
+                applied: Some(outcome.patch_applied),
+                f2p: Some(outcome.f2p),
                 cost_usd: cost,
                 gate_score,
             });
