@@ -341,7 +341,18 @@ pub fn run_instance(
             // `resolved` is the ORACLE: every FAIL_TO_PASS now passes and every PASS_TO_PASS still
             // does. The gate is the weaker, cheaper check the router is allowed to see — whether
             // the patch applied and the targeted tests moved.
-            let gate_pass = outcome.patch_applied && outcome.f2p.0 == outcome.f2p.1;
+            // The gate now also demands NO REGRESSIONS in the tests it can see. Measured on 50
+            // instances, the old gate ("applied AND the named test passes") had 3/82 = 3.7%
+            // precision: 79 patches fixed the reported bug and broke something else, and the gate
+            // approved every one. For a router that escalates only on gate failure, a verifier
+            // wrong 96% of the time is the whole mechanism failing.
+            //
+            // It sees a SUBSET of PASS_TO_PASS (the files the failing tests live in), never the
+            // full list — that would make the gate identical to the oracle and leave the benchmark
+            // unable to measure its own gate's error.
+            let no_regressions = outcome.p2p_gate.0 == outcome.p2p_gate.1;
+            let gate_pass =
+                outcome.patch_applied && outcome.f2p.0 == outcome.f2p.1 && no_regressions;
             let gate_score = if outcome.f2p.1 == 0 {
                 0.0
             } else {
