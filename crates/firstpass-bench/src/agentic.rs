@@ -73,6 +73,30 @@ pub struct RecordedRung {
     pub cost_usd: f64,
     /// Fraction of visible tests passed — the continuous gate score.
     pub gate_score: f64,
+    /// Did the candidate patch apply at all? `None` where the concept does not exist (MBPP has
+    /// no patch to apply).
+    ///
+    /// Recorded because `!gate_pass` conflates three failures that need opposite fixes: a model
+    /// that produced no patch, a patch that would not apply, and a patch that applied and failed
+    /// the tests. The first is a budget/format problem, the second is diff brittleness, the third
+    /// is reasoning. Without this, a 4% resolve rate is a number with no actionable direction --
+    /// which is exactly where the 50-instance run left off.
+    ///
+    /// Optional and skipped when absent, so existing checkpoints still deserialize and MBPP
+    /// records are byte-identical. Serde names here are the on-disk contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<bool>,
+    /// `(passed, total)` of FAIL_TO_PASS after the candidate patch. `None` outside SWE-bench.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub f2p: Option<(usize, usize)>,
+    /// Which tolerance level the patch needed: `clean`, `recount`, `c1`, `fuzz`, `rejected`.
+    /// `None` outside SWE-bench.
+    ///
+    /// Persisted so "we loosened apply and the score went up" is auditable rather than asserted.
+    /// If resolutions cluster in `fuzz`, the tolerance is doing suspicious work and the result
+    /// should be distrusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_method: Option<String>,
 }
 
 /// One task's full recorded trajectory.
@@ -297,6 +321,10 @@ pub fn run_task(
                 oracle_correct: hid_total > 0 && hid_pass == hid_total,
                 cost_usd: cost,
                 gate_score,
+                // MBPP has no patch to apply; the SWE-only taxonomy stays absent.
+                applied: None,
+                f2p: None,
+                apply_method: None,
             });
 
             if cheapest_pass.is_none() {
@@ -530,5 +558,47 @@ mod tests {
         );
         assert_eq!(strip_fences("```\ndef f(): pass\n```"), "def f(): pass\n");
         assert_eq!(strip_fences("def f(): pass"), "def f(): pass");
+    }
+
+    /// Old checkpoints predate the failure taxonomy. They must still load, because resuming a
+    /// paid run depends on it — and a schema change that silently invalidates $14 of recorded
+    /// work is the expensive kind of "additive".
+    #[test]
+    fn a_checkpoint_without_the_taxonomy_still_deserializes() {
+        let old = r#"{"model":"m","gate_pass":false,"oracle_correct":false,
+                      "cost_usd":0.01,"gate_score":0.0}"#;
+        let r: RecordedRung = serde_json::from_str(old).expect("pre-taxonomy rung must load");
+        assert_eq!(r.applied, None);
+        assert_eq!(r.f2p, None);
+        assert_eq!(r.apply_method, None);
+        // ...and round-trips back WITHOUT inventing fields, so re-serializing an old record
+        // cannot change its bytes.
+        let back = serde_json::to_string(&r).expect("serialize");
+        assert!(!back.contains("applied"), "absent must stay absent: {back}");
+        assert!(!back.contains("f2p"), "absent must stay absent: {back}");
+        assert!(
+            !back.contains("apply_method"),
+            "absent must stay absent: {back}"
+        );
+    }
+
+    /// The new field must actually survive a write/read cycle, or the taxonomy is decorative.
+    #[test]
+    fn the_taxonomy_round_trips_when_present() {
+        let r = RecordedRung {
+            model: "m".into(),
+            gate_pass: false,
+            oracle_correct: false,
+            cost_usd: 0.02,
+            gate_score: 0.5,
+            applied: Some(false),
+            f2p: Some((1, 3)),
+            apply_method: Some("fuzz".to_owned()),
+        };
+        let s = serde_json::to_string(&r).expect("serialize");
+        let back: RecordedRung = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back.applied, Some(false));
+        assert_eq!(back.f2p, Some((1, 3)));
+        assert_eq!(back.apply_method.as_deref(), Some("fuzz"));
     }
 }
