@@ -76,6 +76,8 @@ pub struct SweOutcome {
     /// The candidate patch did not apply. A real outcome (a model producing an unusable diff),
     /// distinct from an environment fault.
     pub patch_applied: bool,
+    /// Which tolerance level the patch needed: `clean`, `recount`, `c1`, `fuzz`, or `rejected`.
+    pub apply_method: String,
     /// `(passed, total)` for `FAIL_TO_PASS` after the candidate patch.
     pub f2p: (usize, usize),
     /// `(passed, total)` for `PASS_TO_PASS` after the candidate patch.
@@ -160,7 +162,25 @@ git apply /work/in/test.patch 2>/dev/null || { echo "FP_ENV test-patch-failed"; 
 echo "FP_CONTROL_BEGIN"; run /work/in/p2p.txt; echo "FP_CONTROL_END"
 
 if [ -s /work/in/model.patch ]; then
-  git apply /work/in/model.patch 2>/dev/null && echo "FP_PATCH applied" || echo "FP_PATCH rejected"
+  # Tolerance cascade, strictest first. A 10-instance diagnostic found 95% of model patches
+  # (57/60) rejected by plain `git apply` -- the reasoning was never reached, because the diff
+  # was thrown away before any test ran. The patches are structurally well-formed unified diffs;
+  # what they get wrong is exact hunk line numbers and context, which is precisely what these
+  # flags forgive. Each step is strictly more permissive than the last, and the FIRST that
+  # succeeds wins, so a patch that applies cleanly is unaffected.
+  #
+  #   --recount    : trust the hunk BODY, recompute the @@ counts the model miscounted
+  #   -C1          : require 1 line of matching context instead of 3
+  #   patch --fuzz : GNU patch, ignore whitespace, allow hunks to slide
+  #
+  # This forgives WHERE a change goes, never WHAT it changes: a hunk still has to match real
+  # code, and FAIL_TO_PASS/PASS_TO_PASS remain the oracle. A patch that applies in the wrong
+  # place fails the tests, so tolerance cannot manufacture a resolution.
+  if git apply /work/in/model.patch 2>/dev/null; then echo "FP_PATCH applied"
+  elif git apply --recount /work/in/model.patch 2>/dev/null; then echo "FP_PATCH applied recount"
+  elif git apply --recount -C1 /work/in/model.patch 2>/dev/null; then echo "FP_PATCH applied c1"
+  elif patch -p1 -l -f --fuzz=3 -i /work/in/model.patch >/dev/null 2>&1; then echo "FP_PATCH applied fuzz"
+  else echo "FP_PATCH rejected"; fi
 else
   echo "FP_PATCH empty"
 fi
@@ -268,6 +288,22 @@ pub fn evaluate(
     let f2p = parse_pytest(section(&stdout, "FP_F2P_BEGIN", "FP_F2P_END"));
     let p2p = parse_pytest(section(&stdout, "FP_P2P_BEGIN", "FP_P2P_END"));
     let patch_applied = stdout.contains("FP_PATCH applied");
+    // WHICH tolerance level was needed. Recorded because "we made apply more permissive and the
+    // score went up" is exactly the claim a reviewer should distrust: if resolutions only appear
+    // under the fuzziest fallback, the tolerance is doing suspicious work. Plain applies and
+    // --recount applies are unremarkable; a resolution that needs `patch --fuzz` deserves a look.
+    let apply_method = if !patch_applied {
+        "rejected"
+    } else if stdout.contains("FP_PATCH applied fuzz") {
+        "fuzz"
+    } else if stdout.contains("FP_PATCH applied c1") {
+        "c1"
+    } else if stdout.contains("FP_PATCH applied recount") {
+        "recount"
+    } else {
+        "clean"
+    }
+    .to_owned();
     let control_ok = control.1 > 0 && control.0 == control.1;
 
     Ok(SweOutcome {
@@ -276,6 +312,7 @@ pub fn evaluate(
         resolved: control_ok && f2p.1 > 0 && f2p.0 == f2p.1 && p2p.1 > 0 && p2p.0 == p2p.1,
         control_ok,
         patch_applied,
+        apply_method,
         f2p,
         p2p,
     })
@@ -455,6 +492,56 @@ mod tests {
             fixed.resolved,
             "gold must resolve the instance; f2p={:?} p2p={:?}",
             fixed.f2p, fixed.p2p
+        );
+    }
+
+    /// The cascade forgives WHERE a change lands, never WHAT it does. This is the guard against
+    /// the obvious objection: "you loosened `git apply` until the score improved."
+    ///
+    /// A patch that applies under fuzz but breaks the code must still fail the oracle, because
+    /// `resolved` requires every FAIL_TO_PASS to pass AND every PASS_TO_PASS to still pass.
+    /// Tolerance changes the denominator of "patches evaluated", never the numerator of
+    /// "patches correct".
+    #[test]
+    #[ignore = "requires the published SWE-bench image and a container daemon"]
+    fn a_fuzzily_applied_but_wrong_patch_still_fails_the_oracle() {
+        let path = std::env::var("FIRSTPASS_SWE_DATASET").unwrap_or_default();
+        let Ok(instances) = load_swebench_jsonl(&path) else {
+            eprintln!("set FIRSTPASS_SWE_DATASET to run this");
+            return;
+        };
+        let Some(inst) = instances
+            .iter()
+            .find(|i| i.instance_id == "astropy__astropy-12907")
+        else {
+            return;
+        };
+        // Deliberately sloppy line numbers (so strict apply refuses and the cascade engages)
+        // wrapped around a change that is real but WRONG.
+        let wrong = "--- a/astropy/modeling/separable.py\n\
+                     +++ b/astropy/modeling/separable.py\n\
+                     @@ -1,3 +1,4 @@\n\
+                      # Licensed under a 3-clause BSD style license - see LICENSE.rst\n\
+                     +BROKEN_SENTINEL = 1 / 0\n\
+                      \n";
+        let out = evaluate(inst, wrong, &SweLimits::default()).expect("eval runs");
+        // NOT VACUOUS: the patch must actually have been APPLIED, or this proves nothing about
+        // tolerance -- a rejected patch fails the oracle trivially and would let the test pass
+        // while testing nothing.
+        assert!(
+            out.patch_applied,
+            "the cascade must have applied this patch for the test to mean anything (method: {})",
+            out.apply_method
+        );
+        assert_ne!(
+            out.apply_method, "clean",
+            "sloppy line numbers should have needed a fallback, not applied cleanly"
+        );
+        assert!(
+            !out.resolved,
+            "a patch that injects a ZeroDivisionError must never resolve, however it applied \
+             (method: {})",
+            out.apply_method
         );
     }
 }

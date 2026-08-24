@@ -325,6 +325,19 @@ pub fn run_instance(
             let patch = strip_fences(&text);
 
             let outcome = evaluate(instance, &patch, limits)?;
+            // Diagnostic: 95% of rungs produced a patch git refused. "Did not apply" says nothing
+            // about WHY -- offset hunks and structurally corrupt output need opposite fixes -- so
+            // dump the head of a rejected patch. Gated on an env var; off by default, because a
+            // benchmark should not spray model output into its own logs.
+            if !outcome.patch_applied && std::env::var("FIRSTPASS_SWE_DUMP_REJECTS").is_ok() {
+                let head: Vec<&str> = patch.lines().take(12).collect();
+                eprintln!(
+                    "--- REJECTED PATCH ({}) {} lines total ---\n{}\n--- end ---",
+                    instance.instance_id,
+                    patch.lines().count(),
+                    head.join("\n")
+                );
+            }
             // `resolved` is the ORACLE: every FAIL_TO_PASS now passes and every PASS_TO_PASS still
             // does. The gate is the weaker, cheaper check the router is allowed to see — whether
             // the patch applied and the targeted tests moved.
@@ -342,6 +355,7 @@ pub fn run_instance(
                 // The taxonomy: distinguishes "would not apply" from "applied and failed tests".
                 applied: Some(outcome.patch_applied),
                 f2p: Some(outcome.f2p),
+                apply_method: Some(outcome.apply_method.clone()),
                 cost_usd: cost,
                 gate_score,
             });

@@ -89,6 +89,14 @@ pub struct RecordedRung {
     /// `(passed, total)` of FAIL_TO_PASS after the candidate patch. `None` outside SWE-bench.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub f2p: Option<(usize, usize)>,
+    /// Which tolerance level the patch needed: `clean`, `recount`, `c1`, `fuzz`, `rejected`.
+    /// `None` outside SWE-bench.
+    ///
+    /// Persisted so "we loosened apply and the score went up" is auditable rather than asserted.
+    /// If resolutions cluster in `fuzz`, the tolerance is doing suspicious work and the result
+    /// should be distrusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_method: Option<String>,
 }
 
 /// One task's full recorded trajectory.
@@ -316,6 +324,7 @@ pub fn run_task(
                 // MBPP has no patch to apply; the SWE-only taxonomy stays absent.
                 applied: None,
                 f2p: None,
+                apply_method: None,
             });
 
             if cheapest_pass.is_none() {
@@ -561,11 +570,16 @@ mod tests {
         let r: RecordedRung = serde_json::from_str(old).expect("pre-taxonomy rung must load");
         assert_eq!(r.applied, None);
         assert_eq!(r.f2p, None);
+        assert_eq!(r.apply_method, None);
         // ...and round-trips back WITHOUT inventing fields, so re-serializing an old record
         // cannot change its bytes.
         let back = serde_json::to_string(&r).expect("serialize");
         assert!(!back.contains("applied"), "absent must stay absent: {back}");
         assert!(!back.contains("f2p"), "absent must stay absent: {back}");
+        assert!(
+            !back.contains("apply_method"),
+            "absent must stay absent: {back}"
+        );
     }
 
     /// The new field must actually survive a write/read cycle, or the taxonomy is decorative.
@@ -579,10 +593,12 @@ mod tests {
             gate_score: 0.5,
             applied: Some(false),
             f2p: Some((1, 3)),
+            apply_method: Some("fuzz".to_owned()),
         };
         let s = serde_json::to_string(&r).expect("serialize");
         let back: RecordedRung = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back.applied, Some(false));
         assert_eq!(back.f2p, Some((1, 3)));
+        assert_eq!(back.apply_method.as_deref(), Some("fuzz"));
     }
 }
