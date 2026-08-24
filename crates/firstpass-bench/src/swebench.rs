@@ -90,6 +90,50 @@ pub fn classify_apply(stdout: &str) -> String {
     .to_owned()
 }
 
+/// Split `PASS_TO_PASS` into the part a GATE may see and the part reserved for the oracle.
+///
+/// The 50-instance run measured the gate at **3/82 = 3.7% precision**: 79 patches fixed the named
+/// failing test and broke something else, and the gate — which only checked the named test —
+/// waved every one of them through. A cascade router whose verifier is wrong 96% of the time
+/// stops early on garbage, confidently. That is the product's core mechanism failing, not a
+/// benchmark artifact.
+///
+/// The obvious fix is to make the gate check regressions too, and the obvious fix is a trap: a
+/// gate that runs the FULL `PASS_TO_PASS` list becomes byte-identical to the oracle, and a
+/// benchmark whose gate equals its oracle can no longer measure its own gate's error. That is the
+/// one line this repo does not cross.
+///
+/// So the gate sees a realistic SUBSET: the regression tests living in the same files as the
+/// failing tests — what a developer or agent actually runs next to a fix. The oracle keeps the
+/// entire list, including everything the gate never saw. The gate can still be wrong, and the
+/// benchmark can still catch it being wrong.
+///
+/// Deterministic: no sampling, no ambient randomness, so an auditor reproduces the split exactly.
+#[must_use]
+pub fn split_p2p_for_gate(
+    fail_to_pass: &[String],
+    pass_to_pass: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let file_of = |t: &str| t.split("::").next().unwrap_or(t).to_owned();
+    let touched: std::collections::BTreeSet<String> =
+        fail_to_pass.iter().map(|t| file_of(t)).collect();
+    let (mut gate, mut rest): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for t in pass_to_pass {
+        if touched.contains(&file_of(t)) {
+            gate.push(t.clone());
+        } else {
+            rest.push(t.clone());
+        }
+    }
+    // A fix in a file with no sibling regression tests would leave the gate blind again, so fall
+    // back to a deterministic slice rather than to nothing.
+    if gate.is_empty() {
+        let take = rest.len().min(10);
+        gate = rest.drain(..take).collect();
+    }
+    (gate, rest)
+}
+
 /// What one instance produced.
 #[derive(Debug, Clone)]
 pub struct SweOutcome {
@@ -107,8 +151,12 @@ pub struct SweOutcome {
     pub apply_method: String,
     /// `(passed, total)` for `FAIL_TO_PASS` after the candidate patch.
     pub f2p: (usize, usize),
-    /// `(passed, total)` for `PASS_TO_PASS` after the candidate patch.
+    /// `(passed, total)` for `PASS_TO_PASS` after the candidate patch — the ORACLE's full list.
     pub p2p: (usize, usize),
+    /// `(passed, total)` for the regression tests a GATE is allowed to see: the `PASS_TO_PASS`
+    /// entries sharing a file with the failing tests. A strict subset of [`Self::p2p`], so the
+    /// gate stays weaker than the oracle and its error remains measurable.
+    pub p2p_gate: (usize, usize),
 }
 
 /// Resource ceilings for one instance. The workdir must hold a copy of the repository.
@@ -181,6 +229,14 @@ cd /work/repo
 # unpatched code and every number it produces is meaningless.
 export PYTHONPATH=/work/repo
 run() { python -m pytest -q -p no:cacheprovider --no-header $(tr '\n' ' ' < "$1") 2>&1 | tail -3; }
+# Verbose variant: emits one line per test so the GATE subset can be scored from the SAME
+# invocation as the oracle. Splitting PASS_TO_PASS into two pytest runs looked equivalent and was
+# not -- the 6 oracle-only tests hit `TypeError` during COLLECTION when imported without their
+# siblings, so a gold patch that resolves scored 13/19 and the oracle called it a failure. Same
+# tests, same container, different invocation, opposite verdict. Partition the RESULTS, never the
+# run. Filtered to result lines plus the summary so a suite of hundreds does not flood stdout.
+runv() { python -m pytest -q -p no:cacheprovider --no-header -v --tb=no $(tr '\n' ' ' < "$1") 2>&1 \
+  | grep -E "::.+ (PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)|[0-9]+ (passed|failed|error)" | tail -800; }
 
 git apply /work/in/test.patch 2>/dev/null || { echo "FP_ENV test-patch-failed"; exit 0; }
 
@@ -221,7 +277,7 @@ else
 fi
 
 echo "FP_F2P_BEGIN"; run /work/in/f2p.txt; echo "FP_F2P_END"
-echo "FP_P2P_BEGIN"; run /work/in/p2p.txt; echo "FP_P2P_END"
+echo "FP_P2P_BEGIN"; runv /work/in/p2p.txt; echo "FP_P2P_END"
 "#
     .to_owned()
 }
@@ -247,6 +303,38 @@ pub fn parse_pytest(section: &str) -> (usize, usize) {
         }
     }
     (passed, passed + other)
+}
+
+/// Score the gate-visible subset from the per-test lines of the full `PASS_TO_PASS` run.
+///
+/// The oracle keeps reading the pytest SUMMARY, so `resolved` means exactly what it meant in
+/// every earlier benchmark file. The gate is derived from the same output, never a second run:
+/// re-invoking pytest on a subset changes collection and therefore changes results.
+///
+/// Returns `(passed, scored)` over gate-visible tests only. SKIPPED is excluded from both, which
+/// matches [`parse_pytest`] — a skipped test is not evidence either way.
+#[must_use]
+pub fn score_gate_subset(section: &str, gate_ids: &[String]) -> (usize, usize) {
+    let want: std::collections::BTreeSet<&str> = gate_ids.iter().map(String::as_str).collect();
+    let (mut passed, mut scored) = (0usize, 0usize);
+    for line in section.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(id), Some(verdict)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if !want.contains(id) {
+            continue;
+        }
+        match verdict {
+            "PASSED" | "XPASS" => {
+                passed += 1;
+                scored += 1;
+            }
+            "FAILED" | "ERROR" | "XFAIL" => scored += 1,
+            _ => {}
+        }
+    }
+    (passed, scored)
 }
 
 /// Pull the text between two markers.
@@ -320,8 +408,15 @@ pub fn evaluate(
     }
 
     let control = parse_pytest(section(&stdout, "FP_CONTROL_BEGIN", "FP_CONTROL_END"));
+    // Raw eval stdout, for when a verdict needs explaining rather than trusting. Off by default.
+    if std::env::var("FIRSTPASS_SWE_DUMP_EVAL").is_ok() {
+        eprintln!("=== EVAL STDOUT ===\n{stdout}\n=== END ===");
+    }
+    let p2p_section = section(&stdout, "FP_P2P_BEGIN", "FP_P2P_END");
+    let (gate_ids, _) = split_p2p_for_gate(&instance.fail_to_pass, &instance.pass_to_pass);
+    let p2p_gate = score_gate_subset(p2p_section, &gate_ids);
     let f2p = parse_pytest(section(&stdout, "FP_F2P_BEGIN", "FP_F2P_END"));
-    let p2p = parse_pytest(section(&stdout, "FP_P2P_BEGIN", "FP_P2P_END"));
+    let p2p = parse_pytest(p2p_section);
     let patch_applied = stdout.contains("FP_PATCH applied");
     // WHICH tolerance level was needed. Recorded because "we made apply more permissive and the
     // score went up" is exactly the claim a reviewer should distrust: if resolutions only appear
@@ -339,12 +434,14 @@ pub fn evaluate(
         apply_method,
         f2p,
         p2p,
+        p2p_gate,
     })
 }
 
 /// Build the uncompressed tar delivered on stdin: the two patch files and the two test lists.
 /// A tar rather than base64-per-file because a `test_patch` can be large and this keeps one
-/// delivery mechanism for all four inputs.
+/// delivery mechanism for every input. PASS_TO_PASS ships three ways: the full list (control),
+/// the gate-visible subset, and the oracle-only remainder.
 fn build_input_tar(instance: &SweInstance, model_patch: &str) -> Result<Vec<u8>, String> {
     let files: [(&str, String); 4] = [
         ("test.patch", instance.test_patch.clone()),
@@ -478,45 +575,65 @@ mod tests {
         std::fs::remove_file(&p).ok();
         assert!(err.contains("unfalsifiable"), "{err}");
     }
-
-    /// The real thing, against a real published image. Reproduces by code the hand-run that
-    /// validated ADR 0010: gold patch resolves, empty patch does not, and the control holds in
-    /// both. Ignored by default — it needs ~1.1GB of image.
+    /// End-to-end oracle check: the REAL gold patch must resolve, an empty patch must not.
     ///
-    ///   docker pull --platform linux/amd64 swebench/sweb.eval.x86_64.astropy_1776_astropy-12907
-    ///   cargo test -p firstpass-bench --lib swebench::tests::real_ -- --ignored --nocapture
+    /// This test was silently dead. It read its dataset from a hardcoded `/tmp/swe-3.jsonl` and
+    /// its patch from `/tmp/gold.patch`, both leftovers from a machine state that no longer
+    /// exists, so it failed on `.expect()` before asserting anything -- and being `#[ignore]`d,
+    /// CI never ran it and nobody noticed. A test that looks like coverage and provides none is
+    /// worse than no test.
+    ///
+    /// Now self-contained: the dataset ships in `docs/benchmarks/` and the gold patch is a
+    /// committed fixture. It is the regression guard for the gate/oracle split -- if partitioning
+    /// PASS_TO_PASS ever loses or double-counts a test, a known-correct patch stops resolving
+    /// and this fails.
     #[test]
     #[ignore = "requires the published SWE-bench image (~1.1GB) and a container daemon"]
     fn real_gold_patch_resolves_and_an_empty_patch_does_not() {
-        let path = std::env::var("FIRSTPASS_SWE_DATASET")
-            .unwrap_or_else(|_| "/tmp/swe-3.jsonl".to_owned());
-        let instances = load_swebench_jsonl(&path).expect("dataset");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        let dataset = root.join("docs/benchmarks/swebench-50-testexec.dataset.jsonl");
+        let instances =
+            load_swebench_jsonl(&dataset.to_string_lossy()).expect("committed dataset loads");
         let inst = instances
             .iter()
             .find(|i| i.instance_id == "astropy__astropy-12907")
             .expect("astropy instance present");
-        let gold = std::fs::read_to_string("/tmp/gold.patch").expect("gold patch");
-        let limits = SweLimits::default();
+        let gold = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/gold_astropy-12907.patch"),
+        )
+        .expect("committed gold fixture");
 
-        // No patch: the control must hold and FAIL_TO_PASS must still fail. If this "resolves",
-        // the harness is measuring unpatched code — the exact trap the editable install sets.
-        let base = evaluate(inst, "", &limits).expect("base run");
-        assert!(base.control_ok, "PASS_TO_PASS must pass on the base commit");
-        assert!(!base.resolved, "the bug must be present before the fix");
+        let fixed = evaluate(inst, &gold, &SweLimits::default()).expect("gold eval runs");
         assert!(
-            base.f2p.0 < base.f2p.1,
-            "F2P should fail at base: {:?}",
-            base.f2p
+            fixed.control_ok,
+            "environment must be sane before blaming a patch"
         );
-
-        // Gold patch: resolves.
-        let fixed = evaluate(inst, &gold, &limits).expect("gold run");
         assert!(fixed.patch_applied, "gold patch must apply");
         assert!(
             fixed.resolved,
-            "gold must resolve the instance; f2p={:?} p2p={:?}",
-            fixed.f2p, fixed.p2p
+            "the GOLD patch must resolve; if this breaks, the oracle is wrong, not the model \
+             (f2p {:?} p2p {:?} gate {:?})",
+            fixed.f2p, fixed.p2p, fixed.p2p_gate
         );
+        // The split must not lose tests: the gate subset plus the remainder is the whole suite.
+        assert_eq!(
+            fixed.p2p.1,
+            inst.pass_to_pass.len(),
+            "oracle must still run every PASS_TO_PASS test after the gate/oracle split"
+        );
+        assert!(
+            fixed.p2p_gate.1 < fixed.p2p.1,
+            "the gate must see FEWER tests than the oracle (gate {} of {})",
+            fixed.p2p_gate.1,
+            fixed.p2p.1
+        );
+
+        let empty = evaluate(inst, "", &SweLimits::default()).expect("empty eval runs");
+        assert!(!empty.resolved, "an empty patch must never resolve");
     }
 
     /// The cascade forgives WHERE a change lands, never WHAT it does. This is the guard against
@@ -591,5 +708,92 @@ mod tests {
         // The ordering trap: "applied fuzz" CONTAINS "applied", so a most-specific-last check
         // would call every fallback `clean` and hide exactly the case worth auditing.
         assert_eq!(classify_apply("FP_PATCH applied fuzz"), "fuzz");
+    }
+
+    /// The gate must stay STRICTLY WEAKER than the oracle. If the split ever hands the gate every
+    /// PASS_TO_PASS test, gate_pass becomes oracle_correct by construction, every gate-error
+    /// measurement in this repo silently reads 100% precision, and the benchmark stops being able
+    /// to catch its own verifier being wrong. That is the failure this test exists to prevent.
+    #[test]
+    fn the_gate_never_sees_the_whole_oracle_suite() {
+        let f2p = vec!["tests/test_wcs.py::test_sip".to_owned()];
+        let p2p = vec![
+            "tests/test_wcs.py::test_a".to_owned(),   // same file -> gate
+            "tests/test_wcs.py::test_b".to_owned(),   // same file -> gate
+            "tests/test_io.py::test_c".to_owned(),    // elsewhere -> oracle only
+            "tests/test_table.py::test_d".to_owned(), // elsewhere -> oracle only
+        ];
+        let (gate, rest) = split_p2p_for_gate(&f2p, &p2p);
+        assert_eq!(gate.len(), 2, "gate takes the sibling tests: {gate:?}");
+        assert!(
+            !rest.is_empty(),
+            "the oracle MUST retain tests the gate cannot see"
+        );
+        assert_eq!(
+            gate.len() + rest.len(),
+            p2p.len(),
+            "the split must lose nothing"
+        );
+        for t in &gate {
+            assert!(!rest.contains(t), "buckets must be disjoint");
+        }
+    }
+
+    /// A fix in a file with no sibling regression tests must not leave the gate blind again —
+    /// that would silently restore the 3.7%-precision gate for exactly the instances where the
+    /// change is most isolated.
+    #[test]
+    fn a_file_with_no_sibling_tests_still_gets_a_gate_subset() {
+        let f2p = vec!["tests/test_lonely.py::test_x".to_owned()];
+        let p2p: Vec<String> = (0..25)
+            .map(|i| format!("tests/test_other.py::t{i}"))
+            .collect();
+        let (gate, rest) = split_p2p_for_gate(&f2p, &p2p);
+        assert!(
+            !gate.is_empty(),
+            "fallback must give the gate something to check"
+        );
+        assert!(
+            !rest.is_empty(),
+            "and must still reserve tests for the oracle"
+        );
+        assert_eq!(
+            gate.len() + rest.len(),
+            p2p.len(),
+            "the split must lose nothing"
+        );
+    }
+
+    /// Deterministic: an auditor re-running the split gets byte-identical buckets.
+    #[test]
+    fn the_split_is_deterministic() {
+        let f2p = vec!["a/t.py::x".to_owned()];
+        let p2p: Vec<String> = (0..40).map(|i| format!("b/u.py::t{i}")).collect();
+        let first = split_p2p_for_gate(&f2p, &p2p);
+        for _ in 0..5 {
+            assert_eq!(split_p2p_for_gate(&f2p, &p2p), first, "split must not vary");
+        }
+    }
+
+    /// Scoring the gate from the shared run's per-test lines, including the case that caused the
+    /// bug: a test the gate cannot see must not affect the gate's verdict.
+    #[test]
+    fn the_gate_scores_only_its_own_tests() {
+        let out = "\
+tests/test_wcs.py::test_a PASSED\n\
+tests/test_wcs.py::test_b FAILED\n\
+tests/test_io.py::test_c FAILED\n\
+tests/test_io.py::test_d PASSED\n\
+tests/test_wcs.py::test_e SKIPPED\n\
+2 passed, 2 failed in 1.0s\n";
+        let gate = vec![
+            "tests/test_wcs.py::test_a".to_owned(),
+            "tests/test_wcs.py::test_b".to_owned(),
+            "tests/test_wcs.py::test_e".to_owned(),
+        ];
+        // 1 of 2 scored: test_e is SKIPPED and counts for neither, and the two test_io failures
+        // belong to the oracle alone -- if they leaked in, the gate would inherit the oracle's
+        // strictness and stop being independently measurable.
+        assert_eq!(score_gate_subset(out, &gate), (1, 2));
     }
 }
