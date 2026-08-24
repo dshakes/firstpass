@@ -63,6 +63,33 @@ pub struct SweInstance {
     pub image: String,
 }
 
+/// Which tolerance level (if any) applied the candidate patch, read off the eval script's markers.
+///
+/// Pure and separate so the classification is testable without a container. Two distinctions here
+/// are load-bearing and both were got wrong first time:
+/// - `no-patch` (the model emitted nothing) is NOT `rejected` (git refused a real diff). One is a
+///   budget/format failure, the other is diff brittleness; collapsing them rebuilds the exact
+///   conflation the taxonomy exists to break.
+/// - the fallbacks are checked most-permissive-first, because the script's markers are prefixed
+///   ("applied fuzz" contains "applied") and a naive check would report every fallback as `clean`.
+#[must_use]
+pub fn classify_apply(stdout: &str) -> String {
+    if stdout.contains("FP_PATCH empty") {
+        "no-patch"
+    } else if stdout.contains("FP_PATCH applied fuzz") {
+        "fuzz"
+    } else if stdout.contains("FP_PATCH applied c1") {
+        "c1"
+    } else if stdout.contains("FP_PATCH applied recount") {
+        "recount"
+    } else if stdout.contains("FP_PATCH applied") {
+        "clean"
+    } else {
+        "rejected"
+    }
+    .to_owned()
+}
+
 /// What one instance produced.
 #[derive(Debug, Clone)]
 pub struct SweOutcome {
@@ -173,13 +200,21 @@ if [ -s /work/in/model.patch ]; then
   #   -C1          : require 1 line of matching context instead of 3
   #   patch --fuzz : GNU patch, ignore whitespace, allow hunks to slide
   #
+  # The `patch` step is guarded by --dry-run first, and this is not belt-and-braces. `git apply`
+  # is ATOMIC -- it applies every hunk or none -- but GNU `patch` is not: on partial success it
+  # writes the hunks it liked, drops .rej files, and exits non-zero. Without the dry run, a
+  # "rejected" verdict could leave the repo HALF PATCHED, and the F2P/P2P runs that follow would
+  # score a tree that is neither the base commit nor the model's patch. Silent result
+  # contamination, reported as a clean rejection. Caught in review.
+  #
   # This forgives WHERE a change goes, never WHAT it changes: a hunk still has to match real
   # code, and FAIL_TO_PASS/PASS_TO_PASS remain the oracle. A patch that applies in the wrong
   # place fails the tests, so tolerance cannot manufacture a resolution.
   if git apply /work/in/model.patch 2>/dev/null; then echo "FP_PATCH applied"
   elif git apply --recount /work/in/model.patch 2>/dev/null; then echo "FP_PATCH applied recount"
   elif git apply --recount -C1 /work/in/model.patch 2>/dev/null; then echo "FP_PATCH applied c1"
-  elif patch -p1 -l -f --fuzz=3 -i /work/in/model.patch >/dev/null 2>&1; then echo "FP_PATCH applied fuzz"
+  elif patch -p1 -l -f --fuzz=3 --dry-run -i /work/in/model.patch >/dev/null 2>&1 \
+       && patch -p1 -l -f --fuzz=3 -i /work/in/model.patch >/dev/null 2>&1; then echo "FP_PATCH applied fuzz"
   else echo "FP_PATCH rejected"; fi
 else
   echo "FP_PATCH empty"
@@ -292,18 +327,7 @@ pub fn evaluate(
     // score went up" is exactly the claim a reviewer should distrust: if resolutions only appear
     // under the fuzziest fallback, the tolerance is doing suspicious work. Plain applies and
     // --recount applies are unremarkable; a resolution that needs `patch --fuzz` deserves a look.
-    let apply_method = if !patch_applied {
-        "rejected"
-    } else if stdout.contains("FP_PATCH applied fuzz") {
-        "fuzz"
-    } else if stdout.contains("FP_PATCH applied c1") {
-        "c1"
-    } else if stdout.contains("FP_PATCH applied recount") {
-        "recount"
-    } else {
-        "clean"
-    }
-    .to_owned();
+    let apply_method = classify_apply(&stdout);
     let control_ok = control.1 > 0 && control.0 == control.1;
 
     Ok(SweOutcome {
@@ -543,5 +567,29 @@ mod tests {
              (method: {})",
             out.apply_method
         );
+    }
+
+    /// Every bucket, against the REAL classifier. The first version of this test re-implemented
+    /// the branching inline, so it would have passed even if the shipped code were broken.
+    #[test]
+    fn every_apply_outcome_maps_to_its_own_bucket() {
+        for (marker, want) in [
+            ("FP_PATCH empty", "no-patch"),
+            ("FP_PATCH rejected", "rejected"),
+            ("FP_PATCH applied", "clean"),
+            ("FP_PATCH applied recount", "recount"),
+            ("FP_PATCH applied c1", "c1"),
+            ("FP_PATCH applied fuzz", "fuzz"),
+        ] {
+            let out = format!("FP_CONTROL_BEGIN\nFP_CONTROL_END\n{marker}\nFP_F2P_BEGIN");
+            assert_eq!(
+                classify_apply(&out),
+                want,
+                "marker {marker:?} misclassified"
+            );
+        }
+        // The ordering trap: "applied fuzz" CONTAINS "applied", so a most-specific-last check
+        // would call every fallback `clean` and hide exactly the case worth auditing.
+        assert_eq!(classify_apply("FP_PATCH applied fuzz"), "fuzz");
     }
 }
