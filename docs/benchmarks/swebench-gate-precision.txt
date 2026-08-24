@@ -1,0 +1,78 @@
+# Agentic SWE-bench — fixing the verifier, not the model
+
+Three defects, each hiding the next, found while trying to produce a defensible
+cost-per-resolved-task number on multi-turn coding work. Every number below is 50 instances of
+SWE-bench Verified, 3 turns, a haiku->sonnet ladder, measured against the official oracle
+(every FAIL_TO_PASS passes AND every PASS_TO_PASS still passes).
+
+## The headline
+
+| | before | after | |
+|---|---|---|---|
+| patches that APPLIED | 5% | **34.0%** | |
+| gate precision | 3.7% | **8.9%** | Fisher p = 0.22 |
+| resolved | 4.0% | **8.0%** | Fisher p = 0.68 |
+| $/instance | $0.269 | $0.300 | +12% |
+| **$/resolved** | **$6.71** [$1.96, $55] | **$3.75** [$1.56, $13] | |
+
+**Every metric moved the right way and NOT ONE clears significance.** With 2 and 4 resolution
+events, it cannot. The honest claim is consistent directional improvement, no proof.
+
+## What was actually broken
+
+**1. 95% of patches were discarded before any test ran.** Of 60 rungs on a diagnostic, 57
+produced a diff `git apply` refused. The earlier conclusion -- "4% resolve rate, the solver is the
+binding constraint" -- was measuring diff formatting and reporting it as reasoning. The patches
+were not garbage: dumped and inspected, they are well-formed unified diffs that get hunk line
+numbers and context wrong. A tolerance cascade (`--recount` -> `-C1` -> `patch --fuzz=3`) took
+apply-rate from 5% to ~30%, with apply-rate improvement significant at p=0.043.
+
+**2. The gate was wrong 96% of the time.** With patches finally reaching tests, the gate
+("applied AND the named failing test passes") passed 82 rungs of which 3 were correct. 79 patches
+fixed the reported bug and broke something else. For a router whose entire thesis is
+escalate-only-on-gate-failure, a verifier wrong 96% of the time is the mechanism failing -- it
+stops early on garbage, confidently. The gate now also requires no regressions in the tests it
+can see.
+
+**3. A truncation bug made a dead rung look like a bad measurement.** claude-sonnet-5 emits
+thinking blocks by default; on repo-scale prompts the reasoning consumed the whole `max_tokens`
+and the top rung returned no text. Scored as an ordinary failed candidate, it produced 0/54 gate
+passes that read as a disappointing result rather than a broken run.
+
+## Why the gate does not simply run every test
+
+A gate that runs the full PASS_TO_PASS list becomes byte-identical to the oracle, and a benchmark
+whose gate equals its oracle can no longer measure its own gate's error. The gate sees a SUBSET --
+the regression tests sharing a file with the failing tests, i.e. what a developer runs next to a
+fix. The oracle keeps everything, including tests the gate never sees.
+
+Splitting that subset into its OWN pytest invocation looked equivalent and was not: the
+oracle-only tests raise TypeError during COLLECTION when imported without their siblings, so the
+GOLD patch scored 13/19 and the oracle called a known-correct fix a failure. Same tests, same
+container, different invocation, opposite verdict. The gate is scored from the per-test lines of
+the same run. **Partition the results, never the run.**
+
+## What CANNOT be concluded
+
+**Nothing here is statistically established.** p = 0.22 and p = 0.68. Four resolutions.
+
+**These are not paired comparisons.** The runs share instances but not model outputs. Sampling
+variance is large and demonstrable: identical code on identical instances produced 3 resolutions
+one run and 2 the next. Under the new gate, gate PASSES rose 82 -> 90, which is mechanically
+impossible for a stricter criterion on the same patches -- so variance is visibly present in
+these numbers.
+
+**The result leans on the loosest tolerance.** Of 8 resolving rungs, 6 needed `patch --fuzz=3`
+and only 1 applied cleanly. The oracle still gates every one, and an #[ignore]d Docker test
+confirms a deliberately-wrong patch that applies under fuzz still fails the oracle -- but the
+dependency is real and should not be buried.
+
+**$3.75/resolved is a point estimate on 4 events.** Propagating the CI on the rate gives
+$1.56 to $13. Quoting $3.75 alone would present a 8x interval as a number.
+
+## What would settle it
+
+Sample size, not another mechanism fix. At an 8% resolve rate, ~150-200 instances (~$50) brings
+the resolution CI from [2.2%, 19.2%] to roughly [4%, 13%] and gives the precision comparison
+enough events to test. That is the next run, and it is the only remaining blocker to a
+cost-per-resolved number worth publishing.
