@@ -145,6 +145,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=sorted(SOURCES), default="bigcodebench")
     ap.add_argument("--split", default=None, help="override the source's default split")
+    ap.add_argument(
+        "--prefix-order",
+        action="store_true",
+        help="take the first N in dataset order instead of stratifying by repo. Reproduces the "
+        "SKEWED samples of earlier runs; do not use for new measurements.",
+    )
     ap.add_argument("--out", default="bcb-stdlib.jsonl")
     ap.add_argument(
         "--limit", type=int, default=40, help="how many matching tasks to keep"
@@ -192,9 +198,16 @@ def main() -> int:
         return 0
 
     if args.dataset == "swebench":
+        # Scan the WHOLE split, then select. Taking the first N was a trap: SWE-bench Verified is
+        # ordered alphabetically by repo, so every prefix is a near-single-repo sample. A
+        # 150-instance "sample" came out 22 astropy + 128 django, and since the agent scored
+        # 22.7% on astropy and 0/128 on django, the pooled 3.3% described neither population --
+        # and going 50 -> 150 diluted the estimate instead of tightening it. See
+        # docs/benchmarks/swebench-150-stratified.txt.
         kept, scanned = [], 0
-        while scanned < args.limit:
-            rows = fetch_page(src, split, scanned, min(PAGE, args.limit - scanned))
+        pool = []
+        while True:
+            rows = fetch_page(src, split, scanned, PAGE)
             if not rows:
                 break
             scanned += len(rows)
@@ -202,7 +215,7 @@ def main() -> int:
                 # FAIL_TO_PASS / PASS_TO_PASS arrive as JSON *strings*, not lists.
                 f2p = r["FAIL_TO_PASS"]
                 p2p = r["PASS_TO_PASS"]
-                kept.append(
+                pool.append(
                     {
                         "instance_id": r["instance_id"],
                         "repo": r["repo"],
@@ -215,8 +228,29 @@ def main() -> int:
                         "difficulty": r.get("difficulty", ""),
                     }
                 )
+        if args.prefix_order:
+            kept = pool[: args.limit]
+        else:
+            # Round-robin across repos, keeping dataset order within each. Deterministic, so an
+            # auditor reproduces the identical sample; balanced, so a measured rate is not just a
+            # statement about whichever repo sorts first.
+            by_repo = {}
+            for rec in pool:
+                by_repo.setdefault(rec["repo"], []).append(rec)
+            queues = [by_repo[k] for k in sorted(by_repo)]
+            while len(kept) < args.limit and any(queues):
+                for q in queues:
+                    if not q:
+                        continue
+                    kept.append(q.pop(0))
+                    if len(kept) >= args.limit:
+                        break
         write_out(args.out, kept, src, split, "none (SWE-bench Verified, human-validated)", scanned)
-        print(f"wrote {len(kept)} SWE-bench instances to {args.out}")
+        mix = {}
+        for rec in kept:
+            mix[rec["repo"]] = mix.get(rec["repo"], 0) + 1
+        print(f"wrote {len(kept)} SWE-bench instances to {args.out} (scanned {scanned})")
+        print(f"repo mix: {dict(sorted(mix.items(), key=lambda kv: -kv[1]))}")
         print("each needs its own multi-GB eval image; pull them BEFORE the run (no network at eval)")
         return 0 if kept else 1
 
