@@ -117,12 +117,29 @@ pub fn split_p2p_for_gate(
     let file_of = |t: &str| t.split("::").next().unwrap_or(t).to_owned();
     let touched: std::collections::BTreeSet<String> =
         fail_to_pass.iter().map(|t| file_of(t)).collect();
+    // Siblings FIRST, then a deterministic slice of everything else.
+    //
+    // Siblings alone were measured at 0/256 precision on django: 256 patches passed their target
+    // tests and their same-file regression tests, and every one broke something further away.
+    // Django's reverse dependencies span the codebase, so "tests in the file I changed" is not a
+    // regression check there -- it only looked like one on astropy, where behaviour is local.
+    //
+    // Every SPREAD_DENOM-th non-sibling test joins the gate, so coverage reaches modules the
+    // change might break without the gate becoming the oracle: the rest stays reserved, which is
+    // what keeps the gate's own error measurable.
+    const SPREAD_DENOM: usize = 3;
     let (mut gate, mut rest): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let mut far = 0usize;
     for t in pass_to_pass {
         if touched.contains(&file_of(t)) {
             gate.push(t.clone());
         } else {
-            rest.push(t.clone());
+            if far.is_multiple_of(SPREAD_DENOM) {
+                gate.push(t.clone());
+            } else {
+                rest.push(t.clone());
+            }
+            far += 1;
         }
     }
     // A fix in a file with no sibling regression tests would leave the gate blind again, so fall
@@ -724,7 +741,21 @@ mod tests {
             "tests/test_table.py::test_d".to_owned(), // elsewhere -> oracle only
         ];
         let (gate, rest) = split_p2p_for_gate(&f2p, &p2p);
-        assert_eq!(gate.len(), 2, "gate takes the sibling tests: {gate:?}");
+        // Both siblings, plus reach BEYOND the changed file -- siblings alone measured 0/256
+        // precision on django, whose regression surface is not file-local.
+        assert!(
+            gate.contains(&"tests/test_wcs.py::test_a".to_owned())
+                && gate.contains(&"tests/test_wcs.py::test_b".to_owned()),
+            "gate must take the siblings: {gate:?}"
+        );
+        assert!(
+            gate.iter().any(|t| !t.starts_with("tests/test_wcs.py")),
+            "gate must also reach beyond the changed file: {gate:?}"
+        );
+        assert!(
+            gate.len() < p2p.len(),
+            "gate must be a STRICT subset of the oracle suite: {gate:?}"
+        );
         assert!(
             !rest.is_empty(),
             "the oracle MUST retain tests the gate cannot see"
@@ -795,5 +826,38 @@ tests/test_wcs.py::test_e SKIPPED\n\
         // belong to the oracle alone -- if they leaked in, the gate would inherit the oracle's
         // strictness and stop being independently measurable.
         assert_eq!(score_gate_subset(out, &gate), (1, 2));
+    }
+
+    /// The django failure, in miniature. A fix in one module with regression tests spread across
+    /// the codebase: the sibling-only gate saw 2 of 30 tests and certified 256 django patches
+    /// with zero correct. The gate must now reach modules the change could break.
+    #[test]
+    fn the_gate_reaches_beyond_the_changed_module() {
+        let f2p = vec!["tests/forms/test_fields.py::test_x".to_owned()];
+        let mut p2p = vec![
+            "tests/forms/test_fields.py::sib1".to_owned(),
+            "tests/forms/test_fields.py::sib2".to_owned(),
+        ];
+        // 28 regression tests living far from the change, as django's do.
+        p2p.extend((0..28).map(|i| format!("tests/model_fields/test_m{i}.py::t")));
+
+        let (gate, rest) = split_p2p_for_gate(&f2p, &p2p);
+        let far_in_gate = gate.iter().filter(|t| t.contains("model_fields")).count();
+        assert!(
+            far_in_gate >= 5,
+            "gate must cover distant modules, saw {far_in_gate} of 28: {gate:?}"
+        );
+        // ...and must still be strictly weaker than the oracle, or its error stops being
+        // measurable.
+        assert!(
+            !rest.is_empty(),
+            "oracle must keep tests the gate cannot see"
+        );
+        assert!(gate.len() < p2p.len(), "gate must remain a strict subset");
+        assert_eq!(
+            gate.len() + rest.len(),
+            p2p.len(),
+            "split must lose nothing"
+        );
     }
 }
