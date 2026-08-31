@@ -1,0 +1,76 @@
+# Agentic SWE-bench, 150 instances — the pooled number is the wrong number
+
+150 instances, 900 rungs, $32.75, 3 turns, haiku->sonnet ladder, official oracle
+(every FAIL_TO_PASS passes AND every PASS_TO_PASS still passes).
+
+## Reproducibility caveat — read this before citing the numbers
+
+**The raw checkpoint for this run was lost.** It was written to the session scratchpad under
+/private/tmp, which was cleaned between the analysis and the commit. The figures below are as
+computed and are not disputed, but unlike every other file in this directory they have NO
+committed per-instance records, so an auditor cannot re-derive them. The dataset IS committed
+(`swebench-150.dataset.jsonl`), so the run is repeatable — at ~$33.
+
+This was avoidable and previously identified: the same /private/tmp cleanup had already turned a
+diagnostic into a silent zero-instance run earlier in this work, and the response then was to
+commit the dataset. The checkpoint should have been committed on the same reasoning and was not.
+Benchmark runs must checkpoint into the repository, not the scratchpad.
+
+## Result
+
+| stratum | resolved | 95% CI | gate precision | $/resolved |
+|---|---|---|---|---|
+| **astropy** | **5/22 = 22.7%** | [7.8%, 45.4%] | 7/27 = 26% | **$2.48** |
+| **django** | **0/128 = 0.0%** | [0.0%, 2.8%] | **0/256 = 0%** | undefined |
+| pooled | 5/150 = 3.3% | [1.1%, 7.6%] | 7/283 = 2.5% | $7.11 |
+
+**Report the strata, not the pool.** 3.3% describes neither population: it is 22.7% and 0%
+averaged by a sample that happens to be 85% django.
+
+## Django is a hard zero, and it is not small-sample noise
+
+128 instances. 256 gate passes. Zero resolutions. Upper bound 2.8%.
+
+**It is not overfitting.** In-sample django (0/28, developed against) matches fresh django
+(0/100, never seen) exactly. Astropy carries the entire signal. The controlled comparison —
+same repo, both blocks — shows no in-sample advantage, which clears the tolerance cascade and the
+regression-aware gate of having been tuned to their evaluation set.
+
+**The gate is the identified failure.** 256 django gate passes produced zero correct answers.
+Patches apply, pass their target tests, and pass the sibling-file regression tests the gate
+checks — then break something elsewhere. Django's coupling is broad: a change in one module has
+reverse dependencies across the codebase, so "the tests in the same file as the failing test" is
+far too narrow a regression check. The gate introduced in #222 is right in principle and
+under-scoped in practice, and astropy (where behaviour is more local) hid that.
+
+## The sampling flaw behind every SWE-bench number in this repo
+
+`scripts/fetch-coding-dataset.py --limit N` returns instances in dataset order, which is
+alphabetical by repo. **Every prefix is therefore skewed**, and this dataset is 22 astropy +
+128 django. The earlier 22-, 30-, and 50-instance runs all inherit it, including the trajectory
+and test-execution refutations. Those negative results were PAIRED (same instances, both arms) so
+their conclusions stand, but none of their absolute rates are representative of SWE-bench
+Verified.
+
+Scaling from 50 to 150 did not tighten the estimate. It DILUTED it: every added instance came
+from the stratum that scores zero. "Get more samples" was the wrong prescription, confidently
+given.
+
+## Corrections to earlier reporting in this repo
+
+1. **`$/resolved` of $3.75 at n=50** was 44% astropy by composition. The astropy-only figure is
+   $2.48 [$1.14, $7]; there is no django figure.
+2. **"6 of 8 resolving rungs needed `fuzz`"** — at n=150 it is 1 of 8. Resolving rungs:
+   clean 3, recount 2, c1 1, fuzz 1. The tolerance cascade is doing considerably less suspicious
+   work than the n=50 slice suggested.
+3. **"Sample size is the only remaining blocker."** False. Composition was.
+
+## What actually needs building
+
+1. **Repo-stratified sampling.** A prefix of an alphabetically-ordered dataset is not a sample.
+   Selection must spread across repos so a rate generalises.
+2. **A coupling-aware gate subset.** For a codebase where behaviour is not file-local, the gate
+   must see regression tests beyond the changed file's neighbours — otherwise it certifies
+   patches that break the wider suite, which is exactly the 0/256 above.
+
+Neither is a bigger run.
