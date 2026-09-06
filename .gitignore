@@ -13,3 +13,4 @@ paper/main.pdf
 paper/*.aux
 paper/*.log
 paper/*.out
+scripts/__pycache__/

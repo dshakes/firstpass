@@ -109,12 +109,28 @@ def fetch_page(src: dict, split: str, offset: int, length: int) -> list[dict]:
         return [row["row"] for row in json.load(r)["rows"]]
 
 
-def write_out(path: str, kept: list[dict], src: dict, split: str, filt: str, scanned: int) -> None:
+PREFIX_SELECTION = "first N rows in dataset order (a stated prefix, not a random sample)"
+ROUND_ROBIN_SELECTION = (
+    "round-robin across repos over all scanned rows, dataset order within each repo "
+    "(deterministic, not a random sample)"
+)
+
+
+def write_out(
+    path: str,
+    kept: list[dict],
+    src: dict,
+    split: str,
+    filt: str,
+    scanned: int,
+    selection: str = PREFIX_SELECTION,
+) -> None:
     """Write the JSONL and a manifest beside it.
 
-    Rows are a **prefix in dataset order**, never a sample: a prefix reproduces without recording
-    a seed. The manifest says which dataset, split, filter and count produced the file, because a
-    subset is only honest when whatever quotes it can name what was left out.
+    Selection is deterministic — a prefix, or a round-robin over repos — never a random sample, so
+    it reproduces without recording a seed. `selection` must describe what actually happened: a
+    manifest that claims a prefix for a stratified file is worse than no manifest, because a reader
+    would infer the wrong composition from it.
     """
     with open(path, "w") as f:
         for t in kept:
@@ -125,7 +141,7 @@ def write_out(path: str, kept: list[dict], src: dict, split: str, filt: str, sca
                 "dataset": src["dataset"],
                 "config": src["config"],
                 "split": split,
-                "selection": "first N rows in dataset order (a stated prefix, not a random sample)",
+                "selection": selection,
                 "filter": filt,
                 "scanned": scanned,
                 "kept": len(kept),
@@ -245,7 +261,15 @@ def main() -> int:
                     kept.append(q.pop(0))
                     if len(kept) >= args.limit:
                         break
-        write_out(args.out, kept, src, split, "none (SWE-bench Verified, human-validated)", scanned)
+        write_out(
+            args.out,
+            kept,
+            src,
+            split,
+            "none (SWE-bench Verified, human-validated)",
+            scanned,
+            PREFIX_SELECTION if args.prefix_order else ROUND_ROBIN_SELECTION,
+        )
         mix = {}
         for rec in kept:
             mix[rec["repo"]] = mix.get(rec["repo"], 0) + 1

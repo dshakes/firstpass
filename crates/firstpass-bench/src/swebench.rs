@@ -239,7 +239,10 @@ pub fn load_swebench_jsonl(path: &str) -> Result<Vec<SweInstance>, String> {
 fn eval_script() -> String {
     r#"set -u
 mkdir -p /work/in && tar -xf - -C /work/in
-cp -a /testbed /work/repo 2>/dev/null || { echo "FP_ENV copy-failed"; exit 0; }
+# -a would also preserve ownership; some images (matplotlib) carry a vendored build tree
+# owned by an alien uid, and chown fails for a non-root container user. The copy itself
+# succeeds, so treating that exit code as a dead environment silently drops instances.
+cp -dR --preserve=mode,timestamps,links /testbed /work/repo 2>/work/cp.err || { echo "FP_ENV copy-failed: $(tr '\n' ' ' < /work/cp.err | cut -c1-200)"; exit 0; }
 cd /work/repo
 . /opt/miniconda3/etc/profile.d/conda.sh 2>/dev/null && conda activate testbed 2>/dev/null
 # The copy must win over the editable install that points at /testbed, or the run scores
@@ -255,7 +258,7 @@ run() { python -m pytest -q -p no:cacheprovider --no-header $(tr '\n' ' ' < "$1"
 runv() { python -m pytest -q -p no:cacheprovider --no-header -v --tb=no $(tr '\n' ' ' < "$1") 2>&1 \
   | grep -E "::.+ (PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)|[0-9]+ (passed|failed|error)" | tail -800; }
 
-git apply /work/in/test.patch 2>/dev/null || { echo "FP_ENV test-patch-failed"; exit 0; }
+git apply /work/in/test.patch 2>/work/tp.err || { echo "FP_ENV test-patch-failed: $(tr '\n' ' ' < /work/tp.err | cut -c1-200)"; exit 0; }
 
 # CONTROL: PASS_TO_PASS must already pass on the base commit. If not, this environment cannot
 # measure anything and the instance is excluded rather than blamed on the model.
@@ -364,6 +367,17 @@ fn section<'a>(out: &'a str, begin: &str, end: &str) -> &'a str {
 /// Evaluate one instance against `model_patch` (empty = measure the base state).
 ///
 /// # Errors
+/// The `FP_ENV <what>` marker, if the container reported one.
+///
+/// The marker carries the underlying `cp`/`git apply` stderr after a colon, because a bare
+/// "copy-failed" is unactionable: two matplotlib instances failed this way on 2026-09-04 and the
+/// reason had already been discarded to `/dev/null`, so the fault could not be told apart from a
+/// disk-space problem, a tmpfs mount failure, or a permissions one without re-running by hand.
+pub fn parse_env_fault(stdout: &str) -> Option<String> {
+    let (_, rest) = stdout.split_once("FP_ENV ")?;
+    Some(rest.lines().next().unwrap_or("unknown").trim().to_owned())
+}
+
 /// Docker could not run the instance, or the container reported an environment fault (`FP_ENV`).
 /// Both mean the instance cannot be scored — the caller excludes and counts it rather than
 /// recording a model failure that never happened.
@@ -415,8 +429,7 @@ pub fn evaluate(
         .map_err(|e| format!("docker wait failed for {}: {e}", instance.instance_id))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    if let Some(rest) = stdout.split_once("FP_ENV ") {
-        let what = rest.1.lines().next().unwrap_or("unknown").trim();
+    if let Some(what) = parse_env_fault(&stdout) {
         return Err(format!(
             "{}: environment fault ({what}) — excluded rather than scored, because an environment \
              that cannot run the tests says nothing about the model",
@@ -859,5 +872,23 @@ tests/test_wcs.py::test_e SKIPPED\n\
             p2p.len(),
             "split must lose nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod env_fault_tests {
+    use super::parse_env_fault;
+
+    #[test]
+    fn carries_the_underlying_reason_not_just_the_bucket() {
+        let out = "some pytest noise\nFP_ENV copy-failed: cp: cannot create directory: No space left on device\nmore\n";
+        let what = parse_env_fault(out).expect("marker present");
+        // The bucket alone was what made the 2026-09-04 matplotlib faults undiagnosable.
+        assert!(what.contains("No space left on device"), "{what}");
+    }
+
+    #[test]
+    fn absent_marker_is_none_so_a_clean_run_is_never_a_fault() {
+        assert_eq!(parse_env_fault("FP_CONTROL_BEGIN\n1 passed\n"), None);
     }
 }

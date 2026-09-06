@@ -1,0 +1,121 @@
+# Agentic SWE-bench, 60 repo-stratified instances — a cheap weak solver, honestly labelled
+
+60 instances, 12 repos, 459 turns, 122 gate passes, $51.59, up to 8 turns,
+haiku-4.5 -> sonnet-5 ladder, official oracle (every FAIL_TO_PASS passes AND every
+PASS_TO_PASS still passes).
+
+Dataset: `swebench-60-stratified.dataset.jsonl` (+ `.manifest.json`, round-robin across repos).
+Raw records: `swebench-60-stratified.checkpoint.jsonl`.
+Every figure below is re-derivable: `python3 scripts/analyze-swe-checkpoint.py <checkpoint>`.
+
+## The one number to quote, and the one never to quote
+
+| framing | resolved | 95% CI (Clopper-Pearson) | cost | $/resolved |
+|---|---|---|---|---|
+| **turn-1** (SWE-bench convention, one submission) | **8/60 = 13.3%** | [5.9%, 24.6%] | $6.42 | **$0.80** |
+| served (what the router actually returns, per turn) | 40/459 turns = 8.7% | — | $51.59 | $1.29 |
+| pass@any (any of up to 8 turns) | 16/60 = 26.7% | [16.1%, 39.7%] | $51.59 | $3.22 |
+
+**Only the turn-1 row is comparable to a SWE-bench leaderboard entry**, which allows one
+submission per instance. `pass@any` is the flattering framing and must never be printed next to
+a leaderboard number: it credits an oracle that picks the best of 8 attempts, which no deployed
+system has.
+
+**$0.80/resolved is cheap; 13.3% is weak.** Published SWE-bench Verified agents run 60-70%
+resolution. This is a low-cost solver at roughly a fifth of that resolution rate, and the cost
+advantage is not worth much if the task does not get resolved. Cost-per-resolved-task is only a
+fair comparison at comparable resolution, which this is not. Stated plainly so no one has to
+work it out from the table.
+
+## Per repo — the pooled number still hides two hard zeros
+
+| repo | resolved (pass@any) | 95% CI | gate passes | correct | gate precision | $/resolved |
+|---|---|---|---|---|---|---|
+| scikit-learn | 4/5 = 80.0% | [28.4%, 99.5%] | 13 | 8 | 61.5% | $0.57 |
+| pydata/xarray | 4/6 = 66.7% | [22.3%, 95.7%] | 9 | 9 | 100.0% | $1.28 |
+| astropy | 3/6 = 50.0% | [11.8%, 88.2%] | 11 | 10 | 90.9% | $2.15 |
+| sphinx-doc | 2/5 = 40.0% | [5.3%, 85.3%] | 6 | 6 | 100.0% | $1.86 |
+| matplotlib | 1/6 = 16.7% | [0.4%, 64.1%] | 8 | 2 | 25.0% | $7.44 |
+| psf/requests | 1/6 = 16.7% | [0.4%, 64.1%] | 7 | 5 | 71.4% | $4.77 |
+| pylint-dev | 1/6 = 16.7% | [0.4%, 64.1%] | 10 | 1 | 10.0% | $6.80 |
+| **django** | **0/6 = 0.0%** | [0.0%, 45.9%] | **34** | **0** | **0.0%** | — |
+| **sympy** | **0/5 = 0.0%** | [0.0%, 52.2%] | **16** | **0** | **0.0%** | — |
+| pytest-dev | 0/6 = 0.0% | [0.0%, 45.9%] | 8 | 0 | 0.0% | — |
+| mwaskom/seaborn | 0/2 = 0.0% | [0.0%, 84.2%] | 0 | 0 | — | — |
+| pallets/flask | 0/1 = 0.0% | [0.0%, 97.5%] | 0 | 0 | — | — |
+| **pooled** | 16/60 = 26.7% | [16.1%, 39.7%] | 122 | 41 | 33.6% | $3.22 |
+
+Per-repo n is 1-6. Every one of these intervals is wide and none of the between-repo differences
+is individually significant. The ordering is a hypothesis, not a finding.
+
+## What the stratified sample changed, and what it did not
+
+The previous 150-instance run was an alphabetical prefix: 22 astropy + 128 django. This one is
+round-robin across all 12 repos in SWE-bench Verified.
+
+**Pooled gate precision went from 2.5% to 33.6% on identical gate code.** The old number was not
+measuring the gate; it was measuring django. That is the clearest evidence to date that the
+prefix-sampling flaw was distorting conclusions and not merely widening error bars.
+
+**django did not improve.** 0/6 on a fresh stratified draw, 34 gate passes, zero correct —
+consistent with 0/128 before. The diagnosis from the 150-run stands: patches pass their target
+tests and their sibling-file regression tests, then break something further away, because
+django's reverse dependencies span the codebase.
+
+**sympy is a second instance of the same failure.** 16 gate passes, zero correct. It was invisible
+in every earlier run because no earlier sample contained any sympy. Two independent repos now
+exhibit the pattern, so "django is unusual" is no longer a defensible reading — a same-file
+regression check is too narrow wherever coupling is non-local, and that is not one repo's quirk.
+
+## Two harness defects found by this run
+
+**1. Four instances were silently excluded by a cosmetic `cp` exit code.**
+The eval container copies `/testbed` into a tmpfs with `cp -a`, which implies `--preserve=all`.
+Four matplotlib images carry a vendored `build/freetype-2.6.1` tree owned by an alien uid; the
+container runs with `--cap-drop ALL`, so the chown fails, `cp` exits 1 — **having copied every
+file correctly** — and the harness recorded `FP_ENV copy-failed` and dropped the instance.
+
+Two things made this expensive to find. The original marker reported only the bucket
+(`copy-failed`) with the underlying stderr discarded to `/dev/null`, so it was undiagnosable from
+the logs. And the obvious standalone reproduction *succeeded*, because the by-hand `docker run`
+omitted `--cap-drop ALL` and therefore had CAP_CHOWN. An intermediate hypothesis — transient host
+memory pressure, since tmpfs pages are RAM and the host was thrashing in the same window — was
+recorded and is **wrong**; the fault is deterministic and image-specific. Fix: preserve
+mode/timestamps/links but not ownership. Verified against the real image under the exact harness
+flags (`rc=1` before, `rc=0` after), then the four instances were re-run and scored.
+
+Generalisable: an environment fault that reports only a category cannot be diagnosed, and a
+reproduction that drops the sandbox flags is not a reproduction.
+
+**2. Thinking exhaustion confounds matplotlib.**
+6 of 60 instances had claude-sonnet-5 consume its entire output budget on reasoning at both 8192
+and 32768 max_tokens, returning `stop_reason=max_tokens` with zero text — no patch, scored as a
+failed candidate. **4 of the 6 are matplotlib** (4/6 of that repo, against 2/54 elsewhere).
+
+matplotlib's 1/6 is therefore not a clean measurement of the model on matplotlib; it is partly a
+measurement of a budget ceiling. The fix (a thinking-disabled retry as a third budget step) was
+deliberately **not** applied mid-dataset, because changing the harness partway would leave the 60
+instances non-homogeneous and silently uncomparable. It belongs to the next full run.
+
+## Caveats
+
+- **n=60.** The pooled turn-1 interval is [5.9%, 24.6%]. This run distinguishes "roughly 13%"
+  from "roughly 60%"; it does not distinguish 13% from 20%.
+- **One ladder, one vendor.** haiku-4.5 -> sonnet-5. Nothing here speaks to other ladders.
+- **Costs are provider list prices** at run time, summed per rung from the checkpoint.
+- **Up to 8 turns**, so `pass@any` draws on up to 8 attempts. The turn-1 row does not.
+- `$51.59` is the sum of recorded rung costs. A further ~$0.03 was spent on an aborted resume
+  that recorded nothing (it hit the consecutive-failure guard on the `cp` bug above).
+- The run was completed in four phases against one checkpoint; the first stopped on a budget cap,
+  the second completed the dataset, the third aborted on the `cp` bug, the fourth recovered the
+  four excluded instances. `stopped_early: false` on the final phase, 60/60 recorded.
+
+## Verdict
+
+The composition fix did what more samples could not: it turned a meaningless 3.3% pooled rate
+into a per-repo picture with a 13x spread and exposed a second zero-precision stratum. The gate
+is better than the old number suggested (33.6%, not 2.5%) and still has a named, reproducible
+failure mode on non-local coupling, now confirmed on two repos rather than one.
+
+The economics are real but should not be oversold: **$0.80 per resolved task at 13.3%
+resolution.** That is a cheap weak solver. The next move is resolution rate, not cost.
