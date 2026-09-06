@@ -239,7 +239,10 @@ pub fn load_swebench_jsonl(path: &str) -> Result<Vec<SweInstance>, String> {
 fn eval_script() -> String {
     r#"set -u
 mkdir -p /work/in && tar -xf - -C /work/in
-cp -a /testbed /work/repo 2>/work/cp.err || { echo "FP_ENV copy-failed: $(tr '\n' ' ' < /work/cp.err | cut -c1-200)"; exit 0; }
+# -a would also preserve ownership; some images (matplotlib) carry a vendored build tree
+# owned by an alien uid, and chown fails for a non-root container user. The copy itself
+# succeeds, so treating that exit code as a dead environment silently drops instances.
+cp -dR --preserve=mode,timestamps,links /testbed /work/repo 2>/work/cp.err || { echo "FP_ENV copy-failed: $(tr '\n' ' ' < /work/cp.err | cut -c1-200)"; exit 0; }
 cd /work/repo
 . /opt/miniconda3/etc/profile.d/conda.sh 2>/dev/null && conda activate testbed 2>/dev/null
 # The copy must win over the editable install that points at /testbed, or the run scores
