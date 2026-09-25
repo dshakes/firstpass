@@ -10,6 +10,7 @@
 //!   firstpass-bench --replay <checkpoint.jsonl>  # re-study a paid run offline: no key, no sandbox, no spend
 //!   firstpass-bench --fetch-priors <matrix.jsonl> <mbpp.jsonl> <base_url> <out.jsonl>  # OpenJev prior fetch (I/O, resumable)
 //!   firstpass-bench --replay-prior <matrix1> <priors1> [<matrix2> <priors2> ...]  # score the pre-registered prior A/B offline
+//!   firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...]  # Study A: prior+learned blend, offline
 //!   firstpass-bench --multiturn-selfcheck  # prove the multi-turn harness + pre-registered bar work, no spend
 
 use firstpass_bench::coding::{
@@ -208,6 +209,55 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("--replay-prior failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Study A (specs/prior-blend-and-decision-gate.md): does learned traffic statistics blended
+    // into the prior beat the prior alone? Needs the MBPP prompt file up front — its `text`
+    // length is the ex-ante feature every learned/blended arm buckets on — then repeats the
+    // matrix/priors pairs --replay-prior accepts.
+    //   firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...] [--json]
+    if let Some(i) = args.iter().position(|a| a == "--replay-blend") {
+        let Some(mbpp) = args.get(i + 1).filter(|p| !p.starts_with("--")) else {
+            eprintln!(
+                "usage: firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...]"
+            );
+            std::process::exit(2);
+        };
+        let rest: Vec<String> = args[i + 2..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .cloned()
+            .collect();
+        if rest.is_empty() || !rest.len().is_multiple_of(2) {
+            eprintln!(
+                "usage: firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...]"
+            );
+            std::process::exit(2);
+        }
+        let pairs: Vec<(String, String)> = rest
+            .chunks(2)
+            .map(|c| (c[0].clone(), c[1].clone()))
+            .collect();
+        match firstpass_bench::jev_replay::run_replay_blend(mbpp, &pairs) {
+            Ok(study) => {
+                if json {
+                    match serde_json::to_string_pretty(&study) {
+                        Ok(s) => println!("{s}"),
+                        Err(e) => {
+                            eprintln!("cannot serialize report: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    println!("{}", firstpass_bench::jev_replay::render_blend(&study));
+                }
+            }
+            Err(e) => {
+                eprintln!("--replay-blend failed: {e}");
                 std::process::exit(1);
             }
         }
