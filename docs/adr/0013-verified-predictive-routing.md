@@ -181,3 +181,12 @@ field.
 
 The prior also works without `[escalation.bandit]`: the proxy then scores it against a
 zero-observation bandit per request, so the start rung is decided by the prior alone.
+
+### Exploratory follow-up (post-hoc, not a gate): adverse-selection workload
+
+Same seed, every 10th task pushed into a hard tail (difficulty +2.0, past rung 0's clearance floor)
+with tokens scaled by the 2.165x multiplier `costaware.rs` measured on real MBPP. The prior now does
+act — escalations fall 0.91 → 0.74 at σ=0 — but $/success is 0.0736 vs 0.0738 (inside each other's
+bootstrap CIs) and served-failure edges up 0.240 → 0.244; at σ ≥ 0.2 the fused arm is worse. A wash,
+not a win. **PRIOR=STOP stands**; only the live A/B can change it. The unverified Jev-style arm again
+serves a wrong answer on 55–60% of traffic.
