@@ -48,9 +48,10 @@ const DECISION_MODEL: &str = "jev-latest";
 /// The spec's fixed threshold for Study B (`τ = 0.5`); the τ sweep varies this exploratorily.
 const DECISION_THRESHOLD: f64 = 0.5;
 
-/// Build the `/v1/systemone` request body exactly as `DecisionGate::evaluate` does.
+/// Build the `/v1/systemone` request body exactly as `DecisionGate::evaluate` does. `pub(crate)`:
+/// reused by [`crate::verifier_bakeoff`]'s V1 (same shape plus `think`/`samples`).
 #[must_use]
-fn build_decision_request(request_text: &str, candidate_text: &str) -> Value {
+pub(crate) fn build_decision_request(request_text: &str, candidate_text: &str) -> Value {
     serde_json::json!({
         "model": DECISION_MODEL,
         "state": {
@@ -68,8 +69,8 @@ fn build_decision_request(request_text: &str, candidate_text: &str) -> Value {
 
 /// Extract the `ok` question's yes-probability. Mirrors `decision.rs::extract_probability`
 /// exactly: nested `{"answers":{"ok":...}}` or flat `{"ok":...}`, `noul`/`probability`/`p`/`value`,
-/// finite and in `[0, 1]` or the reply is malformed (`None`).
-fn extract_probability(json: &Value) -> Option<f64> {
+/// finite and in `[0, 1]` or the reply is malformed (`None`). `pub(crate)`: reused for V1.
+pub(crate) fn extract_probability(json: &Value) -> Option<f64> {
     let answer = json
         .get("answers")
         .and_then(|a| a.get(QUESTION_NAME))
@@ -87,7 +88,9 @@ fn extract_probability(json: &Value) -> Option<f64> {
 // Stage 1: oracle labels (I/O — sandbox)
 // ---------------------------------------------------------------------------------------------
 
-fn load_labels(path: &str) -> HashMap<String, bool> {
+/// `pub(crate)`: reused by [`crate::verifier_bakeoff`] to load the same cached oracle labels
+/// (V0's labels are every verifier's labels — the oracle doesn't change per verifier).
+pub(crate) fn load_labels(path: &str) -> HashMap<String, bool> {
     std::fs::read_to_string(path)
         .ok()
         .map(|t| {
@@ -113,7 +116,9 @@ fn append_label(path: &str, id: &str, oracle_pass: bool) {
     append_jsonl(path, &rec);
 }
 
-fn append_jsonl<T: Serialize>(path: &str, rec: &T) {
+/// `pub(crate)`: the generic append-one-line-resumable-cache helper, reused by
+/// [`crate::verifier_bakeoff`] for V1/V2/V3's own cache files.
+pub(crate) fn append_jsonl<T: Serialize>(path: &str, rec: &T) {
     let Ok(line) = serde_json::to_string(rec) else {
         return;
     };
@@ -128,7 +133,8 @@ fn append_jsonl<T: Serialize>(path: &str, rec: &T) {
 }
 
 /// `"mbpp-N"` -> `"mbpp/N"`, matching the `id` VRBench candidates use (`~/vrb-cascade.jsonl`).
-fn slash_id(dataset_task_id: &str) -> Option<String> {
+/// `pub(crate)`: reused by [`crate::verifier_bakeoff`] for the same MBPP-task-id join.
+pub(crate) fn slash_id(dataset_task_id: &str) -> Option<String> {
     dataset_task_id
         .strip_prefix("mbpp-")
         .map(|n| format!("mbpp/{n}"))
@@ -136,11 +142,12 @@ fn slash_id(dataset_task_id: &str) -> Option<String> {
 
 /// Run each candidate's `answer` against its MBPP hidden (oracle) set in the fail-closed sandbox,
 /// resuming from `cache_path`. Writes one line **as it completes**, so an interrupted run loses at
-/// most the task in flight.
+/// most the task in flight. `pub(crate)`: every bake-off verifier scores against the same oracle
+/// labels, so [`crate::verifier_bakeoff`] resumes from the identical cache rather than relabeling.
 ///
 /// # Errors
 /// The sandbox itself faulted (never a candidate failure, which is just `oracle_pass: false`).
-fn run_oracle_labels(
+pub(crate) fn run_oracle_labels(
     sb: &dyn Sandbox,
     candidates: &[Submission],
     tasks_by_id: &HashMap<String, CodingTask>,
@@ -178,17 +185,19 @@ fn run_oracle_labels(
 /// Per-call timeout. Generous on purpose — same posture as `jev_replay`'s prior fetch.
 const FETCH_TIMEOUT_SECS: u64 = 120;
 
+/// `pub(crate)`: reused (fields too) by [`crate::verifier_bakeoff`] for V1's own cache file, which
+/// is the same shape (a `/v1/systemone` call, an optional continuous score, a latency).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DecisionScoreRecord {
-    id: String,
+pub(crate) struct DecisionScoreRecord {
+    pub(crate) id: String,
     /// `None` when the call failed, timed out, or the reply didn't parse — an abstain, never a
     /// fabricated pass/fail.
-    score: Option<f64>,
-    raw_ok: bool,
-    latency_ms: u64,
+    pub(crate) score: Option<f64>,
+    pub(crate) raw_ok: bool,
+    pub(crate) latency_ms: u64,
 }
 
-fn load_scores(path: &str) -> HashMap<String, DecisionScoreRecord> {
+pub(crate) fn load_scores(path: &str) -> HashMap<String, DecisionScoreRecord> {
     std::fs::read_to_string(path)
         .ok()
         .map(|t| {
@@ -200,20 +209,19 @@ fn load_scores(path: &str) -> HashMap<String, DecisionScoreRecord> {
         .unwrap_or_default()
 }
 
-/// One blocking `/v1/systemone` call. Never panics: transport error, non-2xx, or an undecodable/
-/// unexpected body all yield `(false, None, elapsed_ms)`.
+/// One blocking `/v1/systemone` call against an already-built request body. Never panics:
+/// transport error, non-2xx, or an undecodable/unexpected body all yield
+/// `(false, None, elapsed_ms)`.
 fn fetch_one(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    request_text: &str,
-    candidate_text: &str,
+    body: &Value,
 ) -> (bool, Option<f64>, u64) {
-    let body = build_decision_request(request_text, candidate_text);
     let url = format!("{}/v1/systemone", base_url.trim_end_matches('/'));
     let start = Instant::now();
     let elapsed_ms = || start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
-    let resp = match client.post(&url).json(&body).send() {
+    let resp = match client.post(&url).json(body).send() {
         Ok(r) => r,
         Err(_) => return (false, None, elapsed_ms()),
     };
@@ -229,11 +237,13 @@ fn fetch_one(
 }
 
 /// Load raw MBPP `{task_id, text}` JSONL, keyed `"mbpp/<N>"` — the "request" the spec asks the
-/// decision gate to see (the natural-language task, not the gated/engineered prompt).
+/// decision gate to see (the natural-language task, not the gated/engineered prompt). `pub(crate)`:
+/// [`crate::verifier_bakeoff`]'s V3 also needs the raw task text (never the candidate) to write
+/// tests from.
 ///
 /// # Errors
 /// Unreadable file, invalid JSON, or a row missing `task_id`/`text`.
-fn load_mbpp_request_text(path: &str) -> Result<HashMap<String, String>, String> {
+pub(crate) fn load_mbpp_request_text(path: &str) -> Result<HashMap<String, String>, String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let mut out = HashMap::new();
     for (i, line) in content.lines().enumerate() {
@@ -255,16 +265,20 @@ fn load_mbpp_request_text(path: &str) -> Result<HashMap<String, String>, String>
     Ok(out)
 }
 
-/// Fetch OpenJev decision scores for every candidate, resuming from `cache_path`.
+/// Fetch OpenJev `/v1/systemone` scores for every candidate, resuming from `cache_path`, using
+/// `build_body` to shape each request. `pub(crate)`: shared by V0 (here, via
+/// [`build_decision_request`]) and [`crate::verifier_bakeoff`]'s V1 (same endpoint, `think`/
+/// `samples` added).
 ///
 /// # Errors
 /// The HTTP client can't be built. A single call failing is not an error here — it is recorded as
 /// `raw_ok: false, score: None` (an abstain) and counted.
-fn run_decision_scores(
+pub(crate) fn run_openjev_scores(
     candidates: &[Submission],
     mbpp_text: &HashMap<String, String>,
     base_url: &str,
     cache_path: &str,
+    build_body: impl Fn(&str, &str) -> Value,
 ) -> Result<(HashMap<String, DecisionScoreRecord>, usize), String> {
     let mut scores = load_scores(cache_path);
     let mut n_missing = 0usize;
@@ -280,7 +294,8 @@ fn run_decision_scores(
             n_missing += 1;
             continue;
         };
-        let (raw_ok, score, latency_ms) = fetch_one(&client, base_url, text, &c.answer);
+        let body = build_body(text, &c.answer);
+        let (raw_ok, score, latency_ms) = fetch_one(&client, base_url, &body);
         let rec = DecisionScoreRecord {
             id: c.id.clone(),
             score,
@@ -299,25 +314,50 @@ fn run_decision_scores(
     Ok((scores, n_missing))
 }
 
+/// V0: OpenJev decision scores with default options — no `think`/`samples`.
+///
+/// # Errors
+/// See [`run_openjev_scores`].
+fn run_decision_scores(
+    candidates: &[Submission],
+    mbpp_text: &HashMap<String, String>,
+    base_url: &str,
+    cache_path: &str,
+) -> Result<(HashMap<String, DecisionScoreRecord>, usize), String> {
+    run_openjev_scores(
+        candidates,
+        mbpp_text,
+        base_url,
+        cache_path,
+        build_decision_request,
+    )
+}
+
 // ---------------------------------------------------------------------------------------------
 // Stage 3: scoring (pure)
 // ---------------------------------------------------------------------------------------------
 
-const BOOT_B: usize = 2000;
-const BOOT_SEED: u64 = 42;
-const ALPHA: f64 = 0.05;
+/// `pub(crate)`: [`crate::verifier_bakeoff`] reuses the same bootstrap width/seed/level so its CIs
+/// are produced the same way as Study B's.
+pub(crate) const BOOT_B: usize = 2000;
+pub(crate) const BOOT_SEED: u64 = 42;
+pub(crate) const ALPHA: f64 = 0.05;
 /// Below this many oracle-wrong answers, catch rate has no statistical power — report
-/// UNDERPOWERED instead of a verdict (spec's degeneracy guard).
-const MIN_WRONG: usize = 20;
+/// UNDERPOWERED instead of a verdict (spec's degeneracy guard). `pub(crate)`: the bake-off's
+/// held-out half uses the identical guard (`specs/verifier-bakeoff.md`'s own `MIN_WRONG = 20`).
+pub(crate) const MIN_WRONG: usize = 20;
 const TAU_SWEEP: [f64; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
 
-fn is_reject(score: Option<f64>, tau: f64) -> bool {
+/// `pub(crate)`: the reject rule (`score < tau`, abstain never rejects) is identical for every
+/// bake-off verifier — all four report a continuous "confidence the candidate is correct".
+pub(crate) fn is_reject(score: Option<f64>, tau: f64) -> bool {
     score.is_some_and(|s| s < tau)
 }
 
 /// AUC of `scores` predicting `labels` (`true` = oracle-correct), via the rank-sum / Mann-Whitney
 /// formula with midrank tie correction. `None` when one class is empty (AUC undefined).
-fn auc(scores: &[f64], labels: &[bool]) -> Option<f64> {
+/// `pub(crate)`: reused by [`crate::verifier_bakeoff`]'s held-out AUC.
+pub(crate) fn auc(scores: &[f64], labels: &[bool]) -> Option<f64> {
     let n_pos = labels.iter().filter(|&&l| l).count();
     let n_neg = labels.len() - n_pos;
     if n_pos == 0 || n_neg == 0 {
@@ -354,8 +394,14 @@ fn auc(scores: &[f64], labels: &[bool]) -> Option<f64> {
 
 /// Bootstrap CI for [`auc`]. A resample that lands all-one-class is simply dropped (AUC
 /// undefined there) rather than counted — with `n_wrong >= MIN_WRONG` this is rare and does not
-/// bias the interval.
-fn bootstrap_auc_ci(scores: &[f64], labels: &[bool], b: usize, seed: u64, alpha: f64) -> Ci {
+/// bias the interval. `pub(crate)`: reused by [`crate::verifier_bakeoff`]'s held-out AUC.
+pub(crate) fn bootstrap_auc_ci(
+    scores: &[f64],
+    labels: &[bool],
+    b: usize,
+    seed: u64,
+    alpha: f64,
+) -> Ci {
     let point = auc(scores, labels).unwrap_or(0.5);
     if scores.is_empty() {
         return Ci {

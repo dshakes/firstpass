@@ -35,6 +35,7 @@ pub mod swe_agentic;
 pub mod swe_explore;
 pub mod swebench;
 pub mod sweep;
+pub mod verifier_bakeoff;
 pub mod vrbench;
 
 use firstpass_core::PriceTable;

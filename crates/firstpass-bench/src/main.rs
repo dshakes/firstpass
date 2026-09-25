@@ -12,6 +12,7 @@
 //!   firstpass-bench --replay-prior <matrix1> <priors1> [<matrix2> <priors2> ...]  # score the pre-registered prior A/B offline
 //!   firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...]  # Study A: prior+learned blend, offline
 //!   firstpass-bench --decision-study <candidates.jsonl> <mbpp.jsonl> <base_url> <labels.jsonl> <scores.jsonl>  # Study B: decision gate error rates (sandbox + live OpenJev)
+//!   firstpass-bench --verifier-bakeoff <candidates.jsonl> <mbpp.jsonl> <scratch_dir>  # V0-V3 held-out bake-off (specs/verifier-bakeoff.md; sandbox + live OpenJev + live local judge/test-writer)
 //!   firstpass-bench --multiturn-selfcheck  # prove the multi-turn harness + pre-registered bar work, no spend
 
 use firstpass_bench::coding::{
@@ -315,6 +316,64 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("--decision-study failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Verifier bake-off (specs/verifier-bakeoff.md): is there a verifier stronger than OpenJev
+    // `noul` for the second gate? Reuses Study B's sandbox oracle labels and V0 cache; V1-V3 hit
+    // two live local servers (OpenJev + mlx-lm), sequentially, cached/resumable under scratch_dir.
+    //   firstpass-bench --verifier-bakeoff <candidates.jsonl> <mbpp.jsonl> <scratch_dir> [--json]
+    if let Some(i) = args.iter().position(|a| a == "--verifier-bakeoff") {
+        let (Some(candidates), Some(mbpp), Some(scratch_dir)) = (
+            args.get(i + 1).filter(|p| !p.starts_with("--")),
+            args.get(i + 2).filter(|p| !p.starts_with("--")),
+            args.get(i + 3).filter(|p| !p.starts_with("--")),
+        ) else {
+            eprintln!(
+                "usage: firstpass-bench --verifier-bakeoff <candidates.jsonl> <mbpp.jsonl> <scratch_dir>"
+            );
+            std::process::exit(2);
+        };
+        let openjev_url = std::env::var("FIRSTPASS_OPENJEV_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
+        let mlx_url = std::env::var("FIRSTPASS_MLX_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8081".to_owned());
+        let sb = match establish_sandbox(&sandbox_image()) {
+            Ok(sb) => sb,
+            Err(e) => {
+                eprintln!(
+                    "cannot run — sandbox not established: {e}\ncandidate answers execute in the \
+                     hidden-test oracle and V3's generated tests and will not be run on the host"
+                );
+                std::process::exit(1);
+            }
+        };
+        match firstpass_bench::verifier_bakeoff::run(
+            sb.as_ref(),
+            candidates,
+            mbpp,
+            &openjev_url,
+            &mlx_url,
+            scratch_dir,
+        ) {
+            Ok(study) => {
+                if json {
+                    match serde_json::to_string_pretty(&study) {
+                        Ok(s) => println!("{s}"),
+                        Err(e) => {
+                            eprintln!("cannot serialize report: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    println!("{}", firstpass_bench::verifier_bakeoff::render(&study));
+                }
+            }
+            Err(e) => {
+                eprintln!("--verifier-bakeoff failed: {e}");
                 std::process::exit(1);
             }
         }
