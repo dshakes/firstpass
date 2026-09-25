@@ -1089,6 +1089,7 @@ async fn evaluate_shadow(
         &state.providers,
         &auth,
         &state.config.prices,
+        &state.http,
     );
     let (budget, max_rungs) = state
         .config
@@ -1734,6 +1735,7 @@ async fn enforce_pipeline_inner(
         &state.providers,
         &auth,
         &state.config.prices,
+        &state.http,
     );
     let session_id = session_header.unwrap_or_else(|| Uuid::now_v7().to_string());
     let (budget, max_rungs, speculation, serve_threshold, elastic) =
