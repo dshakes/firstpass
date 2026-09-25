@@ -205,6 +205,39 @@ mod tests {
         }
     }
 
+    /// Live wire check against a real `/v1/systemone` server (e.g. a local OpenJev). Opt-in:
+    /// `OPENJEV_URL=http://127.0.0.1:8080 cargo test -p firstpass-proxy -- --ignored live_`.
+    #[tokio::test]
+    #[ignore = "needs a live /v1/systemone server in OPENJEV_URL"]
+    async fn live_prior_reads_a_real_choice_answer() {
+        let Ok(url) = std::env::var("OPENJEV_URL") else {
+            return;
+        };
+        let mut cfg = test_cfg(&[
+            "a small fast model fully handles this",
+            "only a frontier model fully handles this",
+        ]);
+        cfg.base_url = url;
+        cfg.timeout_ms = 60_000;
+        let client = PriorClient::new(reqwest::Client::new(), cfg, "local".to_owned());
+        let easy = client
+            .fetch("Write a python function to reverse a string.")
+            .await;
+        let hard = client
+            .fetch("Prove termination and implement a linear-time parser for nested balanced expressions with escapes and error recovery.")
+            .await;
+        let (easy, hard) = (easy.expect("easy prior"), hard.expect("hard prior"));
+        assert_eq!(easy.len(), 2);
+        assert!(
+            (easy[1] - 1.0).abs() < 1e-9,
+            "cumulative ends at 1: {easy:?}"
+        );
+        assert!(
+            easy[0] > hard[0],
+            "easy {easy:?} should favour rung 0 over hard {hard:?}"
+        );
+    }
+
     #[test]
     fn query_text_joins_system_and_messages() {
         let req = ModelRequest {

@@ -165,10 +165,20 @@ n=500) puts a Jev-style unverified router's served-failure at **50.6–56.2%** a
 tested, against Firstpass's own gated served-failure of **15.8%** on the same suite. Full numbers,
 methodology, and both addenda: [ADR 0013](docs/adr/0013-verified-predictive-routing.md).
 
-**`[escalation.prior]` — experimental, default-off, pre-registered verdict PRIOR=STOP.** The
-kill-criterion sim found the fused arm ties plain Firstpass on $/success at σ=0 and loses at higher
-noise (a post-hoc hard-task scenario was a wash, not a win). The block ships anyway — it costs
-nothing while unconfigured, and a live A/B is the next gate before it could flip to default-on:
+**`[escalation.prior]` — experimental, default-off. Simulation said STOP; a real-data replay says
+PROCEED.** The original pre-registered sim (σ-sweep, synthetic noise) found the fused arm tying
+plain Firstpass at σ=0 and losing at higher noise — history, not the current read. A second
+pre-registration replayed the same prior mechanism on 2,418 real recorded MBPP outcomes across three
+ladders, using **OpenJev** (Apache-2.0, DiffusionGemma 26B-A4B, run locally — **not** TypeSafe's
+hosted Jev) as the prior source: pooled $/success **$0.01126 → $0.01075 (−4.6%)**, CI of the
+difference `[-0.00074, -0.00031]` excludes 0, served-failure held (0.0786 → 0.0778). **Verdict:
+PROCEED.** The win is ladder-dependent — −6.3% on haiku→sonnet, −2.4% on haiku→opus, 0% on
+gpt-4.1-mini→gpt-5.5 (a ~20x price ratio where skipping the cheap rung never pays) — and OpenJev
+says nothing about hosted Jev's own accuracy. Full numbers and caveats:
+[`docs/benchmarks/openjev-prior-replay.md`](docs/benchmarks/openjev-prior-replay.md), addendum in
+[ADR 0013](docs/adr/0013-verified-predictive-routing.md). The block stays **default-off** — the
+replay used OpenJev, not hosted Jev, so it isn't evidence about that vendor — but ships because it
+costs nothing while unconfigured:
 
 ```toml
 [escalation.prior]
@@ -191,7 +201,9 @@ served output; the prior only ever moves where the ladder starts.
 **`decision` gate — UNMEASURED.** The same Jev model can also sit behind a `[[gate]] decision = {...}`
 block as a cheap external verifier instead of a frontier LLM judge. A transport error, timeout, or
 unparseable reply ABSTAINs — never a fabricated pass — but its precision/recall against real
-failures has not been benchmarked:
+failures has not been benchmarked; a live smoke test (not a measurement) caught the gate reading the
+wrong wire field (`probability`/`p`/`value` instead of the real `noul`), which would have abstained
+on every real answer — fixed, still unmeasured:
 
 ```toml
 [[gate]]
@@ -199,6 +211,32 @@ id       = "verify"
 decision = { provider = "typesafe", model = "jev-latest", threshold = 0.6 }
 # api_key_env defaults to TYPESAFE_API_KEY; base_url defaults to https://api.typesafe.ai
 ```
+
+### OpenJev (local)
+
+Both `[escalation.prior]` and the `decision` gate speak the same `POST /v1/systemone` contract, so
+either can point at a locally-run **OpenJev** (Apache-2.0, DiffusionGemma 26B-A4B —
+[razorback16/openjev](https://github.com/razorback16/openjev)) instead of TypeSafe's hosted Jev —
+this is what `docs/benchmarks/openjev-prior-replay.md` measured.
+
+```bash
+# Apple Silicon, ~16 GB unified memory — binds 127.0.0.1:8080
+OPENJEV_BACKEND=mlx python -m openjev
+# NVIDIA, 24 GB+ VRAM:
+# docker compose up
+```
+
+```toml
+[escalation.prior]
+provider    = "typesafe"              # still the only accepted value — OpenJev speaks the same wire contract
+base_url    = "http://127.0.0.1:8080"
+api_key_env = "TYPESAFE_API_KEY"      # the client always sends a bearer token — set any placeholder, e.g. TYPESAFE_API_KEY=local
+```
+
+`api_key_env` is required even against a keyless local server — the client always attaches
+`bearer_auth`, so a missing env var disables the prior fail-open rather than sending an empty
+token (`crates/firstpass-proxy/src/run.rs`, `crates/firstpass-proxy/src/gate.rs`). Point the
+`decision` gate's `base_url` at the same server to use OpenJev as the verifier instead of the prior.
 
 See [docs/related-work.md](docs/related-work.md) for how Jev-style routers, RouteLLM, Not Diamond,
 Martian, Sakana Fugu, FrugalGPT, AutoMix, and CP-Router compare on method, not marketing.

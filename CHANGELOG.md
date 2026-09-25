@@ -15,11 +15,20 @@ verifier (~$0.042/M input tokens) instead of a frontier LLM judge — errors ABS
 fabricated pass.
 
 **Status, stated plainly:**
-- `[escalation.prior]` — pre-registered simulation gate result is **PRIOR=STOP** (ties plain
-  Firstpass on $/success at σ=0, loses at higher noise; a post-hoc hard-task scenario was a wash).
-  Live A/B not yet run. See [ADR 0013](docs/adr/0013-verified-predictive-routing.md).
-- `decision` gate — precision/recall against real failures are **UNMEASURED**.
+- `[escalation.prior]` — the original pre-registered *simulation* gate result was **PRIOR=STOP**
+  (synthetic σ-sweep; ties plain Firstpass on $/success at σ=0, loses at higher noise). A second
+  pre-registration replayed the same mechanism on 2,418 real recorded MBPP outcomes across three
+  ladders, using **OpenJev** (Apache-2.0, run locally — not TypeSafe's hosted Jev) as the prior
+  source: pooled $/success $0.01126 → $0.01075 (−4.6%, CI excludes 0), served-failure held.
+  **Verdict: PROCEED** (real-data replay), ladder-dependent (0% win on the ~20x-price-ratio ladder).
+  Block stays **default-off** — the replay is evidence about the prior mechanism, not about hosted
+  Jev. See [`docs/benchmarks/openjev-prior-replay.md`](docs/benchmarks/openjev-prior-replay.md) and
+  [ADR 0013](docs/adr/0013-verified-predictive-routing.md).
+- `decision` gate — precision/recall against real failures are **UNMEASURED**. A live smoke test
+  (not a measurement) found the gate reading the wrong wire field (`probability`/`p`/`value` instead
+  of the real `noul`), which would have abstained on every real answer — fixed.
 - Both are opt-in and off by default; the plumbing ships because it costs nothing unconfigured.
+- Live, opt-in wire tests: `OPENJEV_URL=http://127.0.0.1:8080 cargo test -p firstpass-proxy -- --ignored live_`.
 
 See [README.md#decision-model-routers-jev-vs-firstpass](README.md) and
 [docs/related-work.md](docs/related-work.md) for how this compares to Jev-style unverified routers.

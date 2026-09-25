@@ -201,22 +201,31 @@ fn mean(xs: &[f64]) -> f64 {
 /// saw it.
 type Scored = (Vec<RungOutcome>, f64);
 
-/// Plain first-pass: always open on rung 0, gate, escalate on failure, pay for every rung tried.
-/// Written out rather than expressed as a special case of [`serve`], so the baseline cannot drift
-/// into the policy it is supposed to be measuring.
-fn first_pass(row: &[RungOutcome]) -> (bool, f64, usize) {
+/// Plain first-pass: open on `start`, gate, escalate on failure, pay for every rung tried from
+/// `start` up. Written out rather than expressed as a special case of [`serve`], so the baseline
+/// cannot drift into the policy it is supposed to be measuring.
+///
+/// `start = 0` is what every caller in this module means by "first-pass". A non-zero `start` is
+/// the shared serving primitive for a start-rung *decision* made elsewhere (e.g. a pre-generation
+/// prior's expected-cost argmin) — gated exactly the same way, just beginning further up the
+/// ladder, so a prior can never be compared against a policy that secretly gates differently.
+pub(crate) fn first_pass_from(row: &[RungOutcome], start: usize) -> (bool, f64, usize) {
     let mut spent = 0.0;
-    for (i, o) in row.iter().enumerate() {
+    for (i, o) in row.iter().enumerate().skip(start) {
         spent += o.cost_usd;
         if o.gate_full_pass {
-            return (o.oracle_correct, spent, i + 1);
+            return (o.oracle_correct, spent, i + 1 - start);
         }
     }
     (
         row.last().is_some_and(|o| o.oracle_correct),
         spent,
-        row.len(),
+        row.len().saturating_sub(start),
     )
+}
+
+fn first_pass(row: &[RungOutcome]) -> (bool, f64, usize) {
+    first_pass_from(row, 0)
 }
 
 /// Score one policy over every cross-fitted task.
@@ -405,6 +414,28 @@ mod tests {
             cost_usd: cost,
             judge_score: None,
         }
+    }
+
+    /// `first_pass_from` at a non-zero start must skip every rung below it (unbilled) and gate
+    /// from there exactly like `first_pass` gates from 0 — the shared primitive a start-rung
+    /// decision built elsewhere (e.g. a prior's argmin) is replayed through.
+    #[test]
+    fn first_pass_from_skips_rungs_below_start_and_gates_normally() {
+        let row = vec![
+            o(false, false, 0.01), // rung 0: would fail, must NOT be billed when start=1
+            o(false, false, 0.05), // rung 1: fails gate too
+            o(true, true, 0.20),   // rung 2: passes
+        ];
+        let (correct, spent, rungs_paid) = first_pass_from(&row, 1);
+        assert!(correct);
+        assert!(
+            (spent - 0.25).abs() < 1e-9,
+            "must bill rungs 1 and 2 only, not rung 0; got {spent}"
+        );
+        assert_eq!(rungs_paid, 2);
+
+        // start=0 must be byte-identical to `first_pass`.
+        assert_eq!(first_pass_from(&row, 0), first_pass(&row));
     }
 
     /// The rule's whole purpose: when the cheap attempt costs more than it can buy, skip it and

@@ -8,6 +8,8 @@
 //!   firstpass-bench --coding       # coding-with-tests benchmark, MOCK solver in the sandbox (no spend)
 //!   firstpass-bench --coding-live  # coding-with-tests with a LIVE candidate model (needs ANTHROPIC_API_KEY)
 //!   firstpass-bench --replay <checkpoint.jsonl>  # re-study a paid run offline: no key, no sandbox, no spend
+//!   firstpass-bench --fetch-priors <matrix.jsonl> <mbpp.jsonl> <base_url> <out.jsonl>  # OpenJev prior fetch (I/O, resumable)
+//!   firstpass-bench --replay-prior <matrix1> <priors1> [<matrix2> <priors2> ...]  # score the pre-registered prior A/B offline
 //!   firstpass-bench --multiturn-selfcheck  # prove the multi-turn harness + pre-registered bar work, no spend
 
 use firstpass_bench::coding::{
@@ -138,6 +140,74 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("cannot replay {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Pre-registered OpenJev decision-model prior replay (specs/openjev-prior-replay-ab.md).
+    // Stage 1: hit a live `/v1/systemone` server, sequentially, and save priors to a JSONL file —
+    // never scores anything, so the run can be interrupted and resumed with no double-spend.
+    //   firstpass-bench --fetch-priors <matrix.jsonl> <mbpp.jsonl> <base_url> <out.jsonl>
+    if let Some(i) = args.iter().position(|a| a == "--fetch-priors") {
+        let (Some(matrix), Some(mbpp), Some(base_url), Some(out)) = (
+            args.get(i + 1).filter(|p| !p.starts_with("--")),
+            args.get(i + 2).filter(|p| !p.starts_with("--")),
+            args.get(i + 3).filter(|p| !p.starts_with("--")),
+            args.get(i + 4).filter(|p| !p.starts_with("--")),
+        ) else {
+            eprintln!(
+                "usage: firstpass-bench --fetch-priors <matrix.jsonl> <mbpp.jsonl> <base_url> <out.jsonl>"
+            );
+            std::process::exit(2);
+        };
+        match firstpass_bench::jev_replay::run_fetch_priors(matrix, mbpp, base_url, out) {
+            Ok(summary) => eprintln!("{summary}"),
+            Err(e) => {
+                eprintln!("--fetch-priors failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Stage 2: score the spec's arms offline against saved priors — no key, no server, no spend.
+    // Accepts repeated <matrix> <priors> pairs so all three ladders can be scored (and pooled) in
+    // one run:
+    //   firstpass-bench --replay-prior <m1> <p1> <m2> <p2> <m3> <p3> [--json]
+    if let Some(i) = args.iter().position(|a| a == "--replay-prior") {
+        let rest: Vec<String> = args[i + 1..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .cloned()
+            .collect();
+        if rest.is_empty() || !rest.len().is_multiple_of(2) {
+            eprintln!(
+                "usage: firstpass-bench --replay-prior <matrix1> <priors1> [<matrix2> <priors2> ...]"
+            );
+            std::process::exit(2);
+        }
+        let pairs: Vec<(String, String)> = rest
+            .chunks(2)
+            .map(|c| (c[0].clone(), c[1].clone()))
+            .collect();
+        match firstpass_bench::jev_replay::run_replay_prior(&pairs) {
+            Ok(study) => {
+                if json {
+                    match serde_json::to_string_pretty(&study) {
+                        Ok(s) => println!("{s}"),
+                        Err(e) => {
+                            eprintln!("cannot serialize report: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    println!("{}", firstpass_bench::jev_replay::render(&study));
+                }
+            }
+            Err(e) => {
+                eprintln!("--replay-prior failed: {e}");
                 std::process::exit(1);
             }
         }
