@@ -26,34 +26,31 @@ platform bet.
 
 ## Decision
 
-Add an optional `[escalation.prior]` config block. When set (and `[escalation.bandit]` is also
-set — the prior blends into the bandit's posterior and is a no-op without one), the router asks Jev
+Add an optional `[escalation.prior]` config block. When set, the router asks Jev
 one `choice` question per request, before generation, and blends the answer into the start-rung
 bandit as a Beta prior. **The gate still verifies every output, unchanged.** The prior only ever
 moves where the ladder starts.
 
 ```toml
-[escalation.bandit]
-min_observations = 50
-
 [escalation.prior]
-endpoint   = "https://api.typesafe.ai/v1/systemone"   # default; override for self-hosted/mock Jev
+provider   = "typesafe"                                # the only accepted value today
+base_url   = "https://api.typesafe.ai"                 # default; override for self-hosted/mock Jev
 model      = "jev-latest"
 api_key_env = "TYPESAFE_API_KEY"                      # env var name only — the key itself is never logged
 timeout_ms = 150                                       # fail-open below
-strength   = 20                                        # Beta pseudo-count weight of the prior
-rubric = [
+strength   = 10                                        # Beta pseudo-count weight of the prior
+rungs = [
   "rung 0 (claude-haiku) is the least capable tier that fully handles this request",
   "rung 1 (claude-sonnet) is the least capable tier that fully handles this request",
   "rung 2 (claude-opus) is the least capable tier that fully handles this request",
 ]
 ```
 
-`rubric` has one line per ladder rung (`r0..rN`); `Config::parse` rejects a `rubric.len()` that
-does not match the ladder length, the same class of check as the existing per-rung price
+`rungs` has one rubric line per ladder rung (`r0..rN`); `Config::parse` rejects a `rungs.len()` that
+does not match any enforce route's ladder length, the same class of check as the existing per-rung price
 requirement.
 
-**The math.** The `choice` question's options are the rubric lines, each phrased as "rung `r` is
+**The math.** The `choice` question's options are the `rungs` rubric lines, each phrased as "rung `r` is
 the *least capable* tier that fully handles this" — a partition over "which rung is the cheapest
 sufficient one", not an independent pass/fail per rung. Jev returns `P(option r)` for each `r`.
 Because the options partition the same event space,
@@ -155,3 +152,32 @@ and the claim that it pays gets withdrawn in an addendum rather than silently dr
 Related: ADR 0007 (the start-rung bandit and `bandit@v2-ts` this extends), ADR 0008 (`PassPredictor`
 shadow, the complementary learned signal), ADR 0012 (the measurement discipline and addendum format
 this ADR commits to following), `docs/related-work.md` (where Jev-based routers sit in the field).
+
+## Addendum 2026-09-25 — simulation gate: PRIOR=STOP on the default suite
+
+The pre-registered σ-sweep ran (`cargo run -p firstpass-bench`, n=500, seed 20260708, **simulation**):
+
+| σ | firstpass $/success | firstpass+prior $/success | predictive-prior (unverified) served-fail |
+|---|---|---|---|
+| 0.00 | 0.0469 | 0.0469 | 0.562 |
+| 0.10 | 0.0469 | 0.0472 | 0.556 |
+| 0.20 | 0.0469 | 0.0490 | 0.550 |
+| 0.40 | 0.0469 | 0.0534 | 0.506 |
+
+The kill criterion required *strictly* lower $/success at σ ≤ 0.2; the fused arm ties at σ=0 and
+loses beyond it. **Verdict: PRIOR=STOP on this suite.** The reason is structural, not noise: the
+sim's rung-0 clearance is `strength − 0.45·difficulty ≥ ~0.10` at max difficulty, above the
+cheap/next price ratio, so the expected-cost rule never skips rung 0 even with a perfect prior —
+there is no gap for a prior to close. The same table is the strongest evidence yet for the
+*verification* half: the unverified Jev-style arm serves a wrong answer on 51–56% of traffic at
+every σ, while the gated arms hold their served-failure rate.
+
+What this does and does not settle. It does not refute the prior where the real workload differs
+from the sim — the live MBPP measurement in `costaware.rs` (n=135) found escalation adversely
+selected 2.16x and a per-query P(pass) start rule 22% cheaper than first-pass. It does mean the
+feature stays **default-off and opt-in**, and is not claimed as a win, until the live A/B gate below
+passes. If it fails live, the ADR 0012 precedent applies: remove the acting code, keep the receipt
+field.
+
+The prior also works without `[escalation.bandit]`: the proxy then scores it against a
+zero-observation bandit per request, so the start rung is decided by the prior alone.
