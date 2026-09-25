@@ -10,6 +10,8 @@
 //!   firstpass-bench --replay <checkpoint.jsonl>  # re-study a paid run offline: no key, no sandbox, no spend
 //!   firstpass-bench --fetch-priors <matrix.jsonl> <mbpp.jsonl> <base_url> <out.jsonl>  # OpenJev prior fetch (I/O, resumable)
 //!   firstpass-bench --replay-prior <matrix1> <priors1> [<matrix2> <priors2> ...]  # score the pre-registered prior A/B offline
+//!   firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...]  # Study A: prior+learned blend, offline
+//!   firstpass-bench --decision-study <candidates.jsonl> <mbpp.jsonl> <base_url> <labels.jsonl> <scores.jsonl>  # Study B: decision gate error rates (sandbox + live OpenJev)
 //!   firstpass-bench --multiturn-selfcheck  # prove the multi-turn harness + pre-registered bar work, no spend
 
 use firstpass_bench::coding::{
@@ -208,6 +210,111 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("--replay-prior failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Study A (specs/prior-blend-and-decision-gate.md): does learned traffic statistics blended
+    // into the prior beat the prior alone? Needs the MBPP prompt file up front — its `text`
+    // length is the ex-ante feature every learned/blended arm buckets on — then repeats the
+    // matrix/priors pairs --replay-prior accepts.
+    //   firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...] [--json]
+    if let Some(i) = args.iter().position(|a| a == "--replay-blend") {
+        let Some(mbpp) = args.get(i + 1).filter(|p| !p.starts_with("--")) else {
+            eprintln!(
+                "usage: firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...]"
+            );
+            std::process::exit(2);
+        };
+        let rest: Vec<String> = args[i + 2..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .cloned()
+            .collect();
+        if rest.is_empty() || !rest.len().is_multiple_of(2) {
+            eprintln!(
+                "usage: firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...]"
+            );
+            std::process::exit(2);
+        }
+        let pairs: Vec<(String, String)> = rest
+            .chunks(2)
+            .map(|c| (c[0].clone(), c[1].clone()))
+            .collect();
+        match firstpass_bench::jev_replay::run_replay_blend(mbpp, &pairs) {
+            Ok(study) => {
+                if json {
+                    match serde_json::to_string_pretty(&study) {
+                        Ok(s) => println!("{s}"),
+                        Err(e) => {
+                            eprintln!("cannot serialize report: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    println!("{}", firstpass_bench::jev_replay::render_blend(&study));
+                }
+            }
+            Err(e) => {
+                eprintln!("--replay-blend failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Study B (specs/prior-blend-and-decision-gate.md): the `decision` gate's error rates against
+    // VRBench's hidden-test oracle. Needs the fail-closed sandbox (labels the served MBPP answers)
+    // and a live OpenJev `/v1/systemone` server (scores them) — both results are cached/resumable.
+    //   firstpass-bench --decision-study <candidates.jsonl> <mbpp.jsonl> <base_url> <labels.jsonl> <scores.jsonl> [--json]
+    if let Some(i) = args.iter().position(|a| a == "--decision-study") {
+        let (Some(candidates), Some(mbpp), Some(base_url), Some(labels_cache), Some(scores_cache)) = (
+            args.get(i + 1).filter(|p| !p.starts_with("--")),
+            args.get(i + 2).filter(|p| !p.starts_with("--")),
+            args.get(i + 3).filter(|p| !p.starts_with("--")),
+            args.get(i + 4).filter(|p| !p.starts_with("--")),
+            args.get(i + 5).filter(|p| !p.starts_with("--")),
+        ) else {
+            eprintln!(
+                "usage: firstpass-bench --decision-study <candidates.jsonl> <mbpp.jsonl> <base_url> <labels.jsonl> <scores.jsonl>"
+            );
+            std::process::exit(2);
+        };
+        let sb = match establish_sandbox(&sandbox_image()) {
+            Ok(sb) => sb,
+            Err(e) => {
+                eprintln!(
+                    "cannot run — sandbox not established: {e}\ncandidate answers execute in the \
+                     hidden-test oracle and will not be run on the host"
+                );
+                std::process::exit(1);
+            }
+        };
+        match firstpass_bench::decision_study::run(
+            sb.as_ref(),
+            candidates,
+            mbpp,
+            base_url,
+            labels_cache,
+            scores_cache,
+        ) {
+            Ok(study) => {
+                if json {
+                    match serde_json::to_string_pretty(&study) {
+                        Ok(s) => println!("{s}"),
+                        Err(e) => {
+                            eprintln!("cannot serialize report: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    println!("{}", firstpass_bench::decision_study::render(&study));
+                }
+            }
+            Err(e) => {
+                eprintln!("--decision-study failed: {e}");
                 std::process::exit(1);
             }
         }

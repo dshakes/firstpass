@@ -335,7 +335,7 @@ pub fn study(matrix: &[Vec<RungOutcome>]) -> CostAwareStudy {
             let (c, s, r) = first_pass(row);
             (c, s, r, false)
         }),
-        arm("cost-aware (learned p)", &valid, |row, p| {
+        arm("cost-aware (learned p, HINDSIGHT)", &valid, |row, p| {
             let (c, s, r) = serve(row, p);
             (c, s, r, skips(row, p))
         }),

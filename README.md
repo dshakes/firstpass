@@ -198,12 +198,28 @@ rungs = [
 mismatch is rejected at config parse, never silently truncated. The gate still verifies every
 served output; the prior only ever moves where the ladder starts.
 
-**`decision` gate — UNMEASURED.** The same Jev model can also sit behind a `[[gate]] decision = {...}`
-block as a cheap external verifier instead of a frontier LLM judge. A transport error, timeout, or
-unparseable reply ABSTAINs — never a fabricated pass — but its precision/recall against real
-failures has not been benchmarked; a live smoke test (not a measurement) caught the gate reading the
-wrong wire field (`probability`/`p`/`value` instead of the real `noul`), which would have abstained
-on every real answer — fixed, still unmeasured:
+**Blending in a learned signal: BLEND-NEUTRAL.** A second pre-registration (`specs/prior-blend-and-decision-gate.md`)
+tested whether blending traffic-learned pass rates into the prior beats the prior alone. Pooled
+(n=2418): `prior+learned` **$0.01094** vs `prior` **$0.01075** — paired diff **+0.00019 [+0.00004,
++0.00036]**, excludes 0, the blend is worse. **The prior alone stays the recommendation.** (This
+run also caught and corrected a hindsight leak: an earlier "cost-aware learned-p" arm decided and
+bucketed on each task's own *realized* cost, which only exists after generation — its $0.00919
+pooled figure is optimistic by $0.00190/success. The honest ex-ante version is $0.01109 pooled, only
+~1.5% under first-pass's $0.01126; it's now labeled `learned-p (hindsight)` in every report and any
+earlier "~22% cheaper than first-pass" claim for that arm is withdrawn — see
+[ADR 0013](docs/adr/0013-verified-predictive-routing.md).) Full numbers:
+[`docs/benchmarks/prior-blend-replay.md`](docs/benchmarks/prior-blend-replay.md).
+
+**`decision` gate — NOT-RECOMMENDED (measured with OpenJev; hosted Jev unmeasured).** The same Jev
+model can also sit behind a `[[gate]] decision = {...}` block as a cheap external verifier instead
+of a frontier LLM judge. A transport error, timeout, or unparseable reply ABSTAINs — never a
+fabricated pass — but scored against 974 served MBPP answers with VRBench's hidden-test oracle
+(111 oracle-wrong) and **local OpenJev** as the verifier: catch rate **0.2162** [0.1441, 0.2973],
+collateral **0.1031** [0.0834, 0.1228], AUC **0.6310** [0.5711, 0.6886] — below the pre-registered
+bar (catch ≥ 0.30 **and** collateral ≤ 0.05). **Verdict: NOT-RECOMMENDED** at τ=0.5. This measures
+OpenJev, not hosted Jev, which remains unmeasured. A live smoke test (not a measurement) separately
+caught the gate reading the wrong wire field (`probability`/`p`/`value` instead of the real `noul`)
+— fixed. Full numbers: [`docs/benchmarks/decision-gate-study.md`](docs/benchmarks/decision-gate-study.md).
 
 ```toml
 [[gate]]

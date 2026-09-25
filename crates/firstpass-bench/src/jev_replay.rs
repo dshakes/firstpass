@@ -210,7 +210,14 @@ fn fetch_one(
     let start = std::time::Instant::now();
     let elapsed_ms = || start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
-    let resp = match client.post(&url).json(&body).send() {
+    // Hosted Jev needs a bearer key; a local keyless server (OpenJev) ignores it. The key is read
+    // from the environment only and is never written to the priors file or logged.
+    let req = client.post(&url).json(&body);
+    let req = match std::env::var("TYPESAFE_API_KEY") {
+        Ok(key) if !key.is_empty() => req.bearer_auth(key),
+        _ => req,
+    };
+    let resp = match req.send() {
         Ok(r) => r,
         Err(_) => return (false, None, elapsed_ms()),
     };
@@ -538,11 +545,7 @@ struct ArmSeries {
     cost: Vec<f64>,
 }
 
-fn eval_arm(
-    name: &'static str,
-    tasks: &[TaskFit],
-    serve: impl Fn(&TaskFit) -> Served,
-) -> ArmSeries {
+fn eval_arm<T>(name: &'static str, tasks: &[T], serve: impl Fn(&T) -> Served) -> ArmSeries {
     let mut success = Vec::with_capacity(tasks.len());
     let mut cost = Vec::with_capacity(tasks.len());
     let (mut escalations, mut fallbacks) = (0usize, 0usize);
@@ -660,7 +663,7 @@ const ARM_NAMES: [&str; 7] = [
     "prior-unverified",
     "always-cheap",
     "always-top",
-    "cost-aware (learned p)",
+    "cost-aware (learned p, HINDSIGHT)",
     "cost-aware (ORACLE p — cheats)",
 ];
 
@@ -819,6 +822,454 @@ pub fn render(s: &ReplayPriorStudy) -> String {
         } else {
             "below the 95% threshold"
         }
+    ));
+    out.push_str(&format!("\n**Verdict: {}**\n", s.verdict));
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Study A: prior + learned blend (`specs/prior-blend-and-decision-gate.md`)
+// ---------------------------------------------------------------------------------------------
+
+/// `[escalation.prior] strength`'s pre-registered default — the pseudo-count weight the prior
+/// carries in the blend, same constant `PriorConfig::default_prior_strength` ships.
+const BLEND_STRENGTH: f64 = 10.0;
+
+/// Quartile buckets of the ex-ante MBPP prompt character length, same resolution as
+/// `costaware::PassPredictor`'s cost buckets.
+const EXANTE_BUCKETS: usize = 4;
+
+/// A fitted `P(rung 0 clears the gate | prompt char length)`, keeping the raw per-bucket counts
+/// (`hit`, `seen`) rather than folding them into a rate up front — `prior+learned` blends against
+/// the counts themselves, not their ratio.
+struct ExAntePredictor {
+    /// Upper char-length edge of each bucket (last is infinity).
+    edges: Vec<f64>,
+    hit: Vec<usize>,
+    seen: Vec<usize>,
+    /// Calibration-split base rate, used where a bucket held no examples.
+    base: f64,
+}
+
+impl ExAntePredictor {
+    /// Fit on `(prompt_chars, rung_0_gate_full_pass)` pairs from a calibration fold.
+    /// Deterministic: quartile edges come from the sorted lengths.
+    fn fit(calib: &[(f64, bool)]) -> Self {
+        let mut lens: Vec<f64> = calib.iter().map(|(l, _)| *l).collect();
+        lens.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let edges: Vec<f64> = (1..EXANTE_BUCKETS)
+            .map(|i| {
+                let idx = i * lens.len() / EXANTE_BUCKETS;
+                lens.get(idx).copied().unwrap_or(f64::INFINITY)
+            })
+            .chain(std::iter::once(f64::INFINITY))
+            .collect();
+
+        let mut hit = vec![0usize; EXANTE_BUCKETS];
+        let mut seen = vec![0usize; EXANTE_BUCKETS];
+        let mut passed = 0usize;
+        for (len, pass) in calib {
+            let b = Self::bucket_of(&edges, *len);
+            seen[b] += 1;
+            if *pass {
+                hit[b] += 1;
+                passed += 1;
+            }
+        }
+        Self {
+            edges,
+            hit,
+            seen,
+            base: if calib.is_empty() {
+                0.0
+            } else {
+                passed as f64 / calib.len() as f64
+            },
+        }
+    }
+
+    fn bucket_of(edges: &[f64], len: f64) -> usize {
+        edges
+            .iter()
+            .position(|e| len <= *e)
+            .unwrap_or(EXANTE_BUCKETS - 1)
+            .min(EXANTE_BUCKETS - 1)
+    }
+
+    /// `P(rung 0 passes)` for a prompt this long — bucket rate, base-rate fallback for an empty
+    /// bucket.
+    fn rate(&self, len: f64) -> f64 {
+        let b = Self::bucket_of(&self.edges, len);
+        if self.seen[b] > 0 {
+            self.hit[b] as f64 / self.seen[b] as f64
+        } else {
+            self.base
+        }
+    }
+
+    /// `(passes_b, seen_b)` for the bucket this length falls in — the raw counts `prior+learned`
+    /// blends against, not the rate.
+    fn counts(&self, len: f64) -> (usize, usize) {
+        let b = Self::bucket_of(&self.edges, len);
+        (self.hit[b], self.seen[b])
+    }
+}
+
+/// The blend formula: `(s·prior_r0 + passes_b) / (s + seen_b)`. At `seen_b = 0` this is exactly
+/// `prior_r0` (no traffic statistics to blend in yet); as `seen_b` grows past `s`, it converges to
+/// `passes_b / seen_b`, the bucket's own rate.
+fn blended_r0(prior_r0: f64, passes_b: usize, seen_b: usize) -> f64 {
+    (BLEND_STRENGTH * prior_r0 + passes_b as f64) / (BLEND_STRENGTH + seen_b as f64)
+}
+
+/// Build a `[p0, 1.0, 1.0, ...]` per-rung pass vector from a single rung-0 pass probability,
+/// mirroring how `prior`'s cumulative vector is always forced to `1.0` at the last rung (some
+/// rung must suffice). No ex-ante or blended signal is defined for rungs between 0 and the last —
+/// every ladder this spec measures has exactly two rungs, so this is the 2-rung case the spec
+/// pre-registers (`P(pass r1) = 1`), generalised by treating any further rung the same way.
+fn r0_only_pass_vector(r0: f64, n_rungs: usize) -> Vec<f64> {
+    let mut v = vec![1.0; n_rungs.max(1)];
+    v[0] = r0.clamp(0.0, 1.0);
+    v
+}
+
+/// One task for Study A: the same row/prior/price [`TaskFit`] carries, plus the ex-ante prompt
+/// length feature and what the calibration-fold ex-ante predictor says about it. `None` means no
+/// MBPP prompt matched this task's id — the ex-ante and blended arms then fall back to first-pass,
+/// same discipline as a missing prior.
+struct BlendTaskFit {
+    row: Vec<RungOutcome>,
+    prior: Option<Vec<f64>>,
+    price: Vec<f64>,
+    /// `costaware`'s hindsight pass-rate estimate — kept only for the `learned-p (hindsight)`
+    /// reference arm and the leak-size report, never for a decision an ex-ante arm makes.
+    p_hindsight: f64,
+    ex_ante_r0: Option<f64>,
+    /// `(passes_b, seen_b)` for this task's ex-ante bucket. `None` when no MBPP prompt matched —
+    /// distinct from `Some((0, 0))`, which means the bucket matched but was empty on this fold.
+    ex_ante_counts: Option<(usize, usize)>,
+}
+
+/// Join matrix rows with priors and the ex-ante prompt-length feature, attaching cross-fitted
+/// prices, the hindsight pass-rate estimate, and the ex-ante rate/counts — all fit the same
+/// 2-fold way `build_task_fits` fits the prior study, so no task ever prices, predicts, or
+/// buckets itself.
+fn build_blend_task_fits(
+    rows: &[MatrixRow],
+    priors: &HashMap<String, PriorRecord>,
+    prompt_chars: &HashMap<String, f64>,
+    ladder_len: usize,
+) -> Vec<BlendTaskFit> {
+    let fold_a: Vec<&MatrixRow> = rows.iter().step_by(2).collect();
+    let fold_b: Vec<&MatrixRow> = rows.iter().skip(1).step_by(2).collect();
+    let rungs_a: Vec<Vec<RungOutcome>> = fold_a.iter().map(|r| r.rungs.clone()).collect();
+    let rungs_b: Vec<Vec<RungOutcome>> = fold_b.iter().map(|r| r.rungs.clone()).collect();
+
+    let pred_for_a = PassPredictor::fit(&rungs_b);
+    let pred_for_b = PassPredictor::fit(&rungs_a);
+    let price_for_a = mean_cost_per_rung(&rungs_b, ladder_len);
+    let price_for_b = mean_cost_per_rung(&rungs_a, ladder_len);
+
+    let exante_calib = |fold: &[&MatrixRow]| -> Vec<(f64, bool)> {
+        fold.iter()
+            .filter_map(|r| {
+                let len = *prompt_chars.get(&r.task_id)?;
+                let pass = r.rungs.first().is_some_and(|o| o.gate_full_pass);
+                Some((len, pass))
+            })
+            .collect()
+    };
+    let exante_for_a = ExAntePredictor::fit(&exante_calib(&fold_b));
+    let exante_for_b = ExAntePredictor::fit(&exante_calib(&fold_a));
+
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let in_a = i % 2 == 0;
+            let (pred, price, exante) = if in_a {
+                (&pred_for_a, &price_for_a, &exante_for_a)
+            } else {
+                (&pred_for_b, &price_for_b, &exante_for_b)
+            };
+            let p_hindsight = r.rungs.first().map_or(1.0, |o| pred.p(o.cost_usd));
+            let prior = priors.get(&r.task_id).and_then(|p| {
+                if !p.raw_ok {
+                    return None;
+                }
+                let probs = p.probs.as_ref()?;
+                if probs.len() != ladder_len {
+                    return None;
+                }
+                firstpass_core::cumulative_pass(probs)
+            });
+            let (ex_ante_r0, ex_ante_counts) = match prompt_chars.get(&r.task_id) {
+                Some(&len) => (Some(exante.rate(len)), Some(exante.counts(len))),
+                None => (None, None),
+            };
+            BlendTaskFit {
+                row: r.rungs.clone(),
+                prior,
+                price: price.clone(),
+                p_hindsight,
+                ex_ante_r0,
+                ex_ante_counts,
+            }
+        })
+        .collect()
+}
+
+/// `task_id -> MBPP prompt character length`, the ex-ante feature — known before generation,
+/// never the task's own realized cost.
+///
+/// # Errors
+/// The MBPP file can't be read/parsed.
+fn build_prompt_char_map(
+    mbpp_path: &str,
+    rows: &[MatrixRow],
+) -> Result<HashMap<String, f64>, String> {
+    let mbpp = load_mbpp_examples(mbpp_path)?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id = mbpp_numeric_id(&r.task_id)?;
+            let ex = mbpp.get(&id)?;
+            Some((r.task_id.clone(), ex.text.chars().count() as f64))
+        })
+        .collect())
+}
+
+fn serve_first_pass_blend(t: &BlendTaskFit) -> Served {
+    let (ok, cost, rungs) = costaware::first_pass_from(&t.row, 0);
+    (ok, cost, rungs, true)
+}
+
+fn fallback_to_first_pass_blend(t: &BlendTaskFit) -> Served {
+    let (ok, cost, rungs) = costaware::first_pass_from(&t.row, 0);
+    (ok, cost, rungs, false)
+}
+
+fn serve_prior_blend(t: &BlendTaskFit) -> Served {
+    match &t.prior {
+        Some(p) => {
+            let start = argmin_expected_cost_prior(p, &t.price);
+            let (ok, cost, rungs) = costaware::first_pass_from(&t.row, start);
+            (ok, cost, rungs, true)
+        }
+        None => fallback_to_first_pass_blend(t),
+    }
+}
+
+/// `learned-p (ex-ante)`: decides purely from the calibration-fold bucket rate for this task's
+/// prompt length and the cross-fitted price — never the task's own `cost_usd`.
+fn serve_learned_exante(t: &BlendTaskFit) -> Served {
+    match t.ex_ante_r0 {
+        Some(r0) => {
+            let v = r0_only_pass_vector(r0, t.price.len());
+            let start = argmin_expected_cost_prior(&v, &t.price);
+            let (ok, cost, rungs) = costaware::first_pass_from(&t.row, start);
+            (ok, cost, rungs, true)
+        }
+        None => fallback_to_first_pass_blend(t),
+    }
+}
+
+/// `prior+learned`: the posterior mean blend of the OpenJev prior and the ex-ante traffic
+/// statistics, decided the same expected-cost-argmin way as every other arm. Falls back to
+/// first-pass only when no prior exists at all; a missing ex-ante bucket degrades gracefully to
+/// the prior alone (`passes_b = seen_b = 0` leaves `blended_r0` unchanged).
+fn serve_prior_plus_learned(t: &BlendTaskFit) -> Served {
+    match &t.prior {
+        Some(p) => {
+            let (passes_b, seen_b) = t.ex_ante_counts.unwrap_or((0, 0));
+            let r0 = blended_r0(p[0], passes_b, seen_b);
+            let v = r0_only_pass_vector(r0, t.price.len());
+            let start = argmin_expected_cost_prior(&v, &t.price);
+            let (ok, cost, rungs) = costaware::first_pass_from(&t.row, start);
+            (ok, cost, rungs, true)
+        }
+        None => fallback_to_first_pass_blend(t),
+    }
+}
+
+fn serve_always_top_blend(t: &BlendTaskFit) -> Served {
+    t.row.last().map_or((false, 0.0, 0, true), |o| {
+        (o.oracle_correct, o.cost_usd, 1, true)
+    })
+}
+
+/// `learned-p (hindsight)`: reference only — `costaware::PassPredictor` buckets by the task's own
+/// realized rung-0 cost, which exists only after generation. Never the comparison target.
+fn serve_learned_hindsight(t: &BlendTaskFit) -> Served {
+    let (ok, cost, rungs) = costaware::serve(&t.row, t.p_hindsight);
+    (ok, cost, rungs, true)
+}
+
+const BLEND_ARM_NAMES: [&str; 6] = [
+    "first-pass",
+    "prior",
+    "learned-p (ex-ante)",
+    "prior+learned",
+    "learned-p (hindsight)",
+    "always-top",
+];
+
+fn eval_all_blend_arms(tasks: &[BlendTaskFit]) -> Vec<ArmSeries> {
+    vec![
+        eval_arm(BLEND_ARM_NAMES[0], tasks, serve_first_pass_blend),
+        eval_arm(BLEND_ARM_NAMES[1], tasks, serve_prior_blend),
+        eval_arm(BLEND_ARM_NAMES[2], tasks, serve_learned_exante),
+        eval_arm(BLEND_ARM_NAMES[3], tasks, serve_prior_plus_learned),
+        eval_arm(BLEND_ARM_NAMES[4], tasks, serve_learned_hindsight),
+        eval_arm(BLEND_ARM_NAMES[5], tasks, serve_always_top_blend),
+    ]
+}
+
+/// The spec's Study A pooled verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum BlendVerdict {
+    Helps,
+    Neutral,
+}
+
+impl std::fmt::Display for BlendVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BlendVerdict::Helps => "BLEND-HELPS",
+            BlendVerdict::Neutral => "BLEND-NEUTRAL",
+        })
+    }
+}
+
+/// The whole Study A replay: per-ladder and pooled arms, the pooled paired diff (`prior+learned` −
+/// `prior`), the reported (not gated) leak size, and the verdict.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplayBlendStudy {
+    pub per_ladder: Vec<LadderResult>,
+    pub pooled: LadderResult,
+    /// Bootstrap CI on `prior+learned − prior` for `$/success`, pooled across every ladder.
+    pub pooled_usd_per_success_diff_ci: Ci,
+    /// `learned-p (hindsight)` minus `learned-p (ex-ante)`, pooled `$/success` — the size of the
+    /// hindsight leak the ex-ante arm closes. Reported, not gated.
+    pub leak_usd_per_success: f64,
+    pub verdict: BlendVerdict,
+}
+
+/// Replay every `(matrix, priors)` pair against the shared `mbpp_path`, score Study A's arms per
+/// ladder and pooled, and produce the pre-registered pooled verdict. Pure once the files are read.
+///
+/// # Errors
+/// The MBPP file, any matrix, or any priors file can't be read/parsed, or `pairs` is empty.
+pub fn run_replay_blend(
+    mbpp_path: &str,
+    pairs: &[(String, String)],
+) -> Result<ReplayBlendStudy, String> {
+    if pairs.is_empty() {
+        return Err("--replay-blend needs at least one <matrix> <priors> pair".to_owned());
+    }
+
+    let mut per_ladder = Vec::with_capacity(pairs.len());
+    let mut pooled_tasks: Vec<BlendTaskFit> = Vec::new();
+
+    for (matrix_path, priors_path) in pairs {
+        let (rows, ladder) = load_matrix_with_ids(matrix_path)?;
+        let priors = load_priors(priors_path)?;
+        let prompt_chars = build_prompt_char_map(mbpp_path, &rows)?;
+        let tasks = build_blend_task_fits(&rows, &priors, &prompt_chars, ladder.len());
+        let series = eval_all_blend_arms(&tasks);
+        per_ladder.push(ladder_result(matrix_path, &ladder, &series));
+        pooled_tasks.extend(tasks);
+    }
+
+    let pooled_series = eval_all_blend_arms(&pooled_tasks);
+    let pooled = ladder_result("POOLED", &[], &pooled_series);
+
+    let prior = &pooled_series[1];
+    let blend = &pooled_series[3];
+    let exante = &pooled_series[2];
+    let hindsight = &pooled_series[4];
+
+    let diff_ci = bootstrap_paired_ratio_diff_ci(
+        &blend.cost,
+        &blend.success,
+        &prior.cost,
+        &prior.success,
+        BOOT_B,
+        BOOT_SEED,
+        ALPHA,
+    );
+    let leak_usd_per_success = hindsight.result.usd_per_success - exante.result.usd_per_success;
+
+    let cost_lower_excludes_zero = diff_ci.hi < 0.0;
+    let failure_not_worse =
+        blend.result.served_failure_rate <= prior.result.served_failure_rate + 0.01;
+    let verdict = if cost_lower_excludes_zero && failure_not_worse {
+        BlendVerdict::Helps
+    } else {
+        BlendVerdict::Neutral
+    };
+
+    Ok(ReplayBlendStudy {
+        per_ladder,
+        pooled,
+        pooled_usd_per_success_diff_ci: diff_ci,
+        leak_usd_per_success,
+        verdict,
+    })
+}
+
+/// Markdown render for Study A.
+#[must_use]
+pub fn render_blend(s: &ReplayBlendStudy) -> String {
+    let mut out = String::new();
+    out.push_str("## Prior + learned blend — Study A (real MBPP matrices)\n\n");
+    out.push_str(
+        "Pre-registration: `specs/prior-blend-and-decision-gate.md`. `prior`/`prior+learned` are \
+         the two arms the verdict compares; the rest are context. `learned-p (hindsight)` is \
+         reference only — it uses the task's own realized cost and must never be the comparison \
+         target.\n\n",
+    );
+
+    let render_table = |lr: &LadderResult| -> String {
+        let mut t = String::new();
+        t.push_str(&format!("### {} (n = {})\n\n", lr.label, lr.n));
+        t.push_str(
+            "| arm | success | 95% CI | $/success | 95% CI | served-failure | escalated | fallback (no prior) |\n\
+             |---|---|---|---|---|---|---|---|\n",
+        );
+        for a in &lr.arms {
+            t.push_str(&format!(
+                "| {} | {:.4} | [{:.4}, {:.4}] | ${:.5} | [${:.5}, ${:.5}] | {:.4} | {:.0}% | {:.0}% |\n",
+                a.name,
+                a.success_rate,
+                a.success_ci.lo,
+                a.success_ci.hi,
+                a.usd_per_success,
+                a.usd_per_success_ci.lo,
+                a.usd_per_success_ci.hi,
+                a.served_failure_rate,
+                a.escalation_rate * 100.0,
+                a.fallback_rate * 100.0,
+            ));
+        }
+        t
+    };
+
+    for lr in &s.per_ladder {
+        out.push_str(&render_table(lr));
+        out.push('\n');
+    }
+    out.push_str(&render_table(&s.pooled));
+
+    out.push_str(&format!(
+        "\n**Pooled `$/success` (prior+learned − prior): {:+.5} [{:+.5}, {:+.5}]**\n",
+        s.pooled_usd_per_success_diff_ci.point,
+        s.pooled_usd_per_success_diff_ci.lo,
+        s.pooled_usd_per_success_diff_ci.hi,
+    ));
+    out.push_str(&format!(
+        "\nHindsight leak (learned-p (hindsight) − learned-p (ex-ante), pooled `$/success`): \
+         {:+.5}. Reported, not gated.\n",
+        s.leak_usd_per_success,
     ));
     out.push_str(&format!("\n**Verdict: {}**\n", s.verdict));
     out
@@ -1182,5 +1633,344 @@ mod tests {
         let fits = build_task_fits(&rows, &priors, 2);
         assert!(fits[0].prior.is_some());
         assert!(fits[1].prior.is_none());
+    }
+
+    // =========================================================================================
+    // Study A: prior + learned blend
+    // =========================================================================================
+
+    fn blend_task(
+        row: Vec<RungOutcome>,
+        prior: Option<Vec<f64>>,
+        price: Vec<f64>,
+        ex_ante_r0: Option<f64>,
+        ex_ante_counts: Option<(usize, usize)>,
+    ) -> BlendTaskFit {
+        BlendTaskFit {
+            row,
+            prior,
+            price,
+            p_hindsight: 0.5,
+            ex_ante_r0,
+            ex_ante_counts,
+        }
+    }
+
+    // ---- blend formula ----------------------------------------------------------------------
+
+    #[test]
+    fn blend_at_zero_seen_equals_the_prior() {
+        assert!((blended_r0(0.7, 0, 0) - 0.7).abs() < 1e-12);
+        assert!((blended_r0(0.05, 0, 0) - 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn blend_at_large_seen_approaches_the_bucket_rate() {
+        // Bucket rate 0.8 (800/1000), prior deliberately far away (0.1) — with seen_b >> s the
+        // prior's pseudo-count weight is swamped by the observed traffic.
+        let blended = blended_r0(0.1, 800, 1000);
+        assert!(
+            (blended - 0.8).abs() < 0.01,
+            "blend {blended} should be within 1pp of the bucket rate 0.8"
+        );
+    }
+
+    // ---- ex-ante arms never read the task's own realized cost --------------------------------
+
+    /// Two tasks share everything the ex-ante decision is allowed to see (`ex_ante_r0`, `price`)
+    /// but differ wildly in their own realized rung-0 `cost_usd`. If `serve_learned_exante` ever
+    /// started reading the task's own cost instead of the ex-ante price, an outlier `cost_usd`
+    /// like the second task's would flip the argmin and this test would fail.
+    #[test]
+    fn exante_decision_is_blind_to_the_scored_tasks_own_cost() {
+        let cheap_row = two_rung_row(true, true, 0.001, true, true, 0.05);
+        let mut expensive_row = cheap_row.clone();
+        expensive_row[0].cost_usd = 50.0; // wildly different realized cost, same everything else
+
+        let cheap = blend_task(cheap_row, None, vec![0.02, 0.05], Some(0.5), None);
+        let expensive = blend_task(expensive_row, None, vec![0.02, 0.05], Some(0.5), None);
+
+        let start_cheap = argmin_expected_cost_prior(&r0_only_pass_vector(0.5, 2), &cheap.price);
+        let start_expensive =
+            argmin_expected_cost_prior(&r0_only_pass_vector(0.5, 2), &expensive.price);
+        assert_eq!(
+            start_cheap, start_expensive,
+            "the ex-ante decision must depend only on ex_ante_r0 and price, never on cost_usd"
+        );
+
+        // Same at the served-decision level: rungs paid may legitimately differ (gating still
+        // runs on the real row), but the escalation decision (start rung) must not.
+        let served_cheap = serve_learned_exante(&cheap);
+        let served_expensive = serve_learned_exante(&expensive);
+        assert_eq!(
+            served_cheap.2, served_expensive.2,
+            "same rungs paid from the same start"
+        );
+    }
+
+    /// `prior+learned` must be equally blind: the blended r0 comes from `prior[0]` and the
+    /// calibration-fold bucket counts, never from `t.row`.
+    #[test]
+    fn blend_decision_is_blind_to_the_scored_tasks_own_cost() {
+        let prior = firstpass_core::cumulative_pass(&[0.5, 0.5]);
+        let cheap_row = two_rung_row(true, true, 0.001, true, true, 0.05);
+        let mut expensive_row = cheap_row.clone();
+        expensive_row[0].cost_usd = 50.0;
+
+        let cheap = blend_task(
+            cheap_row,
+            prior.clone(),
+            vec![0.02, 0.05],
+            Some(0.5),
+            Some((40, 100)),
+        );
+        let expensive = blend_task(
+            expensive_row,
+            prior,
+            vec![0.02, 0.05],
+            Some(0.5),
+            Some((40, 100)),
+        );
+        let served_cheap = serve_prior_plus_learned(&cheap);
+        let served_expensive = serve_prior_plus_learned(&expensive);
+        assert_eq!(
+            served_cheap.2, served_expensive.2,
+            "the blended decision must depend only on prior[0] and the ex-ante counts, never on \
+             the scored task's own cost_usd"
+        );
+    }
+
+    // ---- verdict fixtures: HELPS and NEUTRAL --------------------------------------------------
+
+    /// A blend that correctly starts hard tasks at the top rung (because both the prior and the
+    /// ex-ante bucket agree it is hopeless) and easy tasks cheap must report BLEND-HELPS: cheaper
+    /// `$/success` than the prior alone, with no worse served-failure.
+    #[test]
+    fn blend_verdict_helps_when_the_blend_earns_its_keep() {
+        let mut tasks = Vec::new();
+        // 40 "hard" tasks: the prior alone is uninformative (0.5/0.5), but the ex-ante bucket
+        // (fit on real traffic) knows this bucket almost never passes at rung 0 — so only the
+        // blend, not the prior alone, correctly skips the wasted cheap attempt.
+        for _ in 0..40 {
+            tasks.push(blend_task(
+                two_rung_row(false, false, 0.02, true, true, 0.05),
+                firstpass_core::cumulative_pass(&[0.5, 0.5]),
+                vec![0.02, 0.05],
+                Some(0.02),
+                Some((2, 100)),
+            ));
+        }
+        // 60 "easy" tasks: cheap rung passes; both prior and blend agree, no quality cost.
+        for _ in 0..60 {
+            tasks.push(blend_task(
+                two_rung_row(true, true, 0.01, true, true, 0.05),
+                firstpass_core::cumulative_pass(&[0.5, 0.5]),
+                vec![0.02, 0.05],
+                Some(0.98),
+                Some((98, 100)),
+            ));
+        }
+        let series = eval_all_blend_arms(&tasks);
+        let prior = &series[1];
+        let blend = &series[3];
+        let diff_ci = bootstrap_paired_ratio_diff_ci(
+            &blend.cost,
+            &blend.success,
+            &prior.cost,
+            &prior.success,
+            BOOT_B,
+            BOOT_SEED,
+            ALPHA,
+        );
+        let cost_lower = diff_ci.hi < 0.0;
+        let failure_ok =
+            blend.result.served_failure_rate <= prior.result.served_failure_rate + 0.01;
+        assert!(cost_lower, "blend must be cheaper: diff CI {diff_ci:?}");
+        assert!(failure_ok);
+        let verdict = if cost_lower && failure_ok {
+            BlendVerdict::Helps
+        } else {
+            BlendVerdict::Neutral
+        };
+        assert_eq!(verdict, BlendVerdict::Helps);
+    }
+
+    /// A blend fed a bucket signal identical for hard and easy tasks (no traffic signal at all)
+    /// on top of an already-uninformative prior cannot beat the prior's own $/success — reports
+    /// BLEND-NEUTRAL.
+    #[test]
+    fn blend_verdict_neutral_when_the_blend_has_no_signal() {
+        let mut tasks = Vec::new();
+        for _ in 0..40 {
+            tasks.push(blend_task(
+                two_rung_row(false, false, 0.02, true, true, 0.05),
+                firstpass_core::cumulative_pass(&[0.5, 0.5]),
+                vec![0.02, 0.05],
+                Some(0.5),
+                Some((50, 100)),
+            ));
+        }
+        for _ in 0..60 {
+            tasks.push(blend_task(
+                two_rung_row(true, true, 0.01, true, true, 0.05),
+                firstpass_core::cumulative_pass(&[0.5, 0.5]),
+                vec![0.02, 0.05],
+                Some(0.5),
+                Some((50, 100)),
+            ));
+        }
+        let series = eval_all_blend_arms(&tasks);
+        let prior = &series[1];
+        let blend = &series[3];
+        let diff_ci = bootstrap_paired_ratio_diff_ci(
+            &blend.cost,
+            &blend.success,
+            &prior.cost,
+            &prior.success,
+            BOOT_B,
+            BOOT_SEED,
+            ALPHA,
+        );
+        let cost_lower = diff_ci.hi < 0.0;
+        let verdict = if cost_lower {
+            BlendVerdict::Helps
+        } else {
+            BlendVerdict::Neutral
+        };
+        assert_eq!(verdict, BlendVerdict::Neutral);
+    }
+
+    /// **Mutation test**: flip the sign convention (`prior - blend` instead of `blend - prior`)
+    /// and confirm the HELPS fixture above would then read as NEUTRAL — proving the verdict test
+    /// depends on the subtraction order, not on a tautology.
+    #[test]
+    fn blend_verdict_test_is_sensitive_to_the_diff_sign() {
+        let mut tasks = Vec::new();
+        for _ in 0..40 {
+            tasks.push(blend_task(
+                two_rung_row(false, false, 0.02, true, true, 0.05),
+                firstpass_core::cumulative_pass(&[0.5, 0.5]),
+                vec![0.02, 0.05],
+                Some(0.02),
+                Some((2, 100)),
+            ));
+        }
+        for _ in 0..60 {
+            tasks.push(blend_task(
+                two_rung_row(true, true, 0.01, true, true, 0.05),
+                firstpass_core::cumulative_pass(&[0.5, 0.5]),
+                vec![0.02, 0.05],
+                Some(0.98),
+                Some((98, 100)),
+            ));
+        }
+        let series = eval_all_blend_arms(&tasks);
+        let prior = &series[1];
+        let blend = &series[3];
+        // Mutated: prior - blend instead of blend - prior.
+        let mutated_ci = bootstrap_paired_ratio_diff_ci(
+            &prior.cost,
+            &prior.success,
+            &blend.cost,
+            &blend.success,
+            BOOT_B,
+            BOOT_SEED,
+            ALPHA,
+        );
+        assert!(
+            mutated_ci.hi >= 0.0,
+            "mutated sign convention must not still read as BLEND-HELPS"
+        );
+    }
+
+    // ---- missing prior / missing ex-ante data fall back gracefully ---------------------------
+
+    #[test]
+    fn blend_falls_back_to_first_pass_when_no_prior_exists() {
+        let t = blend_task(
+            two_rung_row(false, false, 0.02, true, true, 0.05),
+            None,
+            vec![0.02, 0.05],
+            Some(0.5),
+            Some((10, 20)),
+        );
+        let served = serve_prior_plus_learned(&t);
+        let fp = serve_first_pass_blend(&t);
+        assert_eq!((served.0, served.1, served.2), (fp.0, fp.1, fp.2));
+        assert!(!served.3, "must be counted as a fallback");
+    }
+
+    #[test]
+    fn blend_degrades_to_the_prior_alone_when_no_exante_bucket_matched() {
+        let prior = firstpass_core::cumulative_pass(&[0.02, 0.98]);
+        let with_counts = blend_task(
+            two_rung_row(false, false, 0.02, true, true, 0.05),
+            prior.clone(),
+            vec![0.02, 0.05],
+            None,
+            Some((0, 0)),
+        );
+        let without_counts = blend_task(
+            two_rung_row(false, false, 0.02, true, true, 0.05),
+            prior,
+            vec![0.02, 0.05],
+            None,
+            None,
+        );
+        let a = serve_prior_plus_learned(&with_counts);
+        let b = serve_prior_plus_learned(&without_counts);
+        assert_eq!((a.0, a.1, a.2), (b.0, b.1, b.2));
+    }
+
+    #[test]
+    fn exante_falls_back_to_first_pass_when_no_prompt_matched() {
+        let t = blend_task(
+            two_rung_row(false, false, 0.02, true, true, 0.05),
+            None,
+            vec![0.02, 0.05],
+            None,
+            None,
+        );
+        let served = serve_learned_exante(&t);
+        assert!(!served.3);
+    }
+
+    // ---- prompt char map join ------------------------------------------------------------
+
+    #[test]
+    fn build_prompt_char_map_keys_by_task_id_and_skips_unmatched() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "jev_replay_blend_test_{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "{\"task_id\": 1, \"text\": \"abc\", \"test_list\": [\"assert f(1)==1\"]}\n\
+             {\"task_id\": 2, \"text\": \"abcdefghij\", \"test_list\": [\"assert f(2)==2\"]}\n",
+        )
+        .unwrap();
+        let rows = vec![
+            MatrixRow {
+                task_id: "mbpp-1".to_owned(),
+                ladder: vec!["a".to_owned(), "b".to_owned()],
+                rungs: two_rung_row(true, true, 0.01, true, true, 0.05),
+            },
+            MatrixRow {
+                task_id: "mbpp-2".to_owned(),
+                ladder: vec!["a".to_owned(), "b".to_owned()],
+                rungs: two_rung_row(true, true, 0.01, true, true, 0.05),
+            },
+            MatrixRow {
+                task_id: "mbpp-999".to_owned(), // no matching prompt
+                ladder: vec!["a".to_owned(), "b".to_owned()],
+                rungs: two_rung_row(true, true, 0.01, true, true, 0.05),
+            },
+        ];
+        let map = build_prompt_char_map(path.to_str().unwrap(), &rows).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(map.get("mbpp-1"), Some(&3.0));
+        assert_eq!(map.get("mbpp-2"), Some(&10.0));
+        assert_eq!(map.get("mbpp-999"), None);
     }
 }
