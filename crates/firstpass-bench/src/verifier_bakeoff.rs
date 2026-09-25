@@ -381,8 +381,17 @@ fn run_v3_scores(
     cache_path: &str,
 ) -> Result<HashMap<String, V3ScoreRecord>, String> {
     let mut scores = load_jsonl_map(cache_path, |r: &V3ScoreRecord| r.id.clone());
+    // A `None` score here means either "no tests parsed yet" or "sandbox run produced zero
+    // cases" — both abstains, not a genuine 0.0. `run_v3_tests`'s own resume already retries an
+    // empty test set, so this cache must retry alongside it or a candidate that abstained on one
+    // run stays permanently un-scored even after its tests are successfully regenerated.
+    let done = decision_study::resumable_ids(
+        cache_path,
+        |r: &V3ScoreRecord| r.id.clone(),
+        |r: &V3ScoreRecord| r.score.is_some(),
+    );
     for (i, c) in candidates.iter().enumerate() {
-        if scores.contains_key(&c.id) {
+        if done.contains(&c.id) {
             continue;
         }
         let (Some(task), Some(t)) = (tasks_by_id.get(&c.id), tests.get(&c.id)) else {
@@ -1253,6 +1262,34 @@ mod tests {
         );
         assert!(!done.contains("a"), "zero parsed tests must be retried");
         assert!(done.contains("b"), "a nonempty test set must be skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `run_v3_scores` must retry a cached abstain (`score: None`, from zero runnable tests) the
+    /// same way `run_v3_tests`'s own resume retries an empty test set — otherwise a candidate that
+    /// abstained on one run stays permanently un-scored even after its tests regenerate.
+    #[test]
+    fn v3_scores_resumable_ids_retries_a_cached_abstain() {
+        let dir = std::env::temp_dir().join(format!("fp-v3-score-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("v3-scores.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"id":"a","score":null,"passed":0,"total":0,"latency_ms":1}"#,
+                "\n",
+                r#"{"id":"b","score":0.6,"passed":3,"total":5,"latency_ms":1}"#,
+                "\n",
+            ),
+        )
+        .expect("write");
+        let done = decision_study::resumable_ids(
+            path.to_str().expect("utf8"),
+            |r: &V3ScoreRecord| r.id.clone(),
+            |r: &V3ScoreRecord| r.score.is_some(),
+        );
+        assert!(!done.contains("a"), "a cached abstain must be retried");
+        assert!(done.contains("b"), "a genuine score must be skipped");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
