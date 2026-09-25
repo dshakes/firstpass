@@ -682,11 +682,6 @@ fn ladder_result(label: &str, ladder: &[String], series: &[ArmSeries]) -> Ladder
     }
 }
 
-/// Load a priors JSONL file into a `task_id -> PriorRecord` map.
-///
-/// # Errors
-/// Unreadable file. A malformed line is skipped (not fatal): `run_fetch_priors` may have been
-/// interrupted mid-write, and a partial last line must not sink the whole replay.
 /// Task ids a resumed fetch may skip: only the ones that already have a *successful* prior. A
 /// failed record (`raw_ok: false`) is retried, and the retry is appended; [`load_priors`] keeps the
 /// last record per task, so the retry wins. Skipping failures instead made a keyless first run
@@ -699,6 +694,11 @@ fn resumable_ids(text: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Load a priors JSONL file into a `task_id -> PriorRecord` map.
+///
+/// # Errors
+/// Unreadable file. A malformed line is skipped (not fatal): `run_fetch_priors` may have been
+/// interrupted mid-write, and a partial last line must not sink the whole replay.
 fn load_priors(path: &str) -> Result<HashMap<String, PriorRecord>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     Ok(text

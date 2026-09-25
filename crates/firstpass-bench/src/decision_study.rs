@@ -108,28 +108,53 @@ struct OracleLabel {
     oracle_pass: bool,
 }
 
-fn append_label(path: &str, id: &str, oracle_pass: bool) {
+fn append_label(path: &str, id: &str, oracle_pass: bool) -> Result<(), String> {
     let rec = OracleLabel {
         id: id.to_owned(),
         oracle_pass,
     };
-    append_jsonl(path, &rec);
+    append_jsonl(path, &rec)
 }
 
 /// `pub(crate)`: the generic append-one-line-resumable-cache helper, reused by
-/// [`crate::verifier_bakeoff`] for V1/V2/V3's own cache files.
-pub(crate) fn append_jsonl<T: Serialize>(path: &str, rec: &T) {
-    let Ok(line) = serde_json::to_string(rec) else {
-        return;
-    };
+/// [`crate::verifier_bakeoff`] for V1/V2/V3's own cache files. A dropped write here would silently
+/// desync the cache from the in-memory map that decides what's already "done" — the caller must
+/// know, not just move on as if it landed.
+///
+/// # Errors
+/// The record can't serialize, the file can't be opened for append, or the write fails.
+pub(crate) fn append_jsonl<T: Serialize>(path: &str, rec: &T) -> Result<(), String> {
+    let line = serde_json::to_string(rec).map_err(|e| format!("cannot serialize record: {e}"))?;
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-    {
-        let _ = writeln!(f, "{line}");
-    }
+        .map_err(|e| format!("cannot open {path} for append: {e}"))?;
+    writeln!(f, "{line}").map_err(|e| format!("cannot write to {path}: {e}"))
+}
+
+/// Ids with an already-successful record in `path` — the ones a resume must skip. A failed record
+/// (`is_done` false) is retried and the retry appended; the caller's own last-record-wins load
+/// (e.g. [`load_scores`], `verifier_bakeoff::load_jsonl_map`) then picks up the retry. Mirrors
+/// `jev_replay::resumable_ids` — same fix, same reason: skipping on mere presence instead of
+/// success made a first failed attempt permanent. `pub(crate)`: reused by
+/// [`crate::verifier_bakeoff`]'s V2/V3 resume checks.
+pub(crate) fn resumable_ids<T: for<'de> Deserialize<'de>>(
+    path: &str,
+    id_of: impl Fn(&T) -> String,
+    is_done: impl Fn(&T) -> bool,
+) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|t| {
+            t.lines()
+                .filter_map(|l| serde_json::from_str::<T>(l).ok())
+                .filter(&is_done)
+                .map(|r| id_of(&r))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `"mbpp-N"` -> `"mbpp/N"`, matching the `id` VRBench candidates use (`~/vrb-cascade.jsonl`).
@@ -166,7 +191,7 @@ pub(crate) fn run_oracle_labels(
         };
         let (passed, total) = suite_score(sb, task, &c.answer, &task.hidden_cases, limits)?;
         let oracle_pass = total > 0 && passed == total;
-        append_label(cache_path, &c.id, oracle_pass);
+        append_label(cache_path, &c.id, oracle_pass)?;
         labels.insert(c.id.clone(), oracle_pass);
         eprintln!(
             "[{}/{}] {} oracle_pass={oracle_pass}",
@@ -281,13 +306,20 @@ pub(crate) fn run_openjev_scores(
     build_body: impl Fn(&str, &str) -> Value,
 ) -> Result<(HashMap<String, DecisionScoreRecord>, usize), String> {
     let mut scores = load_scores(cache_path);
+    // A failed call (`raw_ok: false`) is not "done" — only a successful one skips the retry, or a
+    // keyless/flaky first pass would poison the cache for good (same fix as `jev_replay`'s).
+    let done = resumable_ids(
+        cache_path,
+        |r: &DecisionScoreRecord| r.id.clone(),
+        |r: &DecisionScoreRecord| r.raw_ok,
+    );
     let mut n_missing = 0usize;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
     for (i, c) in candidates.iter().enumerate() {
-        if scores.contains_key(&c.id) {
+        if done.contains(&c.id) {
             continue;
         }
         let Some(text) = mbpp_text.get(&c.id) else {
@@ -302,7 +334,7 @@ pub(crate) fn run_openjev_scores(
             raw_ok,
             latency_ms,
         };
-        append_jsonl(cache_path, &rec);
+        append_jsonl(cache_path, &rec)?;
         scores.insert(c.id.clone(), rec);
         eprintln!(
             "[{}/{}] {} raw_ok={raw_ok} latency_ms={latency_ms}",
@@ -670,6 +702,81 @@ pub fn render(s: &DecisionStudy) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- resumable cache writes ------------------------------------------------------------
+
+    /// A failed record must not be treated as done, and a later successful retry for the same id
+    /// must win on load — mirrors `jev_replay`'s `resumable_ids`/last-record-wins pair.
+    #[test]
+    fn resumable_ids_retries_failed_records_and_last_record_wins_on_load() {
+        let dir = std::env::temp_dir().join(format!("fp-decision-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("scores.jsonl");
+
+        let fail = DecisionScoreRecord {
+            id: "mbpp/1".to_owned(),
+            score: None,
+            raw_ok: false,
+            latency_ms: 1,
+        };
+        let ok_other = DecisionScoreRecord {
+            id: "mbpp/2".to_owned(),
+            score: Some(0.7),
+            raw_ok: true,
+            latency_ms: 1,
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&fail).expect("serializes"),
+                serde_json::to_string(&ok_other).expect("serializes"),
+            ),
+        )
+        .expect("write");
+
+        let path_str = path.to_str().expect("utf8");
+        let done = resumable_ids(
+            path_str,
+            |r: &DecisionScoreRecord| r.id.clone(),
+            |r: &DecisionScoreRecord| r.raw_ok,
+        );
+        assert!(!done.contains("mbpp/1"), "a failed call must be retried");
+        assert!(done.contains("mbpp/2"), "a successful call must be skipped");
+
+        // The retry for mbpp/1 succeeds and is appended; load_scores must return the retry, not
+        // the earlier failure.
+        let retry = DecisionScoreRecord {
+            id: "mbpp/1".to_owned(),
+            score: Some(0.4),
+            raw_ok: true,
+            latency_ms: 1,
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        use std::io::Write;
+        writeln!(f, "{}", serde_json::to_string(&retry).expect("serializes")).expect("write");
+
+        let loaded = load_scores(path_str);
+        assert_eq!(loaded["mbpp/1"].score, Some(0.4), "the retry wins on load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_jsonl_surfaces_a_write_failure_instead_of_dropping_it() {
+        // A path with a nonexistent parent directory can never be opened for append.
+        let path = "/nonexistent-dir-for-append-jsonl-test/scores.jsonl";
+        let rec = DecisionScoreRecord {
+            id: "mbpp/1".to_owned(),
+            score: Some(0.5),
+            raw_ok: true,
+            latency_ms: 1,
+        };
+        let err = append_jsonl(path, &rec).expect_err("append to a missing dir must error");
+        assert!(err.contains(path), "error should name the path: {err}");
+    }
 
     // ---- request-shape parity ------------------------------------------------------------
 

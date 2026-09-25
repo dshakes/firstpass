@@ -271,12 +271,19 @@ fn run_v2_scores(
     cache_path: &str,
 ) -> Result<HashMap<String, JudgeScoreRecord>, String> {
     let mut scores = load_jsonl_map(cache_path, |r: &JudgeScoreRecord| r.id.clone());
+    // A reply with no parseable numeric score is not "done" — retry it on resume rather than
+    // freezing an abstain in permanently.
+    let done = decision_study::resumable_ids(
+        cache_path,
+        |r: &JudgeScoreRecord| r.id.clone(),
+        |r: &JudgeScoreRecord| r.score.is_some(),
+    );
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
     for (i, c) in candidates.iter().enumerate() {
-        if scores.contains_key(&c.id) {
+        if done.contains(&c.id) {
             continue;
         }
         let (system, user) = build_judge_prompt(&c.answer);
@@ -288,7 +295,7 @@ fn run_v2_scores(
             score,
             latency_ms,
         };
-        decision_study::append_jsonl(cache_path, &rec);
+        decision_study::append_jsonl(cache_path, &rec)?;
         eprintln!(
             "[{}/{}] V2 {} score={score:?} latency_ms={latency_ms}",
             i + 1,
@@ -312,12 +319,19 @@ fn run_v3_tests(
     cache_path: &str,
 ) -> Result<HashMap<String, V3TestRecord>, String> {
     let mut tests = load_jsonl_map(cache_path, |r: &V3TestRecord| r.id.clone());
+    // Zero parsed assert lines is not "done" — retry it on resume rather than freezing an empty
+    // test set in permanently.
+    let done = decision_study::resumable_ids(
+        cache_path,
+        |r: &V3TestRecord| r.id.clone(),
+        |r: &V3TestRecord| !r.raw_tests.is_empty(),
+    );
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
     for (i, c) in candidates.iter().enumerate() {
-        if tests.contains_key(&c.id) {
+        if done.contains(&c.id) {
             continue;
         }
         let (Some(task), Some(text)) = (tasks_by_id.get(&c.id), mbpp_text.get(&c.id)) else {
@@ -340,7 +354,7 @@ fn run_v3_tests(
             raw_tests,
             latency_ms,
         };
-        decision_study::append_jsonl(cache_path, &rec);
+        decision_study::append_jsonl(cache_path, &rec)?;
         eprintln!(
             "[{}/{}] V3-tests {} n_tests={} latency_ms={latency_ms}",
             i + 1,
@@ -399,7 +413,7 @@ fn run_v3_scores(
             total,
             latency_ms,
         };
-        decision_study::append_jsonl(cache_path, &rec);
+        decision_study::append_jsonl(cache_path, &rec)?;
         eprintln!(
             "[{}/{}] V3-score {} score={score:?} ({passed}/{total})",
             i + 1,
@@ -626,13 +640,25 @@ fn score_bakeoff(
     labels: &HashMap<String, bool>,
     verifiers: [(&str, HashMap<String, ScoreLat>); 4],
 ) -> BakeoffReport {
+    // The dev/held-out split sizes of the *labeled dataset* — fixed once, independent of which
+    // verifier happens to score last (a verifier that only scored a subset of candidates must
+    // never shrink the reported split).
+    let (n_dev, n_held_out) = candidates
+        .iter()
+        .filter(|c| labels.contains_key(&c.id))
+        .fold((0usize, 0usize), |(dev, ho), c| {
+            if is_dev(&c.id) {
+                (dev + 1, ho)
+            } else {
+                (dev, ho + 1)
+            }
+        });
+
     let mut dev_table = Vec::new();
     let mut held_out_table = Vec::new();
     let mut latency_table = Vec::new();
     let mut selected_verifier = VERIFIER_ORDER[0];
     let mut selected_catch = f64::MIN;
-    let mut n_dev = 0;
-    let mut n_held_out = 0;
 
     for (name, scores) in &verifiers {
         let joined = join(candidates, labels, scores);
@@ -646,8 +672,6 @@ fn score_bakeoff(
             .filter(|(id, _)| !is_dev(id))
             .map(|(_, r)| r)
             .collect();
-        n_dev = dev_rows.len();
-        n_held_out = ho_rows.len();
 
         let (tau, dev_catch, dev_collateral) = select_tau(&dev_rows);
         dev_table.push(DevRow {
@@ -697,13 +721,34 @@ fn score_bakeoff(
 // Entry point
 // ---------------------------------------------------------------------------------------------
 
+/// V0 reuses Study B's cached OpenJev `noul` scores — no new call. A missing or empty cache would
+/// silently score V0 at n=0 rather than saying so, so this fails loudly instead.
+///
+/// # Errors
+/// `{scratch}/decision-scores.jsonl` is missing or has no parseable rows.
+fn load_v0_scores_or_err(
+    scratch: &str,
+) -> Result<HashMap<String, decision_study::DecisionScoreRecord>, String> {
+    let path = format!("{scratch}/decision-scores.jsonl");
+    let scores = decision_study::load_scores(&path);
+    if scores.is_empty() {
+        return Err(format!(
+            "{path} is missing or empty — run `firstpass-bench --decision-study` first (or \
+             otherwise populate V0's cache) before `--verifier-bakeoff`; V0 reuses Study B's \
+             cached OpenJev scores and must never be scored at n=0"
+        ));
+    }
+    Ok(scores)
+}
+
 /// Load candidates + MBPP tasks, run all four verifiers' I/O stages (sandbox oracle labels, live
 /// OpenJev, live local judge, live local test-writer + sandbox), and score the result. The one
 /// entry point `main.rs --verifier-bakeoff` calls. Every cache under `scratch_dir` is resumable —
 /// interrupting and re-running picks up where it left off.
 ///
 /// # Errors
-/// Any input file can't be read/parsed, the sandbox itself faults, or an HTTP client can't be built.
+/// Any input file can't be read/parsed, `scratch_dir` can't be created, V0's cache is missing or
+/// empty, the sandbox itself faults, or an HTTP client can't be built.
 pub fn run(
     sb: &dyn Sandbox,
     candidates_path: &str,
@@ -712,6 +757,9 @@ pub fn run(
     mlx_url: &str,
     scratch_dir: &str,
 ) -> Result<BakeoffReport, String> {
+    std::fs::create_dir_all(scratch_dir)
+        .map_err(|e| format!("cannot create scratch dir {scratch_dir}: {e}"))?;
+
     let candidates_text = std::fs::read_to_string(candidates_path)
         .map_err(|e| format!("cannot read {candidates_path}: {e}"))?;
     let candidates = parse_submissions(&candidates_text)?;
@@ -734,7 +782,7 @@ pub fn run(
     )?;
 
     // V0: reuse Study B's cache — no new OpenJev traffic for the baseline.
-    let v0_scores = decision_study::load_scores(&format!("{scratch}/decision-scores.jsonl"));
+    let v0_scores = load_v0_scores_or_err(scratch)?;
 
     // V1: OpenJev + think/samples, live, resumable.
     let (v1_scores, _) = decision_study::run_openjev_scores(
@@ -832,6 +880,21 @@ pub fn run(
     Ok(score_bakeoff(&candidates, &labels, verifiers))
 }
 
+/// Render τ so a small positive value survives — `is_reject` (`score < τ`) treats `1e-9` and
+/// `0.0` completely differently, but `{:.4}` prints both as `0.0000`. `0` renders as a literal
+/// `0` (nothing to disambiguate); anything with magnitude `>= 1e-4` gets the usual 4 decimals;
+/// smaller-but-nonzero switches to scientific notation so it stays visibly nonzero.
+#[must_use]
+fn format_tau(tau: f64) -> String {
+    if tau == 0.0 {
+        "0".to_owned()
+    } else if tau.abs() >= 1e-4 {
+        format!("{tau:.4}")
+    } else {
+        format!("{tau:.2e}")
+    }
+}
+
 /// Markdown render.
 #[must_use]
 pub fn render(r: &BakeoffReport) -> String {
@@ -847,8 +910,14 @@ pub fn render(r: &BakeoffReport) -> String {
     out.push_str("| verifier | τ | n | n_wrong | n_right | catch rate | collateral |\n|---|---|---|---|---|---|---|\n");
     for row in &r.dev_table {
         out.push_str(&format!(
-            "| {} | {:.4} | {} | {} | {} | {:.4} | {:.4} |\n",
-            row.verifier, row.tau, row.n, row.n_wrong, row.n_right, row.catch_rate, row.collateral
+            "| {} | {} | {} | {} | {} | {:.4} | {:.4} |\n",
+            row.verifier,
+            format_tau(row.tau),
+            row.n,
+            row.n_wrong,
+            row.n_right,
+            row.catch_rate,
+            row.collateral
         ));
     }
     out.push_str(&format!(
@@ -864,8 +933,8 @@ pub fn render(r: &BakeoffReport) -> String {
     );
     for row in &r.held_out_table {
         out.push_str(&format!(
-            "| {} | {:.4} | {} | {} | {} | {:.4} [{:.4}, {:.4}] | {:.4} [{:.4}, {:.4}] | {:.4} [{:.4}, {:.4}] | {:.4} [{:.4}, {:.4}] | {} |\n",
-            row.verifier, row.tau, row.n, row.n_wrong, row.n_right,
+            "| {} | {} | {} | {} | {} | {:.4} [{:.4}, {:.4}] | {:.4} [{:.4}, {:.4}] | {:.4} [{:.4}, {:.4}] | {:.4} [{:.4}, {:.4}] | {} |\n",
+            row.verifier, format_tau(row.tau), row.n, row.n_wrong, row.n_right,
             row.catch_rate.point, row.catch_rate.lo, row.catch_rate.hi,
             row.collateral.point, row.collateral.lo, row.collateral.hi,
             row.auc.point, row.auc.lo, row.auc.hi,
@@ -1084,5 +1153,382 @@ mod tests {
         assert_eq!(v1["model"], v0["model"]);
         assert_eq!(v1["state"], v0["state"]);
         assert_eq!(v1["questions"], v0["questions"]);
+    }
+
+    // ---- V0 cache guard -------------------------------------------------------------------------
+
+    #[test]
+    fn load_v0_scores_or_err_rejects_a_missing_cache() {
+        let dir = std::env::temp_dir().join(format!("fp-v0-missing-{}", std::process::id()));
+        let scratch = dir.to_str().expect("utf8").to_owned();
+        // Deliberately not created — `decision-scores.jsonl` cannot exist under it.
+        let err = load_v0_scores_or_err(&scratch).expect_err("missing cache must error");
+        assert!(
+            err.contains("decision-scores.jsonl") && err.contains("--decision-study"),
+            "error should name the file and the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn load_v0_scores_or_err_rejects_an_empty_cache() {
+        let dir = std::env::temp_dir().join(format!("fp-v0-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("decision-scores.jsonl"), "").expect("write empty file");
+        let scratch = dir.to_str().expect("utf8").to_owned();
+        let err = load_v0_scores_or_err(&scratch).expect_err("empty cache must error");
+        assert!(err.contains("decision-scores.jsonl"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mutation-tested: deleting the `scores.is_empty()` guard (returning `Ok(scores)`
+    /// unconditionally) makes this test fail, since it would then observe `Ok` instead of `Err`.
+    #[test]
+    fn load_v0_scores_or_err_accepts_a_nonempty_cache() {
+        let dir = std::env::temp_dir().join(format!("fp-v0-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("decision-scores.jsonl"),
+            r#"{"id":"mbpp/1","score":0.9,"raw_ok":true,"latency_ms":1}"#,
+        )
+        .expect("write");
+        let scratch = dir.to_str().expect("utf8").to_owned();
+        let scores = load_v0_scores_or_err(&scratch).expect("nonempty cache must load");
+        assert_eq!(scores.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- resumable retries (V2/V3) --------------------------------------------------------------
+
+    #[test]
+    fn v2_resumable_ids_retries_a_scoreless_reply() {
+        let done = decision_study::resumable_ids(
+            "/nonexistent-path-doesnt-matter.jsonl",
+            |r: &JudgeScoreRecord| r.id.clone(),
+            |r: &JudgeScoreRecord| r.score.is_some(),
+        );
+        assert!(done.is_empty(), "a missing cache has nothing done yet");
+
+        let dir = std::env::temp_dir().join(format!("fp-v2-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("v2.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"id":"a","score":null,"latency_ms":1}"#,
+                "\n",
+                r#"{"id":"b","score":0.8,"latency_ms":1}"#,
+                "\n",
+            ),
+        )
+        .expect("write");
+        let done = decision_study::resumable_ids(
+            path.to_str().expect("utf8"),
+            |r: &JudgeScoreRecord| r.id.clone(),
+            |r: &JudgeScoreRecord| r.score.is_some(),
+        );
+        assert!(!done.contains("a"), "a scoreless reply must be retried");
+        assert!(done.contains("b"), "a scored reply must be skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v3_resumable_ids_retries_zero_parsed_tests() {
+        let dir = std::env::temp_dir().join(format!("fp-v3-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("v3.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"id":"a","raw_tests":[],"latency_ms":1}"#,
+                "\n",
+                r#"{"id":"b","raw_tests":["assert f(1) == 1"],"latency_ms":1}"#,
+                "\n",
+            ),
+        )
+        .expect("write");
+        let done = decision_study::resumable_ids(
+            path.to_str().expect("utf8"),
+            |r: &V3TestRecord| r.id.clone(),
+            |r: &V3TestRecord| !r.raw_tests.is_empty(),
+        );
+        assert!(!done.contains("a"), "zero parsed tests must be retried");
+        assert!(done.contains("b"), "a nonempty test set must be skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- score_bakeoff ----------------------------------------------------------------------------
+
+    fn sub(id: &str) -> Submission {
+        Submission {
+            vrbench_version: 1,
+            id: id.to_owned(),
+            answer: String::new(),
+            cost_usd: 0.0,
+            attempts: Vec::new(),
+            latency_ms: None,
+        }
+    }
+
+    fn sl(score: Option<f64>) -> ScoreLat {
+        ScoreLat {
+            score,
+            latency_ms: 0,
+        }
+    }
+
+    #[test]
+    fn score_bakeoff_selects_the_verifier_with_the_higher_dev_catch_rate() {
+        let wrong_ids: Vec<String> = (0..40).map(|i| format!("mbpp/wrong-{i}")).collect();
+        let right_ids: Vec<String> = (0..40).map(|i| format!("mbpp/right-{i}")).collect();
+        let all_ids: Vec<String> = wrong_ids.iter().chain(right_ids.iter()).cloned().collect();
+        let candidates: Vec<Submission> = all_ids.iter().map(|id| sub(id)).collect();
+        let labels: HashMap<String, bool> = wrong_ids
+            .iter()
+            .map(|id| (id.clone(), false))
+            .chain(right_ids.iter().map(|id| (id.clone(), true)))
+            .collect();
+
+        // "strong": perfect separation -- catches every wrong answer at zero collateral.
+        let strong: HashMap<String, ScoreLat> = wrong_ids
+            .iter()
+            .map(|id| (id.clone(), sl(Some(0.0))))
+            .chain(right_ids.iter().map(|id| (id.clone(), sl(Some(1.0)))))
+            .collect();
+        // "weak": identical score regardless of oracle outcome -- no achievable tau can catch
+        // more wrong answers than it also rejects right answers, so the collateral cap (0.05)
+        // caps its dev catch rate far below "strong"'s.
+        let weak: HashMap<String, ScoreLat> = all_ids
+            .iter()
+            .map(|id| (id.clone(), sl(Some(0.5))))
+            .collect();
+
+        let verifiers: [(&str, HashMap<String, ScoreLat>); 4] = [
+            ("V0", weak.clone()),
+            ("V1", strong),
+            ("V2", weak.clone()),
+            ("V3", weak),
+        ];
+        let report = score_bakeoff(&candidates, &labels, verifiers);
+        assert_eq!(report.selected_verifier, "V1");
+        let dev_v1 = report
+            .dev_table
+            .iter()
+            .find(|r| r.verifier == "V1")
+            .expect("V1 row");
+        assert!((dev_v1.catch_rate - 1.0).abs() < 1e-9);
+        assert!((dev_v1.collateral - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_bakeoff_breaks_a_tied_dev_catch_rate_toward_the_first_verifier_in_iteration_order() {
+        let ids: Vec<String> = (0..10).map(|i| format!("mbpp/{i}")).collect();
+        let candidates: Vec<Submission> = ids.iter().map(|id| sub(id)).collect();
+        let labels: HashMap<String, bool> = ids.iter().map(|id| (id.clone(), false)).collect();
+        // Identical perfect-catch scores for every verifier -- a genuine tie (none named "V0",
+        // so this cannot pass by coincidentally matching `score_bakeoff`'s initial default).
+        let scores: HashMap<String, ScoreLat> =
+            ids.iter().map(|id| (id.clone(), sl(Some(0.0)))).collect();
+        let verifiers: [(&str, HashMap<String, ScoreLat>); 4] = [
+            ("Y", scores.clone()),
+            ("X", scores.clone()),
+            ("Z", scores.clone()),
+            ("W", scores),
+        ];
+        let report = score_bakeoff(&candidates, &labels, verifiers);
+        assert_eq!(
+            report.selected_verifier, "Y",
+            "first entry in iteration order must win a genuine tie"
+        );
+    }
+
+    #[test]
+    fn score_bakeoff_scores_held_out_at_the_dev_selected_tau_not_a_recomputed_one() {
+        let pool: Vec<String> = (0..400).map(|i| format!("mbpp/tau-{i}")).collect();
+        let dev_pool: Vec<&String> = pool.iter().filter(|id| is_dev(id)).collect();
+        let ho_pool: Vec<&String> = pool.iter().filter(|id| !is_dev(id)).collect();
+        assert!(
+            dev_pool.len() >= 60 && ho_pool.len() >= 60,
+            "pool too small for the split"
+        );
+
+        let dev_wrong = &dev_pool[0..30];
+        let dev_right = &dev_pool[30..60];
+        let ho_wrong = &ho_pool[0..30];
+        let ho_right = &ho_pool[30..60];
+
+        let mut labels = HashMap::new();
+        let mut v1_scores = HashMap::new();
+        for id in dev_wrong {
+            labels.insert((*id).clone(), false);
+            v1_scores.insert((*id).clone(), sl(Some(0.0)));
+        }
+        for id in dev_right {
+            labels.insert((*id).clone(), true);
+            v1_scores.insert((*id).clone(), sl(Some(1.0)));
+        }
+        // Held-out: wrong scores just under right scores -- its OWN best tau would land around
+        // 0.999 (catch=1, collateral=0). Applying dev's tau=1.0 instead rejects both classes.
+        for id in ho_wrong {
+            labels.insert((*id).clone(), false);
+            v1_scores.insert((*id).clone(), sl(Some(0.99)));
+        }
+        for id in ho_right {
+            labels.insert((*id).clone(), true);
+            v1_scores.insert((*id).clone(), sl(Some(0.999)));
+        }
+
+        let all_ids: Vec<&String> = dev_wrong
+            .iter()
+            .chain(dev_right)
+            .chain(ho_wrong)
+            .chain(ho_right)
+            .copied()
+            .collect();
+        let candidates: Vec<Submission> = all_ids.iter().map(|id| sub(id)).collect();
+        let filler: HashMap<String, ScoreLat> = all_ids
+            .iter()
+            .map(|id| ((*id).clone(), sl(Some(0.5))))
+            .collect();
+
+        let verifiers: [(&str, HashMap<String, ScoreLat>); 4] = [
+            ("V0", filler.clone()),
+            ("V1", v1_scores),
+            ("V2", filler.clone()),
+            ("V3", filler),
+        ];
+        let report = score_bakeoff(&candidates, &labels, verifiers);
+
+        let dev_v1 = report
+            .dev_table
+            .iter()
+            .find(|r| r.verifier == "V1")
+            .expect("V1 dev row");
+        assert!(
+            (dev_v1.tau - 1.0).abs() < 1e-9,
+            "dev tau should land at 1.0, got {}",
+            dev_v1.tau
+        );
+
+        let ho_v1 = report
+            .held_out_table
+            .iter()
+            .find(|r| r.verifier == "V1")
+            .expect("V1 held-out row");
+        assert!(
+            (ho_v1.tau - dev_v1.tau).abs() < 1e-12,
+            "the held-out row must be scored at the dev tau"
+        );
+        // Applying dev's tau=1.0 to held-out (0.99 wrong / 0.999 right) rejects BOTH classes --
+        // collateral near 1.0. A held-out-local tau (~0.999) would instead give collateral ~0.0.
+        assert!(
+            ho_v1.collateral.point > 0.9,
+            "held-out collateral {} shows the dev tau (not a held-out-local one) was applied",
+            ho_v1.collateral.point
+        );
+    }
+
+    /// Mutation-tested: reverting to the old `n_dev = dev_rows.len()` (set per-verifier-iteration)
+    /// makes this fail, since it would then report whichever verifier iterates last -- here "V3",
+    /// which only covers a strict subset of the labeled dataset.
+    #[test]
+    fn n_dev_and_n_held_out_are_the_labeled_partition_not_the_last_verifiers_join() {
+        let ids: Vec<String> = (0..60).map(|i| format!("mbpp/npart-{i}")).collect();
+        let candidates: Vec<Submission> = ids.iter().map(|id| sub(id)).collect();
+        let labels: HashMap<String, bool> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i % 2 == 0))
+            .collect();
+        let full: HashMap<String, ScoreLat> =
+            ids.iter().map(|id| (id.clone(), sl(Some(0.5)))).collect();
+        // The LAST verifier in iteration order only scored 2 of the 60 labeled ids.
+        let partial: HashMap<String, ScoreLat> = ids
+            .iter()
+            .take(2)
+            .map(|id| (id.clone(), sl(Some(0.5))))
+            .collect();
+
+        let expected_n_dev = ids.iter().filter(|id| is_dev(id)).count();
+        let expected_n_held_out = ids.len() - expected_n_dev;
+
+        let verifiers: [(&str, HashMap<String, ScoreLat>); 4] = [
+            ("V0", full.clone()),
+            ("V1", full.clone()),
+            ("V2", full),
+            ("V3", partial),
+        ];
+        let report = score_bakeoff(&candidates, &labels, verifiers);
+        assert_eq!(report.n_dev, expected_n_dev);
+        assert_eq!(report.n_held_out, expected_n_held_out);
+    }
+
+    // ---- render -------------------------------------------------------------------------------
+
+    #[test]
+    fn format_tau_keeps_a_small_positive_value_visibly_nonzero() {
+        assert_eq!(format_tau(0.0), "0");
+        assert_eq!(format_tau(0.5), "0.5000");
+        assert_eq!(format_tau(0.00003), "3.00e-5");
+    }
+
+    #[test]
+    fn render_smoke_test_contains_verdict_and_every_verifier_row() {
+        let tiny_ci = |p: f64| Ci {
+            point: p,
+            lo: p,
+            hi: p,
+        };
+        let dev_row = |v: &str, tau: f64| DevRow {
+            verifier: v.to_owned(),
+            tau,
+            n: 10,
+            n_wrong: 5,
+            n_right: 5,
+            catch_rate: 0.5,
+            collateral: 0.02,
+        };
+        let ho_row = |v: &str, tau: f64, verdict: Verdict| HeldOutRow {
+            verifier: v.to_owned(),
+            tau,
+            n: 10,
+            n_wrong: 5,
+            n_right: 5,
+            catch_rate: tiny_ci(0.5),
+            collateral: tiny_ci(0.02),
+            auc: tiny_ci(0.9),
+            abstain_rate: tiny_ci(0.0),
+            verdict,
+        };
+        let report = BakeoffReport {
+            coder_model: "test-model".to_owned(),
+            n_dev: 10,
+            n_held_out: 10,
+            dev_table: vec![dev_row("V0", 0.000_03), dev_row("V1", 0.5)],
+            held_out_table: vec![
+                ho_row("V0", 0.000_03, Verdict::NotRecommended),
+                ho_row("V1", 0.5, Verdict::ValueAdd),
+            ],
+            latency_table: vec![LatencyRow {
+                verifier: "V0".to_owned(),
+                n: 10,
+                p50_ms: 100.0,
+                p95_ms: 200.0,
+            }],
+            selected_verifier: "V1".to_owned(),
+            verdict: Verdict::ValueAdd,
+        };
+        let out = render(&report);
+        assert!(out.contains("**Verdict (selected verifier `V1`, held-out): VALUE-ADD**"));
+        for v in ["V0", "V1"] {
+            assert!(out.contains(&format!("| {v} |")), "missing row for {v}");
+        }
+        assert!(
+            out.contains("3.00e-5"),
+            "a small positive tau must stay visibly nonzero:\n{out}"
+        );
+        assert!(
+            !out.contains("| V0 | 0.0000 |"),
+            "small tau must not render as 0.0000"
+        );
     }
 }
