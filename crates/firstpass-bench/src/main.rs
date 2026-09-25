@@ -15,14 +15,13 @@
 //!   firstpass-bench --multiturn-selfcheck  # prove the multi-turn harness + pre-registered bar work, no spend
 
 use firstpass_bench::coding::{
-    coding_suite, generated_coding_suite, mock_solutions, run_coding_benchmark,
-    run_coding_benchmark_judged, CandidateSolver, CodingReport, GeneratedSolver, Judge, LiveJudge,
-    LiveSolver,
+    CandidateSolver, CodingReport, GeneratedSolver, Judge, LiveJudge, LiveSolver, coding_suite,
+    generated_coding_suite, mock_solutions, run_coding_benchmark, run_coding_benchmark_judged,
 };
 use firstpass_bench::coding_policy::Rung;
 use firstpass_bench::dataset::load_coding_dataset;
 use firstpass_bench::sandbox::establish_sandbox;
-use firstpass_bench::{run_benchmark, run_benchmark_live, BenchConfig};
+use firstpass_bench::{BenchConfig, run_benchmark, run_benchmark_live};
 
 /// Container image for the sandbox self-check (needs `python3` + busybox `base64`/`timeout`).
 /// Default sandbox image. Override with `FIRSTPASS_SANDBOX_IMAGE` — BigCodeBench tasks import
@@ -867,7 +866,7 @@ fn print_coding(r: &CodingReport) {
 /// stopped discriminating.
 fn multiturn_selfcheck(json: bool) {
     use firstpass_bench::coding_policy::RungOutcome;
-    use firstpass_bench::multiturn::{evaluate, MultiTurnTask, PreRegistered, Turn};
+    use firstpass_bench::multiturn::{MultiTurnTask, PreRegistered, Turn, evaluate};
     use firstpass_core::features::TrajectorySignals;
 
     let rung = |cost: f64, pass: bool, correct: bool| RungOutcome {
@@ -971,8 +970,8 @@ fn multiturn_selfcheck(json: bool) {
 /// - Every finished task is checkpointed immediately, and a resumed run skips it. A crash at task
 ///   900 of 974 must not destroy the first 899 — that has happened here before.
 fn agentic_multiturn(json: bool) {
-    use firstpass_bench::agentic::{run_task, AgenticRung, RecordedTask};
-    use firstpass_bench::multiturn::{evaluate, PreRegistered};
+    use firstpass_bench::agentic::{AgenticRung, RecordedTask, run_task};
+    use firstpass_bench::multiturn::{PreRegistered, evaluate};
     use std::io::Write as _;
 
     let Ok(dataset) = std::env::var("FIRSTPASS_CODING_DATASET") else {
@@ -1159,9 +1158,9 @@ fn agentic_multiturn(json: bool) {
 /// SPENDS REAL MONEY and needs multi-GB eval images pulled in advance (no network at eval time).
 fn swe_agentic(json: bool) {
     use firstpass_bench::agentic::RecordedTask;
-    use firstpass_bench::multiturn::{evaluate, PreRegistered};
-    use firstpass_bench::swe_agentic::{run_instance, should_stop_after_failures, SweRung};
-    use firstpass_bench::swebench::{load_swebench_jsonl, SweLimits};
+    use firstpass_bench::multiturn::{PreRegistered, evaluate};
+    use firstpass_bench::swe_agentic::{SweRung, run_instance, should_stop_after_failures};
+    use firstpass_bench::swebench::{SweLimits, load_swebench_jsonl};
     use std::io::Write as _;
 
     let Ok(dataset) = std::env::var("FIRSTPASS_SWE_DATASET") else {

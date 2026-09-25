@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::coding_policy::RungOutcome;
 use crate::costaware::{self, PassPredictor};
 use crate::stats::{
-    self, bootstrap_mean_ci, bootstrap_paired_ratio_diff_ci, bootstrap_ratio_ci, Ci,
+    self, Ci, bootstrap_mean_ci, bootstrap_paired_ratio_diff_ci, bootstrap_ratio_ci,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -571,11 +571,7 @@ fn eval_arm<T>(name: &'static str, tasks: &[T], serve: impl Fn(&T) -> Served) ->
         usd_per_success: {
             let total: f64 = cost.iter().sum();
             let ns: f64 = success.iter().sum();
-            if ns > 0.0 {
-                total / ns
-            } else {
-                f64::INFINITY
-            }
+            if ns > 0.0 { total / ns } else { f64::INFINITY }
         },
         usd_per_success_ci: bootstrap_ratio_ci(&cost, &success, BOOT_B, BOOT_SEED, ALPHA),
         served_failure_rate: 1.0 - success_rate,
