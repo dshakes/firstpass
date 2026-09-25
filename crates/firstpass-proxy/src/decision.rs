@@ -203,18 +203,22 @@ fn build_request(
 
 /// Extract the `ok` question's yes-probability from a Jev response. Accepts either
 /// `{"answers":{"ok":{...}}}` or `{"ok":{...}}` at top level (mirrors [`crate::prior`]'s nested/
-/// flat tolerance), and a numeric `probability`, `p`, or `value` field on the noul answer —
-/// anything else is malformed.
+/// flat tolerance). The wire contract carries P(yes) in a field named after the answer type —
+/// `{"type":"noul","noul":0.998}`, observed from a `/v1/systemone` server whose shapes are checked
+/// against the live API. `probability`, `p` and `value` are kept as tolerance. A value outside
+/// [0,1] or non-finite is malformed.
 fn extract_probability(json: &Value) -> Option<f64> {
     let answer = json
         .get("answers")
         .and_then(|a| a.get(QUESTION_NAME))
         .or_else(|| json.get(QUESTION_NAME))?;
     answer
-        .get("probability")
+        .get("noul")
+        .or_else(|| answer.get("probability"))
         .or_else(|| answer.get("p"))
         .or_else(|| answer.get("value"))
         .and_then(Value::as_f64)
+        .filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
 }
 
 fn elapsed_ms(start: Instant) -> u64 {
@@ -293,6 +297,32 @@ mod tests {
         assert_eq!(
             extract_probability(&serde_json::json!({"answers": {"ok": {"probability": 0.4}}})),
             Some(0.4)
+        );
+    }
+
+    /// The real wire shape. This parser originally knew only `probability`/`p`/`value`, so every
+    /// real answer read as malformed and the gate abstained on every call. The body below is verbatim
+    /// from a live `/v1/systemone` server.
+    #[test]
+    fn extract_probability_reads_the_noul_wire_field() {
+        let body: Value = serde_json::from_str(
+            r#"{"model":"openjev-0.1","answers":{"ok":{"type":"noul","noul":0.9982814685069857}},"usage":{"input_tokens":96,"output_tokens":0}}"#,
+        )
+        .expect("fixture parses");
+        let p = extract_probability(&body).expect("noul field is read");
+        // serde_json's default float parse can land one ULP off the literal.
+        assert!((p - 0.998_281_468_506_985_7).abs() < 1e-12, "got {p}");
+    }
+
+    #[test]
+    fn extract_probability_rejects_out_of_range() {
+        assert_eq!(
+            extract_probability(&serde_json::json!({"ok": {"noul": 1.5}})),
+            None
+        );
+        assert_eq!(
+            extract_probability(&serde_json::json!({"ok": {"noul": -0.1}})),
+            None
         );
     }
 
