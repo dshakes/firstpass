@@ -30,6 +30,7 @@ pub mod cli;
 pub mod condense;
 pub mod config;
 pub mod consistency;
+pub mod decision;
 pub mod demo;
 pub mod error;
 pub mod gate;

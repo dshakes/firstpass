@@ -280,29 +280,38 @@ pub struct PriceDef {
 ///   candidate by agreement with k fresh samples of the same model (Wang et al. 2022).
 /// - **schema** (`schema`): validates the candidate (parsed as JSON) against a JSON-Schema
 ///   subset (top-level `type` / `required` / per-property `type`).
+/// - **decision** (`decision`): a cheap external decision-model verifier (TypeSafe's Jev) that
+///   answers a single yes/no "does this response satisfy the request?" question. **Unmeasured**:
+///   its precision/recall against real failures has not been benchmarked.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GateDef {
     /// The id a route references this gate by (must be unique and not shadow a built-in gate id).
     pub id: String,
     /// Subprocess command: program first, then its args — e.g. `["pytest", "-q"]`. Set this **or**
-    /// `judge` / `consistency` / `schema`, not both.
+    /// `judge` / `consistency` / `schema` / `decision`, not both.
     #[serde(default)]
     pub cmd: Vec<String>,
     /// Hard timeout in milliseconds for a subprocess gate; it abstains (`timeout`) if the process
     /// runs longer.
     #[serde(default = "default_gate_timeout_ms")]
     pub timeout_ms: u64,
-    /// LLM-judge configuration. Set this **or** `cmd` / `consistency` / `schema`, not both.
+    /// LLM-judge configuration. Set this **or** `cmd` / `consistency` / `schema` / `decision`,
+    /// not both.
     #[serde(default)]
     pub judge: Option<JudgeDef>,
-    /// Self-consistency configuration. Set this **or** `cmd` / `judge` / `schema`, not both.
+    /// Self-consistency configuration. Set this **or** `cmd` / `judge` / `schema` / `decision`,
+    /// not both.
     #[serde(default)]
     pub consistency: Option<ConsistencyDef>,
     /// JSON-Schema (subset) the candidate must satisfy. Set this **or** `cmd` / `judge` /
-    /// `consistency`, not both.
+    /// `consistency` / `decision`, not both.
     #[serde(default)]
     pub schema: Option<serde_json::Value>,
+    /// TypeSafe Jev decision-model configuration. Set this **or** `cmd` / `judge` / `consistency`
+    /// / `schema`, not both.
+    #[serde(default)]
+    pub decision: Option<DecisionDef>,
     /// What an **abstain** from this gate means for serving (§7.2). `fail_open` (default): an
     /// abstaining gate never blocks serving — availability over strictness, today's behavior.
     /// `fail_closed`: an abstain blocks serving exactly like a `Fail` — strictness over
@@ -361,6 +370,47 @@ pub struct ConsistencyDef {
     pub threshold: f64,
 }
 
+/// Configuration for a TypeSafe Jev decision-model gate: a cheap (~$0.042/M input tokens) external
+/// verifier, orders of magnitude cheaper than a frontier LLM-judge call. It asks Jev's
+/// `POST {base_url}/v1/systemone` a single `noul` (probability-of-yes) question — "does this
+/// response fully and correctly satisfy this request?" — and passes iff `P(yes) >= threshold`.
+///
+/// The request and candidate response are carried only inside the `state` payload, as DATA — never
+/// interpolated into `instructions` — so a candidate that tries to talk the verifier into a pass
+/// cannot reach the instruction the model actually follows.
+///
+/// **Unmeasured**: this gate's precision/recall against real failures has not been benchmarked.
+/// Treat it as an unvalidated cheap pre-filter, not a drop-in replacement for `judge`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionDef {
+    /// Decision-model provider. Only `"typesafe"` is built in today; validated by
+    /// [`Config::parse`].
+    pub provider: String,
+    /// Model name passed to the provider's API.
+    #[serde(default = "default_decision_model")]
+    pub model: String,
+    /// Env var naming the API key. Read once at gate-build time; never logged, never put on the
+    /// trace.
+    #[serde(default = "default_decision_api_key_env")]
+    pub api_key_env: String,
+    /// Provider API base URL.
+    #[serde(default = "default_decision_base_url")]
+    pub base_url: String,
+    /// Hard timeout for the decision call. A timeout, transport error, non-2xx response, or a
+    /// reply this gate cannot parse all ABSTAIN (fail-safe) — never a fabricated `Pass`.
+    #[serde(default = "default_decision_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Pass iff `P(yes) >= threshold`. Must be in the open interval `(0, 1)`; validated by
+    /// [`Config::parse`].
+    #[serde(default = "default_decision_threshold")]
+    pub threshold: f64,
+    /// Override the default yes/no verification question. `None` (default) uses a generic
+    /// "does the response satisfy the request" instruction.
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
 /// Default subprocess-gate timeout: 30s. Long enough for a test suite, short enough to bound the
 /// enforce-path tail.
 fn default_gate_timeout_ms() -> u64 {
@@ -375,6 +425,26 @@ fn default_judge_threshold() -> f64 {
 /// Default self-consistency k (resample count).
 fn default_consistency_k() -> u32 {
     3
+}
+
+fn default_decision_model() -> String {
+    "jev-latest".to_owned()
+}
+
+fn default_decision_api_key_env() -> String {
+    "TYPESAFE_API_KEY".to_owned()
+}
+
+fn default_decision_base_url() -> String {
+    "https://api.typesafe.ai".to_owned()
+}
+
+fn default_decision_timeout_ms() -> u64 {
+    1_000
+}
+
+fn default_decision_threshold() -> f64 {
+    0.5
 }
 
 /// One routing rule.
@@ -1125,19 +1195,22 @@ impl Config {
             if def.id.trim().is_empty() {
                 return Err(Error::InvalidConfig("gate id must not be empty".to_owned()));
             }
-            // Exactly one kind: `cmd`, `judge`, `consistency`, or `schema` — never more, never none.
+            // Exactly one kind: `cmd`, `judge`, `consistency`, `schema`, or `decision` — never
+            // more, never none.
             let kinds_set = [
                 !def.cmd.is_empty(),
                 def.judge.is_some(),
                 def.consistency.is_some(),
                 def.schema.is_some(),
+                def.decision.is_some(),
             ]
             .iter()
             .filter(|&&b| b)
             .count();
             if kinds_set != 1 {
                 return Err(Error::InvalidConfig(format!(
-                    "gate {:?} must set exactly one of `cmd`, `judge`, `consistency`, or `schema`",
+                    "gate {:?} must set exactly one of `cmd`, `judge`, `consistency`, `schema`, \
+                     or `decision`",
                     def.id
                 )));
             }
@@ -1160,6 +1233,27 @@ impl Config {
                     return Err(Error::InvalidConfig(format!(
                         "gate {:?} consistency threshold {} is outside [0, 1]",
                         def.id, c.threshold
+                    )));
+                }
+            }
+            if let Some(d) = &def.decision {
+                if d.provider != "typesafe" {
+                    return Err(Error::InvalidConfig(format!(
+                        "gate {:?} decision provider {:?} is not supported — only \"typesafe\" \
+                         is built in",
+                        def.id, d.provider
+                    )));
+                }
+                if !(d.threshold.is_finite() && d.threshold > 0.0 && d.threshold < 1.0) {
+                    return Err(Error::InvalidConfig(format!(
+                        "gate {:?} decision threshold {} must be finite and in (0, 1)",
+                        def.id, d.threshold
+                    )));
+                }
+                if d.timeout_ms == 0 {
+                    return Err(Error::InvalidConfig(format!(
+                        "gate {:?} decision timeout_ms must be >= 1",
+                        def.id
                     )));
                 }
             }
@@ -1900,6 +1994,130 @@ schema = { type = "object" }
             err.to_string().contains("exactly one"),
             "two kinds must be rejected: {err}"
         );
+    }
+
+    #[test]
+    fn gate_def_decision_parses_with_defaults() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+gates = ["verify"]
+
+[[gate]]
+id = "verify"
+decision = { provider = "typesafe" }
+"#;
+        let config = Config::parse(toml).expect("decision gate def must parse");
+        let def = &config.gate_defs[0];
+        let d = def.decision.as_ref().expect("decision captured");
+        assert_eq!(d.provider, "typesafe");
+        assert_eq!(d.model, "jev-latest");
+        assert_eq!(d.api_key_env, "TYPESAFE_API_KEY");
+        assert_eq!(d.base_url, "https://api.typesafe.ai");
+        assert_eq!(d.timeout_ms, 1_000);
+        assert!((d.threshold - 0.5).abs() < 1e-12);
+        assert!(d.instructions.is_none());
+    }
+
+    #[test]
+    fn gate_def_decision_overrides_every_field() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+gates = ["verify"]
+
+[[gate]]
+id = "verify"
+decision = { provider = "typesafe", model = "jev-mini", api_key_env = "MY_KEY", base_url = "https://example.test", timeout_ms = 250, threshold = 0.9, instructions = "be strict" }
+"#;
+        let config = Config::parse(toml).expect("parse");
+        let d = config.gate_defs[0].decision.as_ref().unwrap();
+        assert_eq!(d.model, "jev-mini");
+        assert_eq!(d.api_key_env, "MY_KEY");
+        assert_eq!(d.base_url, "https://example.test");
+        assert_eq!(d.timeout_ms, 250);
+        assert!((d.threshold - 0.9).abs() < 1e-12);
+        assert_eq!(d.instructions.as_deref(), Some("be strict"));
+    }
+
+    #[test]
+    fn gate_def_rejects_decision_plus_judge() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[[gate]]
+id = "both"
+decision = { provider = "typesafe" }
+judge = { model = "anthropic/claude-opus-4-8" }
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("exactly one"),
+            "two kinds must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn gate_def_rejects_unsupported_decision_provider() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[[gate]]
+id = "verify"
+decision = { provider = "acme" }
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfig(_)),
+            "unsupported provider must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn gate_def_rejects_decision_threshold_outside_open_interval() {
+        for bad in ["0.0", "1.0", "1.5", "-0.1"] {
+            let toml = format!(
+                r#"
+[[route]]
+match = {{}}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[[gate]]
+id = "verify"
+decision = {{ provider = "typesafe", threshold = {bad} }}
+"#
+            );
+            assert!(
+                matches!(Config::parse(&toml), Err(Error::InvalidConfig(_))),
+                "threshold {bad} outside (0,1) must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_def_rejects_decision_zero_timeout() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[[gate]]
+id = "verify"
+decision = { provider = "typesafe", timeout_ms = 0 }
+"#;
+        assert!(matches!(Config::parse(toml), Err(Error::InvalidConfig(_))));
     }
 
     #[test]

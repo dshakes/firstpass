@@ -43,7 +43,7 @@ pub mod verdict;
 
 pub use config::{
     AbstainPolicy, AuthScheme, BanditAlgorithm, BanditConfig, Budget, Config, ConsistencyDef,
-    Dialect, Escalation, GateDef, JudgeDef, Mode, ModePreset, ModelRef, OnExhausted,
+    DecisionDef, Dialect, Escalation, GateDef, JudgeDef, Mode, ModePreset, ModelRef, OnExhausted,
     PredictorConfig, PriceDef, PriorConfig, ProbeConfig, ProviderDef, Route, RoutingMode,
     SessionPromotion,
 };

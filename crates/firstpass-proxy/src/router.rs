@@ -1032,6 +1032,80 @@ mod tests {
         assert_eq!(trace.final_.served_rung, Some(1));
     }
 
+    /// Fake `/v1/systemone` server: low probability for a candidate containing `NOT_GOOD_ENOUGH`,
+    /// high probability otherwise — enough to drive a real [`crate::decision::DecisionGate`]
+    /// through both a Fail (escalate) and a Pass (serve) without a live TypeSafe endpoint.
+    async fn spawn_decision_server() -> String {
+        use axum::Json;
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/v1/systemone",
+            post(|Json(body): Json<Value>| async move {
+                let bad = body["state"]["response"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("NOT_GOOD_ENOUGH"));
+                let p = if bad { 0.05 } else { 0.95 };
+                Json(serde_json::json!({"ok": {"probability": p}}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn decision_gate_fail_escalates_and_never_serves_the_failed_rung() {
+        // A real DecisionGate (Jev-backed) fused into the enforce loop exactly like any other
+        // gate: rung 0's candidate fails the decision gate's threshold, so it must escalate, and
+        // the failing rung 0 output must never be the one served.
+        let base_url = spawn_decision_server().await;
+        let decision_cfg = firstpass_core::DecisionDef {
+            provider: "typesafe".to_owned(),
+            model: "jev-latest".to_owned(),
+            api_key_env: "TYPESAFE_API_KEY".to_owned(),
+            base_url,
+            timeout_ms: 2_000,
+            threshold: 0.5,
+            instructions: None,
+        };
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(crate::decision::DecisionGate::new(
+            "verify",
+            reqwest::Client::new(),
+            &decision_cfg,
+            "test-key".to_owned(),
+        ))];
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let req = base_request();
+        let providers = registry(vec![
+            ("anthropic", HAIKU, Ok(resp(HAIKU, "NOT_GOOD_ENOUGH"))),
+            ("anthropic", SONNET, Ok(resp(SONNET, "the correct answer"))),
+        ]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+
+        match out {
+            EngineOutcome::Served(r) => {
+                assert_eq!(r.model, SONNET, "must serve the passing rung's model");
+                assert_eq!(r.text, "the correct answer");
+            }
+            EngineOutcome::Failed(e) => panic!("expected served answer, got error: {e}"),
+        }
+        assert_eq!(trace.attempts.len(), 2);
+        assert_eq!(trace.attempts[0].verdict, Verdict::Fail);
+        assert_eq!(trace.attempts[1].verdict, Verdict::Pass);
+        assert_eq!(trace.final_.escalations, 1);
+        assert_eq!(trace.final_.served_rung, Some(1));
+    }
+
     #[tokio::test]
     async fn cross_provider_failover_on_transport_error() {
         // Rung 0 is anthropic (transport error), rung 1 is openai (succeeds).

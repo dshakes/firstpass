@@ -8,6 +8,7 @@
 //! fail open (burns trust) (§7.2).
 
 use crate::consistency::ConsistencyGate;
+use crate::decision::DecisionGate;
 use crate::judge::JudgeGate;
 use crate::provider::{Auth, ModelRequest, ModelResponse, ProviderRegistry};
 use crate::subprocess::SubprocessGate;
@@ -297,11 +298,14 @@ impl Gate for FailClosed {
 /// Resolve a route's gate ids into runnable gates. Built-in ids (`non-empty`, `json-valid`) map to
 /// inline gates; any other id is looked up among the config's `[[gate]]` definitions and built as a
 /// [`SubprocessGate`] (`cmd`, SPEC §8.1), a [`JudgeGate`] (`judge`, §8.3), a [`ConsistencyGate`]
-/// (`consistency`), or a [`SchemaGate`] (`schema`). Model-backed gates (judge/consistency) need a
-/// provider (from `registry`), the caller's credentials (`auth`, BYOK), and `prices` so their
-/// sample-call cost lands on the receipt. An id that is neither built-in nor defined — or a
-/// model gate whose provider isn't registered — is skipped with a warning rather than failing the
-/// request. A def with `on_abstain = "fail_closed"` is wrapped so its abstains block serving.
+/// (`consistency`), a [`SchemaGate`] (`schema`), or a [`DecisionGate`] (`decision`, TypeSafe's Jev
+/// — **unmeasured** precision/recall). Model-backed gates (judge/consistency) need a provider
+/// (from `registry`), the caller's credentials (`auth`, BYOK), and `prices` so their sample-call
+/// cost lands on the receipt; a decision gate needs its own API key, read from `api_key_env` via
+/// `http` (the shared client). An id that is neither built-in nor defined — a model gate whose
+/// provider isn't registered — or a decision gate whose API key env var is unset — is skipped
+/// with a warning rather than failing the request. A def with `on_abstain = "fail_closed"` is
+/// wrapped so its abstains block serving.
 #[must_use]
 pub fn resolve_gates(
     names: &[String],
@@ -309,6 +313,7 @@ pub fn resolve_gates(
     registry: &ProviderRegistry,
     auth: &Auth,
     prices: &PriceTable,
+    http: &reqwest::Client,
 ) -> Vec<Box<dyn Gate>> {
     let mut gates: Vec<Box<dyn Gate>> = Vec::new();
     let mut push = |gate: Box<dyn Gate>, def: Option<&GateDef>| {
@@ -378,6 +383,26 @@ pub fn resolve_gates(
                             Box::new(SchemaGate::new(def.id.clone(), schema.clone())),
                             Some(def),
                         );
+                    }
+                }
+                Some(def) if def.decision.is_some() => {
+                    // `Config::parse` guarantees exactly one kind, so this `if let` always binds.
+                    if let Some(decision) = def.decision.as_ref() {
+                        match std::env::var(&decision.api_key_env) {
+                            Ok(api_key) => push(
+                                Box::new(DecisionGate::new(
+                                    def.id.clone(),
+                                    http.clone(),
+                                    decision,
+                                    api_key,
+                                )),
+                                Some(def),
+                            ),
+                            Err(_) => tracing::warn!(
+                                gate = %other, env_var = %decision.api_key_env,
+                                "decision gate API key env var is unset — skipped"
+                            ),
+                        }
                     }
                 }
                 Some(def) => {
@@ -541,6 +566,7 @@ mod tests {
             &empty_registry(),
             &Auth::default(),
             &PriceTable::default(),
+            &reqwest::Client::new(),
         );
         let ids: Vec<_> = gates.iter().map(|g| g.id()).collect();
         assert_eq!(ids, ["non-empty", "json-valid"]);
@@ -556,6 +582,7 @@ mod tests {
             judge: None,
             consistency: None,
             schema: None,
+            decision: None,
             on_abstain: AbstainPolicy::FailOpen,
         }];
         let gates = resolve_gates(
@@ -564,6 +591,7 @@ mod tests {
             &empty_registry(),
             &Auth::default(),
             &PriceTable::default(),
+            &reqwest::Client::new(),
         );
         let ids: Vec<_> = gates.iter().map(|g| g.id()).collect();
         assert_eq!(
@@ -585,6 +613,7 @@ mod tests {
             judge: None,
             consistency: None,
             schema: None,
+            decision: None,
             on_abstain: AbstainPolicy::FailOpen,
         }];
         let gates = resolve_gates(
@@ -593,6 +622,7 @@ mod tests {
             &empty_registry(),
             &Auth::default(),
             &PriceTable::default(),
+            &reqwest::Client::new(),
         );
         assert_eq!(gates.len(), 1);
         let good = gates[0].evaluate(&req(), &resp("all good")).await;
@@ -618,6 +648,7 @@ mod tests {
             }),
             consistency: None,
             schema: None,
+            decision: None,
             on_abstain: AbstainPolicy::FailOpen,
         }];
 
@@ -633,6 +664,7 @@ mod tests {
             &ProviderRegistry::from_map(map),
             &Auth::default(),
             &PriceTable::default(),
+            &reqwest::Client::new(),
         );
         assert_eq!(
             gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
@@ -646,10 +678,64 @@ mod tests {
             &ProviderRegistry::from_map(HashMap::new()),
             &Auth::default(),
             &PriceTable::default(),
+            &reqwest::Client::new(),
         );
         assert!(
             skipped.is_empty(),
             "judge with no registered provider is skipped"
+        );
+    }
+
+    #[test]
+    fn resolve_builds_configured_decision_gate() {
+        // No unsafe env::set_var (forbidden workspace-wide, and unsound in edition 2024): reuse
+        // `PATH`, guaranteed set in any test process, as a stand-in "the key env var is present"
+        // — resolve_gates only checks presence, never the value's shape. Mirrors the same trick
+        // already used in `provider.rs`'s tests.
+        let def = |api_key_env: &str| GateDef {
+            id: "verify".to_owned(),
+            cmd: vec![],
+            timeout_ms: 30_000,
+            judge: None,
+            consistency: None,
+            schema: None,
+            decision: Some(firstpass_core::DecisionDef {
+                provider: "typesafe".to_owned(),
+                model: "jev-latest".to_owned(),
+                api_key_env: api_key_env.to_owned(),
+                base_url: "https://api.typesafe.ai".to_owned(),
+                timeout_ms: 1_000,
+                threshold: 0.5,
+                instructions: None,
+            }),
+            on_abstain: AbstainPolicy::FailOpen,
+        };
+
+        let gates = resolve_gates(
+            &["verify".to_owned()],
+            &[def("PATH")],
+            &empty_registry(),
+            &Auth::default(),
+            &PriceTable::default(),
+            &reqwest::Client::new(),
+        );
+        assert_eq!(
+            gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
+            ["verify"],
+            "decision gate resolves when its API key env var is set"
+        );
+
+        let gates = resolve_gates(
+            &["verify".to_owned()],
+            &[def("FIRSTPASS_TEST_DEFINITELY_UNSET_DECISION_KEY_XYZ")],
+            &empty_registry(),
+            &Auth::default(),
+            &PriceTable::default(),
+            &reqwest::Client::new(),
+        );
+        assert!(
+            gates.is_empty(),
+            "decision gate with an unset API key env var is skipped, not a hard failure"
         );
     }
 
@@ -670,6 +756,7 @@ mod tests {
                 threshold: 0.6,
             }),
             schema: None,
+            decision: None,
             on_abstain: AbstainPolicy::FailOpen,
         }];
 
@@ -685,6 +772,7 @@ mod tests {
             &ProviderRegistry::from_map(map),
             &Auth::default(),
             &PriceTable::default(),
+            &reqwest::Client::new(),
         );
         assert_eq!(
             gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
@@ -698,6 +786,7 @@ mod tests {
             &ProviderRegistry::from_map(HashMap::new()),
             &Auth::default(),
             &PriceTable::default(),
+            &reqwest::Client::new(),
         );
         assert!(
             skipped.is_empty(),
@@ -785,6 +874,7 @@ mod tests {
             judge: None,
             consistency: None,
             schema: Some(json!({"type": "object", "required": ["name"]})),
+            decision: None,
             on_abstain: firstpass_core::AbstainPolicy::FailOpen,
         }];
         let gates = resolve_gates(
@@ -793,6 +883,7 @@ mod tests {
             &empty_registry(),
             &Auth::default(),
             &PriceTable::default(),
+            &reqwest::Client::new(),
         );
         assert_eq!(
             gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
@@ -815,6 +906,7 @@ mod tests {
                 judge: None,
                 consistency: None,
                 schema: None,
+                decision: None,
                 on_abstain,
             }]
         };
@@ -824,6 +916,7 @@ mod tests {
             &empty_registry(),
             &Auth::default(),
             &PriceTable::default(),
+            &reqwest::Client::new(),
         );
         assert!(!open[0].abstain_fails_closed(), "default stays fail-open");
         let closed = resolve_gates(
@@ -832,6 +925,7 @@ mod tests {
             &empty_registry(),
             &Auth::default(),
             &PriceTable::default(),
+            &reqwest::Client::new(),
         );
         assert!(
             closed[0].abstain_fails_closed(),
