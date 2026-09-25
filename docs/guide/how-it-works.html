@@ -153,12 +153,15 @@
 <div class="tldr">Every request opens on the <b>cheapest rung</b> — the first entry in <code>rungs</code>. There is no per-prompt classifier deciding which model should answer before any output exists. The cheap model takes every first pass. An optional <b>learned start-rung bandit</b> can shift where the cascade <em>begins</em> for traffic classes it has seen escalate repeatedly, but it never changes what gets <em>served</em> — only the gate decides that.</div>
 <p>The request opens on the <strong>start rung</strong> — by default the cheapest model in the ladder. Rungs are ordered cheap-to-capable and named <code>provider/model</code>:</p>
 <p class="subh">The ladder</p>
-<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[ladder]
-rungs = [
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[route]]
+match  = {}
+mode   = &quot;enforce&quot;
+ladder = [
   &quot;anthropic/claude-haiku-4-5&quot;,   # rung 0 — start here
-  &quot;openai/gpt-mini&quot;,              # rung 1
+  &quot;openai/gpt-4.1-mini&quot;,          # rung 1
   &quot;anthropic/claude-sonnet-5&quot;,    # rung 2
-]</code></pre></div>
+]
+gates  = [&quot;non-empty&quot;]</code></pre></div>
 <p class="subh">No classifier — proof instead</p>
 <p>There is no per-prompt classifier deciding <em>which</em> model. The cheap model simply takes the first pass. An optional <a href="routing.html#startrung">learned start-rung bandit</a> can move the entry point for classes of traffic it has seen escalate — but that only sets where the cascade <em>begins</em>, never what it serves.</p>
 <div class="note info"><span class="nt">Under the hood</span> Firstpass forwards the entire request body verbatim, swapping only the <code>model</code> field. For routing decisions it reads: model name, tool count, image blocks, and request headers. It does not inspect, summarize, or rewrite the message history — and <code>tool_use</code>/<code>tool_result</code> blocks are forwarded byte-for-byte, not re-verified.</div>
@@ -175,18 +178,18 @@ rungs = [
 <div class="recap">The gate commits after the output exists, catches failures no classifier could have predicted, and stops the cascade the moment it passes.</div>
 
 <h2 id="escalate">3 · Escalate<a class="anchor" href="#escalate" aria-label="Link to this section">#</a></h2>
-<div class="tldr">On gate failure, Firstpass climbs <b>exactly one rung</b>, re-runs the call, and re-gates the new output. Escalation is bounded by <code>max_rungs</code>, per-request/session/day budgets, and a hard termination guarantee: on exhaustion, Firstpass serves the <b>best attempt</b> — a real model answer, never a router error in place of a completion.</div>
+<div class="tldr">On gate failure, Firstpass climbs <b>exactly one rung</b>, re-runs the call, and re-gates the new output. Escalation is bounded by <code>max_rungs_per_request</code>, per-request/session/day budgets, and a hard termination guarantee: on exhaustion, Firstpass serves the <b>best attempt</b> — a real model answer, never a router error in place of a completion.</div>
 <p>On gate failure, Firstpass climbs exactly one rung and re-runs the candidate + gate. Escalation is bounded:</p>
 <p class="subh">The four rules</p>
 <ul>
   <li><strong>One rung at a time</strong> — never a jump straight to the top (unless <code>max</code> mode asks for it).</li>
-  <li><strong>Budget-capped</strong> — per-request, per-session, and per-day caps stop runaway spend; <code>max_rungs</code> caps the climb.</li>
+  <li><strong>Budget-capped</strong> — per-request, per-session, and per-day caps stop runaway spend; <code>max_rungs_per_request</code> caps the climb.</li>
   <li><strong>Cross-provider failover</strong> — a transport error or 5xx from a provider fails over to the next rung, which can be a different provider entirely.</li>
   <li><strong>Speculative</strong> (optional) — in the marginal gate-pass zone, prefetch the next rung in parallel so a likely escalation doesn't pay serial latency. Served bytes are byte-identical to the serial path.</li>
 </ul>
 <p class="subh">Failover vs escalation</p>
 <p>See <a href="routing.html">Routing &amp; escalation</a> for the ladder, the bandit, speculation, and budgets in full. Failover (triggered by a 5xx or transport error) and escalation (triggered by gate failure) both advance one rung, but they are logged separately in the receipt so you can distinguish "provider down" from "output failed the gate."</p>
-<div class="note"><span class="nt">Key idea</span> Escalation is bounded by design — there is no path to an infinite loop. <code>max_rungs</code> caps the climb, budget caps stop runaway spend, and on exhaustion the <strong>served-failure guarantee</strong> kicks in: a real model answer goes back to the client, never an error message in place of a completion.</div>
+<div class="note"><span class="nt">Key idea</span> Escalation is bounded by design — there is no path to an infinite loop. <code>max_rungs_per_request</code> caps the climb, budget caps stop runaway spend, and on exhaustion the <strong>served-failure guarantee</strong> kicks in: a real model answer goes back to the client, never an error message in place of a completion.</div>
 <div class="note warn"><span class="nt">Common mistake</span> Treating escalation as the normal path and sizing the ladder accordingly (many strong-model rungs "just in case"). The cheap rung passes 82% of real coding traffic — escalation is the exception. A ladder heavy with strong-model rungs means paying the strong-tier price on traffic the cheap rung would have handled. Let the gate data from observe mode tell you how many rungs you actually need.</div>
 <div class="recap">One rung at a time, bounded by caps, with cross-provider failover — and always a real answer at the end, even if every rung is exhausted.</div>
 
@@ -223,7 +226,7 @@ rungs = [
       &quot;gate&quot;: [{&quot;name&quot;: &quot;json-valid&quot;, &quot;verdict&quot;: &quot;pass&quot;},
                {&quot;name&quot;: &quot;schema&quot;, &quot;verdict&quot;: &quot;fail&quot;, &quot;reason&quot;: &quot;missing &#x27;total&#x27;&quot;}],
       &quot;cost_usd&quot;: 0.0003, &quot;escalated&quot;: true },
-    { &quot;rung&quot;: 1, &quot;model&quot;: &quot;openai/gpt-mini&quot;,
+    { &quot;rung&quot;: 1, &quot;model&quot;: &quot;openai/gpt-4.1-mini&quot;,
       &quot;gate&quot;: [{&quot;name&quot;: &quot;json-valid&quot;, &quot;verdict&quot;: &quot;pass&quot;},
                {&quot;name&quot;: &quot;schema&quot;, &quot;verdict&quot;: &quot;pass&quot;, &quot;score&quot;: 0.83}],
       &quot;cost_usd&quot;: 0.0018, &quot;served&quot;: true }

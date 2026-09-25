@@ -125,6 +125,18 @@ judge = { model = "anthropic/claude-opus-4-8", threshold = 0.7, rubric = "The re
 # schema     = { type = "object", required = ["name", "amount"] }
 # on_abstain = "fail_closed"
 
+# A decision-model gate: TypeSafe's Jev model scores the candidate as a cheap external verifier
+# (~$0.042/M input tokens vs a frontier LLM judge). The request and candidate are passed as
+# `state` (data), never interpolated into `instructions` — same prompt-injection hygiene as the
+# judge gate. Pass iff P(yes) >= threshold; any transport error, timeout, or unparseable reply
+# ABSTAINs (fail-safe, never a fabricated pass). Precision/recall on this gate are UNMEASURED —
+# treat it as experimental until benchmarked.
+#
+# [[gate]]
+# id       = "decision"
+# decision = { provider = "typesafe", model = "jev-latest", threshold = 0.6 }
+# # api_key_env defaults to TYPESAFE_API_KEY; base_url defaults to https://api.typesafe.ai
+
 [budget]
 per_request_usd = 0.50
 per_session_usd = 10.00

@@ -150,6 +150,59 @@ The harness recomputes the conformal bound from *your* run's gate/oracle outcome
 
 And the one good idea predictive routers had — *starting* on the right model — is already **inside** Firstpass: a learned start-rung bandit picks where the ladder begins, prediction errors cost only latency, and the gate still decides what ships.
 
+### Decision-model routers (Jev) vs Firstpass
+
+A new class of "System One" decision models — TypeSafe's **Jev** — answers one cheap closed-form
+question per query ($0.042/M input tokens, no text generation) and routes by asking it to pick a
+model tier directly. Products built on it (`jev-router`, `prismhq/jev-router`) then **serve that
+tier's output unverified**. Firstpass's thesis is narrower: **predict the start, verify what's
+served** — the same cheap signal can pick *where the ladder opens* (the start-rung bandit already
+had a slot for exactly this), but the gate still runs on every attempt, so a wrong prediction costs
+money or latency, never a wrong answer shipped.
+
+**The measured gap (simulation, not live).** Firstpass's own σ-sweep (`cargo run -p firstpass-bench`,
+n=500) puts a Jev-style unverified router's served-failure at **50.6–56.2%** across the noise levels
+tested, against Firstpass's own gated served-failure of **15.8%** on the same suite. Full numbers,
+methodology, and both addenda: [ADR 0013](docs/adr/0013-verified-predictive-routing.md).
+
+**`[escalation.prior]` — experimental, default-off, pre-registered verdict PRIOR=STOP.** The
+kill-criterion sim found the fused arm ties plain Firstpass on $/success at σ=0 and loses at higher
+noise (a post-hoc hard-task scenario was a wash, not a win). The block ships anyway — it costs
+nothing while unconfigured, and a live A/B is the next gate before it could flip to default-on:
+
+```toml
+[escalation.prior]
+provider    = "typesafe"                # the only accepted value today
+base_url    = "https://api.typesafe.ai" # default; override for self-hosted/mock Jev
+model       = "jev-latest"
+api_key_env = "TYPESAFE_API_KEY"        # env var name only — the key itself is never logged
+timeout_ms  = 150                       # any error fails open — no prior, no `decision_prior` field
+strength    = 10                        # Beta pseudo-count weight of the prior
+rungs = [
+  "rung 0 (claude-haiku) is the least capable tier that fully handles this request",
+  "rung 1 (claude-sonnet) is the least capable tier that fully handles this request",
+]
+```
+
+`rungs` needs exactly one entry per rung of *every* `enforce`-mode route's ladder — a length
+mismatch is rejected at config parse, never silently truncated. The gate still verifies every
+served output; the prior only ever moves where the ladder starts.
+
+**`decision` gate — UNMEASURED.** The same Jev model can also sit behind a `[[gate]] decision = {...}`
+block as a cheap external verifier instead of a frontier LLM judge. A transport error, timeout, or
+unparseable reply ABSTAINs — never a fabricated pass — but its precision/recall against real
+failures has not been benchmarked:
+
+```toml
+[[gate]]
+id       = "verify"
+decision = { provider = "typesafe", model = "jev-latest", threshold = 0.6 }
+# api_key_env defaults to TYPESAFE_API_KEY; base_url defaults to https://api.typesafe.ai
+```
+
+See [docs/related-work.md](docs/related-work.md) for how Jev-style routers, RouteLLM, Not Diamond,
+Martian, Sakana Fugu, FrugalGPT, AutoMix, and CP-Router compare on method, not marketing.
+
 ---
 
 ## The receipt
@@ -433,7 +486,7 @@ Multi-tenant deployments add per-tenant auth (Argon2id), rate limits, gate-healt
 | ✅ Shipped & verified | 🔬 Next / research |
 |---|---|
 | Both wire dialects, structured enforce **default-on** | Elastic verification (validated, phasing in) |
-| All five gate kinds + per-gate `on_abstain` | Cross-dialect structured translation beyond Anthropic↔OpenAI |
+| All six gate kinds + per-gate `on_abstain` (incl. the experimental, unmeasured `decision` gate) | Cross-dialect structured translation beyond Anthropic↔OpenAI |
 | Start-rung bandit (UCB1 / Thompson), speculation, failover | Four provider dialects await live wire verification |
 | Conformal guarantee + Learn-then-Test | 30-day soak, external security audit |
 | Adaptive threshold, OPE, `savings` / `evals` | Hosted multi-tenant plane |

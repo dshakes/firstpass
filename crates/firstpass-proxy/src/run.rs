@@ -171,6 +171,34 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
             Arc::new(std::sync::Mutex::new(p))
         });
 
+    // Verified predictive routing (opt-in, ADR): a pre-generation decision-model prior on the
+    // start rung. Fails open — a missing API key just disables the prior, it never blocks startup
+    // or serving, and the gate still verifies every output regardless.
+    let prior = config
+        .routing
+        .as_ref()
+        .and_then(|r| r.escalation.prior.as_ref())
+        .and_then(|pc| match std::env::var(&pc.api_key_env) {
+            Ok(api_key) => {
+                let http = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_millis(pc.timeout_ms))
+                    .build()
+                    .ok()?;
+                Some(Arc::new(crate::prior::PriorClient::new(
+                    http,
+                    pc.clone(),
+                    api_key,
+                )))
+            }
+            Err(_) => {
+                tracing::warn!(
+                    env_var = %pc.api_key_env,
+                    "escalation.prior configured but API key env var is unset — disabling prior (fail open)"
+                );
+                None
+            }
+        });
+
     let state = AppState {
         config: Arc::new(config),
         // Observe passthrough may stream SSE, so only bound the CONNECT phase here — a total or
@@ -190,6 +218,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         promoter,
         bandit,
         predictor,
+        prior,
         tenant_rate_limiter,
         spill,
     };

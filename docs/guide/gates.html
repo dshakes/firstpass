@@ -154,7 +154,7 @@
 <div class="tldr">The <code>schema</code> gate validates structural shape — top-level <code>type</code>, <code>required</code>, and per-property <code>type</code> — against a JSON-Schema subset. <b>Free</b> (no extra model calls) and synchronous. It enforces the contract on a structured output without running a full schema engine.</div>
 <p>The <code>schema</code> gate validates against a JSON-Schema subset: top-level <code>type</code>, <code>required</code>, and per-property <code>type</code>. Enough to enforce the shape of a tool call or a structured response without a full schema engine.</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
-kind = &quot;schema&quot;
+id     = &quot;shape&quot;
 schema = { type = &quot;object&quot;, required = [&quot;total&quot;, &quot;items&quot;], properties = {
   total = { type = &quot;number&quot; },
   items = { type = &quot;array&quot; }
@@ -166,7 +166,7 @@ schema = { type = &quot;object&quot;, required = [&quot;total&quot;, &quot;items
 <div class="tldr">The most powerful gate: <b>any executable you write</b>. Candidate output arrives as JSON on stdin; your program returns a JSON verdict. Non-zero exit or timeout = abstain. This is the "bring your own test suite" gate — <code>cargo test</code>, <code>pytest</code>, an eslint run, whatever you already use to verify correctness.</div>
 <p>The most powerful gate: <strong>any executable</strong>. This is "bring your own tests / linter / judge." The candidate arrives as JSON on <strong>stdin</strong> — never as a command-line argument, which keeps it injection-resistant — and the process prints a verdict as JSON.</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
-kind = &quot;subprocess&quot;
+id   = &quot;my-tests&quot;
 cmd  = [&quot;python&quot;, &quot;run_tests.py&quot;]
 timeout_ms = 5000</code></pre></div>
 <p class="subh">The stdin / stdout contract</p>
@@ -216,10 +216,9 @@ cmd = ["python3", "scripts/gates/run-tests.py",
   <li><strong>Operator threshold governs.</strong> The judge emits a score; you decide the bar it must clear.</li>
 </ul>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
-kind = &quot;judge&quot;
-model = &quot;anthropic/claude-sonnet-5&quot;   # must differ from the candidate model
-rubric = &quot;Is the answer correct, complete, and free of unsupported claims?&quot;
-threshold = 0.7</code></pre></div>
+id    = &quot;judge&quot;
+judge = { model = &quot;anthropic/claude-sonnet-5&quot;, rubric = &quot;Is the answer correct, complete, and free of unsupported claims?&quot;, threshold = 0.7 }
+# model must differ from the candidate model — the gate abstains if they match</code></pre></div>
 <div class="note"><span class="nt">Key idea</span> <strong>Maker ≠ checker</strong> is enforced at the config level, not the prompt level. A model that generated the candidate can't be talked into grading itself favorably by the candidate's own text — because Firstpass compares model identifiers and abstains if they match, before the judge call is ever made. The prompt fencing is a defense-in-depth layer on top, not the primary safeguard.</div>
 <div class="note warn"><span class="nt">Common mistake</span> Pointing the judge at the cheapest available model to save money. A judge weaker than the candidate will miss subtle failures and pass them as good enough. Use a model at or above the candidate tier. The cost of one extra judge call is far smaller than the cost of the escalation it should have triggered — or the served failure it silently allowed.</div>
 <div class="recap">The <b>judge</b> gate uses a structurally different model as grader — maker ≠ checker enforced at the config level, candidate fenced as untrusted data, score compared against your threshold.</div>
@@ -228,9 +227,9 @@ threshold = 0.7</code></pre></div>
 <div class="tldr">The <code>consistency</code> gate resamples the output <code>k</code> times and scores by agreement across samples. Unlike the judge, <b>maker == checker is intentional</b> — the signal is the model's own stability, not independence from it. Use it when there is no external oracle and you want to measure how confidently the model arrives at its answer.</div>
 <p>The <code>consistency</code> gate measures self-consistency: resample the candidate <code>k</code> times and score by agreement across samples. Unlike the judge, <strong>maker == checker is intentional here</strong> — the signal is the model's own stability. It suits tasks without a crisp oracle, drawing on self-consistency (Wang et al. 2022) and semantic entropy (Farquhar et al., <em>Nature</em> 2024).</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
-kind = &quot;consistency&quot;
-k = 5              # extra samples — this gate costs k additional calls
-threshold = 0.8</code></pre></div>
+id          = &quot;uncertainty&quot;
+consistency = { model = &quot;anthropic/claude-haiku-4-5&quot;, k = 5, threshold = 0.8 }
+# k = extra samples — this gate costs k additional calls</code></pre></div>
 <div class="note info"><span class="nt">Under the hood</span> Self-consistency (Wang et al. 2022) scores by majority vote across samples. The gate extends this with semantic entropy (Farquhar et al., <em>Nature</em> 2024), which clusters semantically equivalent answers and measures dispersion rather than exact-match agreement — so paraphrases of the same correct answer are not penalized as disagreements.</div>
 <div class="note warn"><span class="nt">Cost</span> Self-consistency runs the model <code>k</code> extra times. It buys a signal where no external check exists, but it is the most expensive gate — price it against the value of the decision.</div>
 <div class="recap">The <b>consistency</b> gate is the most expensive — <code>k</code> extra model calls — and the right choice only when no external oracle exists; maker == checker is intentional here, not a flaw.</div>

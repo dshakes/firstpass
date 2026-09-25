@@ -65,7 +65,7 @@
 <p class="subh">The escalation rule</p>
 <p>A ladder is an ordered list of rungs, cheapest first. Each rung is <code>provider/model</code>. A request opens on the start rung and climbs one rung per gate failure until something passes or a cap is hit.</p>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 260" role="img" aria-labelledby="ldT">
-<title id="ldT">The ladder: rungs ordered cheapest to most capable. A request opens on the start rung, and escalates one rung at a time only when the gate fails, stopping at the first rung whose output passes or when the budget or max_rungs cap is hit.</title>
+<title id="ldT">The ladder: rungs ordered cheapest to most capable. A request opens on the start rung, and escalates one rung at a time only when the gate fails, stopping at the first rung whose output passes or when the budget or max_rungs_per_request cap is hit.</title>
 <g>
   <rect x="60" y="190" width="240" height="52" rx="10" class="n-fill accent-s glow" stroke-width="1.6"/>
   <text x="78" y="214" class="ink m" font-size="13" font-weight="600">anthropic/haiku</text>
@@ -73,7 +73,7 @@
   <text x="275" y="222" text-anchor="end" class="accent-ink m breathe" font-size="11" font-weight="640">$</text>
 </g><g>
   <rect x="360" y="130" width="240" height="52" rx="10" class="n-fill n-stroke" stroke-width="1.6"/>
-  <text x="378" y="154" class="ink m" font-size="13" font-weight="600">openai/gpt-mini</text>
+  <text x="378" y="154" class="ink m" font-size="13" font-weight="600">openai/gpt-4.1-mini</text>
   <text x="378" y="172" class="ink-mut" font-size="11">+1 on gate fail</text>
   <text x="575" y="162" text-anchor="end" class="ink-mut m breathe d3" font-size="11" font-weight="640">$$</text>
 </g><g>
@@ -91,13 +91,18 @@
 <defs><marker id="ld" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-fail)"/></marker></defs>
 </svg></div>
 <p class="subh">Configuring the ladder</p>
-<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[ladder]
-rungs = [
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[route]]
+match  = {}
+mode   = &quot;enforce&quot;
+ladder = [
   &quot;anthropic/claude-haiku-4-5&quot;,   # rung 0
-  &quot;openai/gpt-mini&quot;,              # rung 1
+  &quot;openai/gpt-4.1-mini&quot;,          # rung 1
   &quot;anthropic/claude-sonnet-5&quot;,    # rung 2
 ]
-max_rungs = 3                      # hard cap on the climb</code></pre></div>
+gates  = [&quot;non-empty&quot;]
+
+[escalation]
+max_rungs_per_request = 3          # hard cap on the climb</code></pre></div>
 <div class="figure"><svg class="fp-svg" viewBox="0 0 1000 260" role="img" aria-labelledby="climbT">
 <title id="climbT">Escalation in motion: a request opens on rung 0, the gate fails, so it climbs exactly one rung; the gate on rung 1 passes and that output is served. The climb happens only on proof of gate failure.</title>
 <defs><marker id="cb" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-stroke)"/></marker>
@@ -139,7 +144,7 @@ max_rungs = 3                      # hard cap on the climb</code></pre></div>
   <figcaption>The gate on rung 0 fails, so the request climbs exactly one rung; rung 1 passes and is served. A mis-started rung only changes where the climb begins — the gate always decides what ships.</figcaption>
 </div>
 <div class="note"><span class="nt">Key idea</span> The gate is the arbiter of what ships; the ladder is just the order in which Firstpass tries rungs. An expensive rung fires only on <em>proof</em> of need — a gate failure on the cheaper rung. No gate failure = cheap rung served, regardless of how many rungs are configured above it.</div>
-<div class="note warn"><span class="nt">Common mistake</span> Setting <code>max_rungs</code> too high "just in case." Every escalation costs real tokens on the higher rung. If the quality bar is set by the gate (it should be), a longer ladder only adds spend on requests that would have passed earlier — it does not improve quality above the gate's threshold.</div>
+<div class="note warn"><span class="nt">Common mistake</span> Setting <code>max_rungs_per_request</code> too high "just in case." Every escalation costs real tokens on the higher rung. If the quality bar is set by the gate (it should be), a longer ladder only adds spend on requests that would have passed earlier — it does not improve quality above the gate's threshold.</div>
 <div class="recap">The ladder is cheapest-first; <b>the gate decides every climb</b> — no gate failure, no escalation, no extra cost.</div>
 
 <h2 id="startrung">Learned start-rung<a class="anchor" href="#startrung" aria-label="Link to this section">#</a></h2>
@@ -170,7 +175,7 @@ algo    = &quot;ucb1&quot;           # or &quot;thompson&quot;</code></pre></div
 <!-- rung 1 posterior — high mean, chosen -->
 <path d="M370 240 Q480 96 590 240 Z" class="accent-s glow" fill="var(--accent-soft)" stroke-width="1.8"/>
 <circle cx="480" cy="128" r="7" class="accent beat glow d2"/>
-<text x="480" y="266" text-anchor="middle" class="accent-ink m" font-size="12" font-weight="700">rung 1 · gpt-mini</text>
+<text x="480" y="266" text-anchor="middle" class="accent-ink m" font-size="12" font-weight="700">rung 1 · gpt-4.1-mini</text>
 <text x="480" y="284" text-anchor="middle" class="ink-mut m" font-size="10.5">$$ · cheapest safe start</text>
 <!-- rung 2 posterior — high mean but pricier -->
 <path d="M630 240 Q740 108 850 240 Z" class="n-stroke breathe d4" fill="var(--d-fill-2)" stroke-width="1.4"/>
@@ -248,7 +253,7 @@ speculation_band = [0.35, 0.65]   # only speculate when the pass-signal is margi
   <div class="row"><div class="k">per_request</div><div class="v">Cap on total cost for a single request across all rungs and gates.</div></div>
   <div class="row"><div class="k">per_session</div><div class="v">Cap across a session / conversation.</div></div>
   <div class="row"><div class="k">per_day</div><div class="v">A daily ceiling so an unattended loop can't produce a surprise bill.</div></div>
-  <div class="row"><div class="k">max_rungs</div><div class="v">The maximum number of rungs a single request may climb.</div></div>
+  <div class="row"><div class="k">max_rungs_per_request</div><div class="v">The maximum number of rungs a single request may climb.</div></div>
 </div>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[budget]
 per_request_usd = 0.05

@@ -22,6 +22,8 @@ pub mod metaverify;
 pub mod metrics;
 pub mod multiturn;
 pub mod policy;
+pub mod prior;
+pub mod prior_sweep;
 pub mod report;
 pub mod routerbench;
 pub mod sandbox;
@@ -106,7 +108,33 @@ pub fn run_benchmark(cfg: &BenchConfig) -> Report {
     );
     // Disjoint calibration suite for conformal (sim only — free to draw more tasks).
     let calib = task_suite(cfg.n_tasks.max(2000), cfg.seed.wrapping_add(1));
-    run_core(cfg, &suite, &calib, &backend, &gate, true)
+    let mut report = run_core(cfg, &suite, &calib, &backend, &gate, true);
+    // The noisy-prior σ sweep needs SimBackend's ground-truth clearance, which only exists in the
+    // simulation — so it is attached here, not inside the generic (also-used-by-live) run_core.
+    report.prior_sweep = Some(prior_sweep::run_sweep(
+        &suite,
+        &cfg.ladder,
+        &backend,
+        &gate,
+        &PriceTable::defaults(),
+        cfg.seed,
+        cfg.alpha,
+        cfg.predictor_noise,
+        cfg.budget_usd,
+    ));
+    // Exploratory, post-hoc — see `prior_sweep`'s module doc. Cannot override the verdict above.
+    report.prior_sweep_adverse_selection = Some(prior_sweep::run_adverse_selection_scenario(
+        cfg.n_tasks,
+        &cfg.ladder,
+        &backend,
+        &gate,
+        &PriceTable::defaults(),
+        cfg.seed,
+        cfg.alpha,
+        cfg.predictor_noise,
+        cfg.budget_usd,
+    ));
+    report
 }
 
 /// Run the full benchmark against **live providers** (Anthropic Messages) over a verifiable task
@@ -273,6 +301,9 @@ fn run_core(
             proceed,
             rationale,
         },
+        // Populated by `run_benchmark` only (needs sim-only ground truth); `None` on the live path.
+        prior_sweep: None,
+        prior_sweep_adverse_selection: None,
     }
 }
 
@@ -347,6 +378,17 @@ mod tests {
         assert!(
             !r.kill.proceed,
             "should STOP when the cheap tier is hopeless"
+        );
+    }
+
+    #[test]
+    fn report_is_deterministic_for_the_same_seed() {
+        let cfg = BenchConfig::default();
+        let a = run_benchmark(&cfg).to_json().expect("json");
+        let b = run_benchmark(&cfg).to_json().expect("json");
+        assert_eq!(
+            a, b,
+            "same seed must produce byte-identical report JSON, including the prior sweep"
         );
     }
 }

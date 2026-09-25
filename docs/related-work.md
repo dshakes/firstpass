@@ -51,6 +51,40 @@ so verifier errors don't compound. If our imperfect-gate benchmark
 ([`specs/imperfect-gate-benchmark.md`](../specs/imperfect-gate-benchmark.md)) shows a
 material false-reject rate on noisier gates, that is the prior art to adopt.
 
+## Decision-model routers (Jev) and where Firstpass sits
+
+A new entrant since the survey above was written: **"System One" decision models** — TypeSafe
+AI's **Jev** (launched 2026-09-15; one closed-form question in, a probability distribution out;
+$0.042/M input tokens, $0 output; no published accuracy benchmarks; answers are not deterministic)
+— let a router ask "which tier handles this?" for a fraction of a cent instead of training a
+classifier. `jev-router` and `prismhq/jev-router` use it to pick a tier and **serve that tier's
+output unverified**. That is a faster way to do the same thing RouteLLM, Not Diamond, Martian, and
+Sakana Fugu already do: decide before the output exists. It does not change *which family* the
+decision belongs to, and per the survey's own taxonomy that family is the large majority of the
+field — Firstpass and its two nearest neighbors (AutoMix, CP-Router) remain the minority that
+decides after.
+
+| System | Decides before / after generation | Verifies the output | Cold start without training | Per-query granularity | Tamper-evident audit | Served-failure guarantee |
+|---|---|---|---|---|---|---|
+| Jev-based routers (`jev-router`) | before | no — serves the predicted tier | yes (pretrained decision model, no local training) | yes | not reported | no |
+| RouteLLM | before | no | no — classifier is trained; a new model needs retraining | yes | not reported | no |
+| Not Diamond | before | not reported | not reported | not reported | not reported | not reported |
+| Martian | before | not reported | not reported | not reported | not reported | not reported |
+| Sakana Fugu | before | not reported | not reported | not reported | not reported | not reported |
+| FrugalGPT | after | yes — learned scorer on the answer (soft, not a hard check) | no — scorer is trained | yes | not reported | not reported |
+| AutoMix | after | yes — self-verification + POMDP meta-verifier | not reported | yes | not reported | not reported |
+| CP-Router | before | no — builds a prediction set, doesn't check the answer | not reported | yes | not reported | no — coverage guarantee is on prediction-set size, not served output |
+| Firstpass (today) | after | yes — operator-written gate (tests/schema/judge) | yes — zero-retrain; but start-rung prediction needs a warm bandit (`min_observations`) per context | yes (gate); no (start-rung, until warm) | yes — hash-chained receipt | yes — split-conformal bound |
+| Firstpass + decision prior (ADR 0013) | both — prior before, gate after | yes — unchanged | yes — the prior removes the bandit's own cold-start wait | yes — including on the very first query in a context | yes — prior vector recorded as `decision_prior` | yes — unchanged |
+
+**The thesis:** predictive routers pick the start; verification decides what is served. Those are
+different jobs, and the fusion in ADR 0013 takes the cheap start a decision model is good at
+*without giving up the gate that decides what ships* — Jev's own model family is exactly what
+these routers already skip verifying. The combined router's advantage in the table above is a
+**design argument plus simulation**, not a measured result: it holds only once the
+`firstpass+prior` σ-sweep and the live MBPP A/B in
+[ADR 0013](adr/0013-verified-predictive-routing.md) actually run.
+
 ## Not yet comparable
 
 Firstpass does not appear on RouterBench, RouterEval, RouterArena, or RouterXBench. Our

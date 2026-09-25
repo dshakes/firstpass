@@ -17,6 +17,8 @@
 //! - [`cost`] — model pricing and the counterfactual baseline.
 //! - [`conformal`] — split-conformal risk control on the gate threshold (SPEC §10.1).
 //! - [`ltt`] — Learn-then-Test threshold calibration (RCPS, Angelopoulos et al. 2021).
+//! - [`prior`] — verified predictive routing: maps a decision-model's per-rung answer to a
+//!   cumulative gate-pass prior over the ladder.
 //! - [`eprocess`] — anytime-valid risk control: a bound that holds at *every* round, for the
 //!   continuously-recalibrated regime where the fixed-sample guarantees above do not compose.
 //! - [`error`] — the crate [`Error`] type.
@@ -34,14 +36,16 @@ pub mod guardrail;
 pub mod hashchain;
 pub mod ltt;
 pub mod predictor;
+pub mod prior;
 pub mod rollout;
 pub mod trace;
 pub mod verdict;
 
 pub use config::{
     AbstainPolicy, AuthScheme, BanditAlgorithm, BanditConfig, Budget, Config, ConsistencyDef,
-    Dialect, Escalation, GateDef, JudgeDef, Mode, ModePreset, ModelRef, OnExhausted,
-    PredictorConfig, PriceDef, ProbeConfig, ProviderDef, Route, RoutingMode, SessionPromotion,
+    DecisionDef, Dialect, Escalation, GateDef, JudgeDef, Mode, ModePreset, ModelRef, OnExhausted,
+    PredictorConfig, PriceDef, PriorConfig, ProbeConfig, ProviderDef, Route, RoutingMode,
+    SessionPromotion,
 };
 pub use conformal::{ConformalResult, calibrate, served_failure_rate};
 pub use cost::{ModelPrice, PriceTable};
@@ -51,6 +55,7 @@ pub use guardrail::{Guardrail, GuardrailAction, GuardrailVerdict};
 pub use hashchain::{Chained, GENESIS_HASH, canonical_json, record_hash, verify_chain};
 pub use ltt::{LttDiagnostic, LttResult};
 pub use predictor::PassPredictor;
+pub use prior::cumulative_pass;
 pub use rollout::{Rollout, RolloutDecision, RolloutKey};
 pub use trace::{
     Attempt, DeferredVerdict, ElasticAction, ElasticDecision, FinalOutcome, PolicyRef, ProbeRegime,
