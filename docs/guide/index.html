@@ -143,6 +143,35 @@
 <div class="note"><span class="nt">Key idea</span> "Prediction sets the entry point; proof sets the exit." A learned bandit can pick a smarter starting rung for efficiency — but the gate is still what decides whether that output is served. Speed and correctness are separate problems, solved by separate mechanisms, and neither undermines the other.</div>
 <div class="recap">The five novelties are separable and stackable — audit, calibration, and the guarantee each add value independently and compound when combined.</div>
 
+<h2 id="jev">Decision-model routers (Jev) vs Firstpass<a class="anchor" href="#jev" aria-label="Link to this section">#</a></h2>
+<div class="tldr">TypeSafe's <b>Jev</b> answers one cheap closed-form question per query and routes by picking a model tier directly, then serves that tier's output <b>unverified</b>. Firstpass's thesis is narrower: <b>predict the start, verify what's served</b> — the same cheap signal can pick where the ladder opens, but the gate still runs on every attempt. <code>[escalation.prior]</code> is <b>experimental, default-off</b> (pre-registered sim verdict: <b>PRIOR=STOP</b>); the <code>decision</code> gate is <b>UNMEASURED</b>.</div>
+<p>A new class of "System One" decision models — TypeSafe's <strong>Jev</strong> — answers one cheap closed-form question per query ($0.042/M input tokens, no text generation) and routes a query to a model tier by asking it to pick the tier directly. Products built on it (<code>jev-router</code>, <code>prismhq/jev-router</code>) then <strong>serve that tier's output unverified</strong>.</p>
+<p>Firstpass takes the same cheap signal and puts it somewhere narrower: the existing start-rung bandit already had a slot for a per-query prior on <em>where the ladder opens</em>. The gate still runs on every attempt — a wrong prediction costs money or latency, never a wrong answer shipped.</p>
+<p class="subh">The measured gap (simulation, not live)</p>
+<p>Firstpass's own σ-sweep (<code>cargo run -p firstpass-bench</code>, n=500) puts a Jev-style unverified router's served-failure at <strong>50.6–56.2%</strong> across the noise levels tested, against Firstpass's own gated served-failure of <strong>15.8%</strong> on the same suite. Full numbers and both addenda: <a href="https://github.com/dshakes/firstpass/blob/main/docs/adr/0013-verified-predictive-routing.md" rel="noopener">ADR 0013</a>.</p>
+<div class="note warn"><span class="nt">Status: PRIOR=STOP</span> The pre-registered kill-criterion simulation found the fused arm ties plain Firstpass on $/success at σ=0 and loses at higher noise (a post-hoc hard-task scenario was a wash, not a win). <code>[escalation.prior]</code> stays default-off until a live A/B clears its own gate.</div>
+<p class="subh"><code>[escalation.prior]</code> — enabling it anyway</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># experimental — default-off, pre-registered sim verdict PRIOR=STOP</span>
+[escalation.prior]
+provider    = &quot;typesafe&quot;                <span class="tk-c"># the only accepted value today</span>
+base_url    = &quot;https://api.typesafe.ai&quot; <span class="tk-c"># default; self-hosted/mock Jev overrides this</span>
+model       = &quot;jev-latest&quot;
+api_key_env = &quot;TYPESAFE_API_KEY&quot;        <span class="tk-c"># env var name only — the key itself is never logged</span>
+timeout_ms  = 150                       <span class="tk-c"># any error fails open — no prior, no decision_prior field</span>
+strength    = 10                        <span class="tk-c"># Beta pseudo-count weight of the prior</span>
+rungs = [
+  &quot;rung 0 (claude-haiku) is the least capable tier that fully handles this request&quot;,
+  &quot;rung 1 (claude-sonnet) is the least capable tier that fully handles this request&quot;,
+]</code></pre></div>
+<div class="note"><span class="nt">Key idea</span> <code>rungs</code> must have exactly one entry per rung of <em>every</em> <code>enforce</code>-mode route's ladder — a length mismatch is rejected at config parse, never silently truncated. The gate still verifies every served output; the prior only ever moves where the ladder starts.</div>
+<p class="subh"><code>decision</code> gate — UNMEASURED</p>
+<p>The same Jev model can also sit behind a <code>[[gate]]</code> block as a cheap external verifier (~$0.042/M input tokens) instead of a frontier LLM judge. A transport error, timeout, or unparseable reply ABSTAINs — never a fabricated pass — but its precision/recall against real failures has not been benchmarked.</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
+id       = &quot;verify&quot;
+decision = { provider = &quot;typesafe&quot;, model = &quot;jev-latest&quot;, threshold = 0.6 }
+<span class="tk-c"># api_key_env defaults to TYPESAFE_API_KEY; base_url defaults to https://api.typesafe.ai</span></code></pre></div>
+<div class="recap">Jev-style routers guess and serve unverified; Firstpass's prior only ever moves the start rung, and the gate still decides what ships. Both new knobs are opt-in, off by default, and honestly labeled: PRIOR=STOP and UNMEASURED. See <a href="https://github.com/dshakes/firstpass/blob/main/docs/related-work.md" rel="noopener">Related work</a> for the full field comparison.</div>
+
 <h2 id="who">Who it's for<a class="anchor" href="#who" aria-label="Link to this section">#</a></h2>
 <div class="tldr">Three ideal-fit profiles: teams <b>paying frontier prices on tasks a cheap model could handle</b>; anyone who needs a tamper-evident <b>"why" for every routing decision</b>; builders with an existing definition of "good" — tests, schemas, rubrics — who want routing by <b>their</b> criterion instead of a vendor classifier.</div>
 <p class="subh">The three ideal-fit profiles</p>
@@ -162,7 +191,7 @@
   <thead><tr><th>Shipped &amp; verified</th><th>Next / research</th></tr></thead>
   <tbody>
     <tr><td>Both wire dialects, structured enforce</td><td>Elastic verification (validated, phasing in)</td></tr>
-    <tr><td>All five gate kinds</td><td>Per-query difficulty prediction</td></tr>
+    <tr><td>All six gate kinds (incl. experimental, unmeasured <code>decision</code>)</td><td>Per-query difficulty prediction</td></tr>
     <tr><td>Start-rung bandit, speculation, failover</td><td>Session-level routing</td></tr>
     <tr><td>Conformal guarantee + Learn-then-Test</td><td>Hosted plane (gated on external audit)</td></tr>
     <tr><td>Adaptive threshold, OPE, savings/evals</td><td>crates.io publish, 30-day soak</td></tr>
@@ -184,7 +213,7 @@
 
 <nav class="pager" aria-label="Pagination"><span></span><a class="next" href="quickstart.html"><span class="dir">Next →</span><span class="t">Quickstart</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#what" class="">What Firstpass is</a><a href="#moves" class="">The four moves</a><a href="#novelty" class="">What is actually new</a><a href="#who" class="">Who it&#x27;s for</a><a href="#status" class="">Status</a><a href="#next" class="">Where to go next</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#what" class="">What Firstpass is</a><a href="#moves" class="">The four moves</a><a href="#novelty" class="">What is actually new</a><a href="#jev" class="">Decision-model routers (Jev)</a><a href="#who" class="">Who it&#x27;s for</a><a href="#status" class="">Status</a><a href="#next" class="">Where to go next</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">

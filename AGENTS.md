@@ -78,6 +78,10 @@ Config surface (the parser is `deny_unknown_fields`, so a wrong key is a hard fa
   The escalation cap is `[escalation] max_rungs_per_request`.
 - **A written `firstpass.toml` is inert unless `FIRSTPASS_CONFIG` names it** — `from_env` has no default path.
 - **`route.mode = "enforce"` is what enables enforcement**, not the global `FIRSTPASS_MODE`.
+- **`[escalation.prior]` `rungs` length must equal every `enforce` route's ladder length** — a
+  mismatch is rejected at parse (`Config::parse`), never truncated or padded.
+- **A `decision` gate errors ⇒ Abstain, never Pass** — but a missing/unset `api_key_env` just skips
+  the gate with a `tracing::warn!` at gate-build time, not a startup error.
 
 CI signals (check the signal that actually covers your change):
 

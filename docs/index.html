@@ -203,6 +203,42 @@
   </div>
 </div></section>
 
+<!-- JEV -->
+<section class="sec" style="padding-top:0"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">decision-model routers</p>
+    <h2>Predict the start. Verify what's served.</h2>
+    <p class="lead">A new class of "System One" decision models — TypeSafe's <b>Jev</b> — answers one cheap closed-form question per query and routes by picking a model tier directly, then serves that tier's output <b>unverified</b>. Firstpass takes the same cheap signal and puts it somewhere narrower: the existing start-rung bandit already had a slot for a per-query prior on <em>where the ladder opens</em> — the gate still runs on every attempt.</p>
+  </div>
+  <div class="stats" style="margin-top:28px">
+    <div class="st"><div class="n">50.6<span class="u">–56.2%</span></div><div class="l">served-failure, Jev-style unverified router (simulation σ-sweep)</div></div>
+    <div class="st"><div class="n">15.8<span class="u">%</span></div><div class="l">Firstpass's own gated served-failure, same suite</div></div>
+  </div>
+  <p style="margin-top:12px;color:var(--text-3);font-size:14px">Simulation, not a live measurement — <code>cargo run -p firstpass-bench</code>, n=500. Full numbers and both addenda: <a href="https://github.com/dshakes/firstpass/blob/main/docs/adr/0013-verified-predictive-routing.md" rel="noopener">ADR 0013</a>.</p>
+  <div class="cards g2" style="margin-top:28px">
+    <div class="card">
+      <h3><code>[escalation.prior]</code> — experimental, default-off</h3>
+      <p style="margin-bottom:10px">Pre-registered simulation verdict: <b>PRIOR=STOP</b> (ties plain Firstpass on $/success at σ=0, loses at higher noise). The block ships anyway — it costs nothing while unconfigured, and a live A/B is the next gate.</p>
+      <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># experimental — PRIOR=STOP</span>
+[escalation.prior]
+provider    = <span class="tk-s">&quot;typesafe&quot;</span>
+model       = <span class="tk-s">&quot;jev-latest&quot;</span>
+api_key_env = <span class="tk-s">&quot;TYPESAFE_API_KEY&quot;</span>
+timeout_ms  = <span class="tk-n">150</span>
+strength    = <span class="tk-n">10</span>
+rungs = [<span class="tk-s">&quot;rung 0 …&quot;</span>, <span class="tk-s">&quot;rung 1 …&quot;</span>]</code></pre></div>
+    </div>
+    <div class="card">
+      <h3><code>decision</code> gate — UNMEASURED</h3>
+      <p style="margin-bottom:10px">The same Jev model as a <code>[[gate]]</code>: a cheap external verifier (~$0.042/M input tokens). A transport error, timeout, or unparseable reply ABSTAINs — never a fabricated pass. Precision/recall against real failures not yet benchmarked.</p>
+      <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
+id       = <span class="tk-s">&quot;verify&quot;</span>
+decision = { provider = <span class="tk-s">&quot;typesafe&quot;</span>, model = <span class="tk-s">&quot;jev-latest&quot;</span>, threshold = <span class="tk-n">0.6</span> }</code></pre></div>
+    </div>
+  </div>
+  <p style="margin-top:24px"><a class="btn" href="https://github.com/dshakes/firstpass/blob/main/docs/related-work.md" rel="noopener">Full comparison vs RouteLLM, Not Diamond, Martian, FrugalGPT, AutoMix &amp; more →</a></p>
+</div></section>
+
 <!-- GUARANTEE -->
 <section class="sec"><div class="wrap">
   <div class="sec-head">
@@ -299,7 +335,7 @@
     <p class="lead">A gate is any check on the real output. Firstpass ships several and lets you plug in your own — your tests, your linter, your judge.</p>
   </div>
   <div class="figure" style="margin-bottom:36px"><svg class="fp-svg" viewBox="0 0 1000 300" role="img" aria-labelledby="gkT">
-<title id="gkT">Five gate kinds — inline checks, JSON-Schema, your subprocess, an LLM judge, and k-sample self-consistency — each read the actual output and converge on one verdict. The verdict serves on proof or escalates one rung on failure.</title>
+<title id="gkT">Five of the six gate kinds — inline checks, JSON-Schema, your subprocess, an LLM judge, and k-sample self-consistency (plus an experimental decision-model gate not pictured) — each read the actual output and converge on one verdict. The verdict serves on proof or escalates one rung on failure.</title>
 <defs>
   <marker id="gkP" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-pass)"/></marker>
   <marker id="gkW" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="var(--d-warn)"/></marker>
@@ -353,7 +389,7 @@
     <div class="card"><h3>Fail-open or fail-closed</h3><p>Per-gate <code>on_abstain</code> decides what an inconclusive check does. Flaky gates auto-disable on a rolling error budget.</p></div>
     <div class="card"><h3>Priced on the receipt</h3><p>Every gate's cost is written onto the receipt, so verification overhead is visible, not hidden.</p></div>
   </div>
-  <p style="margin-top:24px"><a class="btn" href="guide/gates.html">All five gate kinds →</a></p>
+  <p style="margin-top:24px"><a class="btn" href="guide/gates.html">All six gate kinds →</a></p>
 </div></section>
 
 <!-- ARCHITECTURE -->
@@ -670,7 +706,7 @@ pip install firstpass    # or install it</code></pre></div></div>
         <li><b>The earned guarantee.</b> ≤10%@95% distribution-free bound on 974 real MBPP tasks (committed artifact), Learn-then-Test calibration, live adaptive threshold.</li>
         <li><b>Learned start-rung.</b> UCB1 or discounted Thompson with logged propensities and a speculative-deferral band — default-off, honest policy stamp on every receipt.</li>
         <li><b>Selectable modes.</b> cost / balanced / quality / latency / max presets, per route or per request via <span class="mono">x-firstpass-mode</span>.</li>
-        <li><b>Five gate kinds.</b> inline · schema · subprocess · LLM-judge (maker ≠ checker) · k-sample self-consistency, each with an error budget and gate cost priced onto the receipt.</li>
+        <li><b>Six gate kinds.</b> inline · schema · subprocess · LLM-judge (maker ≠ checker) · k-sample self-consistency · an experimental, unmeasured decision-model gate — each with an error budget and gate cost priced onto the receipt.</li>
         <li><b>Receipts.</b> hash-chained; <span class="mono">export</span> + <span class="mono">verify</span> re-derive with no proxy or DB; durable never-drop mode.</li>
         <li><b>Policy rehearsal.</b> <span class="mono">firstpass ope</span> replays your logs with IPS / SNIPS / DR and bootstrap CIs before you enforce.</li>
         <li><b>Packaged everywhere.</b> pip · uvx · Homebrew · Docker · curl | sh · binaries, auto-published each release.</li>

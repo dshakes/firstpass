@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added: verified predictive routing prior + decision-model gate (both experimental, default-off)
+
+`[escalation.prior]` — an optional pre-generation decision-model prior (TypeSafe's Jev) that answers
+one cheap choice question per request and blends the result into the existing start-rung bandit as a
+`P(pass | rung)` estimate, recorded on the receipt as `decision_prior`. **The gate still verifies
+every output; a failed rung is never served.** Fail-open on any timeout/error/malformed reply.
+Policy stamp `bandit@v3-prior`.
+
+A new `decision = {...}` gate kind (`[[gate]]`) using the same Jev model as a cheap external
+verifier (~$0.042/M input tokens) instead of a frontier LLM judge — errors ABSTAIN, never a
+fabricated pass.
+
+**Status, stated plainly:**
+- `[escalation.prior]` — pre-registered simulation gate result is **PRIOR=STOP** (ties plain
+  Firstpass on $/success at σ=0, loses at higher noise; a post-hoc hard-task scenario was a wash).
+  Live A/B not yet run. See [ADR 0013](docs/adr/0013-verified-predictive-routing.md).
+- `decision` gate — precision/recall against real failures are **UNMEASURED**.
+- Both are opt-in and off by default; the plumbing ships because it costs nothing unconfigured.
+
+See [README.md#decision-model-routers-jev-vs-firstpass](README.md) and
+[docs/related-work.md](docs/related-work.md) for how this compares to Jev-style unverified routers.
+
 ### Added: session promotion can be shared across replicas
 
 `[escalation.session_promotion] redis_url`, behind the same `redis-cache` build feature as the
