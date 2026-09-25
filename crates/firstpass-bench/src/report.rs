@@ -38,6 +38,10 @@ pub struct Report {
     pub kill: KillDecision,
     /// The noisy decision-model-prior σ sweep (SIMULATION only — `None` on a live run).
     pub prior_sweep: Option<PriorSweepReport>,
+    /// Exploratory, post-hoc adverse-selection variant of the σ sweep (SIMULATION only — `None` on
+    /// a live run). Not pre-registered; cannot override `prior_sweep`'s verdict. See
+    /// [`crate::prior_sweep`]'s module doc.
+    pub prior_sweep_adverse_selection: Option<PriorSweepReport>,
 }
 
 fn ci(c: Ci) -> String {
@@ -200,6 +204,9 @@ impl Report {
 
         if let Some(ps) = &self.prior_sweep {
             s.push_str(&crate::prior_sweep::render(ps));
+        }
+        if let Some(ps) = &self.prior_sweep_adverse_selection {
+            s.push_str(&crate::prior_sweep::render_adverse_selection(ps));
         }
         s
     }

@@ -122,6 +122,18 @@ pub fn run_benchmark(cfg: &BenchConfig) -> Report {
         cfg.predictor_noise,
         cfg.budget_usd,
     ));
+    // Exploratory, post-hoc — see `prior_sweep`'s module doc. Cannot override the verdict above.
+    report.prior_sweep_adverse_selection = Some(prior_sweep::run_adverse_selection_scenario(
+        cfg.n_tasks,
+        &cfg.ladder,
+        &backend,
+        &gate,
+        &PriceTable::defaults(),
+        cfg.seed,
+        cfg.alpha,
+        cfg.predictor_noise,
+        cfg.budget_usd,
+    ));
     report
 }
 
@@ -291,6 +303,7 @@ fn run_core(
         },
         // Populated by `run_benchmark` only (needs sim-only ground truth); `None` on the live path.
         prior_sweep: None,
+        prior_sweep_adverse_selection: None,
     }
 }
 
