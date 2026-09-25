@@ -663,7 +663,7 @@ const ARM_NAMES: [&str; 7] = [
     "prior-unverified",
     "always-cheap",
     "always-top",
-    "cost-aware (learned p)",
+    "cost-aware (learned p, HINDSIGHT)",
     "cost-aware (ORACLE p — cheats)",
 ];
 

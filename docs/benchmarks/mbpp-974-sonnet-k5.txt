@@ -1,3 +1,8 @@
+CORRECTION (2026-09-25): the "cost-aware (learned p)" row below uses HINDSIGHT — it decides and buckets on the
+task's realized cost, which includes post-generation output tokens. The leak-free ex-ante estimator is far
+weaker (pooled $0.01109 vs $0.00919/success). See specs/prior-blend-and-decision-gate.md and
+docs/benchmarks/prior-blend-replay.md. Numbers below are unchanged, as originally generated.
+
 # firstpass-bench --coding-policy · MBPP · haiku→sonnet · k=5 JUDGED
 # date: 2026-08-12 · candidate: live Anthropic · sandbox: docker (runc tier)
 # dataset: mbpp-974.jsonl (974 rows, Muennighoff/mbpp full/test)
