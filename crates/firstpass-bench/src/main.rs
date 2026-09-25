@@ -11,16 +11,18 @@
 //!   firstpass-bench --fetch-priors <matrix.jsonl> <mbpp.jsonl> <base_url> <out.jsonl>  # OpenJev prior fetch (I/O, resumable)
 //!   firstpass-bench --replay-prior <matrix1> <priors1> [<matrix2> <priors2> ...]  # score the pre-registered prior A/B offline
 //!   firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...]  # Study A: prior+learned blend, offline
+//!   firstpass-bench --decision-study <candidates.jsonl> <mbpp.jsonl> <base_url> <labels.jsonl> <scores.jsonl>  # Study B: decision gate error rates (sandbox + live OpenJev)
 //!   firstpass-bench --multiturn-selfcheck  # prove the multi-turn harness + pre-registered bar work, no spend
 
 use firstpass_bench::coding::{
-    CandidateSolver, CodingReport, GeneratedSolver, Judge, LiveJudge, LiveSolver, coding_suite,
-    generated_coding_suite, mock_solutions, run_coding_benchmark, run_coding_benchmark_judged,
+    coding_suite, generated_coding_suite, mock_solutions, run_coding_benchmark,
+    run_coding_benchmark_judged, CandidateSolver, CodingReport, GeneratedSolver, Judge, LiveJudge,
+    LiveSolver,
 };
 use firstpass_bench::coding_policy::Rung;
 use firstpass_bench::dataset::load_coding_dataset;
 use firstpass_bench::sandbox::establish_sandbox;
-use firstpass_bench::{BenchConfig, run_benchmark, run_benchmark_live};
+use firstpass_bench::{run_benchmark, run_benchmark_live, BenchConfig};
 
 /// Container image for the sandbox self-check (needs `python3` + busybox `base64`/`timeout`).
 /// Default sandbox image. Override with `FIRSTPASS_SANDBOX_IMAGE` — BigCodeBench tasks import
@@ -258,6 +260,62 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("--replay-blend failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Study B (specs/prior-blend-and-decision-gate.md): the `decision` gate's error rates against
+    // VRBench's hidden-test oracle. Needs the fail-closed sandbox (labels the served MBPP answers)
+    // and a live OpenJev `/v1/systemone` server (scores them) — both results are cached/resumable.
+    //   firstpass-bench --decision-study <candidates.jsonl> <mbpp.jsonl> <base_url> <labels.jsonl> <scores.jsonl> [--json]
+    if let Some(i) = args.iter().position(|a| a == "--decision-study") {
+        let (Some(candidates), Some(mbpp), Some(base_url), Some(labels_cache), Some(scores_cache)) = (
+            args.get(i + 1).filter(|p| !p.starts_with("--")),
+            args.get(i + 2).filter(|p| !p.starts_with("--")),
+            args.get(i + 3).filter(|p| !p.starts_with("--")),
+            args.get(i + 4).filter(|p| !p.starts_with("--")),
+            args.get(i + 5).filter(|p| !p.starts_with("--")),
+        ) else {
+            eprintln!(
+                "usage: firstpass-bench --decision-study <candidates.jsonl> <mbpp.jsonl> <base_url> <labels.jsonl> <scores.jsonl>"
+            );
+            std::process::exit(2);
+        };
+        let sb = match establish_sandbox(&sandbox_image()) {
+            Ok(sb) => sb,
+            Err(e) => {
+                eprintln!(
+                    "cannot run — sandbox not established: {e}\ncandidate answers execute in the \
+                     hidden-test oracle and will not be run on the host"
+                );
+                std::process::exit(1);
+            }
+        };
+        match firstpass_bench::decision_study::run(
+            sb.as_ref(),
+            candidates,
+            mbpp,
+            base_url,
+            labels_cache,
+            scores_cache,
+        ) {
+            Ok(study) => {
+                if json {
+                    match serde_json::to_string_pretty(&study) {
+                        Ok(s) => println!("{s}"),
+                        Err(e) => {
+                            eprintln!("cannot serialize report: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    println!("{}", firstpass_bench::decision_study::render(&study));
+                }
+            }
+            Err(e) => {
+                eprintln!("--decision-study failed: {e}");
                 std::process::exit(1);
             }
         }
@@ -809,7 +867,7 @@ fn print_coding(r: &CodingReport) {
 /// stopped discriminating.
 fn multiturn_selfcheck(json: bool) {
     use firstpass_bench::coding_policy::RungOutcome;
-    use firstpass_bench::multiturn::{MultiTurnTask, PreRegistered, Turn, evaluate};
+    use firstpass_bench::multiturn::{evaluate, MultiTurnTask, PreRegistered, Turn};
     use firstpass_core::features::TrajectorySignals;
 
     let rung = |cost: f64, pass: bool, correct: bool| RungOutcome {
@@ -913,8 +971,8 @@ fn multiturn_selfcheck(json: bool) {
 /// - Every finished task is checkpointed immediately, and a resumed run skips it. A crash at task
 ///   900 of 974 must not destroy the first 899 — that has happened here before.
 fn agentic_multiturn(json: bool) {
-    use firstpass_bench::agentic::{AgenticRung, RecordedTask, run_task};
-    use firstpass_bench::multiturn::{PreRegistered, evaluate};
+    use firstpass_bench::agentic::{run_task, AgenticRung, RecordedTask};
+    use firstpass_bench::multiturn::{evaluate, PreRegistered};
     use std::io::Write as _;
 
     let Ok(dataset) = std::env::var("FIRSTPASS_CODING_DATASET") else {
@@ -1101,9 +1159,9 @@ fn agentic_multiturn(json: bool) {
 /// SPENDS REAL MONEY and needs multi-GB eval images pulled in advance (no network at eval time).
 fn swe_agentic(json: bool) {
     use firstpass_bench::agentic::RecordedTask;
-    use firstpass_bench::multiturn::{PreRegistered, evaluate};
-    use firstpass_bench::swe_agentic::{SweRung, run_instance, should_stop_after_failures};
-    use firstpass_bench::swebench::{SweLimits, load_swebench_jsonl};
+    use firstpass_bench::multiturn::{evaluate, PreRegistered};
+    use firstpass_bench::swe_agentic::{run_instance, should_stop_after_failures, SweRung};
+    use firstpass_bench::swebench::{load_swebench_jsonl, SweLimits};
     use std::io::Write as _;
 
     let Ok(dataset) = std::env::var("FIRSTPASS_SWE_DATASET") else {

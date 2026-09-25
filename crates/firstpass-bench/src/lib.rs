@@ -16,6 +16,7 @@ pub mod coding;
 pub mod coding_policy;
 pub mod costaware;
 pub mod dataset;
+pub mod decision_study;
 pub mod elastic;
 pub mod jev_replay;
 pub mod live;
