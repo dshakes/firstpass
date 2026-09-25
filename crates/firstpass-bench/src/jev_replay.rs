@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::coding_policy::RungOutcome;
 use crate::costaware::{self, PassPredictor};
 use crate::stats::{
-    self, Ci, bootstrap_mean_ci, bootstrap_paired_ratio_diff_ci, bootstrap_ratio_ci,
+    self, bootstrap_mean_ci, bootstrap_paired_ratio_diff_ci, bootstrap_ratio_ci, Ci,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -210,7 +210,14 @@ fn fetch_one(
     let start = std::time::Instant::now();
     let elapsed_ms = || start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
-    let resp = match client.post(&url).json(&body).send() {
+    // Hosted Jev needs a bearer key; a local keyless server (OpenJev) ignores it. The key is read
+    // from the environment only and is never written to the priors file or logged.
+    let req = client.post(&url).json(&body);
+    let req = match std::env::var("TYPESAFE_API_KEY") {
+        Ok(key) if !key.is_empty() => req.bearer_auth(key),
+        _ => req,
+    };
+    let resp = match req.send() {
         Ok(r) => r,
         Err(_) => return (false, None, elapsed_ms()),
     };
@@ -564,7 +571,11 @@ fn eval_arm<T>(name: &'static str, tasks: &[T], serve: impl Fn(&T) -> Served) ->
         usd_per_success: {
             let total: f64 = cost.iter().sum();
             let ns: f64 = success.iter().sum();
-            if ns > 0.0 { total / ns } else { f64::INFINITY }
+            if ns > 0.0 {
+                total / ns
+            } else {
+                f64::INFINITY
+            }
         },
         usd_per_success_ci: bootstrap_ratio_ci(&cost, &success, BOOT_B, BOOT_SEED, ALPHA),
         served_failure_rate: 1.0 - success_rate,
