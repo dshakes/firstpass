@@ -73,7 +73,7 @@
 <!-- ladder -->
 <g font-size="12" class="m" font-weight="600">
   <rect x="34" y="112" width="180" height="46" rx="9" class="n-fill accent-s" stroke-width="1.5"/><text x="52" y="140" class="ink">anthropic/haiku</text>
-  <rect x="34" y="164" width="180" height="46" rx="9" class="n-fill n-stroke" stroke-width="1.5"/><text x="52" y="192" class="ink">openai/gpt-mini</text>
+  <rect x="34" y="164" width="180" height="46" rx="9" class="n-fill n-stroke" stroke-width="1.5"/><text x="52" y="192" class="ink">openai/gpt-4.1-mini</text>
   <rect x="34" y="216" width="180" height="46" rx="9" class="n-fill n-stroke" stroke-width="1.5"/><text x="52" y="244" class="ink">gemini/flash</text>
 </g>
 <!-- hub -->
@@ -131,17 +131,17 @@
 <div class="recap">BYOK: <b>your key, your provider bill</b>, zero Firstpass markup.</div>
 
 <h2 id="custom">Custom providers<a class="anchor" href="#custom" aria-label="Link to this section">#</a></h2>
-<div class="tldr">Any OpenAI-compatible endpoint becomes a rung with <b>four config lines</b>: a name, a base URL, a dialect, and an auth mode. Once declared, reference it as <code>name/model</code> in any ladder — same as a built-in.</div>
+<div class="tldr">Any OpenAI-compatible endpoint becomes a rung with a handful of config lines: an id, a base URL, a dialect, and an auth mode. Once declared, reference it as <code>id/model</code> in any ladder — same as a built-in.</div>
 <p>Any OpenAI-compatible endpoint becomes a provider with a <code>[[provider]]</code> block — self-hosted models, a gateway, or a cloud-managed endpoint:</p>
-<p class="subh">The four required fields</p>
+<p class="subh">The required fields</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[provider]]
-name     = &quot;myllm&quot;
+id       = &quot;myllm&quot;
 base_url = &quot;https://api.internal.example.com/v1&quot;
 dialect  = &quot;openai&quot;        # openai | anthropic | gemini
-auth     = &quot;api_key&quot;       # api_key | aws_sigv4 | gcp_oauth</code></pre></div>
+auth     = &quot;api_key&quot;       # api_key (default) | aws_sigv4 | gcp_oauth</code></pre></div>
 <p>Then use it in a ladder like any other: <code>myllm/mixtral-8x22b</code>.</p>
 <div class="note warn"><span class="nt">Common mistake</span> Setting <code>dialect</code> based on the model <em>brand</em> rather than what the <em>endpoint</em> actually speaks. <code>dialect</code> controls how Firstpass serializes the outbound request body — it's an endpoint property, not a model property. A Bedrock endpoint that hosts a Claude model but exposes the Anthropic Messages wire format needs <code>dialect = "anthropic"</code>; an OpenAI-compatible gateway fronting any model needs <code>dialect = "openai"</code>. Wrong dialect = serialization mismatch at the provider, not a Firstpass error.</div>
-<div class="recap">Four fields — <code>name</code>, <code>base_url</code>, <code>dialect</code>, <code>auth</code> — is all it takes to onboard <b>any endpoint</b> as a rung.</div>
+<div class="recap">A handful of fields — <code>id</code>, <code>base_url</code>, <code>dialect</code>, <code>auth</code> — is all it takes to onboard <b>any endpoint</b> as a rung.</div>
 
 <h2 id="dialects">Wire dialects<a class="anchor" href="#dialects" aria-label="Link to this section">#</a></h2>
 <div class="tldr">A dialect is the HTTP wire format a provider endpoint speaks. <b>Outbound</b>: set <code>dialect</code> to match the provider's expected format. <b>Inbound</b>: Firstpass accepts both Anthropic and OpenAI dialects from your client and translates — your client keeps whichever it already uses.</div>
