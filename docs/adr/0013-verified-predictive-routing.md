@@ -327,3 +327,26 @@ estimates. **Verdict: NOT-RECOMMENDED** at τ=0.5 (an exploratory τ sweep in th
 change this verdict). The gate code stays available — this is a design decision, not a validated
 win, per the ADR 0012 precedent — but the docs must not suggest pairing it with OpenJev as a
 verifier. Hosted Jev as a gate remains unmeasured.
+
+## Addendum 2026-09-25 — verifier bake-off: no local verifier clears the second-gate bar
+
+Pre-registered in `specs/verifier-bakeoff.md`; report `docs/benchmarks/verifier-bakeoff.md`. Same 974 served MBPP
+answers and oracle labels as Study B, split 488 dev / 486 held-out; the verifier and τ were chosen on dev only.
+
+| verifier | held-out catch | held-out collateral | AUC |
+|---|---|---|---|
+| V0 OpenJev `noul` | 0.0943 | 0.0600 | 0.6268 |
+| V1 OpenJev `noul` + think 1024 + 4 samples | 0.0755 | 0.0624 | 0.5976 |
+| V2 `judge` gate, local Qwen3-Coder-30B-A3B | 0.0000 | 0.0000 | 0.5917 |
+| **V3 generated tests (selected on dev)** | **0.0943** | **0.0670** | **0.6646** |
+
+**Verdict: NOT-RECOMMENDED** (bar: catch ≥ 0.30 and collateral ≤ 0.05). V2's judge scores are genuine,
+not a parse artifact: it scores 0.0 on 17.1% of wrong answers but also on 6.5% of right ones, so every τ that
+catches anything breaks the 5% collateral cap and dev selects τ=0. Thinking and sampling made OpenJev slower
+(p50 767 → 6841 ms) and no better.
+
+What this means. These candidates already passed Firstpass's gate; the 11% that are still wrong are the hard
+residual, and no local verifier tried here separates them from right answers well enough to act on. The
+second-gate idea stays unshipped as a default; the `decision` and `judge` gates remain available for
+workloads that measure their own verifier first. A frontier-model judge was not tried (no API key in this
+environment) and is the obvious next candidate.

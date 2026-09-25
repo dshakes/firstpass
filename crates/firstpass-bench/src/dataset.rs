@@ -161,8 +161,9 @@ fn parse_humaneval_line(line: &str) -> Result<CodingTask, String> {
 /// Convert a Python `assert <expr>[, "message"]` statement into the bare boolean expression the
 /// coding runner `eval()`s. Only strips a trailing message at a top-level comma — one outside all
 /// `()`/`[]`/`{}` nesting and outside any string literal — so call arguments like
-/// `f((1,2),(3,4))` are never split.
-fn convert_assert(stmt: &str) -> Result<String, String> {
+/// `f((1,2),(3,4))` are never split. `pub(crate)`: [`crate::verifier_bakeoff`]'s V3 reuses this to
+/// parse the model-generated `assert` lines the same way MBPP's own `test_list` is parsed.
+pub(crate) fn convert_assert(stmt: &str) -> Result<String, String> {
     let stmt = stmt.trim();
     let rest = stmt
         .strip_prefix("assert")

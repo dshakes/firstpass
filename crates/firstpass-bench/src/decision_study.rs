@@ -48,9 +48,10 @@ const DECISION_MODEL: &str = "jev-latest";
 /// The spec's fixed threshold for Study B (`τ = 0.5`); the τ sweep varies this exploratorily.
 const DECISION_THRESHOLD: f64 = 0.5;
 
-/// Build the `/v1/systemone` request body exactly as `DecisionGate::evaluate` does.
+/// Build the `/v1/systemone` request body exactly as `DecisionGate::evaluate` does. `pub(crate)`:
+/// reused by [`crate::verifier_bakeoff`]'s V1 (same shape plus `think`/`samples`).
 #[must_use]
-fn build_decision_request(request_text: &str, candidate_text: &str) -> Value {
+pub(crate) fn build_decision_request(request_text: &str, candidate_text: &str) -> Value {
     serde_json::json!({
         "model": DECISION_MODEL,
         "state": {
@@ -68,8 +69,8 @@ fn build_decision_request(request_text: &str, candidate_text: &str) -> Value {
 
 /// Extract the `ok` question's yes-probability. Mirrors `decision.rs::extract_probability`
 /// exactly: nested `{"answers":{"ok":...}}` or flat `{"ok":...}`, `noul`/`probability`/`p`/`value`,
-/// finite and in `[0, 1]` or the reply is malformed (`None`).
-fn extract_probability(json: &Value) -> Option<f64> {
+/// finite and in `[0, 1]` or the reply is malformed (`None`). `pub(crate)`: reused for V1.
+pub(crate) fn extract_probability(json: &Value) -> Option<f64> {
     let answer = json
         .get("answers")
         .and_then(|a| a.get(QUESTION_NAME))
@@ -87,7 +88,9 @@ fn extract_probability(json: &Value) -> Option<f64> {
 // Stage 1: oracle labels (I/O — sandbox)
 // ---------------------------------------------------------------------------------------------
 
-fn load_labels(path: &str) -> HashMap<String, bool> {
+/// `pub(crate)`: reused by [`crate::verifier_bakeoff`] to load the same cached oracle labels
+/// (V0's labels are every verifier's labels — the oracle doesn't change per verifier).
+pub(crate) fn load_labels(path: &str) -> HashMap<String, bool> {
     std::fs::read_to_string(path)
         .ok()
         .map(|t| {
@@ -105,30 +108,58 @@ struct OracleLabel {
     oracle_pass: bool,
 }
 
-fn append_label(path: &str, id: &str, oracle_pass: bool) {
+fn append_label(path: &str, id: &str, oracle_pass: bool) -> Result<(), String> {
     let rec = OracleLabel {
         id: id.to_owned(),
         oracle_pass,
     };
-    append_jsonl(path, &rec);
+    append_jsonl(path, &rec)
 }
 
-fn append_jsonl<T: Serialize>(path: &str, rec: &T) {
-    let Ok(line) = serde_json::to_string(rec) else {
-        return;
-    };
+/// `pub(crate)`: the generic append-one-line-resumable-cache helper, reused by
+/// [`crate::verifier_bakeoff`] for V1/V2/V3's own cache files. A dropped write here would silently
+/// desync the cache from the in-memory map that decides what's already "done" — the caller must
+/// know, not just move on as if it landed.
+///
+/// # Errors
+/// The record can't serialize, the file can't be opened for append, or the write fails.
+pub(crate) fn append_jsonl<T: Serialize>(path: &str, rec: &T) -> Result<(), String> {
+    let line = serde_json::to_string(rec).map_err(|e| format!("cannot serialize record: {e}"))?;
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-    {
-        let _ = writeln!(f, "{line}");
-    }
+        .map_err(|e| format!("cannot open {path} for append: {e}"))?;
+    writeln!(f, "{line}").map_err(|e| format!("cannot write to {path}: {e}"))
+}
+
+/// Ids with an already-successful record in `path` — the ones a resume must skip. A failed record
+/// (`is_done` false) is retried and the retry appended; the caller's own last-record-wins load
+/// (e.g. [`load_scores`], `verifier_bakeoff::load_jsonl_map`) then picks up the retry. Mirrors
+/// `jev_replay::resumable_ids` — same fix, same reason: skipping on mere presence instead of
+/// success made a first failed attempt permanent. `pub(crate)`: reused by
+/// [`crate::verifier_bakeoff`]'s V2/V3 resume checks.
+pub(crate) fn resumable_ids<T: for<'de> Deserialize<'de>>(
+    path: &str,
+    id_of: impl Fn(&T) -> String,
+    is_done: impl Fn(&T) -> bool,
+) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|t| {
+            t.lines()
+                .filter_map(|l| serde_json::from_str::<T>(l).ok())
+                .filter(&is_done)
+                .map(|r| id_of(&r))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `"mbpp-N"` -> `"mbpp/N"`, matching the `id` VRBench candidates use (`~/vrb-cascade.jsonl`).
-fn slash_id(dataset_task_id: &str) -> Option<String> {
+/// `pub(crate)`: reused by [`crate::verifier_bakeoff`] for the same MBPP-task-id join.
+pub(crate) fn slash_id(dataset_task_id: &str) -> Option<String> {
     dataset_task_id
         .strip_prefix("mbpp-")
         .map(|n| format!("mbpp/{n}"))
@@ -136,11 +167,12 @@ fn slash_id(dataset_task_id: &str) -> Option<String> {
 
 /// Run each candidate's `answer` against its MBPP hidden (oracle) set in the fail-closed sandbox,
 /// resuming from `cache_path`. Writes one line **as it completes**, so an interrupted run loses at
-/// most the task in flight.
+/// most the task in flight. `pub(crate)`: every bake-off verifier scores against the same oracle
+/// labels, so [`crate::verifier_bakeoff`] resumes from the identical cache rather than relabeling.
 ///
 /// # Errors
 /// The sandbox itself faulted (never a candidate failure, which is just `oracle_pass: false`).
-fn run_oracle_labels(
+pub(crate) fn run_oracle_labels(
     sb: &dyn Sandbox,
     candidates: &[Submission],
     tasks_by_id: &HashMap<String, CodingTask>,
@@ -159,7 +191,7 @@ fn run_oracle_labels(
         };
         let (passed, total) = suite_score(sb, task, &c.answer, &task.hidden_cases, limits)?;
         let oracle_pass = total > 0 && passed == total;
-        append_label(cache_path, &c.id, oracle_pass);
+        append_label(cache_path, &c.id, oracle_pass)?;
         labels.insert(c.id.clone(), oracle_pass);
         eprintln!(
             "[{}/{}] {} oracle_pass={oracle_pass}",
@@ -178,17 +210,19 @@ fn run_oracle_labels(
 /// Per-call timeout. Generous on purpose — same posture as `jev_replay`'s prior fetch.
 const FETCH_TIMEOUT_SECS: u64 = 120;
 
+/// `pub(crate)`: reused (fields too) by [`crate::verifier_bakeoff`] for V1's own cache file, which
+/// is the same shape (a `/v1/systemone` call, an optional continuous score, a latency).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DecisionScoreRecord {
-    id: String,
+pub(crate) struct DecisionScoreRecord {
+    pub(crate) id: String,
     /// `None` when the call failed, timed out, or the reply didn't parse — an abstain, never a
     /// fabricated pass/fail.
-    score: Option<f64>,
-    raw_ok: bool,
-    latency_ms: u64,
+    pub(crate) score: Option<f64>,
+    pub(crate) raw_ok: bool,
+    pub(crate) latency_ms: u64,
 }
 
-fn load_scores(path: &str) -> HashMap<String, DecisionScoreRecord> {
+pub(crate) fn load_scores(path: &str) -> HashMap<String, DecisionScoreRecord> {
     std::fs::read_to_string(path)
         .ok()
         .map(|t| {
@@ -200,20 +234,19 @@ fn load_scores(path: &str) -> HashMap<String, DecisionScoreRecord> {
         .unwrap_or_default()
 }
 
-/// One blocking `/v1/systemone` call. Never panics: transport error, non-2xx, or an undecodable/
-/// unexpected body all yield `(false, None, elapsed_ms)`.
+/// One blocking `/v1/systemone` call against an already-built request body. Never panics:
+/// transport error, non-2xx, or an undecodable/unexpected body all yield
+/// `(false, None, elapsed_ms)`.
 fn fetch_one(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    request_text: &str,
-    candidate_text: &str,
+    body: &Value,
 ) -> (bool, Option<f64>, u64) {
-    let body = build_decision_request(request_text, candidate_text);
     let url = format!("{}/v1/systemone", base_url.trim_end_matches('/'));
     let start = Instant::now();
     let elapsed_ms = || start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
-    let resp = match client.post(&url).json(&body).send() {
+    let resp = match client.post(&url).json(body).send() {
         Ok(r) => r,
         Err(_) => return (false, None, elapsed_ms()),
     };
@@ -229,11 +262,13 @@ fn fetch_one(
 }
 
 /// Load raw MBPP `{task_id, text}` JSONL, keyed `"mbpp/<N>"` — the "request" the spec asks the
-/// decision gate to see (the natural-language task, not the gated/engineered prompt).
+/// decision gate to see (the natural-language task, not the gated/engineered prompt). `pub(crate)`:
+/// [`crate::verifier_bakeoff`]'s V3 also needs the raw task text (never the candidate) to write
+/// tests from.
 ///
 /// # Errors
 /// Unreadable file, invalid JSON, or a row missing `task_id`/`text`.
-fn load_mbpp_request_text(path: &str) -> Result<HashMap<String, String>, String> {
+pub(crate) fn load_mbpp_request_text(path: &str) -> Result<HashMap<String, String>, String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let mut out = HashMap::new();
     for (i, line) in content.lines().enumerate() {
@@ -255,39 +290,51 @@ fn load_mbpp_request_text(path: &str) -> Result<HashMap<String, String>, String>
     Ok(out)
 }
 
-/// Fetch OpenJev decision scores for every candidate, resuming from `cache_path`.
+/// Fetch OpenJev `/v1/systemone` scores for every candidate, resuming from `cache_path`, using
+/// `build_body` to shape each request. `pub(crate)`: shared by V0 (here, via
+/// [`build_decision_request`]) and [`crate::verifier_bakeoff`]'s V1 (same endpoint, `think`/
+/// `samples` added).
 ///
 /// # Errors
 /// The HTTP client can't be built. A single call failing is not an error here — it is recorded as
 /// `raw_ok: false, score: None` (an abstain) and counted.
-fn run_decision_scores(
+pub(crate) fn run_openjev_scores(
     candidates: &[Submission],
     mbpp_text: &HashMap<String, String>,
     base_url: &str,
     cache_path: &str,
+    build_body: impl Fn(&str, &str) -> Value,
 ) -> Result<(HashMap<String, DecisionScoreRecord>, usize), String> {
     let mut scores = load_scores(cache_path);
+    // A failed call (`raw_ok: false`) is not "done" — only a successful one skips the retry, or a
+    // keyless/flaky first pass would poison the cache for good (same fix as `jev_replay`'s).
+    let done = resumable_ids(
+        cache_path,
+        |r: &DecisionScoreRecord| r.id.clone(),
+        |r: &DecisionScoreRecord| r.raw_ok,
+    );
     let mut n_missing = 0usize;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
     for (i, c) in candidates.iter().enumerate() {
-        if scores.contains_key(&c.id) {
+        if done.contains(&c.id) {
             continue;
         }
         let Some(text) = mbpp_text.get(&c.id) else {
             n_missing += 1;
             continue;
         };
-        let (raw_ok, score, latency_ms) = fetch_one(&client, base_url, text, &c.answer);
+        let body = build_body(text, &c.answer);
+        let (raw_ok, score, latency_ms) = fetch_one(&client, base_url, &body);
         let rec = DecisionScoreRecord {
             id: c.id.clone(),
             score,
             raw_ok,
             latency_ms,
         };
-        append_jsonl(cache_path, &rec);
+        append_jsonl(cache_path, &rec)?;
         scores.insert(c.id.clone(), rec);
         eprintln!(
             "[{}/{}] {} raw_ok={raw_ok} latency_ms={latency_ms}",
@@ -299,25 +346,50 @@ fn run_decision_scores(
     Ok((scores, n_missing))
 }
 
+/// V0: OpenJev decision scores with default options — no `think`/`samples`.
+///
+/// # Errors
+/// See [`run_openjev_scores`].
+fn run_decision_scores(
+    candidates: &[Submission],
+    mbpp_text: &HashMap<String, String>,
+    base_url: &str,
+    cache_path: &str,
+) -> Result<(HashMap<String, DecisionScoreRecord>, usize), String> {
+    run_openjev_scores(
+        candidates,
+        mbpp_text,
+        base_url,
+        cache_path,
+        build_decision_request,
+    )
+}
+
 // ---------------------------------------------------------------------------------------------
 // Stage 3: scoring (pure)
 // ---------------------------------------------------------------------------------------------
 
-const BOOT_B: usize = 2000;
-const BOOT_SEED: u64 = 42;
-const ALPHA: f64 = 0.05;
+/// `pub(crate)`: [`crate::verifier_bakeoff`] reuses the same bootstrap width/seed/level so its CIs
+/// are produced the same way as Study B's.
+pub(crate) const BOOT_B: usize = 2000;
+pub(crate) const BOOT_SEED: u64 = 42;
+pub(crate) const ALPHA: f64 = 0.05;
 /// Below this many oracle-wrong answers, catch rate has no statistical power — report
-/// UNDERPOWERED instead of a verdict (spec's degeneracy guard).
-const MIN_WRONG: usize = 20;
+/// UNDERPOWERED instead of a verdict (spec's degeneracy guard). `pub(crate)`: the bake-off's
+/// held-out half uses the identical guard (`specs/verifier-bakeoff.md`'s own `MIN_WRONG = 20`).
+pub(crate) const MIN_WRONG: usize = 20;
 const TAU_SWEEP: [f64; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
 
-fn is_reject(score: Option<f64>, tau: f64) -> bool {
+/// `pub(crate)`: the reject rule (`score < tau`, abstain never rejects) is identical for every
+/// bake-off verifier — all four report a continuous "confidence the candidate is correct".
+pub(crate) fn is_reject(score: Option<f64>, tau: f64) -> bool {
     score.is_some_and(|s| s < tau)
 }
 
 /// AUC of `scores` predicting `labels` (`true` = oracle-correct), via the rank-sum / Mann-Whitney
 /// formula with midrank tie correction. `None` when one class is empty (AUC undefined).
-fn auc(scores: &[f64], labels: &[bool]) -> Option<f64> {
+/// `pub(crate)`: reused by [`crate::verifier_bakeoff`]'s held-out AUC.
+pub(crate) fn auc(scores: &[f64], labels: &[bool]) -> Option<f64> {
     let n_pos = labels.iter().filter(|&&l| l).count();
     let n_neg = labels.len() - n_pos;
     if n_pos == 0 || n_neg == 0 {
@@ -354,8 +426,14 @@ fn auc(scores: &[f64], labels: &[bool]) -> Option<f64> {
 
 /// Bootstrap CI for [`auc`]. A resample that lands all-one-class is simply dropped (AUC
 /// undefined there) rather than counted — with `n_wrong >= MIN_WRONG` this is rare and does not
-/// bias the interval.
-fn bootstrap_auc_ci(scores: &[f64], labels: &[bool], b: usize, seed: u64, alpha: f64) -> Ci {
+/// bias the interval. `pub(crate)`: reused by [`crate::verifier_bakeoff`]'s held-out AUC.
+pub(crate) fn bootstrap_auc_ci(
+    scores: &[f64],
+    labels: &[bool],
+    b: usize,
+    seed: u64,
+    alpha: f64,
+) -> Ci {
     let point = auc(scores, labels).unwrap_or(0.5);
     if scores.is_empty() {
         return Ci {
@@ -624,6 +702,81 @@ pub fn render(s: &DecisionStudy) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- resumable cache writes ------------------------------------------------------------
+
+    /// A failed record must not be treated as done, and a later successful retry for the same id
+    /// must win on load — mirrors `jev_replay`'s `resumable_ids`/last-record-wins pair.
+    #[test]
+    fn resumable_ids_retries_failed_records_and_last_record_wins_on_load() {
+        let dir = std::env::temp_dir().join(format!("fp-decision-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("scores.jsonl");
+
+        let fail = DecisionScoreRecord {
+            id: "mbpp/1".to_owned(),
+            score: None,
+            raw_ok: false,
+            latency_ms: 1,
+        };
+        let ok_other = DecisionScoreRecord {
+            id: "mbpp/2".to_owned(),
+            score: Some(0.7),
+            raw_ok: true,
+            latency_ms: 1,
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&fail).expect("serializes"),
+                serde_json::to_string(&ok_other).expect("serializes"),
+            ),
+        )
+        .expect("write");
+
+        let path_str = path.to_str().expect("utf8");
+        let done = resumable_ids(
+            path_str,
+            |r: &DecisionScoreRecord| r.id.clone(),
+            |r: &DecisionScoreRecord| r.raw_ok,
+        );
+        assert!(!done.contains("mbpp/1"), "a failed call must be retried");
+        assert!(done.contains("mbpp/2"), "a successful call must be skipped");
+
+        // The retry for mbpp/1 succeeds and is appended; load_scores must return the retry, not
+        // the earlier failure.
+        let retry = DecisionScoreRecord {
+            id: "mbpp/1".to_owned(),
+            score: Some(0.4),
+            raw_ok: true,
+            latency_ms: 1,
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        use std::io::Write;
+        writeln!(f, "{}", serde_json::to_string(&retry).expect("serializes")).expect("write");
+
+        let loaded = load_scores(path_str);
+        assert_eq!(loaded["mbpp/1"].score, Some(0.4), "the retry wins on load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_jsonl_surfaces_a_write_failure_instead_of_dropping_it() {
+        // A path with a nonexistent parent directory can never be opened for append.
+        let path = "/nonexistent-dir-for-append-jsonl-test/scores.jsonl";
+        let rec = DecisionScoreRecord {
+            id: "mbpp/1".to_owned(),
+            score: Some(0.5),
+            raw_ok: true,
+            latency_ms: 1,
+        };
+        let err = append_jsonl(path, &rec).expect_err("append to a missing dir must error");
+        assert!(err.contains(path), "error should name the path: {err}");
+    }
 
     // ---- request-shape parity ------------------------------------------------------------
 

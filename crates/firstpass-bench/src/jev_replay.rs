@@ -263,14 +263,8 @@ pub fn run_fetch_priors(
     let (rows, ladder) = load_matrix_with_ids(matrix_path)?;
     let mbpp = load_mbpp_examples(mbpp_path)?;
 
-    let resumed: std::collections::HashSet<String> = std::fs::read_to_string(out_path)
-        .ok()
-        .map(|t| {
-            t.lines()
-                .filter_map(|l| serde_json::from_str::<PriorRecord>(l).ok())
-                .map(|r| r.task_id)
-                .collect()
-        })
+    let resumed = std::fs::read_to_string(out_path)
+        .map(|t| resumable_ids(&t))
         .unwrap_or_default();
     if !resumed.is_empty() {
         eprintln!(
@@ -686,6 +680,18 @@ fn ladder_result(label: &str, ladder: &[String], series: &[ArmSeries]) -> Ladder
         n: series.first().map_or(0, |a| a.result.n),
         arms: series.iter().map(|a| a.result.clone()).collect(),
     }
+}
+
+/// Task ids a resumed fetch may skip: only the ones that already have a *successful* prior. A
+/// failed record (`raw_ok: false`) is retried, and the retry is appended; [`load_priors`] keeps the
+/// last record per task, so the retry wins. Skipping failures instead made a keyless first run
+/// poison the file: a rerun with a valid key would skip every task.
+fn resumable_ids(text: &str) -> std::collections::HashSet<String> {
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<PriorRecord>(l).ok())
+        .filter(|r| r.raw_ok)
+        .map(|r| r.task_id)
+        .collect()
 }
 
 /// Load a priors JSONL file into a `task_id -> PriorRecord` map.
@@ -1278,6 +1284,32 @@ pub fn render_blend(s: &ReplayBlendStudy) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed record must not be skipped on resume, or a keyless first run poisons the file.
+    #[test]
+    fn resume_skips_only_successful_priors_and_retries_win() {
+        let text = concat!(
+            r#"{"task_id":"mbpp-1","ladder":["a","b"],"probs":[0.9,0.1],"raw_ok":true,"latency_ms":1}"#,
+            "\n",
+            r#"{"task_id":"mbpp-2","ladder":["a","b"],"probs":null,"raw_ok":false,"latency_ms":1}"#,
+            "\n",
+        );
+        let ids = resumable_ids(text);
+        assert!(ids.contains("mbpp-1"));
+        assert!(!ids.contains("mbpp-2"), "failed fetch must be retried");
+
+        let dir = std::env::temp_dir().join(format!("fp-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("p.jsonl");
+        let retried = format!(
+            "{text}{}\n",
+            r#"{"task_id":"mbpp-2","ladder":["a","b"],"probs":[0.2,0.8],"raw_ok":true,"latency_ms":1}"#
+        );
+        std::fs::write(&path, retried).expect("write");
+        let loaded = load_priors(path.to_str().expect("utf8")).expect("load");
+        assert!(loaded["mbpp-2"].raw_ok, "the later successful retry wins");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn rung(gate: bool, oracle: bool, cost: f64) -> RungOutcome {
         RungOutcome {
