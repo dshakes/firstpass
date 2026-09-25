@@ -33,3 +33,16 @@ Held-out split: 488 dev / 486 held-out (seeded `sha256(id)` parity). Coder model
 | V2 | 974 | 670 | 981 |
 | V3 | 974 | 2870 | 7154 |
 
+
+### Memory (measured post-hoc, not by the harness)
+
+The pre-registration promised memory use; the harness did not record it. To avoid re-running the models (which
+could move the numbers above), it was measured afterwards on the same machine (Apple M4 Max, 137 GB) from the
+still-running verifier servers with macOS `footprint` (`phys_footprint`, which counts MLX's unified-memory buffers;
+plain RSS does not):
+
+| verifier | process | phys_footprint |
+|---|---|---|
+| V0, V1 | OpenJev (DiffusionGemma 26B-A4B, MLX 4-bit) | 22 GB |
+| V2, V3 | mlx-lm (Qwen3-Coder-30B-A3B-Instruct, MLX 4-bit) | 17 GB |
+| V3 test execution | fail-closed Docker sandbox, per run | ≤ 512 MB cap (`sandbox.rs` `mem_mb`) |
