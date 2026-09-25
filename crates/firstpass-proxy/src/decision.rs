@@ -396,14 +396,24 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_abstains() {
-        // The handler never returns before the client's near-zero timeout fires.
-        let base_url = spawn_fake_server(|| {
-            axum::Json(serde_json::json!({"ok": {"probability": 0.99}})).into_response()
-        })
-        .await;
+        // The handler sleeps far past the client timeout, so the timeout path wins deterministically.
+        // (A 0 ms timeout against an instant local server raced under parallel test load.)
+        let app = axum::Router::new().route(
+            "/v1/systemone",
+            axum::routing::post(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                axum::Json(serde_json::json!({"ok": {"probability": 0.99}})).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         let mut d = cfg(&base_url);
-        d.timeout_ms = 0; // instantly elapsed — timeout_ms = 0 would fail config validation in
-        // production; the fetch path must still handle it without panicking.
+        d.timeout_ms = 50;
         let gate = DecisionGate::new("verify", reqwest::Client::new(), &d, "test-key".to_owned());
         let out = gate.evaluate(&req_with("q"), &candidate("a")).await;
         assert_eq!(out.verdict, Verdict::Abstain);
