@@ -135,6 +135,12 @@ pub struct StartRungBandit {
     rng: u64,
     /// context → (rung index → counts).
     data: HashMap<ContextBucket, HashMap<u32, ArmCounts>>,
+    /// Pseudo-count strength for [`Self::choose_start_with_prior`]'s Beta blend: `strength ·
+    /// prior[r]` prior "pass" pseudo-observations and `strength · (1 − prior[r])` prior "fail"
+    /// pseudo-observations per rung, before any real observation. Irrelevant unless a prior is
+    /// actually passed in. Set via [`Self::with_prior_strength`]; mirrors
+    /// `PriorConfig::strength`'s default.
+    prior_strength: f64,
 }
 
 /// Start-rung selection algorithm.
@@ -214,7 +220,15 @@ impl StartRungBandit {
             discount: discount.clamp(f64::MIN_POSITIVE, 1.0),
             rng: seed.max(1),
             data: HashMap::new(),
+            prior_strength: 10.0,
         }
+    }
+
+    /// Set the pseudo-count strength used by [`Self::choose_start_with_prior`] (builder-style).
+    #[must_use]
+    pub fn with_prior_strength(mut self, strength: f64) -> Self {
+        self.prior_strength = strength;
+        self
     }
 
     /// Apply one step of multiplicative forgetting to every arm in `ctx` (no-op at 1.0).
@@ -419,6 +433,82 @@ impl StartRungBandit {
             .count();
         // Clamp away 0: the MC estimate can miss a genuinely-possible arm in finite samples,
         // and a zero propensity would blow up IPS. 1/(2·M) is the standard floor.
+        let p = (matches as f64 / PROPENSITY_SAMPLES as f64)
+            .max(1.0 / (2.0 * PROPENSITY_SAMPLES as f64));
+        (choice, Some(p))
+    }
+
+    /// Raw observed (pass, fail) counts for `(ctx, rung)`, or `(0.0, 0.0)` if unobserved.
+    fn counts(&self, ctx: &ContextBucket, rung: u32) -> (f64, f64) {
+        self.data
+            .get(ctx)
+            .and_then(|arms| arms.get(&rung))
+            .map_or((0.0, 0.0), |c| (c.pass, c.fail))
+    }
+
+    /// Choose the start rung using an optional decision-model prior (verified predictive
+    /// routing), blended with any observed gate verdicts as Beta pseudo-counts.
+    ///
+    /// `prior[r]` is the cumulative gate-pass probability for rung `r`, in ladder order (see
+    /// [`firstpass_core::cumulative_pass`]) — one entry per ladder rung. Each rung gets
+    /// `prior_strength · prior[r]` prior "pass" and `prior_strength · (1 − prior[r])` prior
+    /// "fail" pseudo-observations, blended with whatever has actually been observed for this
+    /// context. Unlike [`Self::choose_start`]/[`Self::choose_start_with_propensity`], there is
+    /// **no cold-start cliff**: a context with zero real observations still gets an informed
+    /// answer straight from the prior.
+    ///
+    /// `prior = None`, an empty prior, or a length mismatch with `ladder` all fall back to
+    /// [`Self::choose_start_with_propensity`] unchanged — behavior is provably identical to
+    /// today when no prior is supplied.
+    #[must_use]
+    pub fn choose_start_with_prior(
+        &mut self,
+        ctx: &ContextBucket,
+        ladder: &[String],
+        prices: &PriceTable,
+        prior: Option<&[f64]>,
+    ) -> (u32, Option<f64>) {
+        let Some(prior) = prior else {
+            return self.choose_start_with_propensity(ctx, ladder, prices);
+        };
+        if prior.is_empty() || prior.len() != ladder.len() {
+            return self.choose_start_with_propensity(ctx, ladder, prices);
+        }
+        let strength = self.prior_strength;
+
+        if self.algorithm == Algorithm::Ucb1 {
+            let choice =
+                argmin_expected_cost(ladder, prices, ctx.representative_prompt_tokens(), |r| {
+                    let (obs_pass, obs_fail) = self.counts(ctx, r);
+                    let a = strength * prior[r as usize] + obs_pass;
+                    let b = strength * (1.0 - prior[r as usize]) + obs_fail;
+                    (a / (a + b)).clamp(0.0, 1.0)
+                });
+            return (choice, None);
+        }
+
+        let draw = |this: &mut Self| {
+            let samples: Vec<f64> = (0..ladder.len())
+                .map(|r| {
+                    let (obs_pass, obs_fail) = this.counts(ctx, r as u32);
+                    // +1.0 Laplace floor keeps both Beta shapes >= 1.0 (required by the Gamma
+                    // sampler) even when the prior is exactly 0 or 1 at this rung.
+                    let a = (strength * prior[r] + obs_pass + 1.0).max(1.0);
+                    let b = (strength * (1.0 - prior[r]) + obs_fail + 1.0).max(1.0);
+                    let x = this.next_gamma(a);
+                    let y = this.next_gamma(b);
+                    x / (x + y)
+                })
+                .collect();
+            argmin_expected_cost(ladder, prices, ctx.representative_prompt_tokens(), |r| {
+                samples[r as usize]
+            })
+        };
+
+        let choice = draw(self);
+        let matches = (0..PROPENSITY_SAMPLES)
+            .filter(|_| draw(self) == choice)
+            .count();
         let p = (matches as f64 / PROPENSITY_SAMPLES as f64)
             .max(1.0 / (2.0 * PROPENSITY_SAMPLES as f64));
         (choice, Some(p))
@@ -667,6 +757,7 @@ mod tests {
             shadow: None,
             route_ix: None,
             predicted_pass: None,
+            decision_prior: None,
             elastic: None,
         };
         trace.recompute_savings();
@@ -726,6 +817,113 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&db);
+    }
+
+    // ---- Verified predictive routing: choose_start_with_prior --------------------------
+
+    #[test]
+    fn prior_none_matches_choose_start_with_propensity() {
+        // Property check: with no prior, the two methods must make identical decisions given
+        // identical bandit state and PRNG state (same seed, same call sequence).
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let prices = PriceTable::defaults();
+        let ctx = ctx_code();
+
+        let mut a = StartRungBandit::with_algorithm(10, 1.0, Algorithm::Thompson, 1.0, 123);
+        let mut b = StartRungBandit::with_algorithm(10, 1.0, Algorithm::Thompson, 1.0, 123);
+        for _ in 0..30 {
+            a.observe(&ctx, 0, Verdict::Fail);
+            a.observe(&ctx, 1, Verdict::Pass);
+            b.observe(&ctx, 0, Verdict::Fail);
+            b.observe(&ctx, 1, Verdict::Pass);
+        }
+
+        for _ in 0..20 {
+            let want = a.choose_start_with_propensity(&ctx, &ladder, &prices);
+            let got = b.choose_start_with_prior(&ctx, &ladder, &prices, None);
+            assert_eq!(
+                want, got,
+                "prior=None must be byte-identical to the existing method"
+            );
+        }
+    }
+
+    #[test]
+    fn confident_hard_prior_starts_above_zero_with_no_observations() {
+        // n=0 (no bandit warm-start at all): a confident prior that rung 0/1 are hopeless and
+        // rung 2 is where this request will pass must drive the start rung above 0, with no
+        // min_observations cliff blocking it.
+        let ladder = vec![
+            HAIKU.to_owned(),
+            SONNET.to_owned(),
+            "anthropic/claude-opus-4-8".to_owned(),
+        ];
+        let prices = PriceTable::defaults();
+        let ctx = ctx_code();
+        let hard_prior = firstpass_core::cumulative_pass(&[0.05, 0.05, 0.9]).unwrap();
+
+        let mut b = StartRungBandit::with_algorithm(50, 1.0, Algorithm::Ucb1, 1.0, 1)
+            .with_prior_strength(10.0);
+        let (choice, _) = b.choose_start_with_prior(&ctx, &ladder, &prices, Some(&hard_prior));
+        assert!(
+            choice > 0,
+            "a confident hard prior must start above rung 0 with zero observations, got {choice}"
+        );
+    }
+
+    #[test]
+    fn confident_easy_prior_starts_at_zero_with_no_observations() {
+        let ladder = vec![
+            HAIKU.to_owned(),
+            SONNET.to_owned(),
+            "anthropic/claude-opus-4-8".to_owned(),
+        ];
+        let prices = PriceTable::defaults();
+        let ctx = ctx_code();
+        let easy_prior = firstpass_core::cumulative_pass(&[0.95, 0.03, 0.02]).unwrap();
+
+        let mut b = StartRungBandit::with_algorithm(50, 1.0, Algorithm::Ucb1, 1.0, 1)
+            .with_prior_strength(10.0);
+        let (choice, _) = b.choose_start_with_prior(&ctx, &ladder, &prices, Some(&easy_prior));
+        assert_eq!(
+            choice, 0,
+            "a confident easy prior must start at rung 0 with zero observations, got {choice}"
+        );
+    }
+
+    #[test]
+    fn many_observations_override_a_wrong_prior() {
+        // The prior confidently claims rung 0 is hopeless, but 200 real observations say
+        // otherwise — with strength=10 (pseudo-count 10 vs 200 real), data must win.
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let prices = PriceTable::defaults();
+        let ctx = ctx_code();
+        let wrong_prior = firstpass_core::cumulative_pass(&[0.02, 0.98]).unwrap();
+
+        let mut b = StartRungBandit::with_algorithm(50, 0.0, Algorithm::Ucb1, 1.0, 1)
+            .with_prior_strength(10.0);
+        for _ in 0..200 {
+            b.observe(&ctx, 0, Verdict::Pass);
+        }
+        let (choice, _) = b.choose_start_with_prior(&ctx, &ladder, &prices, Some(&wrong_prior));
+        assert_eq!(
+            choice, 0,
+            "200 real passes at rung 0 must override a wrong low-strength prior, got {choice}"
+        );
+    }
+
+    #[test]
+    fn mismatched_prior_length_falls_back_to_propensity_method() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let prices = PriceTable::defaults();
+        let ctx = ctx_code();
+        let mut a = StartRungBandit::new(50, 1.0);
+        let mut b = StartRungBandit::new(50, 1.0);
+        let bad_prior = vec![0.5]; // wrong length for a 2-rung ladder
+        assert_eq!(
+            a.choose_start_with_propensity(&ctx, &ladder, &prices),
+            b.choose_start_with_prior(&ctx, &ladder, &prices, Some(&bad_prior)),
+        );
     }
 
     #[test]

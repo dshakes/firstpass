@@ -803,6 +803,7 @@ mod tests {
             shadow: None,
             route_ix: None,
             predicted_pass: None,
+            decision_prior: None,
             elastic: None,
         };
         trace.recompute_savings();
@@ -890,6 +891,7 @@ mod tests {
             shadow: None,
             route_ix: None,
             predicted_pass: None,
+            decision_prior: None,
             elastic: None,
         };
         trace.recompute_savings();
@@ -1307,6 +1309,7 @@ serve_threshold = 0.75
             shadow: None,
             route_ix: None,
             predicted_pass: None,
+            decision_prior: None,
             elastic: None,
         };
         trace.recompute_savings();

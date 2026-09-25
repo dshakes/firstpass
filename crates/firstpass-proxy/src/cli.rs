@@ -1088,6 +1088,7 @@ mod tests {
             shadow: None,
             route_ix: None,
             predicted_pass: None,
+            decision_prior: None,
             elastic: None,
         };
         let t0 = mk(GENESIS_HASH, "s0");
@@ -1196,6 +1197,7 @@ mod tests {
             },
             deferred: vec![],
             predicted_pass: None,
+            decision_prior: None,
             probe: None,
             elastic: None,
             rollout: None,
@@ -1314,6 +1316,7 @@ mod tests {
             },
             deferred: vec![],
             predicted_pass: None,
+            decision_prior: None,
             probe: None,
             elastic: None,
             rollout: None,
@@ -1410,6 +1413,7 @@ mod tests {
             shadow: None,
             route_ix: None,
             predicted_pass: None,
+            decision_prior: None,
             elastic: None,
         };
         let ex = explain_trace(&t);

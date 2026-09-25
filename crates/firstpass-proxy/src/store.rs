@@ -626,6 +626,7 @@ mod tests {
             shadow: None,
             route_ix: None,
             predicted_pass: None,
+            decision_prior: None,
             elastic: None,
         };
         trace.recompute_savings();

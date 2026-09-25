@@ -607,6 +607,13 @@ pub struct Escalation {
     /// `None` (default) = off = byte-identical to today (no predictor, no `predicted_pass`).
     #[serde(default)]
     pub predictor: Option<PredictorConfig>,
+    /// Verified predictive routing: an optional pre-generation decision-model **prior** over
+    /// which ladder rung is the least capable one that fully handles this request, fed into the
+    /// existing start-rung expected-cost argmin as `P(pass | rung)`. `None` (default) = off =
+    /// byte-identical to today — no extra call, no `decision_prior` on the trace. The gate still
+    /// verifies every output regardless of the prior; a failed rung is never served.
+    #[serde(default)]
+    pub prior: Option<PriorConfig>,
     /// Elastic verification (ADR 0008 Phase 3): skip the named expensive gates on a serve when the
     /// cheap **visible** gate score clears the conformally-calibrated threshold λ. `None` (default)
     /// runs every gate on every serve — byte-identical to today's uniform verification. See
@@ -637,6 +644,68 @@ fn default_predictor_lr() -> f64 {
 
 fn default_predictor_l2() -> f64 {
     1e-4
+}
+
+/// Verified predictive routing config: a pre-generation decision-model **prior** (TypeSafe's
+/// Jev today — `provider` is a discriminator on purpose, so a future second provider is an
+/// additive match arm, not a breaking rename) that answers, per query, "which is the least
+/// capable ladder rung that fully and correctly handles this?" The answer's probabilities become
+/// a `P(pass | rung)` prior fed into the existing start-rung expected-cost argmin
+/// ([`crate::prior::cumulative_pass`]).
+///
+/// This is a PRIOR, not a verifier: the enforce gate still runs on every served attempt exactly
+/// as before. A confident prior can only change *where the ladder starts*, never whether a
+/// failing output is served. `None` (default) = off = byte-identical to today.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriorConfig {
+    /// Decision-model provider. Only `"typesafe"` is built in today; validated by
+    /// [`Config::parse`].
+    pub provider: String,
+    /// Model name passed to the provider's API.
+    #[serde(default = "default_prior_model")]
+    pub model: String,
+    /// Env var naming the API key. Read once at startup; never logged, never put on the trace.
+    #[serde(default = "default_prior_api_key_env")]
+    pub api_key_env: String,
+    /// Provider API base URL.
+    #[serde(default = "default_prior_base_url")]
+    pub base_url: String,
+    /// Hard timeout for the prior call. A timeout or any other error fails open (no prior for
+    /// this request, `decision_prior` absent, start rung falls back to the prior-free choice) —
+    /// this is a cost hint, never a serving dependency.
+    #[serde(default = "default_prior_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Beta pseudo-count weight: how many observations the prior is worth relative to the
+    /// bandit's own learned counts at a context. Higher = the prior dominates longer before
+    /// real data overrides it. Must be finite and `> 0`; validated by [`Config::parse`].
+    #[serde(default = "default_prior_strength")]
+    pub strength: f64,
+    /// Ladder rung names, in the same order as the route's `ladder`, used as the choice
+    /// question's criteria labels (`r0`, `r1`, ... map to `rungs[0]`, `rungs[1]`, ...). Must be
+    /// non-empty and match the length of every enforce route's ladder; validated by
+    /// [`Config::parse`].
+    pub rungs: Vec<String>,
+}
+
+fn default_prior_model() -> String {
+    "jev-latest".to_owned()
+}
+
+fn default_prior_api_key_env() -> String {
+    "TYPESAFE_API_KEY".to_owned()
+}
+
+fn default_prior_base_url() -> String {
+    "https://api.typesafe.ai".to_owned()
+}
+
+fn default_prior_timeout_ms() -> u64 {
+    150
+}
+
+fn default_prior_strength() -> f64 {
+    10.0
 }
 
 /// Config for anytime-valid risk control ([`crate::eprocess::EProcessRiskControl`], ADR 0011).
@@ -897,6 +966,7 @@ impl Default for Escalation {
             exploration: None,
             probe: None,
             predictor: None,
+            prior: None,
             elastic: None,
         }
     }
@@ -1218,6 +1288,43 @@ impl Config {
                     "escalation.predictor.l2 must be finite and >= 0, got {}",
                     pred.l2
                 )));
+            }
+        }
+        if let Some(prior) = &config.escalation.prior {
+            if prior.provider != "typesafe" {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.prior.provider {:?} is not supported — only \"typesafe\" is \
+                     built in",
+                    prior.provider
+                )));
+            }
+            if !prior.strength.is_finite() || prior.strength <= 0.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "escalation.prior.strength must be finite and > 0, got {}",
+                    prior.strength
+                )));
+            }
+            if prior.timeout_ms == 0 {
+                return Err(Error::InvalidConfig(
+                    "escalation.prior.timeout_ms must be >= 1".to_owned(),
+                ));
+            }
+            if prior.rungs.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "escalation.prior.rungs must not be empty".to_owned(),
+                ));
+            }
+            // A prior with the wrong arity can't be mapped onto the ladder it is meant to score,
+            // so it is rejected at parse rather than silently truncated/padded at request time.
+            for (i, route) in config.routes.iter().enumerate() {
+                if route.mode == Mode::Enforce && prior.rungs.len() != route.ladder.len() {
+                    return Err(Error::InvalidConfig(format!(
+                        "escalation.prior.rungs has {} entries but route[{i}]'s enforce ladder \
+                         has {} — they must match 1:1",
+                        prior.rungs.len(),
+                        route.ladder.len()
+                    )));
+                }
             }
         }
         if let Some(elastic) = &config.escalation.elastic {
@@ -2031,6 +2138,98 @@ discount = 0.98
         assert!(Config::parse(&base.replace("lr = 0.05", "lr = 0.0")).is_err());
         assert!(Config::parse(&base.replace("lr = 0.05", "lr = 1.5")).is_err());
         assert!(Config::parse(&base.replace("l2 = 0.001", "l2 = -1.0")).is_err());
+    }
+
+    #[test]
+    fn prior_config_parses_and_validates() {
+        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\", \"anthropic/claude-sonnet-5\"]\n[escalation.prior]\nprovider = \"typesafe\"\nrungs = [\"cheap\", \"strong\"]\n";
+        let cfg = Config::parse(base).expect("valid prior must parse");
+        let prior = cfg.escalation.prior.unwrap();
+        assert_eq!(prior.model, "jev-latest");
+        assert_eq!(prior.api_key_env, "TYPESAFE_API_KEY");
+        assert_eq!(prior.base_url, "https://api.typesafe.ai");
+        assert_eq!(prior.timeout_ms, 150);
+        assert!((prior.strength - 10.0).abs() < 1e-12);
+        assert_eq!(prior.rungs, vec!["cheap".to_owned(), "strong".to_owned()]);
+    }
+
+    #[test]
+    fn prior_config_overrides_all_defaults() {
+        let cfg = Config::parse(
+            "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n\
+             [escalation.prior]\nprovider = \"typesafe\"\nmodel = \"jev-2\"\n\
+             api_key_env = \"MY_KEY\"\nbase_url = \"https://example.test\"\ntimeout_ms = 500\n\
+             strength = 5.0\nrungs = [\"cheap\"]\n",
+        )
+        .unwrap();
+        let prior = cfg.escalation.prior.unwrap();
+        assert_eq!(prior.model, "jev-2");
+        assert_eq!(prior.api_key_env, "MY_KEY");
+        assert_eq!(prior.base_url, "https://example.test");
+        assert_eq!(prior.timeout_ms, 500);
+        assert!((prior.strength - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn prior_rejects_unsupported_provider() {
+        let bad = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n[escalation.prior]\nprovider = \"openai\"\nrungs = [\"cheap\"]\n";
+        assert!(
+            matches!(Config::parse(bad), Err(Error::InvalidConfig(_))),
+            "unsupported provider must be rejected"
+        );
+    }
+
+    #[test]
+    fn prior_rejects_non_positive_strength() {
+        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n[escalation.prior]\nprovider = \"typesafe\"\nrungs = [\"cheap\"]\nstrength = ";
+        assert!(matches!(
+            Config::parse(&format!("{base}0.0\n")),
+            Err(Error::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            Config::parse(&format!("{base}-1.0\n")),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn prior_rejects_zero_timeout() {
+        let bad = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n[escalation.prior]\nprovider = \"typesafe\"\nrungs = [\"cheap\"]\ntimeout_ms = 0\n";
+        assert!(matches!(Config::parse(bad), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn prior_rejects_empty_rungs() {
+        let bad = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n[escalation.prior]\nprovider = \"typesafe\"\nrungs = []\n";
+        assert!(matches!(Config::parse(bad), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn prior_rejects_rung_count_mismatch_with_enforce_ladder() {
+        // Ladder has 2 rungs, prior names only 1 -> reject.
+        let bad = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\", \"anthropic/claude-sonnet-5\"]\n[escalation.prior]\nprovider = \"typesafe\"\nrungs = [\"only-one\"]\n";
+        let err = Config::parse(bad).expect_err("rung count mismatch must be rejected");
+        assert!(matches!(err, Error::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn prior_ignores_rung_count_mismatch_on_observe_only_routes() {
+        // An observe-mode route's ladder isn't enforced, so a mismatched prior there is harmless.
+        let cfg = Config::parse(
+            "[[route]]\nmatch = {}\nmode = \"observe\"\nladder = [\"anthropic/claude-haiku-4-5\", \"anthropic/claude-sonnet-5\"]\n\
+             [escalation.prior]\nprovider = \"typesafe\"\nrungs = [\"only-one\"]\n",
+        )
+        .expect("observe-only ladder mismatch must not be rejected");
+        assert_eq!(cfg.escalation.prior.unwrap().rungs.len(), 1);
+    }
+
+    #[test]
+    fn prior_absent_by_default() {
+        let cfg = Config::parse(
+            "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.escalation.prior.is_none());
     }
 
     /// An unpriced ladder rung must be rejected at parse. The router prices a call with

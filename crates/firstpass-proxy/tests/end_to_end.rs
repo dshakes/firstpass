@@ -205,6 +205,7 @@ async fn spawn_proxy_with(
         promoter,
         verified_cache,
         predictor: None,
+        prior: None,
         tenant_rate_limiter: None,
         spill: None,
     };

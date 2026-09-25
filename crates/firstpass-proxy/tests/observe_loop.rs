@@ -65,6 +65,7 @@ async fn spawn_proxy(upstream: &str) -> (String, std::path::PathBuf) {
         promoter: None,
         verified_cache: None,
         predictor: None,
+        prior: None,
         tenant_rate_limiter: None,
         spill: None,
     };

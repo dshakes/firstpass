@@ -87,6 +87,13 @@ pub struct AppState {
     /// feeds this request's attempts back for online learning — in-memory, per-process, warm-
     /// started from receipts on boot.
     pub predictor: Option<Arc<std::sync::Mutex<firstpass_core::PassPredictor>>>,
+    /// Optional verified predictive routing config + resolved API key (`[escalation.prior]`).
+    /// `None` (default) = off = byte-identical to today: no pre-generation call, no
+    /// `decision_prior` on the trace, the start-rung argmin runs exactly as before. When
+    /// `Some`, `handle_enforce` fetches a per-query prior before choosing the start rung and
+    /// feeds it into the bandit's expected-cost argmin — the enforce gate still verifies every
+    /// output regardless of what the prior said.
+    pub prior: Option<Arc<crate::prior::PriorClient>>,
     /// Per-tenant request rate limiter (ADR 0004 §D6). `None` (the default) disables rate
     /// limiting entirely — set via [`build_tenant_rate_limiter`] from
     /// [`ProxyConfig::tenant_rate_per_sec`].
@@ -178,6 +185,7 @@ fn cache_hit_trace(
         },
         deferred: Vec::new(),
         predicted_pass: None,
+        decision_prior: None,
         probe: None,
         elastic: None,
         rollout: None,
@@ -1786,19 +1794,54 @@ async fn enforce_pipeline_inner(
     // money/latency but can never cause a wrong answer to be served.
     let bandit_ctx = crate::bandit::ContextBucket::from_features(&features);
 
-    // Step 1: greedy start — bandit prediction or rung 0 (cold-start / no bandit).
+    // Verified predictive routing (opt-in, ADR): a pre-generation decision-model prior on the
+    // start rung. `None` whenever `[escalation.prior]` is off (the default), the call errors,
+    // times out, or comes back malformed — fetch_prior fails open, never blocks serving, and the
+    // gate below still verifies every output regardless of what the prior said.
+    let decision_prior: Option<Vec<f64>> = match state.prior.as_ref() {
+        Some(prior_client) => {
+            prior_client
+                .fetch(&crate::prior::query_text(&base_request))
+                .await
+        }
+        None => None,
+    };
+
+    // Step 1: greedy start — bandit prediction (blended with the prior, if any) or rung 0
+    // (cold-start / no bandit and no prior).
     // Thompson sampling returns its own Monte-Carlo selection propensity (the policy is
     // stochastic by nature); UCB1 returns None and relies on the epsilon overlay as before.
     let (greedy_rung, base_policy_id, ts_propensity) = {
-        let (chosen, ts_p) = state
-            .bandit
-            .as_ref()
-            .and_then(|b| b.lock().ok())
-            .map(|mut b| {
-                b.choose_start_with_propensity(&bandit_ctx, &route.ladder, &state.config.prices)
-            })
-            .unwrap_or((0, None));
-        let policy = if ts_p.is_some() {
+        let (chosen, ts_p) = match state.bandit.as_ref() {
+            Some(bandit) => bandit
+                .lock()
+                .ok()
+                .map(|mut b| {
+                    b.choose_start_with_prior(
+                        &bandit_ctx,
+                        &route.ladder,
+                        &state.config.prices,
+                        decision_prior.as_deref(),
+                    )
+                })
+                .unwrap_or((0, None)),
+            // No bandit configured, but a prior is: a zero-observation throwaway bandit lets the
+            // same expected-cost argmin decide from the prior alone.
+            None => match (state.prior.as_ref(), decision_prior.as_deref()) {
+                (Some(prior_client), Some(prior)) => crate::bandit::StartRungBandit::new(0, 1.0)
+                    .with_prior_strength(prior_client.strength())
+                    .choose_start_with_prior(
+                        &bandit_ctx,
+                        &route.ladder,
+                        &state.config.prices,
+                        Some(prior),
+                    ),
+                _ => (0, None),
+            },
+        };
+        let policy = if decision_prior.is_some() {
+            "bandit@v3-prior".to_owned()
+        } else if ts_p.is_some() {
             "bandit@v2-ts".to_owned()
         } else if chosen > 0 {
             "bandit@v1".to_owned()
@@ -1984,6 +2027,9 @@ async fn enforce_pipeline_inner(
     if routing_mode != RoutingMode::Balanced {
         trace.policy.mode_profile = Some(routing_mode.as_str().to_owned());
     }
+    // Verified predictive routing: record what the decision-model prior said, if anything did.
+    // None whenever `[escalation.prior]` is off — absent from JSON, byte-identical to before.
+    trace.decision_prior = decision_prior;
 
     // Online bandit learning: feed back every gate verdict from this request so the bandit
     // refines its start-rung estimates. Cheap in-memory update; done before offer_trace so the
@@ -2968,6 +3014,7 @@ fn base_trace(
         shadow: None,
         route_ix: None,
         predicted_pass: None,
+        decision_prior: None,
         elastic: None,
     }
 }
@@ -4389,6 +4436,7 @@ mod tests {
             promoter: None,
             verified_cache: None,
             predictor: None,
+            prior: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -4570,6 +4618,7 @@ mod tests {
             promoter: None,
             verified_cache: None,
             predictor: None,
+            prior: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -4984,6 +5033,7 @@ mod tests {
             promoter: None,
             verified_cache: None,
             predictor: None,
+            prior: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -5210,6 +5260,7 @@ mod tests {
             promoter: None,
             verified_cache: None,
             predictor: None,
+            prior: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -5582,6 +5633,7 @@ mod tests {
             promoter: None,
             verified_cache: None,
             predictor: None,
+            prior: None,
             tenant_rate_limiter,
             spill: None,
         }
@@ -5953,6 +6005,7 @@ mod tests {
             promoter: None,
             verified_cache: None,
             predictor: None,
+            prior: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -6325,6 +6378,7 @@ mod tests {
             promoter: None,
             verified_cache: None,
             predictor: None,
+            prior: None,
             tenant_rate_limiter,
             spill: None,
         }
@@ -6445,6 +6499,7 @@ mod tests {
             promoter: None,
             verified_cache: None,
             predictor: None,
+            prior: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -6723,6 +6778,7 @@ mod tests {
             promoter: None,
             verified_cache: None,
             predictor,
+            prior: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -6815,6 +6871,7 @@ mod tests {
             promoter: None,
             verified_cache: None,
             predictor: None,
+            prior: None,
             tenant_rate_limiter: None,
             spill: None,
         };
@@ -6951,6 +7008,192 @@ mod tests {
         assert!(
             checked_enforced > 0 && checked_control > 0,
             "test saw only one arm ({checked_enforced} enforced, {checked_control} control)"
+        );
+    }
+
+    // ---- Verified predictive routing: end-to-end through the enforce handler --------------
+
+    /// Fake `/v1/systemone` server returning a fixed JSON body on every call (mirrors the one in
+    /// `crate::prior`'s own tests — duplicated rather than shared because it's five lines and
+    /// crossing a private test-module boundary isn't worth a shared helper for that).
+    async fn spawn_fake_prior_server(body: serde_json::Value) -> String {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/v1/systemone",
+            post(move || {
+                let body = body.clone();
+                async move { axum::Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn prior_client(base_url: String, rungs: &[&str]) -> crate::prior::PriorClient {
+        let cfg = firstpass_core::PriorConfig {
+            provider: "typesafe".to_owned(),
+            model: "jev-latest".to_owned(),
+            api_key_env: "TYPESAFE_API_KEY".to_owned(),
+            base_url,
+            timeout_ms: 2000,
+            strength: 10.0,
+            rungs: rungs.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        crate::prior::PriorClient::new(reqwest::Client::new(), cfg, "test-key".to_owned())
+    }
+
+    const OPUS: &str = "anthropic/claude-opus-4-8";
+
+    #[tokio::test]
+    async fn confident_prior_starts_above_zero_and_records_decision_prior() {
+        let base_url = spawn_fake_prior_server(serde_json::json!({
+            "answers": { "rung": { "choice": "r2", "confidence": 0.9,
+                "probabilities": { "r0": 0.05, "r1": 0.05, "r2": 0.9 } } }
+        }))
+        .await;
+        let (mut state, rx) = enforce_state(
+            &[
+                "anthropic/claude-haiku-4-5",
+                "anthropic/claude-sonnet-5",
+                OPUS,
+            ],
+            &["non-empty"],
+            vec![
+                (
+                    "anthropic/claude-haiku-4-5",
+                    Ok(model_resp("anthropic/claude-haiku-4-5", "ok")),
+                ),
+                (
+                    "anthropic/claude-sonnet-5",
+                    Ok(model_resp("anthropic/claude-sonnet-5", "ok")),
+                ),
+                (OPUS, Ok(model_resp(OPUS, "ok"))),
+            ],
+        );
+        state.prior = Some(Arc::new(prior_client(
+            base_url,
+            &[
+                "anthropic/claude-haiku-4-5",
+                "anthropic/claude-sonnet-5",
+                OPUS,
+            ],
+        )));
+        let trace = run_enforce_get_trace(state, rx).await;
+
+        assert!(
+            !trace.attempts.is_empty(),
+            "at least one attempt must be recorded"
+        );
+        assert!(
+            trace.attempts[0].rung >= 1,
+            "a confident hard prior (rung 0/1 nearly hopeless) must start above rung 0, started \
+             at {}",
+            trace.attempts[0].rung
+        );
+        let decision_prior = trace
+            .decision_prior
+            .as_ref()
+            .expect("a successful prior fetch must record decision_prior");
+        assert_eq!(decision_prior.len(), 3);
+        assert!(
+            decision_prior[2] > decision_prior[0],
+            "cumulative prior must be monotone non-decreasing: {decision_prior:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prior_server_error_fails_open_start_rung_zero_no_decision_prior() {
+        // Port 1 is reserved and nothing listens there — a fast, deterministic transport error,
+        // which fetch_prior must fail open on exactly like a timeout or a 500.
+        let unreachable = "http://127.0.0.1:1".to_owned();
+        let (mut state, rx) = enforce_state(
+            &["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"],
+            &["non-empty"],
+            vec![(
+                "anthropic/claude-haiku-4-5",
+                Ok(model_resp("anthropic/claude-haiku-4-5", "ok")),
+            )],
+        );
+        state.prior = Some(Arc::new(prior_client(
+            unreachable,
+            &["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"],
+        )));
+        let trace = run_enforce_get_trace(state, rx).await;
+
+        assert_eq!(
+            trace.attempts[0].rung, 0,
+            "a failed prior fetch must fail open to the static start rung 0"
+        );
+        assert!(
+            trace.decision_prior.is_none(),
+            "a failed prior fetch must leave decision_prior unset"
+        );
+    }
+
+    /// The invariant that must never regress: even with a confident prior pushing the start rung
+    /// up, a start rung whose output fails the gate is escalated past, never served.
+    #[tokio::test]
+    async fn gate_failed_start_rung_is_never_served_with_prior_on() {
+        let base_url = spawn_fake_prior_server(serde_json::json!({
+            "answers": { "rung": { "choice": "r2", "confidence": 0.9,
+                "probabilities": { "r0": 0.05, "r1": 0.05, "r2": 0.9 } } }
+        }))
+        .await;
+        // Every rung but the top one fails the non-empty gate (empty response); the top rung
+        // passes. Whichever rung the prior picks as the start, the served output must be the
+        // top rung's, and any earlier attempt must be recorded as Fail — never served.
+        let (mut state, rx) = enforce_state(
+            &[
+                "anthropic/claude-haiku-4-5",
+                "anthropic/claude-sonnet-5",
+                OPUS,
+            ],
+            &["non-empty"],
+            vec![
+                (
+                    "anthropic/claude-haiku-4-5",
+                    Ok(model_resp("anthropic/claude-haiku-4-5", "")),
+                ),
+                (
+                    "anthropic/claude-sonnet-5",
+                    Ok(model_resp("anthropic/claude-sonnet-5", "")),
+                ),
+                (OPUS, Ok(model_resp(OPUS, "ok"))),
+            ],
+        );
+        state.prior = Some(Arc::new(prior_client(
+            base_url,
+            &[
+                "anthropic/claude-haiku-4-5",
+                "anthropic/claude-sonnet-5",
+                OPUS,
+            ],
+        )));
+        let trace = run_enforce_get_trace(state, rx).await;
+
+        assert_eq!(
+            trace.final_.served_rung,
+            Some(2),
+            "only the top rung passes the gate, so it must be what's served, regardless of \
+             which rung the prior started at"
+        );
+        for attempt in &trace.attempts[..trace.attempts.len() - 1] {
+            assert_eq!(
+                attempt.verdict,
+                firstpass_core::Verdict::Fail,
+                "every attempt before the served one must be a recorded gate failure, not a \
+                 silently-served output"
+            );
+        }
+        assert_eq!(
+            trace.attempts.last().unwrap().verdict,
+            firstpass_core::Verdict::Pass
         );
     }
 }
