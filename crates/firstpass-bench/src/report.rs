@@ -2,6 +2,7 @@
 //! pre-registered kill criterion (SPEC §10).
 
 use crate::metrics::PolicyMetrics;
+use crate::prior_sweep::PriorSweepReport;
 use crate::stats::Ci;
 use firstpass_core::conformal::ConformalResult;
 use serde::Serialize;
@@ -35,6 +36,8 @@ pub struct Report {
     pub conformal: ConformalResult,
     /// Go / no-go.
     pub kill: KillDecision,
+    /// The noisy decision-model-prior σ sweep (SIMULATION only — `None` on a live run).
+    pub prior_sweep: Option<PriorSweepReport>,
 }
 
 fn ci(c: Ci) -> String {
@@ -194,6 +197,10 @@ impl Report {
             if k.proceed { "PROCEED" } else { "STOP" },
             k.rationale
         );
+
+        if let Some(ps) = &self.prior_sweep {
+            s.push_str(&crate::prior_sweep::render(ps));
+        }
         s
     }
 }

@@ -4,6 +4,7 @@
 //! harness is that a policy decides **without** reading ground-truth correctness; only the gate
 //! (imperfectly) and the final metrics (with hindsight) get to see it.
 
+use crate::prior::{argmin_expected_cost, noisy_prior};
 use crate::sim::{Gate, ModelBackend, Rung, Task, hash01};
 use firstpass_core::{PriceTable, Verdict};
 
@@ -238,6 +239,49 @@ impl Policy for PredictiveRouter {
     }
 }
 
+/// Gate-and-escalate from `start` upward: gate each attempt, serve the first pass, and on
+/// exhausting the ladder (or the budget) serve the best (highest) attempt made. Shared by
+/// [`Firstpass`] (`start = 0`) and [`FirstpassPrior`] (`start` = the prior's argmin rung) so the
+/// verification loop itself — never serve a failed rung — is identical for both.
+fn escalate_from(
+    task: &Task,
+    start: usize,
+    ladder: &[Rung],
+    be: &dyn ModelBackend,
+    gate: &dyn Gate,
+    p: &PriceTable,
+    budget_usd: Option<f64>,
+) -> Decision {
+    let mut attempts = Vec::with_capacity(ladder.len().saturating_sub(start));
+    let mut spent = 0.0;
+    let mut served = None;
+    for idx in start..ladder.len() {
+        let a = run_attempt(task, idx, &ladder[idx], be, Some(gate), p);
+        spent += a.model_cost_usd + a.gate_cost_usd;
+        let passed = a.verdict == Some(Verdict::Pass);
+        attempts.push(a);
+        if passed {
+            served = Some(attempts.len() - 1);
+            break;
+        }
+        // Budget guard: stop escalating if the next attempt would blow the cap.
+        if let Some(cap) = budget_usd
+            && idx + 1 < ladder.len()
+            && spent >= cap
+        {
+            break;
+        }
+    }
+    // No pass: serve the best (highest) attempt we made.
+    let served = served.or_else(|| attempts.len().checked_sub(1));
+    let escalations = attempts.len().saturating_sub(1) as u32;
+    Decision {
+        attempts,
+        served,
+        escalations,
+    }
+}
+
 /// **Firstpass:** cheapest rung first, gate the output, escalate one rung only on gate failure,
 /// serve the first output the gate passes. If the ladder (or budget) is exhausted without a pass,
 /// serve the best attempt seen (here: the highest rung tried).
@@ -258,34 +302,73 @@ impl Policy for Firstpass {
         gate: &dyn Gate,
         p: &PriceTable,
     ) -> Decision {
-        let mut attempts = Vec::with_capacity(ladder.len());
-        let mut spent = 0.0;
-        let mut served = None;
-        for (idx, rung) in ladder.iter().enumerate() {
-            let a = run_attempt(task, idx, rung, be, Some(gate), p);
-            spent += a.model_cost_usd + a.gate_cost_usd;
-            let passed = a.verdict == Some(Verdict::Pass);
-            attempts.push(a);
-            if passed {
-                served = Some(idx);
-                break;
-            }
-            // Budget guard: stop escalating if the next attempt would blow the cap.
-            if let Some(cap) = self.budget_usd
-                && idx + 1 < ladder.len()
-                && spent >= cap
-            {
-                break;
-            }
-        }
-        // No pass: serve the best (highest) attempt we made.
-        let served = served.or_else(|| attempts.len().checked_sub(1));
-        let escalations = attempts.len().saturating_sub(1) as u32;
+        escalate_from(task, 0, ladder, be, gate, p, self.budget_usd)
+    }
+}
+
+/// A **noisy-prior predictive router**: a stand-in for a Jev-style pre-generation decision model.
+/// It builds a noisy oracle prior over per-rung pass probability ([`noisy_prior`]), picks the rung
+/// that minimises expected cost ([`argmin_expected_cost`]) — the same rule Firstpass's own
+/// start-rung bandit uses — and serves that rung's output **without verifying it**. Its structural
+/// weakness is [`PredictiveRouter`]'s: a wrong prior is served, undetected.
+#[derive(Debug, Clone, Copy)]
+pub struct PredictivePrior {
+    /// Seed for the prior's noise draw.
+    pub seed: u64,
+    /// Std-dev of the prior's per-rung noise.
+    pub sigma: f64,
+}
+impl Policy for PredictivePrior {
+    fn name(&self) -> &'static str {
+        "predictive-prior"
+    }
+    fn decide(
+        &self,
+        task: &Task,
+        ladder: &[Rung],
+        be: &dyn ModelBackend,
+        _g: &dyn Gate,
+        p: &PriceTable,
+    ) -> Decision {
+        let prior = noisy_prior(task, ladder, self.sigma, self.seed);
+        let start = argmin_expected_cost(task, ladder, p, &prior);
+        let a = run_attempt(task, start, &ladder[start], be, None, p);
         Decision {
-            attempts,
-            served,
-            escalations,
+            attempts: vec![a],
+            served: Some(0),
+            escalations: 0,
         }
+    }
+}
+
+/// **Firstpass + prior:** start from the same noisy-prior argmin rung as [`PredictivePrior`], then
+/// run Firstpass's ordinary gate-and-escalate loop from there. A failed rung is never served — this
+/// is the fused arm the σ sweep exists to evaluate: does a noisy decision-model prior help once it
+/// only ever picks *where verification starts*, never *what ships unverified*?
+#[derive(Debug, Clone, Copy)]
+pub struct FirstpassPrior {
+    /// Seed for the prior's noise draw.
+    pub seed: u64,
+    /// Std-dev of the prior's per-rung noise.
+    pub sigma: f64,
+    /// Optional per-request USD cap; escalation stops once the next attempt would exceed it.
+    pub budget_usd: Option<f64>,
+}
+impl Policy for FirstpassPrior {
+    fn name(&self) -> &'static str {
+        "firstpass+prior"
+    }
+    fn decide(
+        &self,
+        task: &Task,
+        ladder: &[Rung],
+        be: &dyn ModelBackend,
+        gate: &dyn Gate,
+        p: &PriceTable,
+    ) -> Decision {
+        let prior = noisy_prior(task, ladder, self.sigma, self.seed);
+        let start = argmin_expected_cost(task, ladder, p, &prior);
+        escalate_from(task, start, ladder, be, gate, p, self.budget_usd)
     }
 }
 
@@ -357,6 +440,99 @@ mod tests {
             d.attempts.len() < 3,
             "budget should cut escalation short, got {}",
             d.attempts.len()
+        );
+    }
+
+    /// σ=0 prior on a task the cheap rung fails ⇒ firstpass+prior must start above rung 0.
+    #[test]
+    fn sigma_zero_prior_starts_above_cheap_rung_when_it_fails() {
+        let ladder = ladder();
+        let prices = PriceTable::defaults();
+        let be = SimBackend::new(3);
+        let gate = SimGate::new(3, 0.08, 0.10, 0.0);
+
+        // Difficulty high enough that the cheap rung's clearance clamps to the floor (0.02) —
+        // near-hopeless, which is what the expected-cost rule is supposed to skip past — then
+        // search for a task (fixed difficulty, varying id) where the ground-truth draw actually
+        // fails at that rung, the literal premise of the test, not just a low prior.
+        let task = (0..200)
+            .map(|id| crate::sim::Task {
+                id,
+                difficulty: 3.0,
+                prompt_tokens: 800,
+                prompt: None,
+                expected: None,
+            })
+            .find(|t| !be.run(t, &ladder[0]).correct)
+            .expect("some task in range must fail the cheap rung at this difficulty");
+
+        let d = FirstpassPrior {
+            seed: 1,
+            sigma: 0.0,
+            budget_usd: None,
+        }
+        .decide(&task, &ladder, &be, &gate, &prices);
+        assert!(
+            d.attempts[0].rung_idx > 0,
+            "expected-cost start should skip the near-hopeless cheap rung, started at {}",
+            d.attempts[0].rung_idx
+        );
+    }
+
+    /// The verification advantage: a badly wrong prior (claims every rung is a near-certain pass)
+    /// makes `predictive-prior` always start cheap and serve it unverified. On tasks where the
+    /// cheap rung is truly wrong but the top rung is truly right, that means `predictive-prior`
+    /// serves a failure every time — while `firstpass+prior`, gated, escalates past the same wrong
+    /// start and lands on the true pass, serving zero failures on the identical task set.
+    #[test]
+    fn badly_wrong_prior_predictive_serves_failures_firstpass_prior_does_not() {
+        let ladder = ladder();
+        let prices = PriceTable::defaults();
+        let be = SimBackend::new(11);
+        // A perfect gate: verdict == ground truth. Isolates the prior's effect from gate noise.
+        let gate = SimGate::new(11, 0.0, 0.0, 0.0);
+        let top = ladder.len() - 1;
+
+        let candidates = crate::sim::task_suite(300, 11);
+        let hard_but_solvable: Vec<_> = candidates
+            .into_iter()
+            .filter(|t| !be.run(t, &ladder[0]).correct && be.run(t, &ladder[top]).correct)
+            .take(20)
+            .collect();
+        assert!(
+            hard_but_solvable.len() >= 10,
+            "need enough qualifying tasks, got {}",
+            hard_but_solvable.len()
+        );
+
+        // Badly wrong: claims every rung is a near-certain pass, so the expected-cost rule always
+        // starts cheap regardless of the task.
+        let bad_prior = vec![0.99, 0.99, 0.99];
+
+        let mut predictive_failures = 0;
+        let mut firstpass_prior_failures = 0;
+        for t in &hard_but_solvable {
+            let start = argmin_expected_cost(t, &ladder, &prices, &bad_prior);
+            assert_eq!(start, 0, "a maximally confident prior must start cheap");
+
+            let a = run_attempt(t, start, &ladder[start], &be, None, &prices);
+            if !a.correct {
+                predictive_failures += 1;
+            }
+
+            let d = escalate_from(t, start, &ladder, &be, &gate, &prices, None);
+            if !d.served_correct() {
+                firstpass_prior_failures += 1;
+            }
+        }
+        assert_eq!(
+            predictive_failures,
+            hard_but_solvable.len(),
+            "predictive-prior should blindly serve every one of these wrong"
+        );
+        assert_eq!(
+            firstpass_prior_failures, 0,
+            "the gate must catch every one of these — this is the verification advantage"
         );
     }
 }
