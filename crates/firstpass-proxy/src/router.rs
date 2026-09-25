@@ -250,6 +250,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
         shadow: None,
         route_ix: None,
         predicted_pass: None,
+        decision_prior: None,
         elastic,
     };
     trace.recompute_savings();

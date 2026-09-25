@@ -582,6 +582,7 @@ mod tests {
             },
             deferred: vec![],
             predicted_pass: None,
+            decision_prior: None,
             probe: None,
             elastic: None,
             rollout: None,

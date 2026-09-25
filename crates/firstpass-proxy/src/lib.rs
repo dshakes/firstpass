@@ -42,6 +42,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod onboard;
 pub mod ope;
+pub mod prior;
 pub mod provider;
 pub mod proxy;
 pub mod responses;

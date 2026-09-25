@@ -195,6 +195,13 @@ pub struct Trace {
     /// pre-predictor traces and hash-chain compatible. Recorded but never acted on in this phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicted_pass: Option<f64>,
+    /// Cumulative gate-pass prior per ladder rung from the pre-generation decision-model prior
+    /// (verified predictive routing), in ladder order: `decision_prior[r]` is `P(rung r fully
+    /// handles this request)`. Absent when `[escalation.prior]` is off (the default) —
+    /// byte-identical to pre-prior traces and hash-chain compatible. Feeds the start-rung
+    /// expected-cost argmin; the gate still verifies every output regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_prior: Option<Vec<f64>>,
     /// Elastic verification decision (ADR 0008 Phase 3) on the served rung: why the expensive gates
     /// were skipped or run, plus the λ / calibration provenance the skip was authorized under.
     /// Absent when elastic is off (the default) — byte-identical to pre-elastic traces and
@@ -498,6 +505,7 @@ mod tests {
             shadow: None,
             route_ix: None,
             predicted_pass: None,
+            decision_prior: None,
             elastic: None,
         };
         t.recompute_savings();
@@ -752,5 +760,50 @@ mod tests {
             verify_chain(&chain, GENESIS_HASH).is_err(),
             "tampered probe must break the chain"
         );
+    }
+
+    // ── decision_prior serde backward-compat (verified predictive routing) ──────
+
+    /// `decision_prior = None` (the default, prior off) must be absent from the JSON — a trace
+    /// serializes byte-identically to before this field existed, so the hash chain is unchanged.
+    #[test]
+    fn decision_prior_none_serializes_byte_identically_to_before() {
+        let t = sample_trace(GENESIS_HASH, 1);
+        assert!(t.decision_prior.is_none());
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(
+            !j.contains("decision_prior"),
+            "decision_prior=None must be omitted (skip_serializing_if): {j}"
+        );
+        // Chained with a successor, exactly as any pre-prior trace would be.
+        let t1 = sample_trace(&t.hash().unwrap(), 2);
+        assert!(verify_chain(&[t, t1], GENESIS_HASH).is_ok());
+    }
+
+    /// Old JSON without a `decision_prior` field deserializes cleanly (defaults to `None`).
+    #[test]
+    fn old_trace_without_decision_prior_deserializes_to_none() {
+        let t = sample_trace(GENESIS_HASH, 1);
+        let j = serde_json::to_string(&t).unwrap();
+        let back: Trace = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.decision_prior, None);
+    }
+
+    /// `decision_prior = Some(...)` round-trips and participates in the hash chain.
+    #[test]
+    fn decision_prior_some_roundtrips_and_hashes() {
+        let mut t0 = sample_trace(GENESIS_HASH, 30);
+        t0.decision_prior = Some(vec![0.2, 0.6, 1.0]);
+        let j = serde_json::to_string(&t0).unwrap();
+        assert!(j.contains("\"decision_prior\":[0.2,0.6,1.0]"), "{j}");
+        let back: Trace = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.decision_prior, t0.decision_prior);
+
+        let t1 = sample_trace(&t0.hash().unwrap(), 31);
+        let mut chain = [t0, t1];
+        assert!(verify_chain(&chain, GENESIS_HASH).is_ok());
+        // Tampering the field is detectable via the hash chain.
+        chain[0].decision_prior = Some(vec![0.9, 0.95, 1.0]);
+        assert!(verify_chain(&chain, GENESIS_HASH).is_err());
     }
 }
