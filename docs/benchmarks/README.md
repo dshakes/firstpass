@@ -13,6 +13,8 @@ as stale and the artifact as the bug to file.
 | [`mbpp-policy-974-opus.txt`](mbpp-policy-974-opus.txt) ✅ | Same comparison on a ~15× ladder, haiku→opus | same, plus `FIRSTPASS_CODING_LADDER="anthropic/claude-haiku-4-5,anthropic/claude-opus-4-8"` | your key + Docker, ~$9 |
 | [`elastic-validation.txt`](elastic-validation.txt) ✅ | Elastic-verification Phase 3: cost saved + held-out served-failure bound | `cargo run --release -p firstpass-bench -- --elastic` | free (offline) |
 | `live-200.txt` | 200-task live cost/success table | `cargo run -p firstpass-bench -- --live` | your key, ~a few $ |
+| [`prior-blend-replay.md`](prior-blend-replay.md) ✅ | Study A: prior+learned blend is BLEND-NEUTRAL (+ the hindsight-leak correction) | `cargo run --release -p firstpass-bench -- --replay-blend <mbpp.jsonl> <matrix1> <priors1> ...` | free (offline replay of committed matrices + priors) |
+| [`decision-gate-study.md`](decision-gate-study.md) ✅ | Study B: `decision` gate error rates on real MBPP, NOT-RECOMMENDED (OpenJev) | `cargo run --release -p firstpass-bench -- --decision-study <candidates.jsonl> <mbpp.jsonl> <base_url> <labels.jsonl> <scores.jsonl>` | local OpenJev + fail-closed sandbox |
 
 Provenance rules:
 

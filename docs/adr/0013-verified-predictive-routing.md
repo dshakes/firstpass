@@ -1,6 +1,7 @@
 # ADR 0013 — Verified predictive routing: a decision-model prior on the start rung, never on what is served
 
-Status: **accepted — PROCEED on real-data replay (OpenJev); hosted-Jev unmeasured** · 2026-09-25
+Status: **accepted — prior: PROCEED on real-data replay (OpenJev); prior+learned blend: NEUTRAL;
+decision gate: NOT-RECOMMENDED (OpenJev); hosted-Jev unmeasured** · 2026-09-25
 
 ## Context
 
@@ -174,10 +175,13 @@ every σ, while the gated arms hold their served-failure rate.
 
 What this does and does not settle. It does not refute the prior where the real workload differs
 from the sim — the live MBPP measurement in `costaware.rs` (n=135) found escalation adversely
-selected 2.16x and a per-query P(pass) start rule 22% cheaper than first-pass. It does mean the
-feature stays **default-off and opt-in**, and is not claimed as a win, until the live A/B gate below
-passes. If it fails live, the ADR 0012 precedent applies: remove the acting code, keep the receipt
-field.
+selected 2.16x and a per-query P(pass) start rule 22% cheaper than first-pass. **[RETRACTED
+2026-09-25 — see the hindsight-leak correction addendum below.]** That 22% figure came from the
+same realized-cost arm now labeled `learned-p (hindsight)`; it decides and buckets on each task's
+own post-generation cost, which is optimism, not signal a router has before generating. It does
+mean the feature stays **default-off and opt-in**, and is not claimed as a win, until the live A/B
+gate below passes. If it fails live, the ADR 0012 precedent applies: remove the acting code, keep
+the receipt field.
 
 The prior also works without `[escalation.bandit]`: the proxy then scores it against a
 zero-observation bandit per request, so the start rung is decided by the prior alone.
@@ -237,9 +241,11 @@ wrong about its own construction; its construction wasn't representative of this
 2. **The win is modest and ladder-dependent** (table above) — real, but not the >20% swings a
    headline number might suggest.
 3. **A bench-only cost-aware learned-p estimator (cross-fitted on traffic) still beats the prior**:
-   $0.00919 pooled vs. the prior's $0.01075. The prior's advantage is that it needs no traffic — a
-   cold-start signal. The next thing to measure is blending the two (the proxy already can), not
-   choosing one.
+   $0.00919 pooled vs. the prior's $0.01075. **[RETRACTED 2026-09-25 — see the hindsight-leak
+   correction addendum below.]** $0.00919 is the realized-cost `learned-p (hindsight)` arm; it is
+   optimistic by $0.00190/success. The honest ex-ante version is $0.01109 pooled — only ~1.5% under
+   first-pass's $0.01126, not a beat of the prior. Blending the two was measured (Study A, below):
+   the blend is **worse** than the prior alone, not better.
 4. **The unverified Jev-router stand-in served a wrong answer on 18.16% of pooled traffic**, against
    7.78% for the gated `prior` arm. Verification is still the reason this is safe to ship — an
    unverified decision-model router more than doubles served-failure versus the gated version of the
@@ -259,4 +265,65 @@ Two bugs were found and fixed getting here, both worth recording:
   `OPENJEV_URL=http://127.0.0.1:8080 cargo test -p firstpass-proxy -- --ignored live_`.
 
 The `decision` gate's own precision/recall against real failures is **still unmeasured** — this
-replay scored the *prior*, not the gate — and stays labeled that way.
+replay scored the *prior*, not the gate — and stays labeled that way. **[UPDATE 2026-09-25 — the
+gate itself was measured next; see the Study B addendum below: NOT-RECOMMENDED with OpenJev as the
+verifier. Hosted Jev as a gate remains unmeasured.]**
+
+## Addendum 2026-09-25 — correction: the cost-aware learned-p savings claim is withdrawn (hindsight leak)
+
+Pre-registration: `specs/prior-blend-and-decision-gate.md`. `costaware::serve` (`costaware.rs:145`)
+decides and buckets `PassPredictor` on the task's own **realized** `c0.cost_usd`/`c1.cost_usd` —
+values that include output tokens that exist only after generation, and hard tasks produce longer
+outputs. That arm is hindsight, not a signal a router has before generating, and its $/success is
+optimistic by **$0.00190/success** (pooled) versus the honest ex-ante version. It is now labeled
+`learned-p (hindsight)` in every report and must never be the comparison target.
+
+This retracts, without deleting, two claims made earlier in this ADR (both annotated in place
+above, per the ADR 0012 addendum convention):
+
+- The "22% cheaper than first-pass" figure in the "What this does and does not settle" paragraph
+  under the simulation addendum — came from the leaking arm.
+- Caveat 3 above ("a bench-only cost-aware learned-p estimator ... still beats the prior: $0.00919
+  pooled") — $0.00919 is the hindsight number. The honest ex-ante `learned-p (ex-ante)` is
+  **$0.01109 pooled**, only ~1.5% under first-pass's $0.01126, not a beat of the prior's $0.01075.
+
+## Addendum 2026-09-25 — Study A: prior+learned blend is BLEND-NEUTRAL
+
+Pre-registration: `specs/prior-blend-and-decision-gate.md`. Full tables:
+`docs/benchmarks/prior-blend-replay.md`.
+
+Same three MBPP outcome matrices and committed OpenJev priors as the PROCEED replay above, plus a
+cross-fitted ex-ante learned-p arm (bucketed on the MBPP prompt's character length — known before
+generation — using the calibration fold's quartiles) and a `prior+learned` blend using the proxy's
+own posterior-mean formula: `(s·prior_r0 + passes_b)/(s + seen_b)`, `s = 10` (the
+`[escalation.prior] strength` default), `passes_b`/`seen_b` from the calibration-fold bucket.
+
+Pooled (n=2418): `prior+learned` **$0.01094** vs `prior` **$0.01075**; paired bootstrap diff
+**+0.00019 [+0.00004, +0.00036]** — excludes 0, the blend is worse. Honest ex-ante `learned-p
+(ex-ante)` is $0.01109 pooled, only ~1.5% under first-pass's $0.01126.
+
+**Verdict: BLEND-NEUTRAL. The prior alone stays the recommendation** — blending the learned signal
+into the prior does not pay for itself on this data.
+
+## Addendum 2026-09-25 — Study B: decision gate as a second gate is NOT-RECOMMENDED (OpenJev)
+
+Pre-registration: `specs/prior-blend-and-decision-gate.md`. Full tables:
+`docs/benchmarks/decision-gate-study.md`.
+
+974 served MBPP answers (`~/vrb-cascade.jsonl`) that already passed the existing gate, labeled by
+VRBench's hidden-test oracle in the fail-closed sandbox (111 oracle-wrong, 863 oracle-right), scored
+by the proxy's `DecisionGate` request shape against **local OpenJev** at `http://127.0.0.1:8080` —
+this measures OpenJev, not hosted Jev.
+
+| metric | point | 95% CI |
+|---|---|---|
+| catch rate (τ=0.5) | 0.2162 | [0.1441, 0.2973] |
+| collateral (τ=0.5) | 0.1031 | [0.0834, 0.1228] |
+| AUC | 0.6310 | [0.5711, 0.6886] |
+| abstain rate | 0.0000 | [0.0000, 0.0000] |
+
+The pre-registered bar was catch rate ≥ 0.30 **and** collateral ≤ 0.05; both missed on point
+estimates. **Verdict: NOT-RECOMMENDED** at τ=0.5 (an exploratory τ sweep in the full report cannot
+change this verdict). The gate code stays available — this is a design decision, not a validated
+win, per the ADR 0012 precedent — but the docs must not suggest pairing it with OpenJev as a
+verifier. Hosted Jev as a gate remains unmeasured.

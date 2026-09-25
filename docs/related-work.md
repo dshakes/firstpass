@@ -88,6 +88,22 @@ ladder-dependent and says nothing about hosted Jev's own accuracy — full numbe
 [`docs/benchmarks/openjev-prior-replay.md`](benchmarks/openjev-prior-replay.md), addendum in
 [ADR 0013](adr/0013-verified-predictive-routing.md).
 
+A third pre-registration tested blending traffic-learned pass rates into the prior: pooled
+`prior+learned` $0.01094 vs `prior` $0.01075, paired diff +0.00019 [+0.00004, +0.00036] (excludes
+0, worse). **Verdict: BLEND-NEUTRAL** — the prior alone stays the recommendation. That run also
+traced an earlier "cost-aware learned-p" claim to a hindsight leak (it decided on each task's own
+post-generation cost); that claim, including any earlier "~22% cheaper than first-pass" figure, is
+withdrawn — full numbers in [`docs/benchmarks/prior-blend-replay.md`](benchmarks/prior-blend-replay.md),
+correction addendum in [ADR 0013](adr/0013-verified-predictive-routing.md).
+
+A fourth pre-registration measured the `decision` gate itself as a second gate (not the prior) on
+974 served MBPP answers (111 oracle-wrong) using **local OpenJev** as the verifier: catch rate
+0.2162 [0.1441, 0.2973], collateral 0.1031 [0.0834, 0.1228], AUC 0.6310 [0.5711, 0.6886] — below the
+pre-registered bar (catch ≥0.30 and collateral ≤0.05). **Verdict: NOT-RECOMMENDED** at τ=0.5; this
+measures OpenJev, not hosted Jev, which remains unmeasured — full numbers in
+[`docs/benchmarks/decision-gate-study.md`](benchmarks/decision-gate-study.md), addendum in
+[ADR 0013](adr/0013-verified-predictive-routing.md).
+
 ## Not yet comparable
 
 Firstpass does not appear on RouterBench, RouterEval, RouterArena, or RouterXBench. Our

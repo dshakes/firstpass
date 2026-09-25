@@ -24,11 +24,28 @@ fabricated pass.
   Block stays **default-off** — the replay is evidence about the prior mechanism, not about hosted
   Jev. See [`docs/benchmarks/openjev-prior-replay.md`](docs/benchmarks/openjev-prior-replay.md) and
   [ADR 0013](docs/adr/0013-verified-predictive-routing.md).
-- `decision` gate — precision/recall against real failures are **UNMEASURED**. A live smoke test
-  (not a measurement) found the gate reading the wrong wire field (`probability`/`p`/`value` instead
-  of the real `noul`), which would have abstained on every real answer — fixed.
+- A third pre-registration (`specs/prior-blend-and-decision-gate.md`) tested blending traffic-learned
+  pass rates into the prior: pooled `prior+learned` $0.01094 vs `prior` $0.01075, paired diff
+  +0.00019 [+0.00004, +0.00036] — excludes 0, the blend is worse. **Verdict: BLEND-NEUTRAL**, the
+  prior alone stays the recommendation. That run also traced an earlier "cost-aware learned-p"
+  savings claim (including any "~22% cheaper than first-pass" framing) to a hindsight leak — the
+  arm decided and bucketed on each task's own realized (post-generation) cost — and withdraws it;
+  the arm is now labeled `learned-p (hindsight)` in every report. See
+  [`docs/benchmarks/prior-blend-replay.md`](docs/benchmarks/prior-blend-replay.md) and the
+  correction addendum in [ADR 0013](docs/adr/0013-verified-predictive-routing.md).
+- `decision` gate — measured as a second gate against 974 served MBPP answers (111 oracle-wrong)
+  with **local OpenJev** as the verifier: catch rate 0.2162 [0.1441, 0.2973], collateral 0.1031
+  [0.0834, 0.1228], AUC 0.6310 [0.5711, 0.6886] — below the pre-registered bar (catch ≥0.30 and
+  collateral ≤0.05). **Verdict: NOT-RECOMMENDED** at τ=0.5. This measures OpenJev, not hosted Jev,
+  which remains unmeasured. A live smoke test (not a measurement) separately found the gate reading
+  the wrong wire field (`probability`/`p`/`value` instead of the real `noul`), which would have
+  abstained on every real answer — fixed. See
+  [`docs/benchmarks/decision-gate-study.md`](docs/benchmarks/decision-gate-study.md).
 - Both are opt-in and off by default; the plumbing ships because it costs nothing unconfigured.
 - Live, opt-in wire tests: `OPENJEV_URL=http://127.0.0.1:8080 cargo test -p firstpass-proxy -- --ignored live_`.
+- `firstpass-bench --fetch-priors` now sends `TYPESAFE_API_KEY` as a bearer token when set, so a
+  hosted-Jev prior replay can be run once the key is available. Not yet run — hosted Jev accuracy
+  stays unmeasured above.
 
 See [README.md#decision-model-routers-jev-vs-firstpass](README.md) and
 [docs/related-work.md](docs/related-work.md) for how this compares to Jev-style unverified routers.
