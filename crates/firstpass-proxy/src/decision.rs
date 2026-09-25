@@ -280,6 +280,26 @@ mod tests {
         assert!(!instructions.contains("fix the bug"));
     }
 
+    /// Live wire check against a real `/v1/systemone` server. Opt-in, like the prior's.
+    #[tokio::test]
+    #[ignore = "needs a live /v1/systemone server in OPENJEV_URL"]
+    async fn live_decision_gate_passes_right_and_fails_wrong() {
+        let Ok(url) = std::env::var("OPENJEV_URL") else {
+            return;
+        };
+        let mut d = cfg(&url);
+        d.timeout_ms = 60_000;
+        let gate = DecisionGate::new("verify", reqwest::Client::new(), &d, "local".to_owned());
+        let right = gate
+            .evaluate(&req_with("What is 2+2?"), &candidate("4"))
+            .await;
+        let wrong = gate
+            .evaluate(&req_with("What is 2+2?"), &candidate("17"))
+            .await;
+        assert_eq!(right.verdict, Verdict::Pass, "{right:?}");
+        assert_eq!(wrong.verdict, Verdict::Fail, "{wrong:?}");
+    }
+
     #[test]
     fn extract_probability_accepts_probability_p_or_value() {
         assert_eq!(
