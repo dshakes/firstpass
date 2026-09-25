@@ -218,8 +218,8 @@
   <div class="cards g2" style="margin-top:28px">
     <div class="card">
       <h3><code>[escalation.prior]</code> — experimental, default-off</h3>
-      <p style="margin-bottom:10px">Pre-registered simulation verdict: <b>PRIOR=STOP</b> (ties plain Firstpass on $/success at σ=0, loses at higher noise). The block ships anyway — it costs nothing while unconfigured, and a live A/B is the next gate.</p>
-      <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># experimental — PRIOR=STOP</span>
+      <p style="margin-bottom:10px">Pre-registered <em>simulation</em> verdict was PRIOR=STOP (synthetic σ-sweep). A second pre-registration replayed the same prior on 2,418 real MBPP outcomes using <b>OpenJev</b> (Apache-2.0, run locally — not hosted Jev): pooled $/success $0.01126 → $0.01075 (−4.6%, CI excludes 0), served-failure held. <b>Verdict: PROCEED</b> — ladder-dependent, says nothing about hosted Jev. Still default-off. Full numbers: <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/openjev-prior-replay.md" rel="noopener">openjev-prior-replay.md</a>.</p>
+      <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># experimental — sim was PRIOR=STOP, real-data replay says PROCEED (OpenJev)</span>
 [escalation.prior]
 provider    = <span class="tk-s">&quot;typesafe&quot;</span>
 model       = <span class="tk-s">&quot;jev-latest&quot;</span>
@@ -230,7 +230,7 @@ rungs = [<span class="tk-s">&quot;rung 0 …&quot;</span>, <span class="tk-s">&q
     </div>
     <div class="card">
       <h3><code>decision</code> gate — UNMEASURED</h3>
-      <p style="margin-bottom:10px">The same Jev model as a <code>[[gate]]</code>: a cheap external verifier (~$0.042/M input tokens). A transport error, timeout, or unparseable reply ABSTAINs — never a fabricated pass. Precision/recall against real failures not yet benchmarked.</p>
+      <p style="margin-bottom:10px">The same Jev model as a <code>[[gate]]</code>: a cheap external verifier (~$0.042/M input tokens). A transport error, timeout, or unparseable reply ABSTAINs — never a fabricated pass. Precision/recall against real failures still not benchmarked (a live smoke test, not a measurement, caught it reading the wrong wire field — fixed).</p>
       <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[gate]]
 id       = <span class="tk-s">&quot;verify&quot;</span>
 decision = { provider = <span class="tk-s">&quot;typesafe&quot;</span>, model = <span class="tk-s">&quot;jev-latest&quot;</span>, threshold = <span class="tk-n">0.6</span> }</code></pre></div>

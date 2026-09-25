@@ -80,10 +80,13 @@ decides after.
 **The thesis:** predictive routers pick the start; verification decides what is served. Those are
 different jobs, and the fusion in ADR 0013 takes the cheap start a decision model is good at
 *without giving up the gate that decides what ships* — Jev's own model family is exactly what
-these routers already skip verifying. The combined router's advantage in the table above is a
-**design argument plus simulation**, not a measured result: it holds only once the
-`firstpass+prior` σ-sweep and the live MBPP A/B in
-[ADR 0013](adr/0013-verified-predictive-routing.md) actually run.
+these routers already skip verifying. A pre-registered simulation of this fusion found PRIOR=STOP;
+a second pre-registration replayed the same mechanism on 2,418 real MBPP outcomes using **OpenJev**
+(Apache-2.0, run locally — not TypeSafe's hosted Jev) as the prior source and found **PROCEED**:
+pooled $/success $0.01126 → $0.01075 (−4.6%, CI excludes 0), served-failure held. The win is
+ladder-dependent and says nothing about hosted Jev's own accuracy — full numbers in
+[`docs/benchmarks/openjev-prior-replay.md`](benchmarks/openjev-prior-replay.md), addendum in
+[ADR 0013](adr/0013-verified-predictive-routing.md).
 
 ## Not yet comparable
 

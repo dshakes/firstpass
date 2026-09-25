@@ -1,6 +1,6 @@
 # ADR 0013 — Verified predictive routing: a decision-model prior on the start rung, never on what is served
 
-Status: **accepted (pending live measurement)** · 2026-09-25
+Status: **accepted — PROCEED on real-data replay (OpenJev); hosted-Jev unmeasured** · 2026-09-25
 
 ## Context
 
@@ -190,3 +190,73 @@ act — escalations fall 0.91 → 0.74 at σ=0 — but $/success is 0.0736 vs 0.
 bootstrap CIs) and served-failure edges up 0.240 → 0.244; at σ ≥ 0.2 the fused arm is worse. A wash,
 not a win. **PRIOR=STOP stands**; only the live A/B can change it. The unverified Jev-style arm again
 serves a wrong answer on 55–60% of traffic.
+
+## Addendum 2026-09-25 — real-data replay: PROCEED
+
+The live A/B gate ran — not against hosted Jev, but against **OpenJev** (Apache-2.0, DiffusionGemma
+26B-A4B), served locally via `POST /v1/systemone`. Pre-registration: `specs/openjev-prior-replay-ab.md`.
+Full tables: `docs/benchmarks/openjev-prior-replay.md`.
+
+Three real MBPP outcome matrices (already-recorded model+gate results, no new generation), scored
+with a prior fetched once from OpenJev and replayed deterministically:
+
+- `fp-mbpp-974-sonnet-k5.jsonl` (haiku-4-5 → sonnet-5, n=974)
+- `fp-mbpp-974-opus-k5.jsonl` (haiku-4-5 → opus-4-8, n=470)
+- `fp-mbpp-974-openai.jsonl` (gpt-4.1-mini → gpt-5.5, n=974)
+
+**Pooled (n=2418): $/success $0.01126 → $0.01075 (−4.6%)**, paired-bootstrap CI of the difference
+`[-0.00074, -0.00031]` — excludes 0. Success 0.9214 → 0.9222; served-failure 0.0786 → 0.0778 (down,
+not up). Degeneracy guard: 93.4% of prior-covered decisions share the mode start rung, below the 95%
+threshold, so the run is not degenerate. **The pre-registered kill criterion passes: PROCEED.**
+
+Per ladder, the win is real but ladder-dependent:
+
+| ladder | first-pass $/success | prior $/success | Δ |
+|---|---|---|---|
+| haiku→sonnet (n=974) | $0.01697 | $0.01590 | −6.3% |
+| haiku→opus (n=470) | $0.02003 | $0.01955 | −2.4% |
+| gpt-4.1-mini→gpt-5.5 (n=974) | $0.00136 | $0.00136 | 0% |
+
+The gpt-4.1-mini→gpt-5.5 ladder never moves: at that ladder's ~20x price ratio between rungs,
+skipping the cheap rung never pays even when the prior is confident the cheap rung will fail — the
+same "no gap for a prior to close" structure the simulation addendum above found, just realized in
+price ratio instead of a synthetic clearance floor.
+
+**Why the sim said STOP and real data says PROCEED.** The simulation's rung-0 clearance was
+constructed so it never fell below the cheap/next price ratio, so the expected-cost rule never had a
+reason to skip rung 0 even with a perfect prior. Real MBPP is not like that: there are tasks the
+cheap model reliably fails, the prior can see them from the prompt alone, and skipping straight to
+the next rung is cheaper than paying for a doomed cheap attempt plus the escalation. The sim wasn't
+wrong about its own construction; its construction wasn't representative of this workload.
+
+**Caveats that stand alongside the win:**
+
+1. **OpenJev ≠ Jev.** This says nothing about hosted Jev's own accuracy — a different model, a
+   different vendor, run locally rather than over TypeSafe's API. The `[escalation.prior]` block
+   defaults still point at `https://api.typesafe.ai`; using OpenJev is a `base_url` override (below).
+2. **The win is modest and ladder-dependent** (table above) — real, but not the >20% swings a
+   headline number might suggest.
+3. **A bench-only cost-aware learned-p estimator (cross-fitted on traffic) still beats the prior**:
+   $0.00919 pooled vs. the prior's $0.01075. The prior's advantage is that it needs no traffic — a
+   cold-start signal. The next thing to measure is blending the two (the proxy already can), not
+   choosing one.
+4. **The unverified Jev-router stand-in served a wrong answer on 18.16% of pooled traffic**, against
+   7.78% for the gated `prior` arm. Verification is still the reason this is safe to ship — an
+   unverified decision-model router more than doubles served-failure versus the gated version of the
+   same signal.
+5. **`always-top` beats `first-pass` outright on haiku→sonnet** ($0.01500 vs $0.01697) — adverse
+   selection, a finding already known from `costaware.rs`'s live measurement, not new here.
+
+**What changes as a result.** `[escalation.prior]` remains **default-off** — this replay used
+OpenJev, not hosted Jev, so it is not evidence about the vendor the ADR was written against. But the
+pre-registered kill criterion this ADR set for "does the prior mechanism itself pay for itself on
+real outcomes" now reads **PROCEED**, reversing the simulation's PRIOR=STOP on that narrower question.
+Two bugs were found and fixed getting here, both worth recording:
+
+- The `decision` gate read `probability`/`p`/`value` from a `/v1/systemone` reply; the real wire
+  field is `noul`. It would have abstained on every real answer. Fixed in `crates/firstpass-proxy/src/decision.rs`.
+- Live, opt-in wire tests now exist and are not run by default:
+  `OPENJEV_URL=http://127.0.0.1:8080 cargo test -p firstpass-proxy -- --ignored live_`.
+
+The `decision` gate's own precision/recall against real failures is **still unmeasured** — this
+replay scored the *prior*, not the gate — and stays labeled that way.
