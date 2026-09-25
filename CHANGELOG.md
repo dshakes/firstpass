@@ -74,6 +74,12 @@ while doing a fraction of its job.
 - **Startup fails loudly** on a `redis_url` without the feature, or a server that does not answer
   PING within 5s.
 
+- **Verifier bake-off** (`specs/verifier-bakeoff.md`, `docs/benchmarks/verifier-bakeoff.md`,
+  `firstpass-bench --verifier-bakeoff`): OpenJev with think/samples, a local Qwen3-Coder `judge`, and
+  CodeT-style generated tests — none clears the second-gate bar on held-out data (best: generated tests,
+  catch 0.094, collateral 0.067). **NOT-RECOMMENDED**; see ADR 0013.
+- `--fetch-priors` resume now retries failed calls instead of skipping them.
+
 ## [0.7.0]
 
 ### Fixed: `onboard` accepted a foreign listener as the proxy
