@@ -80,17 +80,18 @@ impl Report {
         // Metrics table.
         let _ = writeln!(
             s,
-            "| policy | success | $/success | mean $ | served-fail | escal | regret | gate P/R | p95 ms |"
+            "| policy | success | $/success | mean $ | served-fail | escal | regret | gate P/R | p95 ms | PGR | Pareto |"
         );
-        let _ = writeln!(s, "|---|---|---|---|---|---|---|---|---|");
+        let _ = writeln!(s, "|---|---|---|---|---|---|---|---|---|---|---|");
         for p in &self.policies {
             let pr = match (p.gate_precision, p.gate_recall) {
                 (Some(pr), Some(re)) => format!("{pr:.2}/{re:.2}"),
                 _ => "—".to_owned(),
             };
+            let pgr = p.pgr.map_or_else(|| "—".to_owned(), |g| format!("{g:.2}"));
             let _ = writeln!(
                 s,
-                "| {} | {} | {} | {:.4} | {:.3} | {:.2} | {:.3} | {} | {:.0} |",
+                "| {} | {} | {} | {:.4} | {:.3} | {:.2} | {:.3} | {} | {:.0} | {} | {} |",
                 p.name,
                 ci(p.success),
                 ci(p.cost_per_success),
@@ -100,6 +101,27 @@ impl Report {
                 p.regret_per_request,
                 pr,
                 p.p95_latency_ms,
+                pgr,
+                if p.pareto_optimal { "✓" } else { "" },
+            );
+        }
+
+        // Cost–quality Pareto frontier, cheapest first.
+        let mut frontier: Vec<&PolicyMetrics> =
+            self.policies.iter().filter(|p| p.pareto_optimal).collect();
+        frontier.sort_by(|a, b| a.mean_cost_usd.total_cmp(&b.mean_cost_usd));
+        let _ = writeln!(s, "\n## Cost–quality Pareto frontier");
+        let _ = writeln!(
+            s,
+            "Mean $/request vs success; every policy not listed is dominated. PGR = share of the \
+             always-cheap→always-top success gap recovered (RouteLLM; single operating point, so not \
+             averaged into APGR).\n"
+        );
+        for p in frontier {
+            let _ = writeln!(
+                s,
+                "- **{}** — ${:.4}/req, success {:.3}",
+                p.name, p.mean_cost_usd, p.success.point
             );
         }
 
