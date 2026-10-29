@@ -432,6 +432,7 @@ mod tests {
             visible_cases: vec!["assert add(1,2)==3".into()],
             hidden_cases: vec!["assert add(2,2)==4".into()],
             unit_test: None,
+            reply_is_data: false,
         };
         let hist = vec![rec("def add(a,b): return 0", false)];
         let msgs = build_messages(&task, &hist);
@@ -481,6 +482,7 @@ mod tests {
             visible_cases: vec!["assert f()==1".into()],
             hidden_cases: vec!["assert f()==1".into()],
             unit_test: None,
+            reply_is_data: false,
         };
         let rungs = vec![AgenticRung {
             model: "m".into(),
@@ -517,6 +519,7 @@ mod tests {
             visible_cases: vec!["assert f()==1".into()],
             hidden_cases: vec!["assert f()==1".into()],
             unit_test: None,
+            reply_is_data: false,
         };
         let rungs = vec![AgenticRung {
             model: "m".into(),

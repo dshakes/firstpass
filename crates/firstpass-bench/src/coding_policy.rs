@@ -175,7 +175,7 @@ pub fn measure_judged(
     limits: &Limits,
     judge: Option<&dyn Judge>,
 ) -> Result<Vec<Vec<RungOutcome>>, String> {
-    measure_resumable(tasks, rungs, sb, prices, limits, judge, None)
+    measure_resumable(tasks, rungs, sb, prices, limits, judge, RunOpts::default())
 }
 
 /// As [`measure_judged`], but checkpoints each finished task to `checkpoint` and resumes from it.
@@ -192,7 +192,8 @@ pub fn measure_judged(
 ///
 /// # Errors
 /// Any solver, judge, or environment failure, verbatim — but the checkpoint keeps whatever
-/// completed before it, so the retry resumes rather than restarts.
+/// completed before it, so the retry resumes rather than restarts. Also when the spend cap is
+/// reached: the checkpoint then holds every task paid for, replayable with `--replay`.
 pub fn measure_resumable(
     tasks: &[CodingTask],
     rungs: &[Rung<'_>],
@@ -200,18 +201,32 @@ pub fn measure_resumable(
     prices: &PriceTable,
     limits: &Limits,
     judge: Option<&dyn Judge>,
-    checkpoint: Option<&std::path::Path>,
+    opts: RunOpts<'_>,
 ) -> Result<Vec<Vec<RungOutcome>>, String> {
+    let checkpoint = opts.checkpoint;
     let ladder_ids: Vec<String> = rungs.iter().map(|r| r.model.clone()).collect();
     let mut done = load_checkpoint(checkpoint, &ladder_ids);
     if !done.is_empty() {
         eprintln!("resuming: {} tasks already measured", done.len());
     }
+    // Spend already in the checkpoint counts against the cap: a resume must not get a fresh
+    // budget, or interrupting a run would be a way to spend past it.
+    let mut spent: f64 = done.values().flatten().map(|o| o.cost_usd).sum();
     let mut matrix = Vec::with_capacity(tasks.len());
     for task in tasks {
         if let Some(row) = done.remove(&task.id) {
             matrix.push(row);
             continue;
+        }
+        // Checked before each task, so the overshoot is at most one task's calls.
+        if let Some(cap) = opts.budget_usd
+            && spent >= cap
+        {
+            return Err(format!(
+                "spend cap reached: ${spent:.4} of ${cap:.2} after {} tasks — stopped before \
+                 paying for more; the checkpoint holds every measured task",
+                matrix.len()
+            ));
         }
         let mut row = Vec::with_capacity(rungs.len());
         for rung in rungs {
@@ -253,10 +268,20 @@ pub fn measure_resumable(
                 judge_score: o.judge_score,
             });
         }
+        spent += row.iter().map(|o| o.cost_usd).sum::<f64>();
         append_checkpoint(checkpoint, &task.id, &ladder_ids, &row);
         matrix.push(row);
     }
     Ok(matrix)
+}
+
+/// Run guards for [`measure_resumable`]: where finished work is saved, and the hard spend cap.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOpts<'a> {
+    /// Checkpoint file; `None` keeps nothing between runs.
+    pub checkpoint: Option<&'a std::path::Path>,
+    /// Total USD this study may spend, including spend already in the checkpoint. `None` = no cap.
+    pub budget_usd: Option<f64>,
 }
 
 /// Read a checkpoint into `task_id -> row`. A malformed or absent file yields nothing and the run
@@ -1029,6 +1054,7 @@ mod tests {
             visible_cases: vec!["a".to_owned()],
             hidden_cases: vec!["a".to_owned()],
             unit_test: None,
+            reply_is_data: false,
         }
     }
 
@@ -1143,6 +1169,84 @@ mod tests {
                 .is_some_and(|p| p.cost_metered),
             "a metered judge means the arm can state its cost"
         );
+    }
+
+    /// The spend cap stops BEFORE paying past it (overshoot ≤ one task), counts spend already in
+    /// the checkpoint, and so cannot be dodged by interrupting and resuming.
+    #[test]
+    fn the_spend_cap_stops_before_paying_past_it_and_survives_a_resume() {
+        struct DollarSolver(std::cell::Cell<u32>);
+        impl CandidateSolver for DollarSolver {
+            fn solve(&self, _: &CodingTask) -> Result<crate::coding::Solution, String> {
+                self.0.set(self.0.get() + 1);
+                Ok(crate::coding::Solution {
+                    code: "x".to_owned(),
+                    in_tokens: 1_000_000,
+                    out_tokens: 0,
+                })
+            }
+        }
+        struct PassSandbox;
+        impl Sandbox for PassSandbox {
+            fn runtime(&self) -> &str {
+                "pass"
+            }
+            fn run(
+                &self,
+                _: &crate::sandbox::ExecUnit,
+                _: &Limits,
+            ) -> Result<crate::sandbox::ExecOutcome, crate::sandbox::SandboxError> {
+                Ok(crate::sandbox::ExecOutcome::Completed {
+                    exit_code: 0,
+                    stdout: "FP_SCORE 1 1\n".to_owned(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        // $1 per task (1M tokens at $1/Mtok), cap $2.50, five tasks on offer.
+        let prices = PriceTable::defaults().with_override(
+            "rung/model",
+            firstpass_core::cost::ModelPrice {
+                input_per_mtok: 1.0,
+                output_per_mtok: 0.0,
+            },
+        );
+        let solver = DollarSolver(std::cell::Cell::new(0));
+        let rungs = vec![Rung {
+            model: "rung/model".to_owned(),
+            solver: &solver,
+        }];
+        let tasks: Vec<CodingTask> = (0..5).map(|i| mk_task(&format!("t{i}"))).collect();
+        let ckpt = std::env::temp_dir().join(format!("fp-cap-{}.jsonl", std::process::id()));
+        std::fs::remove_file(&ckpt).ok();
+        let opts = RunOpts {
+            checkpoint: Some(&ckpt),
+            budget_usd: Some(2.5),
+        };
+        let run = || {
+            measure_resumable(
+                &tasks,
+                &rungs,
+                &PassSandbox,
+                &prices,
+                &Limits::default(),
+                None,
+                opts,
+            )
+        };
+
+        let err = run().expect_err("the cap must stop the run");
+        assert!(err.contains("spend cap reached"), "{err}");
+        assert_eq!(
+            solver.0.get(),
+            3,
+            "$0 → $1 → $2 → $3 ≥ $2.50: three paid, the fourth refused"
+        );
+
+        // Resuming must not grant a fresh budget: the $3 already in the checkpoint counts.
+        let _ = run().expect_err("a resume is still over the cap");
+        assert_eq!(solver.0.get(), 3, "no new call after resuming over the cap");
+        std::fs::remove_file(&ckpt).ok();
     }
 
     /// An unpriced JUDGE must abort for the same reason an unpriced rung does: its calls would be
