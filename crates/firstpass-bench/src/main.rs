@@ -140,6 +140,10 @@ fn main() {
                 // Whether spending the cheap attempt was the right call in the first place.
                 let ca = firstpass_bench::costaware::study(&matrix);
                 println!("\n{}", firstpass_bench::costaware::render(&ca));
+                // The market's decision rules on the same candidates — the head-to-head no public
+                // leaderboard can run for a verification router.
+                let hh = firstpass_bench::competitors::study(&matrix);
+                println!("\n{}", firstpass_bench::competitors::render(&hh));
             }
             Err(e) => {
                 eprintln!("cannot replay {path}: {e}");

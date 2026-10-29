@@ -14,6 +14,7 @@ pub mod ablation;
 pub mod agentic;
 pub mod coding;
 pub mod coding_policy;
+pub mod competitors;
 pub mod costaware;
 pub mod dataset;
 pub mod decision_study;
@@ -232,6 +233,7 @@ fn run_core(
             .collect();
         policy_metrics.push(evaluate(pol.name(), &decisions, cfg.seed, cfg.alpha));
     }
+    crate::metrics::annotate_relative(&mut policy_metrics);
 
     // Conformal calibration on rung-0 (score, correct) pairs from the calibration suite.
     let rung0 = &cfg.ladder[0];

@@ -452,7 +452,7 @@ fn serve_fixed(row: &[RungOutcome], idx: usize) -> (bool, f64, usize) {
 /// The first-pass policy: try the cheapest rung, run the gate, and escalate only when the gate
 /// says no. Cost accumulates across every rung tried — the rejected attempt is still billed, which
 /// is exactly the honesty the comparison needs.
-fn serve_first_pass(row: &[RungOutcome]) -> (bool, f64, usize) {
+pub(crate) fn serve_first_pass(row: &[RungOutcome]) -> (bool, f64, usize) {
     let mut spent = 0.0;
     for (i, o) in row.iter().enumerate() {
         spent += o.cost_usd;
