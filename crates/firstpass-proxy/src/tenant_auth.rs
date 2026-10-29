@@ -163,7 +163,19 @@ pub async fn auth_middleware(
             .insert(TenantId(state.config.tenant_id.clone()));
         return next.run(req).await;
     }
-    match extract_key(req.headers()).and_then(|k| state.config.tenant_keys.verify(&k)) {
+    // Argon2 is deliberately slow CPU work; on the async worker it would stall every other
+    // request on that thread for the length of a verify. A failed join fails closed (401).
+    let verified = match extract_key(req.headers()) {
+        Some(key) => {
+            let config = state.config.clone();
+            tokio::task::spawn_blocking(move || config.tenant_keys.verify(&key))
+                .await
+                .ok()
+                .flatten()
+        }
+        None => None,
+    };
+    match verified {
         Some(tenant) => {
             req.extensions_mut().insert(tenant);
             next.run(req).await

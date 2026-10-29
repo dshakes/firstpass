@@ -5880,6 +5880,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_verify_does_not_stall_the_async_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+        // `#[tokio::test]` is single-threaded: if the Argon2 verify ran on the worker, the ticker
+        // could not run until the request finished, and would tick ~0 times.
+        let router = app(two_tenant_state(None)).expect("router");
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        let resp = router
+            .oneshot(cap_request(Some("Bearer tenant-a.key-a")))
+            .await
+            .unwrap();
+        let during = ticks.load(Ordering::Relaxed);
+        ticker.abort();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(
+            during >= 2,
+            "worker was blocked during the verify ({during} ticks)"
+        );
+    }
+
+    #[tokio::test]
     async fn rate_limit_unset_never_429s() {
         use tower::ServiceExt;
         // Backward-compat: with no FIRSTPASS_TENANT_RATE_PER_SEC, drive many requests through and
