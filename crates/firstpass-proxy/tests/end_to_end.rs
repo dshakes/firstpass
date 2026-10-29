@@ -760,3 +760,37 @@ async fn a_failing_outcome_stops_the_cache_replaying_that_answer() {
         "an answer whose proof was retracted must not keep being replayed"
     );
 }
+
+/// The receipt records the guarantee the answer was served under. With a fixed
+/// `serve_threshold` configured (no e-process, no ACI), the stored, hash-chained trace must carry a
+/// `fixed` certificate at exactly that threshold — read back from the real store, and the chain
+/// must still verify with it inside.
+#[tokio::test]
+async fn receipt_carries_the_risk_certificate_it_was_served_under() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy_with(
+        &upstream,
+        &["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"],
+        "",
+        "[escalation]\nserve_threshold = 0.5\n",
+    )
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/messages"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 256,
+            "messages": [{ "role": "user", "content": "write a hello world" }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let traces = wait_for_traces(&db, 1).await;
+    let risk = traces[0].risk.as_ref().expect("certificate on the receipt");
+    assert_eq!(risk.source, firstpass_core::trace::ThresholdSource::Fixed);
+    assert!((risk.threshold - 0.5).abs() < 1e-12);
+    assert_eq!(risk.alpha, None, "a fixed threshold claims no guarantee");
+    verify_chain(&store::load_all_traces(&db).unwrap(), GENESIS_HASH).unwrap();
+}

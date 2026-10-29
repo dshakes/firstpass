@@ -135,6 +135,12 @@ impl AdaptiveConformal {
         self.threshold
     }
 
+    /// The long-run served-failure rate `λ` is steered toward.
+    #[must_use]
+    pub const fn alpha(&self) -> f64 {
+        self.alpha
+    }
+
     /// Observe a **served** item's realized correctness (from deferred feedback) and adapt `λ`. The
     /// ACI update raises `λ` when served errors exceed `alpha` (serve more conservatively) and lowers
     /// it when they're below (serve more), so realized served-failure converges to `alpha`.

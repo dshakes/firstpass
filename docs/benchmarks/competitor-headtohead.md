@@ -40,3 +40,28 @@ n = 974 tasks · every arm sees identical candidates, prices and ground truth
 
 First-pass costs MORE than always-top on this ladder, so it closes none of the always-top → perfect-predictive-router cost gap. The oracle row is an upper bound on every predictive router: it knows each answer's correctness before generating it. Conformal thresholds per fold: [0.2, 0.4].
 
+
+## Agent sessions — SWE-bench Verified, 60 repo-stratified instances, 459 turns
+
+Command: `python3 scripts/analyze-swe-checkpoint.py docs/benchmarks/swebench-60-stratified.checkpoint.jsonl`
+(section "Head-to-head"). $0: replay of the recorded $51.59 run. Every policy is scored on the same recorded
+turns (each turn measured at both rungs, conversation history held as recorded). Intervals are a paired
+bootstrap that resamples whole instances, because turns of one session are not independent.
+
+| arm | correct turns | spend | $/correct | Δ rate (fp − arm) 95% CI | Δ $ (fp − arm) 95% CI |
+|---|---|---|---|---|---|
+| **first-pass** (gate per turn) | **40/459** | $48.70 | $1.217 | — | — |
+| stage router, err≥1 or loop (Switchyard-style) | 35/459 | $43.26 | $1.236 | **[+0.0022, +0.0218]** | [+2.70, +8.06] |
+| stage router, err≥3 or loop (Switchyard-style) | 28/459 | $30.72 | $1.097 | **[+0.0109, +0.0436]** | [+14.35, +21.85] |
+| always-top (ungated) | 38/459 | $48.18 | $1.268 | [+0.0000, +0.0109] | [−1.64, +2.34] |
+
+Reading it:
+- First-pass serves **significantly more correct turns** than either Switchyard-style rule (both intervals
+  exclude 0). It beats the err≥1 variant on both success and $/correct. The err≥3 variant is cheaper
+  per correct turn but serves 12 fewer correct turns.
+- The solver is weak (haiku solves 3/459 turns), so the cheap rung saves little here. The perfect-foresight
+  bound would spend $6.74 for the same 40 correct turns. Almost all of that saving comes from **not attempting
+  turns no model solves (~91% of turns)**, not from choosing a model. For agent sessions the open lever is
+  recognising hopeless turns, not model selection.
+- Limits: n=60 instances; Switchyard's real escalation router also uses an LLM judge over session progress,
+  which these recorded turns do not contain; the stage router is replayed as a rule, not by calling Switchyard.

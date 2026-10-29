@@ -301,6 +301,18 @@ impl EProcessRiskControl {
     pub fn grid(&self) -> &[f64] {
         &self.grid
     }
+
+    /// Target served-failure rate the certificate is stated at.
+    #[must_use]
+    pub const fn alpha(&self) -> f64 {
+        self.alpha
+    }
+
+    /// Family-wise error budget the certificate is stated at.
+    #[must_use]
+    pub const fn delta(&self) -> f64 {
+        self.delta
+    }
 }
 
 #[cfg(test)]
