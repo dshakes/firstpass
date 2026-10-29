@@ -20,6 +20,7 @@ import argparse
 import collections
 import json
 import math
+import random
 import sys
 
 
@@ -187,7 +188,68 @@ def main() -> int:
         f"pass@any (NOT leaderboard-comparable)          {res}/{n_inst} = {pct(res, n_inst)} "
         f"[{100 * lo:.1f}%, {100 * hi:.1f}%]   ${total:.2f}  ->  {dollars(total, res)}/resolved"
     )
+    with open(args.checkpoint) as fh:
+        head_to_head([json.loads(line) for line in fh if line.strip()])
     return 0
+
+
+def first_pass(rungs: list[dict]) -> tuple[bool, float]:
+    """Gate each rung in order and serve the first pass; pay only for the rungs actually tried."""
+    spent = 0.0
+    for g in rungs:
+        spent += g["cost_usd"]
+        if g["gate_pass"]:
+            return bool(g["oracle_correct"]), spent
+    return bool(rungs[-1]["oracle_correct"]), spent
+
+
+def stage_router(turn: dict, min_errors: int) -> tuple[bool, float]:
+    """NVIDIA NeMo Switchyard's stage router, as a decision rule: read the session's recent tool
+    errors and loops, send a troubled turn to the top model, everything else to the cheap one —
+    and serve it. No gate runs on the output."""
+    troubled = turn["tool_errors"] >= min_errors or turn["repeated_tool_calls"] >= 1
+    g = turn["rungs"][-1 if troubled else 0]
+    return bool(g["oracle_correct"]), g["cost_usd"]
+
+
+def head_to_head(records: list[dict], b: int = 4000, seed: int = 42) -> None:
+    """First-pass vs session-signal routing on the same recorded turns.
+
+    Turns of one instance share a conversation, so they are not independent: the bootstrap
+    resamples whole instances, and the interval is on first-pass minus the other arm.
+    """
+    arms = {
+        f"stage-router err>={k} (Switchyard-style)": (lambda t, k=k: stage_router(t, k))
+        for k in (1, 3)
+    }
+    arms["always-top (ungated)"] = lambda t: (
+        bool(t["rungs"][-1]["oracle_correct"]),
+        t["rungs"][-1]["cost_usd"],
+    )
+    fp = [[first_pass(t["rungs"]) for t in r["turns"]] for r in records]
+    n_turns = sum(len(x) for x in fp)
+    fp_ok = sum(o for x in fp for o, _ in x)
+    fp_cost = sum(c for x in fp for _, c in x)
+    print("\n## Head-to-head: session-signal routing (offline replay, $0)\n")
+    print(
+        f"first-pass (gate per turn)  {fp_ok}/{n_turns} correct  ${fp_cost:.2f}  ->  ${fp_cost / fp_ok:.3f}/correct"
+    )
+    rng = random.Random(seed)
+    idx_sets = [[rng.randrange(len(records)) for _ in records] for _ in range(b)]
+    for name, rule in arms.items():
+        other = [[rule(t) for t in r["turns"]] for r in records]
+        d_ok = [sum(a[0] - o[0] for a, o in zip(f, x)) for f, x in zip(fp, other)]
+        d_c = [sum(a[1] - o[1] for a, o in zip(f, x)) for f, x in zip(fp, other)]
+        boot_ok = sorted(sum(d_ok[i] for i in s) / n_turns for s in idx_sets)
+        boot_c = sorted(sum(d_c[i] for i in s) for s in idx_sets)
+        ok = sum(o for x in other for o, _ in x)
+        cost = sum(c for x in other for _, c in x)
+        per = f"${cost / ok:.3f}/correct" if ok else "—"
+        print(
+            f"{name:38s} {ok}/{n_turns} correct  ${cost:.2f}  ->  {per}   "
+            f"fp−arm: Δrate [{boot_ok[int(0.025 * b)]:+.4f}, {boot_ok[int(0.975 * b)]:+.4f}]  "
+            f"Δ$ [{boot_c[int(0.025 * b)]:+.2f}, {boot_c[int(0.975 * b)]:+.2f}]"
+        )
 
 
 def _self_check() -> None:
@@ -218,6 +280,17 @@ def _self_check() -> None:
     # Exhausted ladder serves the TOP rung, not the bottom one. The two must be distinguishable
     # objects or this assertion passes for an implementation that returns rungs[0].
     assert served_rung([cheap_bad, top_bad]) is top_bad
+
+    # The stage router ignores the gate: a quiet session serves the cheap rung even when its gate
+    # failed, and a troubled one goes straight to the top without paying for the cheap rung.
+    cheap = {"gate_pass": False, "oracle_correct": False, "cost_usd": 1.0}
+    top = {"gate_pass": True, "oracle_correct": True, "cost_usd": 5.0}
+    quiet = {"tool_errors": 0, "repeated_tool_calls": 0, "rungs": [cheap, top]}
+    loop = {"tool_errors": 0, "repeated_tool_calls": 1, "rungs": [cheap, top]}
+    assert stage_router(quiet, 1) == (False, 1.0)
+    assert stage_router(loop, 3) == (True, 5.0)
+    # First-pass pays for every rung it tries.
+    assert first_pass([cheap, top]) == (True, 6.0)
     print("self-check ok")
 
 
