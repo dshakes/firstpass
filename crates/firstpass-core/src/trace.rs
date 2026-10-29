@@ -208,6 +208,47 @@ pub struct Trace {
     /// hash-chain compatible (the `skip_serializing_if` keeps absent = absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elastic: Option<ElasticDecision>,
+    /// The risk-control certificate the serve threshold was taken from: which controller, the
+    /// threshold, and the evidence behind it. Inside the hash chain, so an auditor can check from
+    /// the receipt alone which guarantee this answer was served under — and a later edit to it
+    /// breaks the chain. Absent when no serve threshold was in force (plain pass/fail serving) —
+    /// byte-identical to earlier traces and hash-chain compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskCertificate>,
+}
+
+/// Which controller supplied the serve threshold. Precedence is e-process > ACI > fixed
+/// (ADR 0011): only the e-process's bound holds at the round it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdSource {
+    /// Anytime-valid e-process: served-failure ≤ α at every round, with probability ≥ 1−δ.
+    Eprocess,
+    /// Adaptive conformal: long-run average served-failure → α. No per-round guarantee.
+    Aci,
+    /// A configured constant. No guarantee is claimed.
+    Fixed,
+}
+
+/// The guarantee a served answer was decided under (see [`Trace::risk`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RiskCertificate {
+    /// Which controller supplied the threshold.
+    pub source: ThresholdSource,
+    /// The serve threshold in force: a gate score at or above it was servable.
+    pub threshold: f64,
+    /// Target served-failure rate (e-process, ACI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha: Option<f64>,
+    /// Family-wise error budget (e-process only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<f64>,
+    /// E-value backing the threshold; `>= 1/delta` whenever certified (e-process only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e_value: Option<f64>,
+    /// Round at which the threshold was first certified (e-process only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certified_at_round: Option<u64>,
 }
 
 /// Reference to the policy that produced a decision.
@@ -507,6 +548,7 @@ mod tests {
             predicted_pass: None,
             decision_prior: None,
             elastic: None,
+            risk: None,
         };
         t.recompute_savings();
         t
@@ -805,5 +847,45 @@ mod tests {
         // Tampering the field is detectable via the hash chain.
         chain[0].decision_prior = Some(vec![0.9, 0.95, 1.0]);
         assert!(verify_chain(&chain, GENESIS_HASH).is_err());
+    }
+
+    // ── risk certificate in the receipt ─────────────────────────────────────────
+
+    /// No threshold in force ⇒ no `risk` key: pre-certificate traces hash exactly as before.
+    #[test]
+    fn risk_none_serializes_byte_identically_to_before() {
+        let t = sample_trace(GENESIS_HASH, 1);
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(!j.contains("\"risk\""), "risk=None must be omitted: {j}");
+        let back: Trace = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.risk, None);
+    }
+
+    /// The certificate round-trips with its wire names, and editing it after the fact — e.g.
+    /// claiming a tighter α than the answer was served under — breaks the chain.
+    #[test]
+    fn risk_certificate_roundtrips_and_tamper_breaks_chain() {
+        let mut t0 = sample_trace(GENESIS_HASH, 40);
+        t0.risk = Some(RiskCertificate {
+            source: ThresholdSource::Eprocess,
+            threshold: 0.7,
+            alpha: Some(0.1),
+            delta: Some(0.05),
+            e_value: Some(25.0),
+            certified_at_round: Some(312),
+        });
+        let j = serde_json::to_string(&t0).unwrap();
+        assert!(j.contains("\"source\":\"eprocess\""), "{j}");
+        let back: Trace = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.risk, t0.risk);
+
+        let t1 = sample_trace(&t0.hash().unwrap(), 41);
+        let mut chain = [t0, t1];
+        assert!(verify_chain(&chain, GENESIS_HASH).is_ok());
+        chain[0].risk.as_mut().unwrap().alpha = Some(0.01);
+        assert!(
+            verify_chain(&chain, GENESIS_HASH).is_err(),
+            "an edited certificate must break the chain"
+        );
     }
 }

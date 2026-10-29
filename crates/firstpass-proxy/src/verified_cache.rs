@@ -585,6 +585,7 @@ mod tests {
             decision_prior: None,
             probe: None,
             elastic: None,
+            risk: None,
             rollout: None,
             shadow: None,
             route_ix: None,

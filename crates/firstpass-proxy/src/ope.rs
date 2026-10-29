@@ -805,6 +805,7 @@ mod tests {
             predicted_pass: None,
             decision_prior: None,
             elastic: None,
+            risk: None,
         };
         trace.recompute_savings();
         trace
@@ -893,6 +894,7 @@ mod tests {
             predicted_pass: None,
             decision_prior: None,
             elastic: None,
+            risk: None,
         };
         trace.recompute_savings();
         trace
@@ -1311,6 +1313,7 @@ serve_threshold = 0.75
             predicted_pass: None,
             decision_prior: None,
             elastic: None,
+            risk: None,
         };
         trace.recompute_savings();
         trace
