@@ -141,3 +141,31 @@ the Bonferroni correction, updating thresholds that would not have served, and r
 fail exactly their own test and no other. The cap mutation initially **survived** — nothing covered
 it — so the test above was written and the mutation re-run. That is the process working; an
 uncovered constant is indistinguishable from a decorative one.
+
+## Addendum (2026-10-29): the certificate goes on the receipt
+
+Until now the threshold a request was served under, and the evidence behind it, existed only in
+gauges (`firstpass_eprocess_certified_threshold`, `firstpass_eprocess_e_value`). A gauge is a
+moment; an auditor holding one receipt could not tell whether that answer was served under a
+certified anytime-valid bound, an ACI long-run average, a hand-set constant, or nothing at all.
+
+**Decision.** `Trace.risk: Option<RiskCertificate>` records `source` (`eprocess` | `aci` |
+`fixed`), `threshold`, and — only where the controller has them — `alpha`, `delta`, `e_value`,
+`certified_at_round`. It sits inside the hash chain, so editing a certificate after the fact (say,
+claiming a tighter α) breaks verification.
+
+- **One source of truth.** The serve threshold is *read from* the certificate
+  (`proxy::risk_certificate`, same precedence as above), so the receipt cannot describe a
+  different guarantee than the one the decision used.
+- **Compatible.** Absent when no threshold is in force; `skip_serializing_if` keeps every earlier
+  receipt byte-identical and its hash unchanged. No schema bump: an optional field, the same
+  pattern as `probe`, `rollout`, `elastic` and `decision_prior`.
+- **What it does not claim.** A `fixed` or `aci` certificate states the threshold, not a
+  per-round guarantee; only `eprocess` carries one. Receipts are hash-chained, not signed —
+  signing (provider-response attestation à la VeriRouter, arXiv 2610.17431) is a separate decision.
+
+Tests: `trace::risk_none_serializes_byte_identically_to_before`,
+`trace::risk_certificate_roundtrips_and_tamper_breaks_chain`,
+`proxy::risk_certificate_follows_adr_0011_precedence`, and end-to-end
+`receipt_carries_the_risk_certificate_it_was_served_under` (real store, chain verified;
+mutation-tested: dropping the stamp fails it).

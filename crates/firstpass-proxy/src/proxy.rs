@@ -36,7 +36,7 @@ use crate::store;
 use crate::tenant_auth::{TenantId, auth_middleware};
 use crate::upstream::{forward_anthropic, forward_anthropic_streaming};
 use firstpass_core::Route;
-use firstpass_core::trace::ShadowSignal;
+use firstpass_core::trace::{RiskCertificate, ShadowSignal, ThresholdSource};
 
 /// Shared state handed to every request handler. Cheap to clone: an `Arc`ed config, a
 /// pooled HTTP client, and a bounded channel sender.
@@ -188,6 +188,7 @@ fn cache_hit_trace(
         decision_prior: None,
         probe: None,
         elastic: None,
+        risk: None,
         rollout: None,
         shadow: None,
         route_ix: None,
@@ -342,6 +343,33 @@ fn offer_trace(traces: &store::TraceSender, spill: Option<&store::SpillHandle>, 
 /// Record the real signals every trace carries: enforce-mode latency/escalations (observe mode
 /// forwards unchanged, so its wall-clock time isn't a routing-decision latency), and what got
 /// served — regardless of mode, since an upstream failure is worth counting either way.
+/// The serve threshold in force and the guarantee behind it, by ADR 0011 precedence:
+/// e-process (certified) > ACI > fixed config. `None` = no threshold, plain pass/fail serving.
+fn risk_certificate(
+    eprocess: Option<(firstpass_core::eprocess::Certification, f64, f64)>,
+    aci: Option<(f64, f64)>,
+    fixed: Option<f64>,
+) -> Option<RiskCertificate> {
+    let cert = |source, threshold, alpha| RiskCertificate {
+        source,
+        threshold,
+        alpha,
+        delta: None,
+        e_value: None,
+        certified_at_round: None,
+    };
+    if let Some((c, alpha, delta)) = eprocess {
+        return Some(RiskCertificate {
+            delta: Some(delta),
+            e_value: Some(c.e_value),
+            certified_at_round: Some(c.certified_at_round),
+            ..cert(ThresholdSource::Eprocess, c.threshold, Some(alpha))
+        });
+    }
+    aci.map(|(t, alpha)| cert(ThresholdSource::Aci, t, Some(alpha)))
+        .or_else(|| fixed.map(|t| cert(ThresholdSource::Fixed, t, None)))
+}
+
 fn record_trace_metrics(trace: &Trace) {
     if trace.mode == Mode::Enforce {
         metrics::histogram!("firstpass_enforce_latency_ms")
@@ -1763,23 +1791,23 @@ async fn enforce_pipeline_inner(
     // already doing. Serving on an uncertified threshold would be exactly the unproven-claim
     // failure the module exists to prevent, and inventing a number there would be worse than
     // having none.
-    let certified = state
-        .eprocess
-        .as_ref()
-        .and_then(|e| e.lock().ok().and_then(|g| g.certified_threshold()));
-    if let Some(c) = &certified {
+    let certified = state.eprocess.as_ref().and_then(|e| {
+        e.lock()
+            .ok()
+            .and_then(|g| g.certified_threshold().map(|c| (c, g.alpha(), g.delta())))
+    });
+    if let Some((c, _, _)) = &certified {
         metrics::gauge!("firstpass_eprocess_certified_threshold").set(c.threshold);
         metrics::gauge!("firstpass_eprocess_e_value").set(c.e_value);
     }
-    let serve_threshold = certified
-        .map(|c| c.threshold)
-        .or_else(|| {
-            state
-                .adaptive
-                .as_ref()
-                .and_then(|a| a.lock().ok().map(|g| g.threshold()))
-        })
-        .or(serve_threshold);
+    let aci = state
+        .adaptive
+        .as_ref()
+        .and_then(|a| a.lock().ok().map(|g| (g.threshold(), g.alpha())));
+    // The threshold is READ from the certificate, so the receipt can never claim a guarantee
+    // other than the one the decision was actually made under.
+    let risk = risk_certificate(certified, aci, serve_threshold);
+    let serve_threshold = risk.as_ref().map(|r| r.threshold);
 
     // Apply routing-mode preset overrides on top of config values.
     // Balanced preset has all None/false — byte-identical to existing behaviour.
@@ -2032,6 +2060,7 @@ async fn enforce_pipeline_inner(
     // Verified predictive routing: record what the decision-model prior said, if anything did.
     // None whenever `[escalation.prior]` is off — absent from JSON, byte-identical to before.
     trace.decision_prior = decision_prior;
+    trace.risk = risk;
 
     // Online bandit learning: feed back every gate verdict from this request so the bandit
     // refines its start-rung estimates. Cheap in-memory update; done before offer_trace so the
@@ -3018,6 +3047,7 @@ fn base_trace(
         predicted_pass: None,
         decision_prior: None,
         elastic: None,
+        risk: None,
     }
 }
 
@@ -3873,6 +3903,36 @@ async fn responses(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+
+    /// ADR 0011 precedence, and the evidence fields travel only with the controller that has
+    /// them: a certified e-process wins over ACI and config; ACI over config; nothing ⇒ `None`.
+    #[test]
+    fn risk_certificate_follows_adr_0011_precedence() {
+        use super::{ThresholdSource, risk_certificate};
+        let c = firstpass_core::eprocess::Certification {
+            threshold: 0.6,
+            e_value: 30.0,
+            certified_at_round: 200,
+        };
+        let r = risk_certificate(Some((c, 0.1, 0.05)), Some((0.4, 0.1)), Some(0.9)).unwrap();
+        assert_eq!(r.source, ThresholdSource::Eprocess);
+        assert_eq!(
+            (r.threshold, r.e_value, r.delta, r.certified_at_round),
+            (0.6, Some(30.0), Some(0.05), Some(200))
+        );
+
+        let r = risk_certificate(None, Some((0.4, 0.1)), Some(0.9)).unwrap();
+        assert_eq!((r.source, r.threshold), (ThresholdSource::Aci, 0.4));
+        assert_eq!((r.alpha, r.e_value), (Some(0.1), None));
+
+        let r = risk_certificate(None, None, Some(0.9)).unwrap();
+        assert_eq!(
+            (r.source, r.threshold, r.alpha),
+            (ThresholdSource::Fixed, 0.9, None)
+        );
+
+        assert!(risk_certificate(None, None, None).is_none());
+    }
 
     use super::*;
 

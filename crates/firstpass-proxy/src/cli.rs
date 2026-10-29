@@ -1090,6 +1090,7 @@ mod tests {
             predicted_pass: None,
             decision_prior: None,
             elastic: None,
+            risk: None,
         };
         let t0 = mk(GENESIS_HASH, "s0");
         let t1 = mk(&t0.hash().unwrap(), "s1");
@@ -1200,6 +1201,7 @@ mod tests {
             decision_prior: None,
             probe: None,
             elastic: None,
+            risk: None,
             rollout: None,
             shadow: None,
             route_ix: None,
@@ -1319,6 +1321,7 @@ mod tests {
             decision_prior: None,
             probe: None,
             elastic: None,
+            risk: None,
             rollout: None,
             shadow: None,
             route_ix: None,
@@ -1415,6 +1418,7 @@ mod tests {
             predicted_pass: None,
             decision_prior: None,
             elastic: None,
+            risk: None,
         };
         let ex = explain_trace(&t);
         assert_eq!(
