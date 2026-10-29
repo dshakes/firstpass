@@ -5771,17 +5771,44 @@ mod tests {
         let hash_a = crate::tenant_auth::TenantKeys::hash_key("key-a").unwrap();
         let hash_b = crate::tenant_auth::TenantKeys::hash_key("key-b").unwrap();
         let keys = format!("{{\"tenant-a\": {hash_a:?}, \"tenant-b\": {hash_b:?}}}");
-        auth_state_rated(true, Some(keys), rate_per_sec)
+        let mut state = auth_state_rated(true, Some(keys), rate_per_sec);
+        // Each request pays a synchronous Argon2 verify before the limiter, so a burst reaches
+        // it one verify apart; on a loaded runner a per-second bucket refills in between and the
+        // expected 429 becomes a legit 200. An hourly refill keeps the burst semantics and takes
+        // the wall clock out (`build_tenant_rate_limiter`'s own quota is checked directly below).
+        if let Some(n) = rate_per_sec.and_then(std::num::NonZeroU32::new) {
+            state.tenant_rate_limiter = Some(Arc::new(governor::RateLimiter::keyed(
+                governor::Quota::per_hour(n),
+            )));
+        }
+        state
+    }
+
+    #[test]
+    fn tenant_rate_limiter_allows_a_burst_of_exactly_the_configured_rate() {
+        let config = ProxyConfig::from_lookup(|k| {
+            (k == "FIRSTPASS_TENANT_RATE_PER_SEC").then(|| "2".to_owned())
+        })
+        .unwrap();
+        let limiter = build_tenant_rate_limiter(&config).expect("rate configured");
+        let t = "tenant-a".to_owned();
+        assert!(limiter.check_key(&t).is_ok());
+        assert!(limiter.check_key(&t).is_ok());
+        assert!(
+            limiter.check_key(&t).is_err(),
+            "third in the same instant is over the burst"
+        );
+        assert!(
+            limiter.check_key(&"tenant-b".to_owned()).is_ok(),
+            "buckets are per tenant"
+        );
     }
 
     #[tokio::test]
     async fn tenant_exceeding_rate_limit_gets_429_opaque() {
         use tower::ServiceExt;
-        // Burst capacity == rate for `Quota::per_second`, so 1 req/sec allows one request through
-        // and rejects the rest of a burst. The requests are fired CONCURRENTLY so they reach the
-        // limiter in one tight window — a serial sequence is wall-clock sensitive (each request
-        // pays a deliberately slow Argon2 verify, and on a loaded CI runner >1s can elapse between
-        // limiter checks, refilling the bucket and turning the expected 429 into a legit 200).
+        // A burst of 1 allows one request through and rejects the rest (refill is hourly in
+        // `two_tenant_state`, so the timing of the Argon2 verifies cannot refill the bucket).
         let router = app(two_tenant_state(Some(1))).expect("router");
 
         let (r1, r2, r3, r4) = tokio::join!(
@@ -5825,8 +5852,7 @@ mod tests {
         use tower::ServiceExt;
         let router = app(two_tenant_state(Some(1))).expect("router");
 
-        // Tenant A bursts past its 1 req/sec budget (concurrent — see the sibling test for why a
-        // serial sequence would be wall-clock flaky)...
+        // Tenant A bursts past its budget of 1...
         let (a1, a2, a3) = tokio::join!(
             router
                 .clone()
