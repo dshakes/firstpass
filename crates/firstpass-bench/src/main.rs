@@ -611,6 +611,19 @@ fn main() {
                 std::process::exit(2);
             }
         };
+        // A paid run has no default budget: the operator states the most it may spend, and the
+        // run stops before paying past it (resumed spend included). Required, not defaulted, so a
+        // typo'd dataset path or a 10x-larger file cannot quietly cost 10x.
+        let budget_usd = match std::env::var("FIRSTPASS_CODING_BUDGET_USD")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            Some(b) if b.is_finite() && b > 0.0 => b,
+            _ => {
+                eprintln!("--coding-policy needs FIRSTPASS_CODING_BUDGET_USD=<max USD, e.g. 10>");
+                std::process::exit(2);
+            }
+        };
         let dataset_path = match std::env::var("FIRSTPASS_CODING_DATASET") {
             Ok(p) if !p.is_empty() => p,
             _ => {
@@ -697,7 +710,9 @@ fn main() {
         // this, every call already paid for goes with it.
         let ckpt = std::env::var("FIRSTPASS_CODING_CHECKPOINT")
             .unwrap_or_else(|_| format!("{dataset_path}.checkpoint.jsonl"));
-        eprintln!("checkpoint: {ckpt} (delete it to force a clean re-measure)");
+        eprintln!(
+            "checkpoint: {ckpt} (delete it to force a clean re-measure) · spend cap ${budget_usd:.2}"
+        );
         match firstpass_bench::coding_policy::measure_resumable(
             &tasks,
             &rungs,
@@ -707,7 +722,10 @@ fn main() {
             judge
                 .as_ref()
                 .map(|j| j as &dyn firstpass_bench::coding::Judge),
-            Some(std::path::Path::new(&ckpt)),
+            firstpass_bench::coding_policy::RunOpts {
+                checkpoint: Some(std::path::Path::new(&ckpt)),
+                budget_usd: Some(budget_usd),
+            },
         ) {
             Ok(matrix) => {
                 let study = firstpass_bench::coding_policy::replay(&matrix, &ladder, sb.runtime());

@@ -73,3 +73,30 @@ cargo run -p firstpass-bench --release -- --coding-policy
 ```
 
 The artifact and its manifest get committed under `docs/benchmarks/` whatever the outcome.
+
+---
+
+## Addendum, 2026-10-29 — written before any paid call
+
+**Harness defect found and fixed before the run.** The extraction suite reads the reply from
+`solution.py`, but the unit-test execution path never wrote that file and instead prepended the reply
+into the test module as Python. Every candidate would have scored 0 on gate and oracle, and the study
+would have published a false negative. Fixed by `CodingTask.reply_is_data`; a host-executed test now
+proves a right answer scores 1.0 and a well-formed wrong one passes the gate but fails the oracle.
+
+**Added arm: a k-sample judge,** because the open question after the code benchmarks is what a judge
+is worth *where no tests exist* (on MBPP its in-sample best fusion with tests was +1.2pp for +46% cost).
+
+- Judge: `anthropic/claude-haiku-4-5`, k = 5, an answer-checking prompt (not the code-review prompt),
+  one call set per rung per task, billed into each rung's cost.
+- Arms replayed over the one matrix: always-cheap, always-top, first-pass (JSON gate),
+  first-pass+judge (τ = 0.8, fixed), and the head-to-head arms (judge-escalate as the Switchyard-style
+  rule, conformal-cascade α = 0.10 cross-fit).
+- **Secondary questions, decided by paired 95% CIs, not pass/fail for the primary claim:**
+  1. Does first-pass+judge serve more correct answers than first-pass? If the CI on the difference
+     includes 0, a judge is not worth its cost here either.
+  2. Does first-pass+judge beat judge-escalate (judge without the schema gate)?
+- **Hard spend cap: `FIRSTPASS_CODING_BUDGET_USD=10`**, enforced before every task and counting
+  resumed spend. Estimate ≈ $3–6. If the cap stops the run, the measured prefix is reported as such.
+- Known, shared by every arm: the solver's system prompt is the coding one ("Python coding
+  assistant"); the user prompt demands JSON only, and fenced JSON is unwrapped before parsing.

@@ -86,6 +86,7 @@ fn parse_mbpp_line(line: &str) -> Result<CodingTask, String> {
         visible_cases,
         hidden_cases,
         unit_test: None,
+        reply_is_data: false,
     })
 }
 
@@ -155,6 +156,7 @@ fn parse_humaneval_line(line: &str) -> Result<CodingTask, String> {
         visible_cases,
         hidden_cases,
         unit_test: None,
+        reply_is_data: false,
     })
 }
 
@@ -318,6 +320,7 @@ fn parse_bigcodebench_line(line: &str) -> Result<CodingTask, String> {
         visible_cases,
         hidden_cases,
         unit_test: Some(test_src.to_owned()),
+        reply_is_data: false,
     })
 }
 
@@ -647,6 +650,7 @@ fn parse_extraction_line(line: &str) -> Result<CodingTask, String> {
             h
         },
         unit_test: Some(extraction_suite(&required, expected)),
+        reply_is_data: true,
     })
 }
 
@@ -699,6 +703,87 @@ fn extraction_suite(
 #[cfg(test)]
 mod extraction_tests {
     use super::*;
+
+    /// Runs a unit on the host with `python3`. ONLY for author-written fixtures — the replies
+    /// below are literals in this file, never model output — so ADR 0002's never-host-exec rule
+    /// (which is about untrusted candidates) is not engaged. It exists because the only other
+    /// real-execution test needs a container daemon and is `#[ignore]`d, which is how a harness
+    /// that scored every extraction 0 shipped unnoticed.
+    struct HostPython;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    impl crate::sandbox::Sandbox for HostPython {
+        fn runtime(&self) -> &str {
+            "host-test"
+        }
+        fn run(
+            &self,
+            unit: &crate::sandbox::ExecUnit,
+            _: &crate::sandbox::Limits,
+        ) -> Result<crate::sandbox::ExecOutcome, crate::sandbox::SandboxError> {
+            let dir = std::env::temp_dir().join(format!(
+                "fp-ext-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| crate::sandbox::SandboxError::Setup(e.to_string()))?;
+            for (name, body) in &unit.files {
+                std::fs::write(dir.join(name), body)
+                    .map_err(|e| crate::sandbox::SandboxError::Setup(e.to_string()))?;
+            }
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&unit.command)
+                .current_dir(&dir)
+                .output()
+                .map_err(|e| crate::sandbox::SandboxError::Unavailable(e.to_string()))?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(crate::sandbox::ExecOutcome::Completed {
+                exit_code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            })
+        }
+    }
+
+    /// The extraction path executed for real: a right answer passes gate and oracle, a
+    /// well-formed wrong answer passes the gate but fails the oracle (the gap the study measures),
+    /// and JSON that is not Python (`null`) or comes fenced is still read as data. Before the
+    /// `reply_is_data` fix every one of these scored 0.
+    #[test]
+    fn extraction_suite_scores_replies_as_data() {
+        let line = r#"{"id":"q1","text":"The Normans were in Normandy.\n\nQuestion: Who?","required":["answer"],"expected":{"answer":"Normans"}}"#;
+        let task = parse_extraction_line(line).unwrap();
+        assert!(task.reply_is_data);
+        let limits = crate::sandbox::Limits::default();
+        let score = |reply: &str, cases: &[String]| {
+            crate::coding::suite_score(&HostPython, &task, reply, cases, &limits).unwrap()
+        };
+        let all = task.hidden_cases.len();
+        assert_eq!(
+            score(r#"{"answer": "Normans"}"#, &task.hidden_cases),
+            (all, all)
+        );
+        assert_eq!(
+            score(
+                "```json\n{\"answer\": \"Normans\", \"x\": null}\n```",
+                &task.hidden_cases
+            ),
+            (all, all)
+        );
+        let wrong = r#"{"answer": "Vikings"}"#;
+        assert_eq!(
+            score(wrong, &task.visible_cases),
+            (2, 2),
+            "well-formed wrong answer passes the gate"
+        );
+        assert_eq!(
+            score(wrong, &task.hidden_cases),
+            (all - 1, all),
+            "…and fails the oracle"
+        );
+        assert_eq!(score("not json", &task.visible_cases).0, 0);
+    }
 
     fn line() -> &'static str {
         r#"{"id":"inv-1","text":"Invoice from Acme Corp dated 2026-03-04","required":["vendor"],"expected":{"vendor":"Acme Corp","date":"2026-03-04"}}"#

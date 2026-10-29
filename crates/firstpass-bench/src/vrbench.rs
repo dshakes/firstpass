@@ -694,6 +694,7 @@ pub fn run_reference_router(
                 visible_cases: task.visible.cases.clone(),
                 hidden_cases: Vec::new(),
                 unit_test: None,
+                reply_is_data: false,
             };
             let sol = solver
                 .solve(&ct)
