@@ -14,6 +14,7 @@ pub mod ablation;
 pub mod agentic;
 pub mod coding;
 pub mod coding_policy;
+pub mod competitors;
 pub mod costaware;
 pub mod dataset;
 pub mod decision_study;
