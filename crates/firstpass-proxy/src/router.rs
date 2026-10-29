@@ -1676,7 +1676,10 @@ mod tests {
     /// sequentially while speculation prefetches rung 1 during rung 0's gate. Run with `--nocapture`
     /// to see the distribution. Offline (mock delays) but the exact shape a live serial-vs-spec A/B
     /// produces — swap the mock for a live provider for real-provider numbers.
-    #[tokio::test]
+    // Paused virtual time: the mock's delays are `tokio::time::sleep`, so the clock advances by
+    // exactly the simulated latency. A wall-clock p95 on a shared CI runner flaked on one
+    // scheduler hiccup (macOS, 2026-10-29) while measuring nothing about the router.
+    #[tokio::test(start_paused = true)]
     async fn latency_ab_speculative_beats_serial_p95() {
         const DELAY: u64 = 40;
         const N: usize = 30;
@@ -1708,7 +1711,7 @@ mod tests {
                 &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
             );
             c.speculation = speculation;
-            let start = std::time::Instant::now();
+            let start = tokio::time::Instant::now();
             let _ = route_enforce(c).await;
             let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
             if speculation == 0 {
