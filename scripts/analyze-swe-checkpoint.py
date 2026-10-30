@@ -189,7 +189,9 @@ def main() -> int:
         f"[{100 * lo:.1f}%, {100 * hi:.1f}%]   ${total:.2f}  ->  {dollars(total, res)}/resolved"
     )
     with open(args.checkpoint) as fh:
-        head_to_head([json.loads(line) for line in fh if line.strip()])
+        records = [json.loads(line) for line in fh if line.strip()]
+    head_to_head(records)
+    hopeless_stop(records)
     return 0
 
 
@@ -219,7 +221,9 @@ def head_to_head(records: list[dict], b: int = 4000, seed: int = 42) -> None:
     resamples whole instances, and the interval is on first-pass minus the other arm.
     """
     arms = {
-        f"stage-router err>={k} (Switchyard-style)": (lambda t, k=k: stage_router(t, k))
+        f"stage-router err>={k} (= turn index on SWE data)": (
+            lambda t, k=k: stage_router(t, k)
+        )
         for k in (1, 3)
     }
     arms["always-top (ungated)"] = lambda t: (
@@ -249,6 +253,79 @@ def head_to_head(records: list[dict], b: int = 4000, seed: int = 42) -> None:
             f"{name:38s} {ok}/{n_turns} correct  ${cost:.2f}  ->  {per}   "
             f"fp−arm: Δrate [{boot_ok[int(0.025 * b)]:+.4f}, {boot_ok[int(0.975 * b)]:+.4f}]  "
             f"Δ$ [{boot_c[int(0.025 * b)]:+.2f}, {boot_c[int(0.975 * b)]:+.2f}]"
+        )
+
+
+def stop_after(turns: list[dict], k: int) -> list[tuple[bool, float]]:
+    """First-pass per turn, until the top rung's gate has failed on `k` consecutive escalations
+    in this session; from then on a failed cheap rung is served as-is instead of escalated.
+
+    Only what a live router sees feeds the rule: the top rung's gate is observed only on turns
+    that actually escalated, so a turn served cheap adds no evidence either way. `k=0` never stops.
+    """
+    out, streak, stopped = [], 0, False
+    for t in turns:
+        cheap = t["rungs"][0]
+        if not cheap["gate_pass"] and stopped:
+            out.append((bool(cheap["oracle_correct"]), cheap["cost_usd"]))
+            continue
+        out.append(first_pass(t["rungs"]))
+        if not cheap["gate_pass"]:
+            streak = 0 if t["rungs"][-1]["gate_pass"] else streak + 1
+            stopped = k > 0 and streak >= k
+    return out
+
+
+def hopeless_stop(records: list[dict], b: int = 4000, seed: int = 42) -> None:
+    """Stop escalating a session the top model keeps failing. `k` is chosen on one half of the
+    instances (cheapest `k` that loses no correct turn there) and scored on the other half, by
+    index parity, so the reported number never sees the data its threshold was fitted on.
+    """
+
+    def total(rs: list[dict], k: int) -> tuple[int, float]:
+        x = [o for r in rs for o in stop_after(r["turns"], k)]
+        return sum(o for o, _ in x), sum(c for _, c in x)
+
+    def pick(rs: list[dict]) -> int:
+        base, fits = total(rs, 0)[0], []
+        for k in range(1, 13):
+            ok, cost = total(rs, k)
+            if ok >= base:
+                fits.append((cost, k))
+        return min(fits)[1] if fits else 0
+
+    k_even, k_odd = pick(records[1::2]), pick(records[0::2])
+    fp = [stop_after(r["turns"], 0) for r in records]
+    hs = [
+        stop_after(r["turns"], k_even if i % 2 == 0 else k_odd)
+        for i, r in enumerate(records)
+    ]
+
+    def per(arm: list[list[tuple[bool, float]]]) -> tuple[list[int], list[float]]:
+        return [sum(o for o, _ in x) for x in arm], [sum(c for _, c in x) for x in arm]
+
+    (fo, fc), (ho, hc) = per(fp), per(hs)
+    print(
+        "\n## Stop escalating a hopeless session (cross-fit by parity, offline replay, $0)\n"
+    )
+    print(f"k fitted on odd half -> even: {k_even}; on even half -> odd: {k_odd}")
+    for name, o, c in [("first-pass", fo, fc), ("stop-after-k", ho, hc)]:
+        print(
+            f"{name:14s} {sum(o)} correct  ${sum(c):.2f}  ->  ${sum(c) / sum(o):.3f}/correct"
+        )
+    rng = random.Random(seed)
+    d_ok, d_c, d_per = [], [], []
+    for _ in range(b):
+        idx = [rng.randrange(len(records)) for _ in records]
+        so, sh = sum(fo[i] for i in idx), sum(ho[i] for i in idx)
+        d_ok.append(sh - so)
+        d_c.append(sum(hc[i] - fc[i] for i in idx))
+        if so and sh:
+            d_per.append(sum(hc[i] for i in idx) / sh - sum(fc[i] for i in idx) / so)
+    for name, v in [("Δcorrect", d_ok), ("Δ$", d_c), ("Δ$/correct", d_per)]:
+        v.sort()
+        print(
+            f"stop−fp {name:11s} 95% CI [{v[int(0.025 * len(v))]:+.3f}, {v[int(0.975 * len(v))]:+.3f}]"
         )
 
 
@@ -291,6 +368,18 @@ def _self_check() -> None:
     assert stage_router(loop, 3) == (True, 5.0)
     # First-pass pays for every rung it tries.
     assert first_pass([cheap, top]) == (True, 6.0)
+    # Stop-after-k: two escalations whose top gate fails, then the third turn is served cheap.
+    # The third turn's top rung would have passed, so a rule that peeked at it would not stop.
+    top_bad = {"gate_pass": False, "oracle_correct": False, "cost_usd": 5.0}
+    lost = {"rungs": [cheap, top_bad]}
+    assert stop_after([lost, lost, loop], 2) == [
+        (False, 6.0),
+        (False, 6.0),
+        (False, 1.0),
+    ]
+    assert stop_after([lost, lost, loop], 0)[-1] == (True, 6.0)
+    # A passing top gate resets the streak.
+    assert stop_after([lost, loop, lost, loop], 2)[-1] == (True, 6.0)
     print("self-check ok")
 
 
