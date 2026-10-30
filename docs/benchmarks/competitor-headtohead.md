@@ -65,3 +65,26 @@ Reading it:
   recognising hopeless turns, not model selection.
 - Limits: n=60 instances; Switchyard's real escalation router also uses an LLM judge over session progress,
   which these recorded turns do not contain; the stage router is replayed as a rule, not by calling Switchyard.
+
+### Stop escalating a hopeless session (2026-10-29)
+
+Same command, section "Stop escalating a hopeless session". The rule: once the **top** rung's gate has failed
+on `k` consecutive escalations in a session, serve a failed cheap rung as-is for the rest of the session.
+It only uses what a live router sees: the top gate is observed only on turns that actually escalated. `k` is
+fitted on one half of the instances (the cheapest `k` that loses no correct turn there) and scored on the
+other half by index parity, so the reported number never sees the data its threshold came from. Fitted:
+`k=6` and `k=5`.
+
+| arm | correct turns | spend | $/correct |
+|---|---|---|---|
+| first-pass | 40/459 | $48.70 | $1.217 |
+| first-pass + stop-after-k (cross-fit) | 38/459 | $41.58 | $1.094 |
+
+Paired instance bootstrap, stop − first-pass: Δcorrect [−5, 0], **Δ$ [−$9.98, −$4.53]**, Δ$/correct
+[−$0.310, +$0.003].
+
+Verdict: **not shipped as a default.** It cuts spend significantly (about 15%), but $/correct does not
+clear 0, and it gives up 2 correct turns (not significant at n=60). It also replays a counterfactual
+optimistically: a turn served cheap instead of escalated would change the rest of the real conversation,
+which recorded turns can't show. Re-test on a larger agent run before turning it on. The in-sample sweep
+(k=4: 37 correct at $0.995/correct) is selection on the test set and is not the result.
