@@ -221,7 +221,7 @@ def head_to_head(records: list[dict], b: int = 4000, seed: int = 42) -> None:
     resamples whole instances, and the interval is on first-pass minus the other arm.
     """
     arms = {
-        f"stage-router err>={k} (Switchyard-style)": (lambda t, k=k: stage_router(t, k))
+        f"stage-router err>={k} (= turn index on SWE data)": (lambda t, k=k: stage_router(t, k))
         for k in (1, 3)
     }
     arms["always-top (ungated)"] = lambda t: (
