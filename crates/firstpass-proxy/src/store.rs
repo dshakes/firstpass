@@ -539,6 +539,69 @@ pub fn load_deferred(
     Ok(out)
 }
 
+/// Every deferred verdict in the store as `(trace_id, verdict)`, in the order the feedback
+/// arrived. **Operator-wide**: rows are not tenant-scoped here, so callers must join them to
+/// tenant-scoped traces (an id that matches no loaded trace is simply ignored). Rows with an
+/// unparseable id or verdict are skipped, as in [`load_deferred`].
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] on a database error.
+pub fn load_all_deferred(
+    db_path: impl AsRef<Path>,
+) -> Result<Vec<(uuid::Uuid, Verdict)>, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let mut stmt =
+        conn.prepare("SELECT trace_id, verdict FROM deferred_verdicts ORDER BY id ASC")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, verdict) = row?;
+        let verdict = match verdict.as_str() {
+            "pass" => Verdict::Pass,
+            "fail" => Verdict::Fail,
+            "abstain" => Verdict::Abstain,
+            _ => continue,
+        };
+        if let Ok(id) = id.parse::<uuid::Uuid>() {
+            out.push((id, verdict));
+        }
+    }
+    Ok(out)
+}
+
+/// What the feedback path needs to attribute an outcome to a certified-selection experiment:
+/// the trace's session, its route, and its experiment record. `Ok(None)` when the trace is not
+/// visible to `tenant`, or carries no experiment record. Tenant-scoped like [`trace_route`].
+///
+/// # Errors
+/// On a store read failure.
+pub fn trace_experiment(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+    trace_id: &str,
+) -> Result<Option<(String, usize, firstpass_core::trace::ExperimentRecord)>, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let body: Option<String> = conn
+        .query_row(
+            "SELECT body FROM traces WHERE tenant = ?1 AND trace_id = ?2",
+            [tenant, trace_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(body) = body else { return Ok(None) };
+    let trace: Trace = serde_json::from_str(&body)?;
+    Ok(trace.experiment.map(|rec| {
+        (
+            trace.session_id,
+            // Same fallback as the guardrail: a trace with no recorded route is route 0.
+            trace.route_ix.map_or(0, |r| r as usize),
+            rec,
+        )
+    }))
+}
+
 /// Load a single trace by id **scoped to `tenant`**, with its deferred verdicts merged into
 /// `deferred` — the **view** for display/inspection (ADR 0004 §D3). A trace owned by another
 /// tenant returns `None`, exactly like a missing one, so an inspecting agent can never read across
@@ -629,6 +692,7 @@ mod tests {
             decision_prior: None,
             elastic: None,
             risk: None,
+            experiment: None,
         };
         trace.recompute_savings();
         trace

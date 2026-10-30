@@ -760,6 +760,7 @@ mod tests {
             decision_prior: None,
             elastic: None,
             risk: None,
+            experiment: None,
         };
         trace.recompute_savings();
         trace

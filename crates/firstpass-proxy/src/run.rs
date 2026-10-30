@@ -129,6 +129,15 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
             );
             if let Ok(traces_history) = store::load_all_traces(&config.db_path) {
                 for trace in &traces_history {
+                    // A challenger trace's rungs index a different ladder; feeding them would
+                    // teach the incumbent ladder's bandit about models it never ran.
+                    if trace
+                        .experiment
+                        .as_ref()
+                        .is_some_and(|e| e.arm == firstpass_core::Arm::Challenger)
+                    {
+                        continue;
+                    }
                     let ctx = ContextBucket::from_features(&trace.request.features);
                     b.feed_trace_attempts(&ctx, &trace.attempts);
                 }
@@ -152,6 +161,13 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
             if let Ok(traces_history) = store::load_all_traces(&config.db_path) {
                 let mut n = 0usize;
                 for trace in &traces_history {
+                    if trace
+                        .experiment
+                        .as_ref()
+                        .is_some_and(|e| e.arm == firstpass_core::Arm::Challenger)
+                    {
+                        continue; // rung-indexed state belongs to the incumbent ladder
+                    }
                     for attempt in &trace.attempts {
                         match attempt.verdict {
                             firstpass_core::Verdict::Pass => {
@@ -199,6 +215,17 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
             }
         });
 
+    // Certified-selection experiments: rebuilt from receipts, so a restart cannot re-serve a
+    // challenger that was already proven worse. A no-op unless some route has a challenger.
+    let experiments = Arc::new(
+        config
+            .routing
+            .as_ref()
+            .map_or_else(Default::default, |routing| {
+                crate::experiment::build_monitor(&config.db_path, routing)
+            }),
+    );
+
     let state = AppState {
         config: Arc::new(config),
         // Observe passthrough may stream SSE, so only bound the CONNECT phase here — a total or
@@ -210,6 +237,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         providers,
         gate_health: Arc::new(gate_health),
         shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+        experiments,
         guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
         traces,
         adaptive,

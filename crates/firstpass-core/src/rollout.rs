@@ -150,6 +150,110 @@ impl Shadow {
     }
 }
 
+/// A challenger ladder under evaluation on live traffic (ADR 0014).
+///
+/// A randomized `percent` of *sessions* is served by `ladder` instead of the route's own ladder,
+/// through the ordinary enforce path (gates still run). Task outcomes arrive through the feedback
+/// API and a sequential non-inferiority test ([`crate::select::Experiment`]) decides whether the
+/// challenger is certified, halted, or still undecided. Certification never promotes anything by
+/// itself: adopting the ladder is a human edit of the config.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Challenger {
+    /// The ladder under evaluation, cheapest first, as `provider/model` strings. Same shape as
+    /// `Route.ladder`; every rung must resolve to a price and a provider.
+    pub ladder: Vec<String>,
+    /// Percent of *sessions* served by the challenger, in `(0, 100)` exclusive. The rest are the
+    /// incumbent arm, which is the control; at 100 there would be no control and the test could
+    /// never form a pair.
+    pub percent: f64,
+    /// Non-inferiority margin: how much worse (in task success rate) the challenger may be and
+    /// still be certified. See [`crate::select::DEFAULT_MARGIN`].
+    #[serde(default = "default_challenger_margin")]
+    pub margin: f64,
+    /// Error rate of each conclusion (certify / halt). See [`crate::select::DEFAULT_ALPHA`].
+    #[serde(default = "default_challenger_alpha")]
+    pub alpha: f64,
+}
+
+fn default_challenger_margin() -> f64 {
+    crate::select::DEFAULT_MARGIN
+}
+
+fn default_challenger_alpha() -> f64 {
+    crate::select::DEFAULT_ALPHA
+}
+
+impl Challenger {
+    /// Whether this challenger config is coherent on its own. Cross-checks against the route and
+    /// the price table happen in `Config::parse`.
+    ///
+    /// # Errors
+    /// If `percent` is not in `(0, 100)`, the ladder is empty, or `margin`/`alpha` are refused by
+    /// [`crate::select::Experiment::new`].
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.percent.is_finite() || self.percent <= 0.0 || self.percent >= 100.0 {
+            return Err(format!(
+                "route.challenger.percent must be finite and within (0, 100) exclusive — at 100 \
+                 there is no incumbent control and the test can never pair — got {}",
+                self.percent
+            ));
+        }
+        if self.ladder.is_empty() {
+            return Err("route.challenger.ladder must not be empty".to_owned());
+        }
+        crate::select::Experiment::new(self.margin, self.alpha)
+            .map(|_| ())
+            .map_err(|e| format!("route.challenger: {e}"))
+    }
+
+    /// Identity of this experiment's configuration: the first 16 hex of SHA-256 over the canonical
+    /// JSON `[incumbent_ladder, challenger_ladder, margin, alpha]`. Stamped on every receipt so
+    /// that evidence gathered under a different configuration is never pooled with the current
+    /// one — editing either ladder, the margin or alpha starts a fresh experiment.
+    #[must_use]
+    pub fn fingerprint(&self, incumbent_ladder: &[String]) -> String {
+        use sha2::{Digest, Sha256};
+        let canonical = serde_json::json!([incumbent_ladder, self.ladder, self.margin, self.alpha]);
+        let digest = Sha256::digest(canonical.to_string().as_bytes());
+        hex::encode(&digest[..8])
+    }
+
+    /// The bucket `session_key` falls in, within `0..`[`BUCKETS`], under the `challenger` domain
+    /// tag.
+    #[must_use]
+    pub fn bucket(salt: &str, session_key: &str) -> u32 {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(salt.as_bytes());
+        h.update([0u8]);
+        // Distinct tag: arm assignment must be independent of rollout and shadow sampling, or
+        // the challenger arm would be a biased subset of whatever those select.
+        h.update(b"challenger");
+        h.update([0u8]);
+        h.update(session_key.as_bytes());
+        let d = h.finalize();
+        u32::from_be_bytes([d[0], d[1], d[2], d[3]]) % BUCKETS
+    }
+
+    /// The arm for a bucket under this config's `percent`.
+    #[must_use]
+    pub fn arm_of(&self, bucket: u32) -> crate::select::Arm {
+        if in_rollout(bucket, self.percent) {
+            crate::select::Arm::Challenger
+        } else {
+            crate::select::Arm::Incumbent
+        }
+    }
+
+    /// Which arm a session is in. Deterministic for a fixed `salt`, so a whole session stays in
+    /// one arm — outcomes are one per session and pairing assumes the arm never changes mid-run.
+    #[must_use]
+    pub fn arm(&self, salt: &str, session_key: &str) -> crate::select::Arm {
+        self.arm_of(Self::bucket(salt, session_key))
+    }
+}
+
 /// The bucket `key_value` falls in, within `0..`[`BUCKETS`].
 ///
 /// Deterministic for a fixed `salt`. The salt is the per-deployment secret already used for
@@ -469,6 +573,100 @@ mod tests {
             }
             .validate()
             .is_ok()
+        );
+    }
+
+    fn challenger(percent: f64) -> Challenger {
+        Challenger {
+            ladder: vec!["anthropic/claude-haiku-4-5".to_owned()],
+            percent,
+            margin: crate::select::DEFAULT_MARGIN,
+            alpha: crate::select::DEFAULT_ALPHA,
+        }
+    }
+
+    #[test]
+    fn challenger_arm_is_deterministic_and_matches_percent() {
+        use crate::select::Arm;
+        let c = challenger(20.0);
+        for i in 0..200 {
+            let k = format!("s{i}");
+            assert_eq!(c.arm("salt", &k), c.arm("salt", &k));
+        }
+        let n = 10_000;
+        let hits = (0..n)
+            .filter(|i| c.arm("salt", &format!("s{i}")) == Arm::Challenger)
+            .count();
+        let observed = hits as f64 / f64::from(n) * 100.0;
+        assert!((observed - 20.0).abs() < 1.5, "got {observed:.2}%");
+        // The pure function still handles the endpoint (validation is what forbids it).
+        assert!(
+            (0..300).all(|i| challenger(100.0).arm("salt", &format!("s{i}")) == Arm::Challenger)
+        );
+    }
+
+    /// Arm assignment must be independent of shadow sampling at the same salt.
+    #[test]
+    fn challenger_arm_is_uncorrelated_with_shadow_sampling() {
+        use crate::select::Arm;
+        let c = challenger(50.0);
+        let shadow = Shadow {
+            sample_rate: 0.5,
+            max_usd_per_day: 1.0,
+        };
+        let mut cells = [0u32; 4];
+        for i in 0..4000 {
+            let k = format!("s{i}");
+            let a = usize::from(c.arm("salt", &k) == Arm::Challenger);
+            let b = usize::from(shadow.sampled("salt", &k));
+            cells[a * 2 + b] += 1;
+        }
+        for (i, n) in cells.iter().enumerate() {
+            let pct = f64::from(*n) / 4000.0 * 100.0;
+            assert!((pct - 25.0).abs() < 3.0, "cell {i} held {pct:.1}%");
+        }
+    }
+
+    #[test]
+    fn challenger_validate_rejects_incoherent_settings() {
+        for bad in [0.0, -1.0, 100.0, 100.1, f64::NAN, f64::INFINITY] {
+            assert!(challenger(bad).validate().is_err(), "percent {bad}");
+        }
+        for good in [0.01, 10.0, 99.99] {
+            assert!(challenger(good).validate().is_ok(), "percent {good}");
+        }
+        let mut c = challenger(10.0);
+        c.ladder.clear();
+        assert!(c.validate().is_err());
+        let mut c = challenger(10.0);
+        c.margin = 0.0;
+        assert!(c.validate().is_err());
+        let mut c = challenger(10.0);
+        c.alpha = 0.5;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn fingerprint_tracks_ladders_margin_and_alpha() {
+        let inc = vec!["anthropic/claude-sonnet-5".to_owned()];
+        let base = challenger(10.0);
+        let fp = base.fingerprint(&inc);
+        assert_eq!(fp.len(), 16);
+        assert_eq!(fp, challenger(10.0).fingerprint(&inc), "deterministic");
+        // percent is not part of the identity: ramping must not reset the evidence.
+        assert_eq!(fp, challenger(25.0).fingerprint(&inc));
+        let mut c = challenger(10.0);
+        c.ladder = vec!["anthropic/claude-opus-4-8".to_owned()];
+        assert_ne!(fp, c.fingerprint(&inc));
+        let mut c = challenger(10.0);
+        c.margin = 0.04;
+        assert_ne!(fp, c.fingerprint(&inc));
+        let mut c = challenger(10.0);
+        c.alpha = 0.01;
+        assert_ne!(fp, c.fingerprint(&inc));
+        assert_ne!(
+            fp,
+            base.fingerprint(&["anthropic/claude-opus-4-8".to_owned()])
         );
     }
 }

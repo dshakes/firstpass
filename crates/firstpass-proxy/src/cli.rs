@@ -1091,6 +1091,7 @@ mod tests {
             decision_prior: None,
             elastic: None,
             risk: None,
+            experiment: None,
         };
         let t0 = mk(GENESIS_HASH, "s0");
         let t1 = mk(&t0.hash().unwrap(), "s1");
@@ -1205,6 +1206,7 @@ mod tests {
             rollout: None,
             shadow: None,
             route_ix: None,
+            experiment: None,
         }
     }
 
@@ -1325,6 +1327,7 @@ mod tests {
             rollout: None,
             shadow: None,
             route_ix: None,
+            experiment: None,
         };
 
         let rows = export_training_jsonl(&[mk(Some(0.25), true), mk(None, false)]);
@@ -1419,6 +1422,7 @@ mod tests {
             decision_prior: None,
             elastic: None,
             risk: None,
+            experiment: None,
         };
         let ex = explain_trace(&t);
         assert_eq!(
