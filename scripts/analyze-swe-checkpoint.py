@@ -276,6 +276,40 @@ def stop_after(turns: list[dict], k: int) -> list[tuple[bool, float]]:
     return out
 
 
+def eprocess_stop(
+    turns: list[dict],
+    floor: float = 0.25,
+    delta: float = 0.2,
+    bet: float = 0.9,
+    probe_every: int = 3,
+) -> list[tuple[bool, float]]:
+    """First-pass per turn, with escalation switched off once an anytime-valid test says the top
+    rung's gate pass rate in this session is below `floor`.
+
+    Each escalation observes X = top-gate pass. Under H0 "pass rate >= floor", the wealth
+    W = prod(1 + lam * (floor - X)), lam = bet / (1 - floor), is a nonnegative supermartingale,
+    so by Ville's inequality P(W ever >= 1/delta) <= delta: a session where escalation still pays
+    is wrongly cut off with probability at most `delta`, at every turn, however long it runs.
+    While stopped, every `probe_every`-th failed cheap turn escalates anyway and keeps updating W,
+    so a session that turns around can reopen. Constants are fixed before looking at results.
+    """
+    lam = bet / (1 - floor)
+    out, wealth, skipped = [], 1.0, 0
+    for t in turns:
+        cheap = t["rungs"][0]
+        if cheap["gate_pass"]:
+            out.append(first_pass(t["rungs"]))
+            continue
+        if wealth >= 1 / delta:
+            skipped += 1
+            if skipped % probe_every:
+                out.append((bool(cheap["oracle_correct"]), cheap["cost_usd"]))
+                continue
+        out.append(first_pass(t["rungs"]))
+        wealth *= 1 + lam * (floor - float(bool(t["rungs"][-1]["gate_pass"])))
+    return out
+
+
 def hopeless_stop(records: list[dict], b: int = 4000, seed: int = 42) -> None:
     """Stop escalating a session the top model keeps failing. `k` is chosen on one half of the
     instances (cheapest `k` that loses no correct turn there) and scored on the other half, by
@@ -309,7 +343,12 @@ def hopeless_stop(records: list[dict], b: int = 4000, seed: int = 42) -> None:
         "\n## Stop escalating a hopeless session (cross-fit by parity, offline replay, $0)\n"
     )
     print(f"k fitted on odd half -> even: {k_even}; on even half -> odd: {k_odd}")
-    for name, o, c in [("first-pass", fo, fc), ("stop-after-k", ho, hc)]:
+    eo, ec = per([eprocess_stop(r["turns"]) for r in records])
+    for name, o, c in [
+        ("first-pass", fo, fc),
+        ("stop-after-k", ho, hc),
+        ("e-process stop", eo, ec),
+    ]:
         print(
             f"{name:14s} {sum(o)} correct  ${sum(c):.2f}  ->  ${sum(c) / sum(o):.3f}/correct"
         )
@@ -378,6 +417,13 @@ def _self_check() -> None:
         (False, 1.0),
     ]
     assert stop_after([lost, lost, loop], 0)[-1] == (True, 6.0)
+    # E-process: wealth grows 1.3x per failed escalation (floor .25, bet .9), so it needs 7 straight
+    # failures to reach 1/delta = 5; the 8th failed cheap turn is then served cheap (no probe yet).
+    eight = eprocess_stop([lost] * 8)
+    assert eight[:7] == [(False, 6.0)] * 7 and eight[7] == (False, 1.0)
+    assert eprocess_stop([lost] * 7) == [(False, 6.0)] * 7
+    # Probe: of the stopped turns, every 3rd still escalates.
+    assert [c for _, c in eprocess_stop([lost] * 10)][7:] == [1.0, 1.0, 6.0]
     # A passing top gate resets the streak.
     assert stop_after([lost, loop, lost, loop], 2)[-1] == (True, 6.0)
     print("self-check ok")

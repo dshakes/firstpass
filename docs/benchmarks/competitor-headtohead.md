@@ -108,3 +108,12 @@ clear 0, and it gives up 2 correct turns (not significant at n=60). It also repl
 optimistically: a turn served cheap instead of escalated would change the rest of the real conversation,
 which recorded turns can't show. Re-test on a larger agent run before turning it on. The in-sample sweep
 (k=4: 37 correct at $0.995/correct) is selection on the test set and is not the result.
+
+### Anytime-valid session controller (2026-10-30)
+
+Same command; row "e-process stop". Escalation pauses once a betting e-process rejects "the top gate's pass
+rate in this session ≥ 0.25" at δ=0.2 (bet 0.9). It probes every 3rd paused turn. Constants were fixed
+before the run. Result: 40/459 correct (no loss), $46.11 vs $48.70 (−5%). It only ever fires on a session's
+8th, final turn: at δ=0.2 it needs 7 consecutive top-gate failures, and these sessions are capped at 8 turns.
+The guarantee holds, but on this data the effect is small. Real agentic evidence at n=500 is in
+[agentic-real-runs.md](agentic-real-runs.md).
