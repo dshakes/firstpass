@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Choose your model by proof — Firstpass docs</title>
+<meta name="description" content="Serve a randomized share of sessions from a cheaper model, post task outcomes, and let an anytime-valid test certify or halt it on your own traffic. You adopt; Firstpass never switches on its own.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7.5' fill='%2319E3B1'/><path d='M6.5 25.2H14.4V17.2H22.2V9.2H26.4' fill='none' stroke='%23041410' stroke-width='2.5' stroke-opacity='.38' stroke-linecap='round' stroke-linejoin='round'/><path d='M6.5 25.2H14.4' stroke='%23041410' stroke-width='4.6' stroke-linecap='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=5">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass <span class="ver">v0.3.0</span></a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html"><span class="num">01</span>Overview</a>
+<a href="quickstart.html"><span class="num">02</span>Quickstart</a>
+<a href="requests-101.html"><span class="num">03</span>How agents talk</a>
+<a href="how-it-works.html"><span class="num">04</span>How it works</a>
+<a href="request-flow.html"><span class="num">05</span>Every scenario, end to end</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html"><span class="num">06</span>Gates</a>
+<a href="routing.html"><span class="num">07</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">08</span>The guarantee</a>
+<a href="receipts.html"><span class="num">09</span>Receipts &amp; audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">10</span>Providers</a>
+<a href="configuration.html"><span class="num">11</span>Configuration</a>
+<a href="cli.html"><span class="num">12</span>CLI reference</a>
+<a href="api.html"><span class="num">13</span>API &amp; MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research &amp; data</p>
+<a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
+<a href="experiments.html" aria-current="page"><span class="num">16</span>Choose by proof</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / Choose your model by proof</p>
+<h1>Choose your model by proof</h1>
+<p class="page-sub">A public benchmark cannot tell you which cheaper model is good enough for <em>your</em> traffic. Firstpass measures it on your own task outcomes, with an error bound that holds however often you look, and leaves the switch to you.</p>
+
+<div class="tldr">Add a <b><code>[route.challenger]</code></b> to a route. A randomized share of <b>sessions</b> is served by the challenger ladder through the normal enforce path. You post the task outcome of each session to <b><code>/v1/feedback</code></b>. Firstpass reports one of three states: <b>certified</b>, <b>halted</b>, or <b>undecided</b>. It <b>never switches your model on its own</b>.</div>
+
+<h2 id="why">What and why<a class="anchor" href="#why" aria-label="Link to this section">#</a></h2>
+<p>On 500 real SWE-bench agent runs per model, no gate available on a finished agent run was precise enough for per-request escalation to beat always calling the top model. Choosing the right model for the <em>workload</em> is what won: the cheapest model on par with opus-4.5 resolved 374 vs 384 tasks (difference not significant) at $0.219 vs $0.754 per task, 71% cheaper. Numbers and method: <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/agentic-real-runs.md">agentic-real-runs</a>. That selection was made on a public benchmark. This feature makes the same choice on your traffic, using the only honest evidence for an agent task: the task outcome itself. Design record: <a href="https://github.com/dshakes/firstpass/blob/main/docs/adr/0014-certified-model-selection.md">ADR 0014</a>.</p>
+<div class="note"><span class="nt">Key idea</span> Routers that predict which model will do well do not prove it on your outcomes. Here the test is on outcomes, and it is <b>anytime-valid</b>: each conclusion is wrong with probability at most <code>alpha</code> at whatever moment you read it, so checking the panel every morning does not inflate the error rate.</div>
+
+<h2 id="config">1. Configure a challenger<a class="anchor" href="#config" aria-label="Link to this section">#</a></h2>
+<p>Put the challenger on an <code>enforce</code> route. Every rung of both ladders must resolve to a provider and a price. Restart the proxy after editing.</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[route]]
+mode   = &quot;enforce&quot;
+ladder = [&quot;anthropic/claude-opus-4-5&quot;]     # what you run today (the control)
+gates  = [&quot;non-empty&quot;]
+
+[route.challenger]
+ladder  = [&quot;openrouter/minimax-m2.5&quot;]      # what you would like to switch to
+percent = 10                               # % of sessions served by it, randomized per session
+# margin = 0.05                            # default: may be at most 5 points worse
+# alpha  = 0.05                            # default: error rate of each conclusion</code></pre></div>
+<div class="tblwrap"><table>
+  <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>ladder</code></td><td>required</td><td>The ladder under test, cheapest first, as <code>provider/model</code>.</td></tr>
+    <tr><td><code>percent</code></td><td>required</td><td>Percent of <em>sessions</em> served by the challenger, strictly between 0 and 100. The rest are the control.</td></tr>
+    <tr><td><code>margin</code></td><td><code>0.05</code></td><td>How much worse (task success rate) the challenger may be and still be certified.</td></tr>
+    <tr><td><code>alpha</code></td><td><code>0.05</code></td><td>Error rate of each conclusion (certify and halt).</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="feedback">2. Post task outcomes<a class="anchor" href="#feedback" aria-label="Link to this section">#</a></h2>
+<p>Arms are assigned per session. Send the same <code>x-firstpass-session</code> header for every request of one agent run; without it each request is its own session. Then report the outcome with the standard <a href="api.html#feedback">feedback call</a>. The body is <code>trace_id</code>, <code>gate_id</code>, <code>verdict</code> (<code>pass</code>, <code>fail</code> or <code>abstain</code>), <code>reporter</code>, and an optional <code>score</code> in [0, 1].</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code># 1. Group an agent run into one session so it stays on one arm
+curl http://localhost:8080/v1/messages \
+  -H &quot;x-firstpass-session: run-4821&quot; \
+  -H &quot;content-type: application/json&quot; -d @request.json
+
+# 2. Find the receipt for that session (trace_id and session_id are both listed)
+curl -s localhost:8080/v1/receipts?limit=5
+
+# 3. Post the task outcome: the CI result, test run or rating you already have
+curl http://localhost:8080/v1/feedback \
+  -H &quot;content-type: application/json&quot; \
+  -d '{ &quot;trace_id&quot;: &quot;&lt;trace_id from the receipt&gt;&quot;,
+        &quot;gate_id&quot;:  &quot;tests&quot;,
+        &quot;verdict&quot;:  &quot;pass&quot;,
+        &quot;reporter&quot;: &quot;ci&quot; }' </code></pre></div>
+<div class="note warn"><span class="nt">Common mistake</span> Post <b>one</b> outcome per session, and the same kind every time. Only the first <code>pass</code> or <code>fail</code> of each session counts (whatever its <code>gate_id</code>) and <code>abstain</code> is ignored, so mixing several signals makes "first one wins" arbitrary. A trace owned by another tenant returns 404.</div>
+
+<h2 id="read">3. Read the result<a class="anchor" href="#read" aria-label="Link to this section">#</a></h2>
+<p>Two places show the same evidence. <code>firstpass experiment</code> replays your receipts and feedback through the test (add <code>--json</code> or <code>--tenant ID</code>); with nothing to report it tells you the next step instead of printing an empty table. The panel at <code>/panel</code> has an <b>Experiments</b> tab fed by <a href="api.html#experiments"><code>GET /v1/experiments</code></a>: a card per route with the state, each arm's success rate and $/request, and a log-scale bar for each e-value (the evidence) racing toward <code>1/alpha</code>.</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass experiment
+open http://localhost:8080/panel#experiments</code></pre></div>
+<h2 id="states">The three states<a class="anchor" href="#states" aria-label="Link to this section">#</a></h2>
+<div class="tblwrap"><table>
+  <thead><tr><th>State</th><th>Meaning (error at most <code>alpha</code>)</th><th>What happens</th></tr></thead>
+  <tbody>
+    <tr><td><b>certified</b></td><td>The challenger is no worse than your ladder by more than <code>margin</code>.</td><td>If it is also cheaper per request, the report prints the ladder to adopt. <b>You</b> make that edit.</td></tr>
+    <tr><td><b>halted</b></td><td>The challenger is worse by more than <code>margin</code>.</td><td>New sessions stop going to it automatically, with an error log and a metric. Traffic only moves back to your ladder.</td></tr>
+    <tr><td><b>undecided</b></td><td>Not enough evidence yet.</td><td>Keep running and keep posting outcomes.</td></tr>
+  </tbody>
+</table></div>
+<p>The panel also shows <b>unavailable</b> when the receipt history could not be read at startup. Firstpass then cannot know whether the challenger was already halted, so it fails closed and serves only your ladder.</p>
+<p>To adopt a certified challenger, replace the route's <code>ladder</code> with the challenger's and remove <code>[route.challenger]</code>. The report and the panel print the exact line.</p>
+
+<h2 id="time">Defaults and how long it takes<a class="anchor" href="#time" aria-label="Link to this section">#</a></h2>
+<p>These figures come from replaying the design on the 500 real runs per model (incumbent opus-4.5, 50/50 split, 400 replays, capped at 20,000 sessions), not from a live run. At the default <code>margin = 0.05</code>:</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>Challenger vs incumbent</th><th>Outcome</th><th>Median sessions</th></tr></thead>
+  <tbody>
+    <tr><td>Genuinely close (1 point worse, e.g. minimax-2.5, gemini-3-flash)</td><td>Certified in 99% of replays, halted in 1%</td><td>about 3,600</td></tr>
+    <tr><td>10 points worse (haiku-4.5)</td><td>Halted in 99%</td><td>about 2,200</td></tr>
+    <tr><td>20 points worse (gpt-5-mini)</td><td>Halted in 100%</td><td>about 220</td></tr>
+  </tbody>
+</table></div>
+<p>A tighter <code>margin = 0.03</code> certified only 63% of the good challengers within 20,000 sessions, which is why the default is 0.05. The cost is information, not the method: two arms at about 76% success need thousands of sessions to separate a 4-point gap. A lower <code>percent</code> slows the experiment but limits how much traffic the challenger sees.</p>
+
+<h2 id="limits">Limits<a class="anchor" href="#limits" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><b>Outcomes, on the traffic it saw.</b> A workload shift after certification is not covered. Run a fresh experiment.</li>
+  <li><b>Cost is reported, not tested.</b> Adoption is advised only when the challenger's $/request is lower.</li>
+  <li><b>You need outcome feedback.</b> Without it there is nothing to certify, and gate verdicts alone would repeat the failure the benchmark found.</li>
+  <li><b>Changing a ladder, the margin or alpha starts a fresh experiment.</b> Receipts from the old configuration are ignored and counted.</li>
+  <li><b>The halt state is per process</b> and rebuilt from receipts at startup. With several replicas each halts on the outcomes it receives, so read the report against the store all replicas write to.</li>
+  <li><b>Every number above is a replay on public runs.</b> A paid live experiment on a real route is the final proof and has not been run.</li>
+</ul>
+<div class="recap">Add four lines of config, post one outcome per session, read <b><code>firstpass experiment</code></b> or the panel. Certified and cheaper means <em>you</em> adopt it; halted means Firstpass already stopped it.</div>
+
+<nav class="pager" aria-label="Pagination"><a class="prev" href="benchmarks.html"><span class="dir">← Previous</span><span class="t">Benchmarks</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#why" class="">What and why</a><a href="#config" class="">1. Configure</a><a href="#feedback" class="">2. Post outcomes</a><a href="#read" class="">3. Read the result</a><a href="#states" class="">The three states</a><a href="#time" class="">How long it takes</a><a href="#limits" class="">Limits</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass v0.3.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=5"></script>
+</body></html>
