@@ -92,6 +92,22 @@ impl ShadowLedger {
         }
     }
 
+    /// Re-apply spend recorded at `at`, but only if `at` falls on the same UTC day as `now`. Used
+    /// at startup to rebuild today's total from persisted evaluations, so restarting the process
+    /// does not hand out a fresh daily budget.
+    pub fn seed(
+        &self,
+        tenant: &str,
+        route_ix: usize,
+        usd: f64,
+        at: jiff::Timestamp,
+        now: jiff::Timestamp,
+    ) {
+        if day_of(at) == day_of(now) {
+            self.debit(tenant, route_ix, usd, now);
+        }
+    }
+
     /// Spend so far today, for reporting.
     #[must_use]
     pub fn spent_today(&self, tenant: &str, route_ix: usize, now: jiff::Timestamp) -> f64 {
@@ -108,6 +124,24 @@ impl ShadowLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Startup seeding counts today's persisted spend toward today's cap and ignores yesterday's.
+    #[test]
+    fn seed_counts_only_spend_from_the_same_utc_day() {
+        let now: jiff::Timestamp = "2026-10-31T12:00:00Z".parse().unwrap();
+        let earlier_today: jiff::Timestamp = "2026-10-31T00:00:01Z".parse().unwrap();
+        let yesterday: jiff::Timestamp = "2026-10-30T23:59:59Z".parse().unwrap();
+        let l = ShadowLedger::new();
+        l.seed("t", 0, 0.75, yesterday, now);
+        l.seed("t", 0, 0.60, earlier_today, now);
+        l.seed("t", 0, 0.50, earlier_today, now);
+        assert!((l.spent_today("t", 0, now) - 1.10).abs() < 1e-12);
+        assert!(
+            !l.may_spend("t", 0, 1.0, now),
+            "seeded spend counts toward the cap"
+        );
+        assert!(l.may_spend("other", 0, 1.0, now), "per tenant");
+    }
 
     fn ts(secs: i64) -> jiff::Timestamp {
         jiff::Timestamp::from_second(secs).unwrap()

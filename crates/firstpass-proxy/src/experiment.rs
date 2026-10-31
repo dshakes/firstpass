@@ -697,12 +697,22 @@ impl ExperimentMonitor {
                 e.sessions.insert(*hash);
                 before != e.experiment.status()
             }
-            LogRecord::Pair { x_inc, x_ch, .. } => {
+            LogRecord::Pair {
+                x_inc,
+                x_ch,
+                challenger_cost_usd,
+                ..
+            } => {
                 let Some(e) = self.entry(map, tenant, route_ix) else {
                     return false;
                 };
                 let before = e.experiment.status();
-                e.experiment.observe_pair(*x_inc, *x_ch);
+                if e.experiment.observe_pair(*x_inc, *x_ch) {
+                    // The incumbent's cost is already counted on the serving path; only the
+                    // off-path challenger call is new spend.
+                    e.experiment
+                        .observe_cost(Arm::Challenger, *challenger_cost_usd);
+                }
                 before != e.experiment.status()
             }
         }
@@ -838,6 +848,12 @@ impl ExperimentMonitor {
             };
             let before = e.experiment.status();
             let ok = e.experiment.observe_pair(x_inc, x_ch);
+            if ok {
+                // Without this the challenger's $/request reads n/a, and a certified, cheaper
+                // paired challenger could never be recommended for adoption.
+                e.experiment
+                    .observe_cost(Arm::Challenger, challenger_cost_usd);
+            }
             if ok && before != e.experiment.status() {
                 match e.experiment.status() {
                     ExperimentStatus::Halted => tracing::error!(
@@ -997,7 +1013,10 @@ pub fn monitor_from_traces(
         let mut map = monitor.lock();
         if let Some(e) = monitor.entry(&mut map, &row.tenant, row.route_ix) {
             if monitor.fingerprint(row.route_ix) == Some(row.fingerprint.as_str()) {
-                e.experiment.observe_pair(row.x_inc, row.x_ch);
+                if e.experiment.observe_pair(row.x_inc, row.x_ch) {
+                    e.experiment
+                        .observe_cost(Arm::Challenger, row.challenger_cost_usd);
+                }
             } else {
                 e.ignored_stale += 1;
             }
@@ -1014,6 +1033,18 @@ pub fn monitor_from_traces(
 /// served again just because its history could not be read.
 #[must_use]
 pub fn build_monitor(db_path: &str, config: &Config) -> ExperimentMonitor {
+    build_monitor_with(db_path, config, false)
+}
+
+/// [`build_monitor`], told whether a shared experiment log will be attached.
+///
+/// With a shared log, the log is the cluster-wide record of every paired evaluation, and the
+/// sync task reads it from the start on boot. Replaying the local `experiment_pairs` table as
+/// well would apply each pair twice (pairs, unlike live outcomes, carry no session to dedup on),
+/// doubling the e-values and the challenger's spend. So pairs then only register their
+/// experiment, and the evidence itself comes from the log on the first sync.
+#[must_use]
+pub fn build_monitor_with(db_path: &str, config: &Config, shared_log: bool) -> ExperimentMonitor {
     let empty = ExperimentMonitor::from_config(config);
     if !empty.is_active() {
         return empty;
@@ -1023,7 +1054,15 @@ pub fn build_monitor(db_path: &str, config: &Config) -> ExperimentMonitor {
         .and_then(|(t, d)| crate::store::load_all_experiment_pairs(db_path).map(|p| (t, d, p)));
     match loaded {
         Ok((traces, deferred, pairs)) => {
-            let m = monitor_from_traces(&traces, &deferred, &pairs, config);
+            let replayed: &[crate::store::ExperimentPairRow] =
+                if shared_log { &[] } else { &pairs };
+            let m = monitor_from_traces(&traces, &deferred, replayed, config);
+            if shared_log {
+                let mut map = m.lock();
+                for row in &pairs {
+                    let _ = m.entry(&mut map, &row.tenant, row.route_ix);
+                }
+            }
             for s in m.reports() {
                 tracing::info!(
                     tenant = %s.tenant,
@@ -1574,6 +1613,79 @@ mod tests {
         )
         .expect("parses");
         assert!(!build_monitor(&dir.to_string_lossy(), &bare).challenger_blocked("t", 0));
+    }
+
+    /// A paired evaluation's challenger spend must reach the report on every path that applies a
+    /// pair: direct (single replica), synced from the shared log, and rebuilt from the store at
+    /// startup. Without it the challenger's $/request is n/a and a certified, cheaper paired
+    /// challenger can never be recommended for adoption.
+    #[tokio::test]
+    async fn paired_challenger_cost_reaches_the_report_on_every_path() {
+        let cfg = config();
+        let fp_str = fp();
+        let challenger = |m: &ExperimentMonitor| {
+            let r = m.reports();
+            assert_eq!(r.len(), 1);
+            let c = r[0].report.challenger;
+            (c.requests, c.cost_usd, r[0].report.pairs)
+        };
+        let close = |(n, usd, pairs): (u64, f64, u64)| {
+            assert_eq!((n, pairs), (3, 3));
+            assert!((usd - 0.03).abs() < 1e-12, "{usd}");
+        };
+
+        let direct = ExperimentMonitor::from_config(&cfg);
+        for _ in 0..3 {
+            assert!(
+                direct
+                    .record_pair("t", 0, &fp_str, 1.0, 1.0, 0.10, 0.01)
+                    .await
+            );
+        }
+        close(challenger(&direct));
+
+        let shared = Arc::new(InMemoryExperimentLog::new());
+        let a = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+        let b = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+        for _ in 0..3 {
+            a.record_pair("t", 0, &fp_str, 1.0, 1.0, 0.10, 0.01).await;
+        }
+        b.sync_from_backend("t", 0, &fp_str).await;
+        close(challenger(&a));
+        close(challenger(&b));
+
+        let db =
+            std::env::temp_dir().join(format!("firstpass-paircost-{}.db", uuid::Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        for _ in 0..3 {
+            crate::store::append_experiment_pair(
+                &db,
+                &crate::store::ExperimentPairRow {
+                    tenant: "t".to_owned(),
+                    route_ix: 0,
+                    fingerprint: fp_str.clone(),
+                    trace_id: uuid::Uuid::now_v7(),
+                    x_inc: 1.0,
+                    x_ch: 1.0,
+                    challenger_cost_usd: 0.01,
+                    ts: jiff::Timestamp::now(),
+                },
+            )
+            .unwrap();
+        }
+        close(challenger(&build_monitor(&db.to_string_lossy(), &cfg)));
+
+        // Restart with a shared log: the same three pairs are in the store AND the log. They
+        // must count once, not twice (pairs carry no session to dedup on).
+        let restarted = build_monitor_with(&db.to_string_lossy(), &cfg, true)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+        restarted.sync_from_backend("t", 0, &fp_str).await;
+        close(challenger(&restarted));
+        let _ = std::fs::remove_file(&db);
     }
 
     // ── Shared-log tests (InMemoryExperimentLog) ─────────────────────────────────────────────

@@ -228,7 +228,11 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
             .routing
             .as_ref()
             .map_or_else(Default::default, |routing| {
-                crate::experiment::build_monitor(&config.db_path, routing)
+                crate::experiment::build_monitor_with(
+                    &config.db_path,
+                    routing,
+                    experiment_log.is_some(),
+                )
             });
         if let Some(log) = experiment_log {
             monitor.with_log(log)
@@ -238,6 +242,8 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
     });
     // Background sync keeps all replicas ≤ 5 s stale. No-op when no log backend is configured.
     experiments.start_sync_task(std::time::Duration::from_secs(5));
+    // Today's paired-challenger spend survives a restart, so the daily cap is a daily cap.
+    let paired_ledger = Arc::new(crate::proxy::build_paired_ledger(&config));
 
     let state = AppState {
         config: Arc::new(config),
@@ -250,7 +256,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
         providers,
         gate_health: Arc::new(gate_health),
         shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
-        paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+        paired_ledger,
         experiments,
         guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
         traces,

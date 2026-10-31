@@ -122,6 +122,15 @@ open http://localhost:8080/panel#experiments</code></pre></div>
 <p>The panel also shows <b>unavailable</b> when the receipt history could not be read at startup. Firstpass then cannot know whether the challenger was already halted, so it fails closed and serves only your ladder.</p>
 <p>To adopt a certified challenger, replace the route's <code>ladder</code> with the challenger's and remove <code>[route.challenger]</code>. The report and the panel print the exact line.</p>
 
+<h2 id="paired">Paired mode: single-turn routes, no feedback call<a class="anchor" href="#paired" aria-label="Link to this section">#</a></h2>
+<p>On a route where every request stands alone and your gate is a real check, set <code>mode = &quot;paired&quot;</code>. After each sampled request is answered by your ladder, the challenger runs on the <b>same request</b> off the hot path and both answers are graded by your gates. No caller is ever served by the challenger and there is nothing to post to <code>/v1/feedback</code>. Because both models see the same task, the test decides 3 to 4 times faster than live mode in the <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/certified-selection.md">MBPP replay</a>.</p>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[route.challenger]
+ladder          = [&quot;anthropic/claude-haiku-4-5&quot;]
+mode            = &quot;paired&quot;
+sample_rate     = 0.25   # share of requests re-run on the challenger
+max_usd_per_day = 5.0    # required: the challenger makes real calls</code></pre></div>
+<p>The panel card says <b>paired</b>, shows the sample rate and today's challenger spend against the cap, and counts <em>requests compared</em> instead of sessions. Today's spend is rebuilt from the store at startup, so a restart does not reset the cap. What gets certified is <b>gate-pass</b> non-inferiority, so it is only as good as your gate: a route gated only by <code>non-empty</code> is rejected.</p>
+
 <h2 id="time">Defaults and how long it takes<a class="anchor" href="#time" aria-label="Link to this section">#</a></h2>
 <p>These figures come from replaying the design on the 500 real runs per model (incumbent opus-4.5, 50/50 split, 400 replays, capped at 20,000 sessions), not from a live run. At the default <code>margin = 0.05</code>:</p>
 <div class="tblwrap"><table>
@@ -147,7 +156,7 @@ open http://localhost:8080/panel#experiments</code></pre></div>
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="benchmarks.html"><span class="dir">← Previous</span><span class="t">Benchmarks</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#why" class="">What and why</a><a href="#config" class="">1. Configure</a><a href="#feedback" class="">2. Post outcomes</a><a href="#read" class="">3. Read the result</a><a href="#states" class="">The three states</a><a href="#time" class="">How long it takes</a><a href="#limits" class="">Limits</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#why" class="">What and why</a><a href="#config" class="">1. Configure</a><a href="#feedback" class="">2. Post outcomes</a><a href="#read" class="">3. Read the result</a><a href="#states" class="">The three states</a><a href="#paired" class="">Paired mode</a><a href="#time" class="">How long it takes</a><a href="#limits" class="">Limits</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">
