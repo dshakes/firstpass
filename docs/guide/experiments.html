@@ -142,6 +142,7 @@ max_usd_per_day = 5.0    # required: the challenger makes real calls</code></pre
   </tbody>
 </table></div>
 <p>A tighter <code>margin = 0.03</code> certified only 63% of the good challengers within 20,000 sessions, which is why the default is 0.05. The cost is information, not the method: two arms at about 76% success need thousands of sessions to separate a 4-point gap. A lower <code>percent</code> slows the experiment but limits how much traffic the challenger sees.</p>
+<p><b>Live, paired mode</b> (real sonnet-5 vs haiku-4-5, tests run in a sandbox, <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/live-certified-selection.md">full write-up</a>): on all 974 MBPP tasks haiku passed 84.6% against sonnet's 95.4% and was <b>halted at pair 137</b>, robust to the order of the pairs. On 150 APPS contest problems the gap was 6.7 points, close to the margin, and the experiment correctly stayed <b>undecided</b>.</p>
 
 <h2 id="limits">Limits<a class="anchor" href="#limits" aria-label="Link to this section">#</a></h2>
 <ul>
@@ -150,7 +151,7 @@ max_usd_per_day = 5.0    # required: the challenger makes real calls</code></pre
   <li><b>You need outcome feedback.</b> Without it there is nothing to certify, and gate verdicts alone would repeat the failure the benchmark found.</li>
   <li><b>Changing a ladder, the margin or alpha starts a fresh experiment.</b> Receipts from the old configuration are ignored and counted.</li>
   <li><b>The halt state is per process</b> and rebuilt from receipts at startup. With several replicas each halts on the outcomes it receives, so read the report against the store all replicas write to.</li>
-  <li><b>Every number above is a replay on public runs.</b> A paid live experiment on a real route is the final proof and has not been run.</li>
+  <li><b>A pair is skipped when the incumbent errors.</b> If errors cluster on one kind of request (long generations hitting a timeout, for example), the comparison is biased. The live run hit exactly this before the enforce timeout was raised to 600 s.</li>
 </ul>
 <div class="recap">Add four lines of config, post one outcome per session, read <b><code>firstpass experiment</code></b> or the panel. Certified and cheaper means <em>you</em> adopt it; halted means Firstpass already stopped it.</div>
 
