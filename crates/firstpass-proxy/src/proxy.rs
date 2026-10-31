@@ -1548,6 +1548,11 @@ fn spawn_paired_challenger(
     let Some(x_inc) = pair_outcome(served_from) else {
         return;
     };
+    // A halted challenger has been proven worse; live mode stops serving it, and paired mode must
+    // stop paying for it. The halt is final, so further pairs could only spend.
+    if state.experiments.challenger_blocked(&tenant, route_ix) {
+        return;
+    }
 
     let max_usd_per_day = match challenger.max_usd_per_day {
         Some(v) => v,
@@ -8574,6 +8579,84 @@ mod tests {
         assert_eq!(
             pairs[0].x_ch, 0.0,
             "challenger failed json-valid on every rung"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Once a paired experiment halts, the challenger is not run again: no pair, no spend.
+    #[tokio::test]
+    async fn halted_paired_challenger_stops_spending() {
+        use tower::ServiceExt;
+        let db = std::env::temp_dir().join(format!("firstpass-paired-halt-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let (mut state, _rx) = challenger_state(50.0, &db.to_string_lossy());
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 5.0\n"
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
+        state.experiments = Arc::new(crate::experiment::ExperimentMonitor::from_config(
+            cfg.routing.as_ref().unwrap(),
+        ));
+        state.config = Arc::new(cfg);
+        let fingerprint = state.experiments.fingerprint(0).unwrap().to_owned();
+        for _ in 0..500 {
+            if state.experiments.challenger_blocked("default", 0) {
+                break;
+            }
+            state
+                .experiments
+                .record_pair("default", 0, &fingerprint, 1.0, 0.0, 0.01, 0.001)
+                .await;
+        }
+        assert!(
+            state.experiments.challenger_blocked("default", 0),
+            "a challenger that always loses halts"
+        );
+        let mut outs = HashMap::new();
+        outs.insert(
+            INCUMBENT.to_owned(),
+            Ok(model_resp(INCUMBENT, "{\"ok\": 1}")),
+        );
+        outs.insert(
+            CHALLENGER.to_owned(),
+            Ok(model_resp(CHALLENGER, "{\"ok\": 1}")),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        state.providers = ProviderRegistry::from_map(map);
+        let ledger = state.paired_ledger.clone();
+        let router = app(state).expect("router");
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(user_body()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "incumbent still serves"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            crate::store::load_all_experiment_pairs(&db)
+                .unwrap()
+                .is_empty(),
+            "no pair after the halt"
+        );
+        assert!(
+            ledger.may_spend("default", 0, 1e-9, jiff::Timestamp::now()),
+            "nothing debited after the halt"
         );
         let _ = std::fs::remove_file(&db);
     }
