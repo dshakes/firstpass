@@ -1491,7 +1491,9 @@ async fn evaluate_shadow(
 
     // The served rung is recorded on the trace's final outcome; read it there rather than
     // re-deriving it from the attempts, so shadow and enforce agree by construction.
-    let would_pass = matches!(outcome, EngineOutcome::Served(_));
+    // A best attempt is served when every rung failed its gates, so `Served` alone is not a pass.
+    let would_pass = matches!(outcome, EngineOutcome::Served(_))
+        && trace.final_.served_from == firstpass_core::ServedFrom::Attempt;
     let would_serve_rung = if would_pass {
         trace.final_.served_rung
     } else {
@@ -1506,6 +1508,18 @@ async fn evaluate_shadow(
     }
 }
 
+/// A paired arm's outcome: 1.0 when a rung passed its gates, 0.0 when only a best attempt (every
+/// rung failed) was served. `None` when the pair is not comparable: a cache hit had no fresh gate
+/// run, and an error produced no output. Skipping errors can only withhold evidence, so a
+/// challenger that errors stays undecided rather than being certified.
+fn pair_outcome(served_from: firstpass_core::ServedFrom) -> Option<f64> {
+    match served_from {
+        firstpass_core::ServedFrom::Attempt => Some(1.0),
+        firstpass_core::ServedFrom::BestAttempt => Some(0.0),
+        firstpass_core::ServedFrom::Cache | firstpass_core::ServedFrom::Error => None,
+    }
+}
+
 /// Spawn a detached task that evaluates the challenger ladder on the SAME request that was just
 /// served by the incumbent, then records the (x_inc, x_ch) pair in the experiment monitor.
 ///
@@ -1514,11 +1528,7 @@ async fn evaluate_shadow(
 /// or its latency. Every failure path returns silently; the spend ceiling is enforced before any
 /// model call is made.
 ///
-/// `served_from` is the incumbent trace's final `served_from`; it is used to derive `x_inc`:
-/// - `Attempt` (gate passed): 1.0
-/// - `BestAttempt` (gate failed, served anyway): 0.0
-/// - `Cache` or `Error`: pair dropped — the cache path means we don't have a fresh gate
-///   evaluation for this request, and errors are not quality-comparable.
+/// Both arms are graded by [`pair_outcome`] on their trace's final `served_from`.
 #[allow(clippy::too_many_arguments)]
 fn spawn_paired_challenger(
     state: &AppState,
@@ -1535,14 +1545,8 @@ fn spawn_paired_challenger(
     served_from: firstpass_core::ServedFrom,
     incumbent_cost_usd: f64,
 ) {
-    // Compute x_inc here so we don't need to pass served_from into the async closure.
-    let x_inc = match served_from {
-        firstpass_core::ServedFrom::Attempt => 1.0,
-        firstpass_core::ServedFrom::BestAttempt => 0.0,
-        firstpass_core::ServedFrom::Cache | firstpass_core::ServedFrom::Error => {
-            // Cache hit: no fresh gate eval → pair not comparable. Error: no valid output.
-            return;
-        }
+    let Some(x_inc) = pair_outcome(served_from) else {
+        return;
     };
 
     let max_usd_per_day = match challenger.max_usd_per_day {
@@ -1632,17 +1636,17 @@ fn spawn_paired_challenger(
             policy_id: "paired-challenger@v0".to_owned(),
         };
 
-        let (outcome, ch_trace) = route_enforce(ctx).await;
+        let (_, ch_trace) = route_enforce(ctx).await;
         let challenger_cost = ch_trace.final_.total_cost_usd;
         state
             .paired_ledger
             .debit(&tenant, route_ix, challenger_cost, now);
 
-        // x_ch = 1.0 if the challenger produced a gate-passing answer, 0.0 otherwise.
-        let x_ch = if matches!(outcome, crate::router::EngineOutcome::Served(_)) {
-            1.0_f64
-        } else {
-            0.0_f64
+        // Graded exactly like the incumbent. `Served` is not success: a ladder whose every rung
+        // failed its gates still serves its best attempt, and counting that as a pass would
+        // certify a challenger that never passed a gate.
+        let Some(x_ch) = pair_outcome(ch_trace.final_.served_from) else {
+            return;
         };
 
         // Persist the pair to the store for startup rebuild and CLI replay.
@@ -8505,6 +8509,114 @@ mod tests {
         let b = body_json(resp).await;
         assert_eq!(b["configured"][0]["paired"]["spent_today_usd"], 1.25);
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// A paired challenger whose every answer fails the gate must be recorded as a failure. The
+    /// router still serves its best attempt, so "something was served" is not "the gate passed";
+    /// grading on the former once certified a challenger that never passed a gate.
+    #[tokio::test]
+    async fn paired_challenger_that_fails_its_gate_is_recorded_as_a_failure() {
+        use tower::ServiceExt;
+        let db = std::env::temp_dir().join(format!("firstpass-paired-fail-{}.db", Uuid::now_v7()));
+        // Create the schema the way startup does; pairs are appended to it.
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let (mut state, _rx) = challenger_state(50.0, &db.to_string_lossy());
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 5.0\n"
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
+        state.experiments = Arc::new(crate::experiment::ExperimentMonitor::from_config(
+            cfg.routing.as_ref().unwrap(),
+        ));
+        state.config = Arc::new(cfg);
+        let mut outs = HashMap::new();
+        outs.insert(
+            INCUMBENT.to_owned(),
+            Ok(model_resp(INCUMBENT, "{\"ok\": 1}")),
+        );
+        outs.insert(
+            CHALLENGER.to_owned(),
+            Ok(model_resp(CHALLENGER, "not json")),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        state.providers = ProviderRegistry::from_map(map);
+        let router = app(state).expect("router");
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(user_body()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // The challenger runs detached; wait for its pair to land in the store.
+        let mut pairs = Vec::new();
+        for _ in 0..200 {
+            pairs = crate::store::load_all_experiment_pairs(&db).unwrap_or_default();
+            if !pairs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pairs.len(), 1, "one pair recorded");
+        assert_eq!(pairs[0].x_inc, 1.0, "incumbent passed json-valid");
+        assert_eq!(
+            pairs[0].x_ch, 0.0,
+            "challenger failed json-valid on every rung"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Shadow scoring must not report a pass when every rung failed its gates and only a best
+    /// attempt would have been served.
+    #[tokio::test]
+    async fn shadow_reports_no_pass_when_every_rung_fails_its_gate() {
+        let (mut state, _rx) = challenger_state(50.0, ":memory:");
+        let mut outs = HashMap::new();
+        outs.insert(INCUMBENT.to_owned(), Ok(model_resp(INCUMBENT, "not json")));
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        state.providers = ProviderRegistry::from_map(map);
+        let cfg = firstpass_core::Config::parse(&format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n"
+        ))
+        .unwrap();
+        let shadow = firstpass_core::rollout::Shadow {
+            sample_rate: 1.0,
+            max_usd_per_day: 5.0,
+        };
+        let signal = evaluate_shadow(
+            &state,
+            &cfg.routes[0],
+            shadow,
+            0,
+            &user_body(),
+            Auth::from_headers(&HeaderMap::new()),
+            &Features::new(TaskKind::Other),
+            "t".to_owned(),
+            "s".to_owned(),
+            "anthropic.messages",
+            0.0,
+        )
+        .await;
+        assert_eq!(signal.skipped, None);
+        assert!(!signal.would_pass, "a best attempt is not a pass");
+        assert_eq!(signal.would_serve_rung, None);
     }
 
     fn ux_get(uri: &str, bearer: Option<&str>) -> axum::http::Request<Body> {
