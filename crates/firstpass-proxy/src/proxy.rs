@@ -53,6 +53,9 @@ pub struct AppState {
     /// Per-(tenant, route) shadow spend for the current UTC day (ADR 0009 D2). Shadow makes real
     /// model calls, so the daily ceiling is enforced through this rather than trusted.
     pub shadow_ledger: Arc<crate::shadow::ShadowLedger>,
+    /// Per-(tenant, route) paired-challenger spend for the current UTC day. Paired mode runs the
+    /// challenger ladder off-path on real traffic; the daily ceiling is enforced through this.
+    pub paired_ledger: Arc<crate::shadow::ShadowLedger>,
     /// Certified-selection experiments (ADR 0014), one per `(tenant, route)` that has a
     /// `[route.challenger]`. Holds the evidence and is the halt guard the serving path consults.
     pub experiments: Arc<crate::experiment::ExperimentMonitor>,
@@ -265,6 +268,71 @@ pub async fn build_promoter_async(
         }
     }
     Ok(Some(Arc::new(promoter)))
+}
+
+/// Build the shared experiment-log backend from `[route.challenger] redis_url`.
+///
+/// If no challenger route sets `redis_url`, returns `Ok(None)` (single-replica / in-process
+/// behaviour unchanged). If any route sets it:
+///
+/// - All routes that set `redis_url` must agree on the same URL (one shared Redis instance
+///   serves all experiments, since keys are already namespaced by tenant + route + fingerprint).
+///   Two different URLs is rejected at startup rather than silently misrouting experiment events.
+/// - Requires the `redis-cache` build feature; a URL without it is a hard startup error (same
+///   policy as `[escalation.verified_cache] redis_url`).
+/// - The connection is verified with PING before returning — an unreachable Redis is a startup
+///   failure, not a silent per-process fallback.
+///
+/// # Errors
+/// Returns a descriptive `String` on any of the above conditions.
+pub async fn build_experiment_log(
+    config: &ProxyConfig,
+) -> Result<Option<Arc<dyn crate::experiment::ExperimentLogBackend>>, String> {
+    use std::collections::HashSet;
+
+    let urls: HashSet<&str> = config
+        .routing
+        .iter()
+        .flat_map(|r| &r.routes)
+        .filter_map(|r| r.challenger.as_ref()?.redis_url.as_deref())
+        .collect();
+
+    // Destructure into (first_url, rest) without unwrap: the set is non-empty at this point.
+    let mut url_iter = urls.into_iter();
+    let Some(url) = url_iter.next() else {
+        return Ok(None); // unreachable (is_empty checked above), but keeps the compiler happy
+    };
+    if let Some(other) = url_iter.next() {
+        let mut found = vec![url, other];
+        found.extend(url_iter);
+        found.sort_unstable();
+        return Err(format!(
+            "[route.challenger] multiple distinct redis_url values across routes are not \
+             supported — all experiment logs must share one Redis instance (keys are namespaced \
+             by tenant + route + fingerprint). URLs found: {found:?}"
+        ));
+    }
+
+    #[cfg(feature = "redis-cache")]
+    {
+        // `RedisExperimentLog::connect` already has a 5s timeout; no extra wrapper needed.
+        let log = crate::experiment::RedisExperimentLog::connect(url).await?;
+        tracing::info!("experiment log: shared via redis");
+        Ok(Some(
+            Arc::new(log) as Arc<dyn crate::experiment::ExperimentLogBackend>
+        ))
+    }
+
+    #[cfg(not(feature = "redis-cache"))]
+    {
+        let _ = url;
+        Err(
+            "[route.challenger] redis_url is set, but this binary was built without the \
+             `redis-cache` feature. Rebuild with `--features redis-cache`, or remove redis_url \
+             from all [route.challenger] sections to keep experiment state in-process."
+                .to_owned(),
+        )
+    }
 }
 
 #[must_use]
@@ -1111,8 +1179,9 @@ async fn feedback(
             // is the evidence the experiment runs on. Best effort by construction — a failed
             // lookup is logged and skipped, never surfaced: the outcome is already durably
             // recorded above, and the monitor can always be rebuilt from receipts. Skipped
-            // entirely (no extra store read) when no route runs an experiment.
-            if state.experiments.is_active() {
+            // entirely (no extra store read) when no route runs an experiment or when the verdict
+            // is Abstain (carries no evidence and must not burn the cross-replica session slot).
+            if state.experiments.is_active() && verdict != Verdict::Abstain {
                 let (db_x, ten_x, tid_x) = (
                     state.config.db_path.clone(),
                     tenant.clone(),
@@ -1123,15 +1192,19 @@ async fn feedback(
                 })
                 .await
                 {
-                    Ok(Ok(Some((session, route_ix, rec)))) => {
-                        state.experiments.observe_outcome(
-                            &tenant,
-                            route_ix,
-                            &rec.fingerprint,
-                            rec.arm,
-                            &session,
-                            verdict,
-                        );
+                    Ok(Ok(Some((session, route_ix, rec, cost_usd)))) => {
+                        state
+                            .experiments
+                            .record_outcome(
+                                &tenant,
+                                route_ix,
+                                &rec.fingerprint,
+                                rec.arm,
+                                &session,
+                                verdict,
+                                cost_usd,
+                            )
+                            .await;
                     }
                     Ok(Ok(None)) => {}
                     Ok(Err(e)) => {
@@ -1332,6 +1405,186 @@ async fn evaluate_shadow(
         actual_cost_usd,
         skipped: None,
     }
+}
+
+/// Spawn a detached task that evaluates the challenger ladder on the SAME request that was just
+/// served by the incumbent, then records the (x_inc, x_ch) pair in the experiment monitor.
+///
+/// Called after the incumbent response has been returned (guaranteed by the call site in
+/// `enforce_pipeline_inner`). Nothing this task does can affect the served response, its bytes,
+/// or its latency. Every failure path returns silently; the spend ceiling is enforced before any
+/// model call is made.
+///
+/// `served_from` is the incumbent trace's final `served_from`; it is used to derive `x_inc`:
+/// - `Attempt` (gate passed): 1.0
+/// - `BestAttempt` (gate failed, served anyway): 0.0
+/// - `Cache` or `Error`: pair dropped — the cache path means we don't have a fresh gate
+///   evaluation for this request, and errors are not quality-comparable.
+#[allow(clippy::too_many_arguments)]
+fn spawn_paired_challenger(
+    state: &AppState,
+    route: &firstpass_core::Route,
+    challenger: &firstpass_core::Challenger,
+    fingerprint: String,
+    route_ix: usize,
+    body: bytes::Bytes,
+    auth: Auth,
+    features: firstpass_core::Features,
+    tenant: String,
+    session_id: String,
+    api: &str,
+    served_from: firstpass_core::ServedFrom,
+    incumbent_cost_usd: f64,
+) {
+    // Compute x_inc here so we don't need to pass served_from into the async closure.
+    let x_inc = match served_from {
+        firstpass_core::ServedFrom::Attempt => 1.0,
+        firstpass_core::ServedFrom::BestAttempt => 0.0,
+        firstpass_core::ServedFrom::Cache | firstpass_core::ServedFrom::Error => {
+            // Cache hit: no fresh gate eval → pair not comparable. Error: no valid output.
+            return;
+        }
+    };
+
+    let max_usd_per_day = match challenger.max_usd_per_day {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                tenant,
+                route = route_ix,
+                "paired challenger is missing max_usd_per_day; skipping evaluation"
+            );
+            return;
+        }
+    };
+
+    let state = state.clone();
+    let route = route.clone();
+    let challenger = challenger.clone();
+    let api = api.to_owned();
+
+    tokio::spawn(async move {
+        let now = jiff::Timestamp::now();
+        if !state
+            .paired_ledger
+            .may_spend(&tenant, route_ix, max_usd_per_day, now)
+        {
+            tracing::debug!(
+                tenant,
+                route = route_ix,
+                "paired challenger: daily budget exhausted, skipping"
+            );
+            return;
+        }
+
+        let Some(base_request) = parse_model_request(&body) else {
+            return;
+        };
+        let gate_defs = state
+            .config
+            .routing
+            .as_ref()
+            .map_or(&[][..], |cfg| &cfg.gate_defs);
+        let gates = resolve_gates(
+            &route.gates,
+            gate_defs,
+            &state.providers,
+            &auth,
+            &state.config.prices,
+            &state.http,
+        );
+        let (budget, max_rungs) = state
+            .config
+            .routing
+            .as_ref()
+            .map_or((None, u32::MAX), |cfg| {
+                (
+                    cfg.budget.per_request_usd,
+                    cfg.escalation.max_rungs_per_request,
+                )
+            });
+        let mut base_request = base_request;
+        base_request.cache_prefix = state
+            .config
+            .routing
+            .as_ref()
+            .is_some_and(|r| r.escalation.prompt_cache);
+
+        let ctx = EnforceCtx {
+            condense: routing_cfg_condense(&state),
+            ladder: &challenger.ladder,
+            gates: &gates,
+            health: &state.gate_health,
+            base_request: &base_request,
+            providers: &state.providers,
+            auth: &auth,
+            prices: &state.config.prices,
+            budget_per_request_usd: budget,
+            max_rungs,
+            speculation: 0,
+            serve_threshold: None,
+            elastic: None,
+            features,
+            start_rung: 0,
+            tenant_id: tenant.clone(),
+            session_id: session_id.clone(),
+            prompt_hash: prompt_hash(&state.config.prompt_salt, &body),
+            api: api.clone(),
+            policy_id: "paired-challenger@v0".to_owned(),
+        };
+
+        let (outcome, ch_trace) = route_enforce(ctx).await;
+        let challenger_cost = ch_trace.final_.total_cost_usd;
+        state
+            .paired_ledger
+            .debit(&tenant, route_ix, challenger_cost, now);
+
+        // x_ch = 1.0 if the challenger produced a gate-passing answer, 0.0 otherwise.
+        let x_ch = if matches!(outcome, crate::router::EngineOutcome::Served(_)) {
+            1.0_f64
+        } else {
+            0.0_f64
+        };
+
+        // Persist the pair to the store for startup rebuild and CLI replay.
+        let pair_row = crate::store::ExperimentPairRow {
+            tenant: tenant.clone(),
+            route_ix,
+            fingerprint: fingerprint.clone(),
+            trace_id: ch_trace.trace_id,
+            x_inc,
+            x_ch,
+            challenger_cost_usd: challenger_cost,
+            ts: now,
+        };
+        if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
+            tracing::warn!(%e, "paired challenger: failed to persist pair to store");
+        }
+
+        // Record the pair in the experiment monitor (updates local state and, if a log
+        // backend is configured, propagates to other replicas).
+        state
+            .experiments
+            .record_pair(
+                &tenant,
+                route_ix,
+                &fingerprint,
+                x_inc,
+                x_ch,
+                incumbent_cost_usd,
+                challenger_cost,
+            )
+            .await;
+
+        tracing::debug!(
+            tenant,
+            route = route_ix,
+            x_inc,
+            x_ch,
+            challenger_cost_usd = challenger_cost,
+            "paired challenger evaluation complete"
+        );
+    });
 }
 
 /// Per-request routing-mode override. Case-insensitive; unknown values are logged and ignored
@@ -1955,6 +2208,9 @@ async fn enforce_pipeline_inner(
     // generated just above, which the trace records — each unsessioned request is its own
     // session). If the experiment has been halted, challenger-assigned sessions are served by the
     // incumbent and recorded as incumbent, so per-arm cost is never blended.
+    //
+    // In **paired** mode the challenger never serves any session: arm is always Incumbent, and the
+    // challenger is evaluated off-path by `spawn_paired_challenger` after the response is returned.
     let experiment = route
         .challenger
         .as_ref()
@@ -1962,8 +2218,9 @@ async fn enforce_pipeline_inner(
         .map(|ch| {
             let bucket = firstpass_core::Challenger::bucket(&state.config.prompt_salt, &session_id);
             let assigned = ch.arm_of(bucket);
-            let arm = if assigned == firstpass_core::Arm::Challenger
-                && state.experiments.challenger_blocked(&tenant, route_ix)
+            let arm = if ch.is_paired()
+                || (assigned == firstpass_core::Arm::Challenger
+                    && state.experiments.challenger_blocked(&tenant, route_ix))
             {
                 firstpass_core::Arm::Incumbent
             } else {
@@ -2228,6 +2485,13 @@ async fn enforce_pipeline_inner(
         .routing
         .as_ref()
         .is_some_and(|r| r.escalation.prompt_cache);
+    // Paired challenger (ADR 0014): save clones BEFORE moving into EnforceCtx. Only when a paired
+    // challenger is active to avoid cloning on every enforce request.
+    let paired_spawn_data: Option<(Features, String, String)> = experiment
+        .as_ref()
+        .filter(|(ch, _)| ch.is_paired())
+        .map(|_| (features.clone(), tenant.clone(), session_id.clone()));
+
     let ctx = EnforceCtx {
         condense: routing_cfg_condense(state),
         ladder,
@@ -2517,6 +2781,36 @@ async fn enforce_pipeline_inner(
             )
             .await;
         metrics::counter!("firstpass_cache_stores_total").increment(1);
+    }
+
+    // Paired challenger (ADR 0014, Stage 2): run the challenger ladder on the same request in a
+    // detached task AFTER the response is built but BEFORE the trace is moved into `offer_trace`.
+    // `paired_spawn_data` was cloned before EnforceCtx took ownership of the originals.
+    if let Some((ch, rec)) = &experiment
+        && ch.is_paired()
+    {
+        let trace_id_str = trace.trace_id.to_string();
+        if ch.paired_sampled(&state.config.prompt_salt, &trace_id_str)
+            && let Some((spawn_feats, spawn_tenant, spawn_session)) = paired_spawn_data
+        {
+            let served_from = trace.final_.served_from;
+            let incumbent_cost = trace.final_.total_cost_usd;
+            spawn_paired_challenger(
+                state,
+                route,
+                ch,
+                rec.fingerprint.clone(),
+                route_ix,
+                body.clone(),
+                auth.clone(),
+                spawn_feats,
+                spawn_tenant,
+                spawn_session,
+                api,
+                served_from,
+                incumbent_cost,
+            );
+        }
     }
 
     // The trace is already built; enqueue it off-path (non-blocking `try_send`, so no spawn needed).
@@ -4766,6 +5060,7 @@ mod tests {
             providers,
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -4949,6 +5244,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -5366,6 +5662,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -5594,6 +5891,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -5968,6 +6266,7 @@ mod tests {
             providers: ProviderRegistry::from_map(providers),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -6397,6 +6696,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -6771,6 +7071,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -6893,6 +7194,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -7173,6 +7475,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -7267,6 +7570,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -7456,6 +7760,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments,
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -7570,6 +7875,111 @@ mod tests {
             "halted challenger was still served"
         );
         assert_eq!(t.experiment.unwrap().arm, Arm::Incumbent);
+    }
+
+    /// Shared-log wiring: when two AppStates (two "replicas") are built with an
+    /// `InMemoryExperimentLog` — the way `run.rs` wires a Redis-backed log — feedback processed
+    /// by replica A propagates to replica B after one `sync_from_backend`, halting the experiment
+    /// cluster-wide, and a session that would normally serve the challenger is rerouted to the
+    /// incumbent on replica B.
+    ///
+    /// Mutation test: remove `.with_log(...)` from replica B's monitor → `sync_from_backend`
+    /// is a no-op → `challenger_blocked` stays `false` after "sync" → the session IS served
+    /// by the challenger → the final `arm == Incumbent` assertion fails.
+    #[tokio::test]
+    async fn shared_log_wiring_halt_propagates_to_replica_b() {
+        use firstpass_core::{Arm, ExperimentStatus, Verdict};
+
+        let shared_log = Arc::new(crate::experiment::InMemoryExperimentLog::new());
+
+        // Replica A — with shared log (the way run.rs wires a Redis-backed log).
+        // `_rx_a`: replica A never serves requests in this test; we drive it via record_outcome.
+        let (mut state_a, _rx_a) = challenger_state(50.0, "unused-a.db");
+        {
+            let monitor = crate::experiment::ExperimentMonitor::from_config(
+                state_a.config.routing.as_ref().unwrap(),
+            )
+            .with_log(Arc::clone(&shared_log) as Arc<dyn crate::experiment::ExperimentLogBackend>);
+            state_a.experiments = Arc::new(monitor);
+        }
+
+        // Replica B — same shared log.
+        // MUTATION TEST: remove the `.with_log(...)` call below; the final assertions fail.
+        let (mut state_b, mut rx_b) = challenger_state(50.0, "unused-b.db");
+        {
+            let monitor = crate::experiment::ExperimentMonitor::from_config(
+                state_b.config.routing.as_ref().unwrap(),
+            )
+            .with_log(Arc::clone(&shared_log) as Arc<dyn crate::experiment::ExperimentLogBackend>);
+            state_b.experiments = Arc::new(monitor);
+        }
+
+        let fp = state_a.experiments.fingerprint(0).unwrap().to_owned();
+
+        // Drive experiment to Halted via record_outcome — the same function the HTTP feedback
+        // handler calls. Incumbent always passes; challenger always fails.
+        let mut halted = false;
+        for i in 0..500 {
+            state_a
+                .experiments
+                .record_outcome(
+                    "default",
+                    0,
+                    &fp,
+                    Arm::Incumbent,
+                    &format!("i{i}"),
+                    Verdict::Pass,
+                    0.10,
+                )
+                .await;
+            state_a
+                .experiments
+                .record_outcome(
+                    "default",
+                    0,
+                    &fp,
+                    Arm::Challenger,
+                    &format!("c{i}"),
+                    Verdict::Fail,
+                    0.02,
+                )
+                .await;
+            if state_a.experiments.status("default", 0) == ExperimentStatus::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "experiment never halted on replica A");
+
+        // Replica B has not synced yet — unaware of the halt.
+        assert!(
+            !state_b.experiments.challenger_blocked("default", 0),
+            "replica B must not block before syncing"
+        );
+
+        // One sync makes B read the shared log and reach the same Halted decision.
+        state_b
+            .experiments
+            .sync_from_backend("default", 0, &fp)
+            .await;
+        assert!(
+            state_b.experiments.challenger_blocked("default", 0),
+            "replica B must block the challenger after syncing the halt from the shared log"
+        );
+
+        // A session that would normally land on the challenger arm is rerouted to the incumbent.
+        // This verifies the block gate in the serve path (proxy.rs arm-assignment logic).
+        let ch_session = session_in_arm(&state_b, Arm::Challenger, 999);
+        let t = serve_session(&state_b, &mut rx_b, &ch_session).await;
+        assert_eq!(
+            t.experiment.as_ref().unwrap().arm,
+            Arm::Incumbent,
+            "a halted challenger-arm session must be rerouted to the incumbent on replica B"
+        );
+        assert_eq!(
+            t.attempts[0].model, INCUMBENT,
+            "the incumbent model must have been called, not the challenger"
+        );
     }
 
     /// If the store was unreadable at startup the monitor is built blocked: the challenger is not

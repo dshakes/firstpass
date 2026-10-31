@@ -195,6 +195,7 @@ pub(crate) async fn spawn_proxy(
         providers,
         gate_health: Arc::new(crate::gate::GateHealthRegistry::new()),
         shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+        paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
         experiments: Arc::default(),
         guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
         traces,

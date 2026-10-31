@@ -150,6 +150,25 @@ impl Shadow {
     }
 }
 
+/// Whether a challenger runs as a live arm or as a paired shadow (ADR 0014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChallengerMode {
+    /// (Default) A randomized fraction of *sessions* is served by the challenger ladder through
+    /// the normal enforce path. Task outcomes arrive through the feedback API. Only valid on
+    /// routes where the task outcome is a meaningful signal; not suitable for agent sessions
+    /// when no per-session outcome gate is available.
+    #[default]
+    Live,
+    /// The challenger ladder runs on the **same request** in a detached task after the incumbent
+    /// response has been returned, comparing gate verdicts rather than task outcomes. No session
+    /// is ever served by the challenger, so this is safe for single-turn routes. Requires at
+    /// least one gate other than `non-empty` (a pass-everything gate makes gate-pass
+    /// non-inferiority meaningless — finding 1 of ADR 0014) and a daily spend ceiling
+    /// (`max_usd_per_day`). Certifies **gate-pass** non-inferiority, not outcome.
+    Paired,
+}
+
 /// A challenger ladder under evaluation on live traffic (ADR 0014).
 ///
 /// A randomized `percent` of *sessions* is served by `ladder` instead of the route's own ladder,
@@ -163,17 +182,40 @@ pub struct Challenger {
     /// The ladder under evaluation, cheapest first, as `provider/model` strings. Same shape as
     /// `Route.ladder`; every rung must resolve to a price and a provider.
     pub ladder: Vec<String>,
-    /// Percent of *sessions* served by the challenger, in `(0, 100)` exclusive. The rest are the
-    /// incumbent arm, which is the control; at 100 there would be no control and the test could
-    /// never form a pair.
+    /// **Live mode**: percent of *sessions* served by the challenger, in `(0, 100)` exclusive.
+    /// The rest are the incumbent arm; at 100 there would be no control and the test could never
+    /// form a pair. **Paired mode**: unused — set to `0` or omit (defaults to `0`).
+    #[serde(default)]
     pub percent: f64,
-    /// Non-inferiority margin: how much worse (in task success rate) the challenger may be and
-    /// still be certified. See [`crate::select::DEFAULT_MARGIN`].
+    /// Non-inferiority margin: how much worse the challenger may be and still be certified.
+    /// See [`crate::select::DEFAULT_MARGIN`].
     #[serde(default = "default_challenger_margin")]
     pub margin: f64,
     /// Error rate of each conclusion (certify / halt). See [`crate::select::DEFAULT_ALPHA`].
     #[serde(default = "default_challenger_alpha")]
     pub alpha: f64,
+    /// How this challenger collects evidence. `"live"` (default) assigns sessions to an arm by
+    /// salted hash. `"paired"` runs the challenger off-path on every (sampled) incumbent request.
+    #[serde(default)]
+    pub mode: ChallengerMode,
+    /// **Paired mode only**: fraction of enforce requests sampled for pairing, in `[0, 1]`.
+    /// `1.0` (default) pairs every enforce request. Values below `1.0` reduce challenger spend
+    /// at the cost of slower convergence. Ignored in `"live"` mode.
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: f64,
+    /// **Paired mode only**: hard ceiling on challenger spend per UTC day, in USD. Required when
+    /// `mode = "paired"` (the challenger makes real model calls off the hot path; a silent spend
+    /// would be worse than a visible one). Ignored in `"live"` mode.
+    #[serde(default)]
+    pub max_usd_per_day: Option<f64>,
+    /// Optional Redis URL for sharing experiment state across replicas.
+    ///
+    /// When set, all replicas append outcomes / pairs to a shared Redis list and rebuild their
+    /// local `Experiment` incrementally from it, so the halt/certify decision is global rather
+    /// than per-process. Requires the `redis-cache` build feature in `firstpass-proxy`; a URL
+    /// without that feature is rejected at startup rather than silently ignored.
+    #[serde(default)]
+    pub redis_url: Option<String>,
 }
 
 fn default_challenger_margin() -> f64 {
@@ -184,27 +226,92 @@ fn default_challenger_alpha() -> f64 {
     crate::select::DEFAULT_ALPHA
 }
 
+fn default_sample_rate() -> f64 {
+    1.0
+}
+
 impl Challenger {
+    /// Whether this challenger is in paired mode.
+    #[must_use]
+    pub fn is_paired(&self) -> bool {
+        self.mode == ChallengerMode::Paired
+    }
+
     /// Whether this challenger config is coherent on its own. Cross-checks against the route and
     /// the price table happen in `Config::parse`.
     ///
     /// # Errors
-    /// If `percent` is not in `(0, 100)`, the ladder is empty, or `margin`/`alpha` are refused by
-    /// [`crate::select::Experiment::new`].
+    /// - Live mode: if `percent` is not in `(0, 100)`.
+    /// - Paired mode: if `sample_rate` is not in `[0, 1]`, or `max_usd_per_day` is absent / invalid.
+    /// - Either mode: if the ladder is empty, or `margin`/`alpha` are refused by
+    ///   [`crate::select::Experiment::new`].
     pub fn validate(&self) -> Result<(), String> {
-        if !self.percent.is_finite() || self.percent <= 0.0 || self.percent >= 100.0 {
-            return Err(format!(
-                "route.challenger.percent must be finite and within (0, 100) exclusive — at 100 \
-                 there is no incumbent control and the test can never pair — got {}",
-                self.percent
-            ));
-        }
         if self.ladder.is_empty() {
             return Err("route.challenger.ladder must not be empty".to_owned());
+        }
+        match self.mode {
+            ChallengerMode::Live => {
+                if !self.percent.is_finite() || self.percent <= 0.0 || self.percent >= 100.0 {
+                    return Err(format!(
+                        "route.challenger.percent must be finite and within (0, 100) exclusive — \
+                         at 100 there is no incumbent control and the test can never pair — got {}",
+                        self.percent
+                    ));
+                }
+            }
+            ChallengerMode::Paired => {
+                if !self.sample_rate.is_finite() || !(0.0..=1.0).contains(&self.sample_rate) {
+                    return Err(format!(
+                        "route.challenger.sample_rate must be finite and within [0, 1], got {}",
+                        self.sample_rate
+                    ));
+                }
+                let max = self.max_usd_per_day.ok_or_else(|| {
+                    "route.challenger.max_usd_per_day is required in paired mode — the challenger \
+                     makes real model calls off the hot path; a ceiling prevents silent spend"
+                        .to_owned()
+                })?;
+                if !max.is_finite() || max < 0.0 {
+                    return Err(format!(
+                        "route.challenger.max_usd_per_day must be finite and >= 0, got {max}"
+                    ));
+                }
+            }
         }
         crate::select::Experiment::new(self.margin, self.alpha)
             .map(|_| ())
             .map_err(|e| format!("route.challenger: {e}"))
+    }
+
+    /// Whether a given request falls in the paired sample (paired mode only).
+    ///
+    /// Uses the same salted-bucketing discipline as shadow sampling, under a `"paired"` domain tag
+    /// so the sample is independent of rollout and shadow membership. `request_id` should be the
+    /// trace id of the served request (a stable, per-request identity that does not repeat).
+    #[must_use]
+    pub fn paired_sampled(&self, salt: &str, request_id: &str) -> bool {
+        if self.sample_rate <= 0.0 {
+            return false;
+        }
+        if self.sample_rate >= 1.0 {
+            return true;
+        }
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(salt.as_bytes());
+        h.update([0u8]);
+        h.update(b"paired"); // distinct tag: independent of rollout and shadow sampling
+        h.update([0u8]);
+        h.update(request_id.as_bytes());
+        let d = h.finalize();
+        let bucket = u32::from_be_bytes([d[0], d[1], d[2], d[3]]) % BUCKETS;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "sample_rate is validated finite in [0,1]"
+        )]
+        let cutoff = (self.sample_rate * f64::from(BUCKETS)) as u32;
+        bucket < cutoff
     }
 
     /// Identity of this experiment's configuration: the first 16 hex of SHA-256 over the canonical
@@ -582,6 +689,23 @@ mod tests {
             percent,
             margin: crate::select::DEFAULT_MARGIN,
             alpha: crate::select::DEFAULT_ALPHA,
+            mode: ChallengerMode::Live,
+            sample_rate: 1.0,
+            max_usd_per_day: None,
+            redis_url: None,
+        }
+    }
+
+    fn paired_challenger() -> Challenger {
+        Challenger {
+            ladder: vec!["anthropic/claude-haiku-4-5".to_owned()],
+            percent: 0.0,
+            margin: crate::select::DEFAULT_MARGIN,
+            alpha: crate::select::DEFAULT_ALPHA,
+            mode: ChallengerMode::Paired,
+            sample_rate: 1.0,
+            max_usd_per_day: Some(5.0),
+            redis_url: None,
         }
     }
 
@@ -644,6 +768,62 @@ mod tests {
         let mut c = challenger(10.0);
         c.alpha = 0.5;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn paired_challenger_validate_rejects_incoherent_settings() {
+        assert!(paired_challenger().validate().is_ok(), "base paired ok");
+        // Missing max_usd_per_day in paired mode.
+        let mut c = paired_challenger();
+        c.max_usd_per_day = None;
+        assert!(c.validate().is_err(), "missing max_usd_per_day");
+        // Negative max_usd_per_day.
+        let mut c = paired_challenger();
+        c.max_usd_per_day = Some(-1.0);
+        assert!(c.validate().is_err(), "negative max_usd_per_day");
+        // sample_rate out of range.
+        let mut c = paired_challenger();
+        c.sample_rate = 1.5;
+        assert!(c.validate().is_err(), "sample_rate > 1");
+        let mut c = paired_challenger();
+        c.sample_rate = -0.1;
+        assert!(c.validate().is_err(), "sample_rate < 0");
+        // Empty ladder.
+        let mut c = paired_challenger();
+        c.ladder.clear();
+        assert!(c.validate().is_err(), "empty ladder");
+    }
+
+    #[test]
+    fn paired_sampled_is_deterministic_and_approximately_rate() {
+        let c = paired_challenger();
+        // sample_rate = 1.0: all sampled.
+        for i in 0..100 {
+            assert!(c.paired_sampled("salt", &format!("r{i}")));
+        }
+        // sample_rate = 0.0: none sampled.
+        let mut c0 = paired_challenger();
+        c0.sample_rate = 0.0;
+        for i in 0..100 {
+            assert!(!c0.paired_sampled("salt", &format!("r{i}")));
+        }
+        // sample_rate = 0.5: approximately 50%.
+        let mut c5 = paired_challenger();
+        c5.sample_rate = 0.5;
+        let n = 10_000u32;
+        let hits = (0..n)
+            .filter(|i| c5.paired_sampled("salt", &format!("r{i}")))
+            .count();
+        let observed = hits as f64 / f64::from(n) * 100.0;
+        assert!((observed - 50.0).abs() < 2.0, "got {observed:.2}%");
+        // Deterministic: same result on repeated calls.
+        for i in 0..100 {
+            let key = format!("req-{i}");
+            assert_eq!(
+                c5.paired_sampled("salt", &key),
+                c5.paired_sampled("salt", &key)
+            );
+        }
     }
 
     #[test]

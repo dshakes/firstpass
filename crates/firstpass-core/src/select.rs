@@ -271,6 +271,46 @@ impl Experiment {
         true
     }
 
+    /// Record a paired observation directly, bypassing the FIFO queues.
+    ///
+    /// In paired shadow mode both the incumbent's and the challenger's gate verdicts for the **same
+    /// request** are known simultaneously and arrive as a complete unit. The FIFO pairing is
+    /// unnecessary in that case — its buffering semantics would make the arrival order depend on
+    /// which arm returns first — so this method steps the e-process directly with `D = x_inc − x_ch`.
+    ///
+    /// Returns `false` if either value is not a finite `f64` in `[0, 1]`: an out-of-range value
+    /// would break the nonnegativity the guarantee rests on, and clamping would silently alter what
+    /// the caller reported. Abstaining on either side (passing `None` to the caller's wrapper)
+    /// should drop the pair before calling this; here only fully resolved values are accepted.
+    pub fn observe_pair(&mut self, x_inc: f64, x_ch: f64) -> bool {
+        if !x_inc.is_finite()
+            || !(0.0..=1.0).contains(&x_inc)
+            || !x_ch.is_finite()
+            || !(0.0..=1.0).contains(&x_ch)
+        {
+            return false;
+        }
+        self.incumbent.outcomes += 1;
+        self.incumbent.outcome_sum += x_inc;
+        self.challenger.outcomes += 1;
+        self.challenger.outcome_sum += x_ch;
+        self.pairs += 1;
+        if self.status == Status::Undecided {
+            let d = x_inc - x_ch;
+            self.certify.step(d, self.margin);
+            self.halt.step(d, self.margin);
+            let level = 1.0 / self.alpha;
+            if self.certify.e_value() >= level {
+                self.status = Status::Certified;
+                self.decided_at_pair = Some(self.pairs);
+            } else if self.halt.e_value() >= level {
+                self.status = Status::Halted;
+                self.decided_at_pair = Some(self.pairs);
+            }
+        }
+        true
+    }
+
     /// Record the cost of one request served by `arm`. Negative or non-finite costs are ignored.
     pub fn observe_cost(&mut self, arm: Arm, cost_usd: f64) {
         if !cost_usd.is_finite() || cost_usd < 0.0 {
@@ -475,6 +515,81 @@ mod tests {
                 assert!(mix.wealth.iter().all(|w| *w >= 0.0), "m={m} sign={sign}");
             }
         }
+    }
+
+    #[test]
+    fn observe_pair_out_of_range_is_refused_not_clamped() {
+        let mut exp = Experiment::new(0.05, 0.05).expect("valid");
+        assert!(!exp.observe_pair(1.5, 0.5));
+        assert!(!exp.observe_pair(0.5, -0.1));
+        assert!(!exp.observe_pair(f64::NAN, 1.0));
+        assert!(!exp.observe_pair(1.0, f64::INFINITY));
+        // Nothing was counted.
+        let r = exp.report();
+        assert_eq!(r.pairs, 0);
+        assert_eq!(r.incumbent.outcomes, 0);
+        assert_eq!(r.challenger.outcomes, 0);
+    }
+
+    #[test]
+    fn observe_pair_bypasses_fifo_queues() {
+        let mut exp = Experiment::new(0.05, 0.05).expect("valid");
+        // Pre-load the FIFO queues via observe_outcome.
+        exp.observe_outcome(Arm::Incumbent, 1.0);
+        exp.observe_outcome(Arm::Incumbent, 1.0);
+        // A direct pair should form immediately, irrespective of the FIFO depth.
+        assert!(exp.observe_pair(1.0, 1.0));
+        let r = exp.report();
+        // The pair from observe_pair + the 2 incumbents waiting in FIFO.
+        // observe_pair does NOT drain the FIFO, so pair count is 1 (just the paired one).
+        assert_eq!(r.pairs, 1);
+        assert_eq!(r.incumbent.outcomes, 3); // 2 from observe_outcome + 1 from observe_pair
+        assert_eq!(r.challenger.outcomes, 1); // only from observe_pair
+    }
+
+    #[test]
+    fn observe_pair_validity_at_null_boundary() {
+        // Incumbent 0.76, challenger exactly `m` worse (0.71): certifying this is the error the
+        // test promises to bound at `alpha`. In paired mode the incumbents are all 1.0 (gate
+        // always passes on the served request) and the challenger is Bernoulli(1 − m) = Bernoulli(0.95).
+        // The false-certification rate must not exceed alpha + 2σ ≈ alpha + 0.022.
+        let mut certify_count = 0u32;
+        for s in 0..400u64 {
+            let mut rng = Rng(0xFEED_CAFE ^ (s + 1));
+            let mut exp = Experiment::new(DEFAULT_MARGIN, DEFAULT_ALPHA).expect("valid");
+            for _ in 0..10_000 {
+                // x_inc is always 1.0 (enforce always serves a gate-passing answer).
+                let x_ch = rng.bern(1.0 - DEFAULT_MARGIN); // exactly at the boundary
+                exp.observe_pair(1.0, x_ch);
+                if exp.status() != Status::Undecided {
+                    break;
+                }
+            }
+            if exp.status() == Status::Certified {
+                certify_count += 1;
+            }
+        }
+        // u32 → f64 is exact (32-bit mantissa fits in f64's 53-bit); no precision loss.
+        let rate = certify_count as f64 / 400.0;
+        assert!(
+            rate <= DEFAULT_ALPHA + 0.022,
+            "false-certification rate at null boundary: {rate} (limit {})",
+            DEFAULT_ALPHA + 0.022
+        );
+    }
+
+    #[test]
+    fn a_clearly_worse_paired_challenger_halts() {
+        // x_inc always 1.0; x_ch = 0.0 (challenger always fails the gate).
+        // D = 1.0 > margin, so the halt arm should trip quickly.
+        let mut exp = Experiment::new(DEFAULT_MARGIN, DEFAULT_ALPHA).expect("valid");
+        for _ in 0..500 {
+            exp.observe_pair(1.0, 0.0);
+            if exp.status() != Status::Undecided {
+                break;
+            }
+        }
+        assert_eq!(exp.status(), Status::Halted);
     }
 
     #[test]

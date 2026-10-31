@@ -179,7 +179,23 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             reported_at TEXT NOT NULL,
             reporter TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS deferred_trace_idx ON deferred_verdicts(trace_id);",
+        CREATE INDEX IF NOT EXISTS deferred_trace_idx ON deferred_verdicts(trace_id);
+        -- Paired-shadow experiment pairs (ADR 0014 Stage 2): one row per paired evaluation.
+        -- Gate verdicts from the incumbent (x_inc) and challenger (x_ch) are stored here so the
+        -- experiment can be rebuilt deterministically at startup or CLI replay: arrival order is
+        -- the row id, and replaying in that order yields the same e-process trajectory.
+        CREATE TABLE IF NOT EXISTS experiment_pairs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant TEXT NOT NULL,
+            route_ix INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL,
+            trace_id TEXT NOT NULL,
+            x_inc REAL NOT NULL,
+            x_ch REAL NOT NULL,
+            challenger_cost_usd REAL NOT NULL,
+            ts TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS exp_pairs_tenant_idx ON experiment_pairs(tenant, route_ix, fingerprint);",
     )?;
     Ok(())
 }
@@ -581,7 +597,7 @@ pub fn trace_experiment(
     db_path: impl AsRef<Path>,
     tenant: &str,
     trace_id: &str,
-) -> Result<Option<(String, usize, firstpass_core::trace::ExperimentRecord)>, StoreError> {
+) -> Result<Option<(String, usize, firstpass_core::trace::ExperimentRecord, f64)>, StoreError> {
     let conn = connect(db_path.as_ref())?;
     let body: Option<String> = conn
         .query_row(
@@ -592,12 +608,14 @@ pub fn trace_experiment(
         .optional()?;
     let Some(body) = body else { return Ok(None) };
     let trace: Trace = serde_json::from_str(&body)?;
+    let cost_usd = trace.final_.total_cost_usd;
     Ok(trace.experiment.map(|rec| {
         (
             trace.session_id,
             // Same fallback as the guardrail: a trace with no recorded route is route 0.
             trace.route_ix.map_or(0, |r| r as usize),
             rec,
+            cost_usd,
         )
     }))
 }
@@ -628,6 +646,115 @@ pub fn load_trace_view(
     let mut trace: Trace = serde_json::from_str(&body)?;
     trace.deferred = load_deferred(db_path, trace_id)?;
     Ok(Some(trace))
+}
+
+/// One row from the `experiment_pairs` table.
+///
+/// Used to rebuild paired-mode experiments at startup and in the CLI, so the e-process trajectory
+/// is identical whether derived live or replayed. Arrival order = row `id` (insertion order).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExperimentPairRow {
+    /// Tenant that owns this pair.
+    pub tenant: String,
+    /// Route index the challenger belongs to.
+    pub route_ix: usize,
+    /// Fingerprint of the experiment config (incumbent + challenger ladders, margin, alpha).
+    pub fingerprint: String,
+    /// Trace id of the served (incumbent) request that triggered this pair.
+    pub trace_id: uuid::Uuid,
+    /// Incumbent gate verdict: 1.0 = gate passed, 0.0 = gate failed / best-attempt.
+    pub x_inc: f64,
+    /// Challenger gate verdict: 1.0 = gate passed, 0.0 = gate failed.
+    pub x_ch: f64,
+    /// USD spent by the challenger on this pair.
+    pub challenger_cost_usd: f64,
+    /// When the pair was recorded.
+    pub ts: jiff::Timestamp,
+}
+
+/// Append one experiment pair to the `experiment_pairs` table.
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] on a database write failure.
+pub fn append_experiment_pair(
+    db_path: impl AsRef<std::path::Path>,
+    row: &ExperimentPairRow,
+) -> Result<(), StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    conn.execute(
+        "INSERT INTO experiment_pairs \
+         (tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, ts) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            row.tenant,
+            row.route_ix as i64,
+            row.fingerprint,
+            row.trace_id.to_string(),
+            row.x_inc,
+            row.x_ch,
+            row.challenger_cost_usd,
+            row.ts.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load every experiment pair in insertion order. Used at startup (rebuild) and CLI replay.
+///
+/// Rows with an unparseable `trace_id` or `ts` are skipped with a warning rather than failing the
+/// read — a single corrupt row must not prevent an otherwise healthy experiment from being restored.
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] on a database read failure.
+pub fn load_all_experiment_pairs(
+    db_path: impl AsRef<std::path::Path>,
+) -> Result<Vec<ExperimentPairRow>, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let mut stmt = conn.prepare(
+        "SELECT tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, ts \
+         FROM experiment_pairs ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, f64>(4)?,
+            row.get::<_, f64>(5)?,
+            row.get::<_, f64>(6)?,
+            row.get::<_, String>(7)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (tenant, route_ix, fingerprint, trace_id_s, x_inc, x_ch, ch_cost, ts_s) = row?;
+        let Ok(trace_id) = trace_id_s.parse::<uuid::Uuid>() else {
+            tracing::warn!(
+                %trace_id_s,
+                "experiment_pairs: skipping row with unparseable trace_id"
+            );
+            continue;
+        };
+        let Ok(ts) = ts_s.parse::<jiff::Timestamp>() else {
+            tracing::warn!(
+                %trace_id_s,
+                "experiment_pairs: skipping row with unparseable ts"
+            );
+            continue;
+        };
+        out.push(ExperimentPairRow {
+            tenant,
+            route_ix: route_ix as usize,
+            fingerprint,
+            trace_id,
+            x_inc,
+            x_ch,
+            challenger_cost_usd: ch_cost,
+            ts,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
