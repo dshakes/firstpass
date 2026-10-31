@@ -1,110 +1,504 @@
 <!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Firstpass — receipts</title>
+<meta name="color-scheme" content="light dark">
+<title>Firstpass — panel</title>
 <style>
   :root {
-    --ink: #0c1116; --panel: #141b22; --line: #232d38; --text: #e6edf3;
-    --dim: #8b9bab; --mint: #19E3B1; --amber: #f5a524; --red: #f4506a;
+    --bg: #f6f8fa; --surface: #ffffff; --surface2: #eef2f6; --line: #d5dce4;
+    --text: #14202b; --dim: #55646f;
+    --ok: #0a7d5f; --warn: #94600a; --bad: #b3263f; --info: #1f5fbf;
+    --ok-bg: #dff5ec; --warn-bg: #fdf0d5; --bad-bg: #fbe3e8; --info-bg: #e1ecfb;
+    --focus: #1f5fbf;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0c1116; --surface: #141b22; --surface2: #1b252f; --line: #2a3643;
+      --text: #e6edf3; --dim: #93a3b2;
+      --ok: #19e3b1; --warn: #f5a524; --bad: #f4506a; --info: #6aa8ff;
+      --ok-bg: #0f2e27; --warn-bg: #33270d; --bad-bg: #351620; --info-bg: #14263f;
+      --focus: #6aa8ff;
+    }
   }
   * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
   body {
-    margin: 0; background: var(--ink); color: var(--text);
-    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    padding: 24px;
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    overflow-x: hidden;
   }
-  h1 { font-size: 15px; margin: 0 0 2px; letter-spacing: .04em; }
-  h1 b { color: var(--mint); }
-  .sub { color: var(--dim); font-size: 12px; margin-bottom: 20px; }
-  .totals { display: flex; gap: 28px; flex-wrap: wrap; margin-bottom: 20px; }
-  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; min-width: 130px; }
-  .stat .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
-  .stat .v { font-size: 20px; margin-top: 4px; }
-  .saved .v { color: var(--mint); }
-  .r { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; }
-  .rh { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; color: var(--dim); font-size: 12px; }
-  .rung { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; }
-  .rung .n { color: var(--dim); min-width: 52px; }
-  .rung .m { flex: 1; min-width: 180px; }
-  .pass { color: var(--mint); } .fail { color: var(--red); } .abstain { color: var(--amber); }
-  .cost { color: var(--dim); }
-  .empty { color: var(--dim); border: 1px dashed var(--line); border-radius: 8px; padding: 28px; text-align: center; }
-  code { color: var(--mint); }
-  /* Wide content scrolls inside its own box; the page itself never scrolls sideways. */
-  .wrap { overflow-x: auto; }
+  .mono, code, pre, .hash { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+  .skip { position: absolute; left: -999px; top: 0; background: var(--surface); padding: 8px 12px; z-index: 20; }
+  .skip:focus { left: 8px; top: 8px; }
+  header.top {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px;
+    padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--surface);
+  }
+  .brand { font-weight: 700; letter-spacing: .02em; }
+  .brand b { color: var(--ok); }
+  nav[role=tablist] { display: flex; gap: 4px; flex-wrap: wrap; }
+  nav button {
+    font: inherit; color: var(--dim); background: none; border: 1px solid transparent;
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; min-height: 36px;
+  }
+  nav button[aria-selected=true] { color: var(--text); background: var(--surface2); border-color: var(--line); font-weight: 600; }
+  .live { margin-left: auto; color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); display: inline-block; }
+  .dot.on { background: var(--ok); }
+  .dot.err { background: var(--bad); }
+  main { padding: 16px; max-width: 1100px; margin: 0 auto; }
+  h2 { font-size: 16px; margin: 0 0 4px; }
+  .lede { color: var(--dim); margin: 0 0 16px; max-width: 70ch; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; min-width: 0; }
+  .tile .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .tile .v { font-size: 22px; margin-top: 2px; overflow-wrap: anywhere; }
+  .tile .s { color: var(--dim); font-size: 12px; }
+  .v.pos { color: var(--ok); } .v.neg { color: var(--warn); }
+  .box { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; min-width: 0; }
+  .mix { display: flex; height: 12px; border-radius: 6px; overflow: hidden; background: var(--surface2); margin: 8px 0; }
+  .mix span { display: block; height: 100%; }
+  .mix .p { background: var(--ok); } .mix .f { background: var(--bad); } .mix .a { background: var(--warn); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; }
+  .pill {
+    display: inline-block; padding: 1px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    border: 1px solid currentColor; white-space: nowrap;
+  }
+  .pill.undecided { color: var(--info); background: var(--info-bg); }
+  .pill.certified { color: var(--ok); background: var(--ok-bg); }
+  .pill.halted { color: var(--bad); background: var(--bad-bg); }
+  .pill.unavailable { color: var(--warn); background: var(--warn-bg); }
+  .pass { color: var(--ok); } .fail { color: var(--bad); } .abstain { color: var(--warn); }
+  .card h3 { margin: 0; font-size: 15px; }
+  .card .hd { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; justify-content: space-between; }
+  .ladder { color: var(--dim); font-size: 13px; overflow-wrap: anywhere; margin: 4px 0 10px; }
+  .wrap { overflow-x: auto; max-width: 100%; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--dim); font-weight: 600; }
+  .bar { height: 10px; background: var(--surface2); border-radius: 5px; overflow: hidden; border: 1px solid var(--line); }
+  .bar > i { display: block; height: 100%; background: var(--info); }
+  .bar.cert > i { background: var(--ok); } .bar.halt > i { background: var(--bad); }
+  .ev { margin: 8px 0; }
+  .ev .l { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+  .note { background: var(--surface2); border-radius: 6px; padding: 8px 12px; margin: 10px 0; overflow-wrap: anywhere; }
+  .note.adopt { background: var(--ok-bg); border: 1px solid var(--ok); }
+  pre { margin: 6px 0; padding: 10px; background: var(--surface2); border-radius: 6px; overflow-x: auto; max-width: 100%; font-size: 12.5px; }
+  button.btn, select, input[type=password] {
+    font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 10px; min-height: 34px;
+  }
+  button.btn { cursor: pointer; }
+  button.btn:hover { background: var(--surface2); }
+  details { margin: 6px 0; } summary { cursor: pointer; color: var(--dim); }
+  .filters { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: end; margin-bottom: 12px; }
+  .filters label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--dim); }
+  .rows { display: grid; gap: 6px; }
+  .row {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; width: 100%; text-align: left;
+    font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 12px; cursor: pointer;
+  }
+  .row:hover { background: var(--surface2); }
+  .row .id { overflow-wrap: anywhere; color: var(--dim); font-size: 12px; }
+  .row .meta { color: var(--dim); font-size: 12px; text-align: right; }
+  .badge { font-size: 11px; padding: 0 7px; border-radius: 4px; border: 1px solid var(--line); color: var(--dim); }
+  .badge.challenger { color: var(--info); background: var(--info-bg); border-color: var(--info); }
+  .empty { border: 1px dashed var(--line); border-radius: 8px; padding: 20px; color: var(--dim); }
+  .empty h3 { color: var(--text); margin: 0 0 6px; font-size: 15px; }
+  .banner { border: 1px solid var(--warn); background: var(--warn-bg); border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; }
+  .banner.err { border-color: var(--bad); background: var(--bad-bg); }
+  .banner form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .hidden { display: none; }
+  #drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100%); background: var(--surface);
+    border-left: 1px solid var(--line); box-shadow: -8px 0 24px rgba(0,0,0,.25); padding: 16px;
+    overflow-y: auto; z-index: 10; transition: transform .15s ease;
+  }
+  #drawer[hidden] { display: none; }
+  #drawer .close { float: right; }
+  .kv { display: grid; grid-template-columns: 8.5em minmax(0, 1fr); gap: 2px 10px; font-size: 13px; }
+  .kv dt { color: var(--dim); } .kv dd { margin: 0; overflow-wrap: anywhere; }
+  .att { border-top: 1px solid var(--line); padding: 8px 0; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }
 </style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="brand"><b>firstpass</b> panel</div>
+  <nav role="tablist" aria-label="Panel sections">
+    <button role="tab" id="tab-overview" aria-controls="view-overview" aria-selected="true" data-view="overview">Overview</button>
+    <button role="tab" id="tab-experiments" aria-controls="view-experiments" aria-selected="false" data-view="experiments" tabindex="-1">Experiments</button>
+    <button role="tab" id="tab-receipts" aria-controls="view-receipts" aria-selected="false" data-view="receipts" tabindex="-1">Receipts</button>
+  </nav>
+  <div class="live" role="status" aria-live="polite"><span class="dot" id="dot"></span><span id="livetxt">connecting</span></div>
+</header>
 
-<h1><b>firstpass</b> — receipts</h1>
-<div class="sub">every routing decision this proxy made, and what it cost against always calling the top rung</div>
+<main id="main">
+  <div id="banner"></div>
 
-<div class="totals">
-  <div class="stat"><div class="k">requests</div><div class="v" id="n">—</div></div>
-  <div class="stat"><div class="k">spent</div><div class="v" id="spent">—</div></div>
-  <div class="stat"><div class="k">baseline</div><div class="v" id="base">—</div></div>
-  <div class="stat saved"><div class="k">saved</div><div class="v" id="saved">—</div></div>
-</div>
+  <section id="view-overview" role="tabpanel" aria-labelledby="tab-overview">
+    <h2>Overview</h2>
+    <p class="lede">Every routing decision this proxy made for your tenant, and what it cost against always calling the top rung.</p>
+    <div class="tiles" id="tiles" aria-live="off"></div>
+    <div class="box" id="mixbox"></div>
+  </section>
 
-<div class="wrap" id="list"></div>
+  <section id="view-experiments" role="tabpanel" aria-labelledby="tab-experiments" class="hidden">
+    <h2>Experiments</h2>
+    <p class="lede">A route with a <code>[route.challenger]</code> sends a random share of sessions to a cheaper model and measures task outcomes against your current one. Firstpass never switches models on its own: it stops sending traffic to a challenger that is proven worse, and shows you the change to make when one is proven good enough.</p>
+    <div id="exp-list"></div>
+  </section>
+
+  <section id="view-receipts" role="tabpanel" aria-labelledby="tab-receipts" class="hidden">
+    <h2>Receipts</h2>
+    <p class="lede">Newest first. Select a receipt for every attempt, gate verdict, cost, latency and its place in the hash chain.</p>
+    <div class="filters" role="group" aria-label="Filter receipts">
+      <label>Served rung<select id="f-rung"><option value="">any</option></select></label>
+      <label>Verdict<select id="f-verdict"><option value="">any</option><option value="pass">pass</option><option value="fail">fail</option><option value="abstain">abstain</option><option value="none">none served</option></select></label>
+      <label>Experiment arm<select id="f-arm"><option value="">any</option><option value="incumbent">incumbent</option><option value="challenger">challenger</option><option value="none">no experiment</option></select></label>
+      <span id="f-count" class="lede" style="margin:0"></span>
+    </div>
+    <div class="rows" id="rows"></div>
+  </section>
+</main>
+
+<aside id="drawer" role="dialog" aria-modal="false" aria-labelledby="drawer-title" hidden tabindex="-1">
+  <button class="btn close" id="drawer-close" type="button">Close</button>
+  <h2 id="drawer-title">Receipt</h2>
+  <div id="drawer-body"></div>
+</aside>
 
 <script>
+  'use strict';
   // Sign goes outside the symbol: "-$0.0027" reads as money lost, "$-0.0027" reads as a typo.
   const usd = n => (Number(n || 0) < 0 ? '-$' : '$') + Math.abs(Number(n || 0)).toFixed(4);
-  const cls = v => ({ pass: 'pass', fail: 'fail', abstain: 'abstain' })[String(v).toLowerCase()] || '';
+  const num = n => Number(n || 0).toLocaleString();
+  const pct = (a, b) => (Number(b) > 0 ? Math.round(Number(a) / Number(b) * 100) + '%' : 'n/a');
 
-  // Receipt fields are ATTACKER-CONTROLLED. `model` is echoed from the caller's request body on
-  // the observe path and stored in the trace, so anyone who can send one request through this
-  // proxy can plant markup that runs when an operator opens this page. Everything interpolated
-  // below goes through here.
+  // Receipt and experiment fields are ATTACKER-CONTROLLED. `model` is echoed from the caller's
+  // request body on the observe path and stored in the trace, so anyone who can send one request
+  // through this proxy can plant markup that runs when an operator opens this page. Everything
+  // interpolated into innerHTML below goes through here, or through one of the numeric formatters
+  // above (which coerce with Number), or through an `h_` renderer that is itself built from these.
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
-  async function tick() {
-    let data;
-    try {
-      const res = await fetch('/v1/receipts?limit=50');
-      if (res.status === 401) return render(null, 'This proxy requires auth. The panel is meant for local use; receipts stay behind the tenant key.');
-      data = await res.json();
-    } catch (e) {
-      return render(null, 'Cannot reach the proxy.');
-    }
-    render(data.receipts || []);
+  const cls = v => ({ pass: 'pass', fail: 'fail', abstain: 'abstain' })[String(v).toLowerCase()] || '';
+  const $ = id => document.getElementById(id);
+
+  const SNIPPET = '[route.challenger]\nladder  = ["openrouter/minimax-m2.5"]\npercent = 10\n# then restart the proxy';
+  const FEEDBACK = 'curl -s localhost:8080/v1/feedback -d \'{"trace_id":"<id>","gate_id":"tests","verdict":"pass","reporter":"ci"}\'';
+
+  const state = { receipts: [], summary: null, experiments: null, view: 'overview', openId: null, key: '', sig: '' };
+  try { state.key = sessionStorage.getItem('fp-key') || ''; } catch (e) { /* storage may be blocked */ }
+
+  // ---- fetching -------------------------------------------------------------------------------
+  async function get(path) {
+    const headers = state.key ? { Authorization: 'Bearer ' + state.key } : {};
+    const res = await fetch(path, { headers, cache: 'no-store' });
+    if (res.status === 401) { const e = new Error('auth'); e.auth = true; throw e; }
+    if (!res.ok) throw new Error('http ' + res.status);
+    return res.json();
   }
 
-  function render(receipts, note) {
-    const list = document.getElementById('list');
-    if (!receipts) { list.innerHTML = `<div class="empty">${note}</div>`; return; }
-    if (!receipts.length) {
-      list.innerHTML = '<div class="empty">No receipts yet. Send a request through the proxy — try <code>firstpass kiosk</code>.</div>';
+  let timer = null;
+  async function tick() {
+    timer = null;
+    try {
+      const [r, x] = await Promise.all([get('/v1/receipts?limit=200'), get('/v1/experiments')]);
+      state.receipts = r.receipts || [];
+      state.summary = r.summary || null;
+      state.experiments = x;
+      setLive('live', 'on');
+      banner(null);
+      const sig = JSON.stringify([r, x]);
+      if (sig !== state.sig) { state.sig = sig; render(); }
+    } catch (e) {
+      if (e && e.auth) { setLive('auth required', 'err'); banner('auth'); }
+      else { setLive('unreachable', 'err'); banner('down'); }
+    }
+    schedule();
+  }
+  // Poll every 2s, but not while the tab is hidden: a background tab should not keep a proxy busy.
+  function schedule() {
+    if (timer !== null || document.hidden) return;
+    timer = setTimeout(tick, 2000);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { if (timer !== null) { clearTimeout(timer); timer = null; } setLive('paused (tab hidden)', ''); }
+    else if (timer === null) { tick(); }
+  });
+
+  function setLive(text, kind) {
+    $('livetxt').textContent = text;
+    $('dot').className = 'dot' + (kind ? ' ' + kind : '');
+  }
+
+  function banner(kind) {
+    const el = $('banner');
+    if (kind === 'auth') {
+      if (el.dataset.k === 'auth') return;
+      el.dataset.k = 'auth';
+      el.innerHTML = `<div class="banner" role="alert"><b>This proxy requires a tenant key (401).</b>
+        Receipts and experiments are per-tenant data, so they stay behind your key; the page itself carries none.
+        Paste the key (<code>tenant.secret</code>) to view them. It is kept in this tab only (session storage) and sent to this proxy only.
+        <form id="keyform"><label for="keyin" class="lede" style="margin:0">Tenant key</label>
+        <input id="keyin" type="password" autocomplete="off" aria-label="Tenant key" required>
+        <button class="btn" type="submit">Use key</button></form></div>`;
+      $('keyform').addEventListener('submit', ev => {
+        ev.preventDefault();
+        state.key = $('keyin').value.trim();
+        try { sessionStorage.setItem('fp-key', state.key); } catch (e) { /* ignore */ }
+        state.sig = ''; el.dataset.k = ''; tick();
+      });
+    } else if (kind === 'down') {
+      if (el.dataset.k === 'down') return;
+      el.dataset.k = 'down';
+      el.innerHTML = '<div class="banner err" role="alert"><b>Cannot reach the proxy.</b> Is <code>firstpass up</code> still running? This page retries every 2 seconds.</div>';
+    } else { el.dataset.k = ''; el.innerHTML = ''; }
+  }
+
+  // ---- overview -------------------------------------------------------------------------------
+  function tile(k, v, s, tone) {
+    return `<div class="tile"><div class="k">${esc(k)}</div><div class="v ${esc(tone || '')}">${esc(v)}</div><div class="s">${esc(s || '')}</div></div>`;
+  }
+  function h_overview() {
+    const s = state.summary;
+    if (!s || !s.requests) {
+      $('tiles').innerHTML = '';
+      $('mixbox').innerHTML = `<div class="empty"><h3>No receipts yet</h3>Send a request through the proxy to see it here. Fastest way: <code>firstpass kiosk</code> (or <code>firstpass demo</code> with no API key).</div>`;
       return;
     }
-    let spent = 0, base = 0, saved = 0;
-    for (const r of receipts) { spent += r.total_cost_usd; base += r.baseline_usd; saved += r.savings_usd; }
-    document.getElementById('n').textContent = receipts.length;
-    document.getElementById('spent').textContent = usd(spent);
-    document.getElementById('base').textContent = usd(base);
     // Escalating past the top rung genuinely costs MORE than going straight there. Showing that
-    // loss in the same mint as a win would make the panel flatter the product it is auditing.
-    const savedEl = document.getElementById('saved');
-    savedEl.textContent = usd(saved) + (base > 0 ? ` (${Math.round(saved / base * 100)}%)` : '');
-    savedEl.style.color = saved < 0 ? 'var(--amber)' : 'var(--mint)';
-
-    const num = n => Number(n || 0).toLocaleString();
-    list.innerHTML = receipts.map(r => `
-      <div class="r">
-        <div class="rh">
-          <span>${esc(r.trace_id)}</span>
-          <span>served rung ${esc(r.served_rung ?? '—')} · ${usd(r.total_cost_usd)} of ${usd(r.baseline_usd)}</span>
-        </div>
-        ${(r.attempts || []).map(a => `
-          <div class="rung">
-            <span class="n">rung ${esc(a.rung)}</span>
-            <span class="m">${esc(a.model)}</span>
-            <span class="${cls(a.verdict)}">${esc(String(a.verdict).toUpperCase())}</span>
-            <span class="cost">${usd(a.cost_usd)} · ${num(a.latency_ms)}ms</span>
-          </div>`).join('')}
-      </div>`).join('');
+    // loss in the same green as a win would make the panel flatter the product it is auditing.
+    const saved = Number(s.saved_usd);
+    $('tiles').innerHTML = [
+      tile('requests', num(s.requests), 'all time, this tenant'),
+      tile('spent', usd(s.spent_usd), 'what you paid'),
+      tile('baseline', usd(s.baseline_usd), 'always calling the top rung'),
+      tile('saved', usd(saved), saved < 0 ? 'negative: escalation cost more than going straight to the top' : pct(saved, s.baseline_usd) + ' of baseline', saved < 0 ? 'neg' : 'pos'),
+      tile('first-pass rate', pct(s.first_pass, s.requests), num(s.first_pass) + ' served at rung 0'),
+      tile('escalation rate', pct(s.escalated, s.requests), num(s.escalated) + ' climbed at least one rung'),
+    ].join('');
+    const g = s.gates || {};
+    const total = (g.pass || 0) + (g.fail || 0) + (g.abstain || 0);
+    const h_w = n => (total ? (Number(n) / total * 100).toFixed(2) : 0);
+    $('mixbox').innerHTML = `<h2>Gate verdicts</h2>
+      <div class="lede" style="margin:0">Every gate run across every attempt. Fails are what trigger an escalation; abstains are never treated as passes.</div>
+      <div class="mix" role="img" aria-label="Gate verdict mix: ${esc(num(g.pass))} pass, ${esc(num(g.fail))} fail, ${esc(num(g.abstain))} abstain">
+        <span class="p" style="width:${h_w(g.pass)}%"></span><span class="f" style="width:${h_w(g.fail)}%"></span><span class="a" style="width:${h_w(g.abstain)}%"></span></div>
+      <div class="legend"><span class="pass">pass ${esc(num(g.pass))} (${esc(pct(g.pass, total))})</span>
+        <span class="fail">fail ${esc(num(g.fail))} (${esc(pct(g.fail, total))})</span>
+        <span class="abstain">abstain ${esc(num(g.abstain))} (${esc(pct(g.abstain, total))})</span></div>`;
   }
 
+  // ---- experiments ----------------------------------------------------------------------------
+  const EXPLAIN = {
+    undecided: 'Not enough evidence either way yet. Keep running and keep posting task outcomes: one per session. Nothing is decided and nothing changes.',
+    certified: 'The challenger is no worse than your current model by more than the margin, with error at most alpha, however often you looked. If it is also cheaper, the change to adopt is below. You make that edit; Firstpass never switches models on its own.',
+    halted: 'The challenger is worse than your current model by more than the margin. Firstpass has already stopped sending it new sessions (automatic: it only ever moves traffic back to your ladder). Nothing for you to do.',
+    unavailable: 'The receipt history could not be read at startup, so Firstpass cannot tell whether this challenger was already halted. It fails closed: every session is served by your current ladder until the store is readable and the proxy restarted.',
+  };
+  const EVIDENCE = 'Evidence is an e-value: a running bet against "the challenger is too different". It starts at 1 and the test decides when it reaches 1/alpha (20 at the default alpha 0.05). The bar is log scale. Because it is anytime-valid you may read it as often as you like without inflating the error rate.';
+
+  function h_evbar(label, e, target, kind) {
+    const v = Number(e) || 0;
+    const frac = v <= 1 || target <= 1 ? 0 : Math.min(1, Math.log(v) / Math.log(target));
+    const p = Math.round(frac * 100);
+    return `<div class="ev"><div class="l"><span title="${esc(EVIDENCE)}">${esc(label)}</span><span class="mono">${esc(v >= 1000 ? '>=1000' : v.toFixed(2))} of ${esc(target.toFixed(0))} needed</span></div>
+      <div class="bar ${esc(kind)}" role="progressbar" aria-label="${esc(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${esc(p)}"><i style="width:${esc(p)}%"></i></div></div>`;
+  }
+  function rate(a) { return a.outcomes > 0 ? (a.outcome_sum / a.outcomes) : null; }
+  function cpr(a) { return a.requests > 0 ? (a.cost_usd / a.requests) : null; }
+  const fpct = v => (v === null ? 'n/a' : (v * 100).toFixed(1) + '%');
+  const fusd = v => (v === null ? 'n/a' : '$' + v.toFixed(6));
+
+  function h_arm(name, a) {
+    return `<tr><td>${esc(name)}</td><td>${esc(num(a.outcomes))}</td><td>${esc(fpct(rate(a)))}</td><td>${esc(num(a.requests))}</td><td>${esc(fusd(cpr(a)))}</td></tr>`;
+  }
+  function adoptToml(v) {
+    return '# firstpass.toml: route ' + v.route_ix + '\nladder = [' + (v.challenger_ladder || []).map(m => JSON.stringify(String(m))).join(', ') + ']';
+  }
+  const h_delta = d => (d === null ? '' : ' (' + esc(d) + '% $/request)');
+  function h_card(v, conf) {
+    const r = v.report;
+    const status = conf && conf.unavailable ? 'unavailable' : r.status;
+    const target = 1 / (r.alpha || 0.05);
+    const ci = cpr(r.incumbent), cc = cpr(r.challenger);
+    const delta = ci && cc !== null ? Math.round((cc - ci) / ci * 100) : null;
+    let h_rec = '';
+    if (status === 'certified' && v.recommendation === 'adopt') {
+      h_rec = `<div class="note adopt"><b>Adopt it.</b> Certified non-inferior and cheaper${h_delta(delta)}. Replace this route's ladder with the challenger's, then remove <code>[route.challenger]</code>:
+        <pre id="toml-${esc(v.route_ix)}">${esc(adoptToml(v))}</pre>
+        <button class="btn" type="button" data-copy="toml-${esc(v.route_ix)}">Copy</button></div>`;
+    } else if (status === 'certified') {
+      h_rec = '<div class="note">Certified, but not measurably cheaper per request, so there is nothing to gain. Keep your current ladder.</div>';
+    }
+    const h_stale = v.ignored_stale > 0
+      ? `<div class="note">${esc(num(v.ignored_stale))} receipts from an earlier experiment configuration were ignored. Changing either ladder, the margin or alpha starts a fresh experiment.</div>` : '';
+    return `<article class="box card" aria-label="Experiment, route ${esc(v.route_ix)}">
+      <div class="hd"><h3>Route ${esc(v.route_ix)}</h3><span class="pill ${esc(status)}">${esc(status)}</span></div>
+      <div class="ladder">current: ${esc((conf ? conf.incumbent_ladder : []).join(' > ') || 'your ladder')} &nbsp;|&nbsp; challenger: ${esc((v.challenger_ladder || []).join(' > '))}</div>
+      <p style="margin:0 0 8px">${esc(EXPLAIN[status] || '')}</p>
+      <div class="wrap"><table><caption class="lede" style="text-align:left;margin:0">${esc(num(r.pairs))} matched pairs. Margin ${esc(r.margin)}, alpha ${esc(r.alpha)}.</caption>
+        <thead><tr><th>arm</th><th>sessions with outcome</th><th>success</th><th>requests</th><th>$/request</th></tr></thead>
+        <tbody>${h_arm('current', r.incumbent)}${h_arm('challenger', r.challenger)}</tbody></table></div>
+      ${h_evbar('Evidence the challenger is good enough', r.e_certify, target, 'cert')}
+      ${h_evbar('Evidence the challenger is too weak', r.e_halt, target, 'halt')}
+      <details><summary>What is evidence?</summary><div class="lede">${esc(EVIDENCE)}</div></details>
+      ${h_rec}${h_stale}
+    </article>`;
+  }
+  const h_feedbackpre = conf => (conf.unavailable ? '' : `<pre>${esc(FEEDBACK)}</pre>`);
+  function h_waiting(conf) {
+    const status = conf.unavailable ? 'unavailable' : 'undecided';
+    return `<article class="box card" aria-label="Experiment, route ${esc(conf.route_ix)}">
+      <div class="hd"><h3>Route ${esc(conf.route_ix)}</h3><span class="pill ${esc(status)}">${esc(status)}</span></div>
+      <div class="ladder">current: ${esc(conf.incumbent_ladder.join(' > '))} &nbsp;|&nbsp; challenger: ${esc(conf.challenger_ladder.join(' > '))} (${esc(conf.percent)}% of sessions)</div>
+      <p style="margin:0 0 8px">${esc(conf.unavailable ? EXPLAIN.unavailable : 'Configured, but no outcomes have been recorded yet. Send traffic, then post one task outcome per session to the feedback endpoint:')}</p>
+      ${h_feedbackpre(conf)}
+    </article>`;
+  }
+  function h_experiments() {
+    const x = state.experiments;
+    const views = (x && x.experiments) || [], conf = (x && x.configured) || [];
+    const byIx = new Map(conf.map(c => [c.route_ix, c]));
+    const seen = new Set(views.map(v => v.route_ix));
+    const cards = views.map(v => h_card(v, byIx.get(v.route_ix))).concat(conf.filter(c => !seen.has(c.route_ix)).map(h_waiting));
+    if (!cards.length) {
+      return `<div class="empty"><h3>No experiments yet</h3>
+        Find out if a cheaper model is good enough on <i>your</i> traffic. Add four lines to a route in <code>firstpass.toml</code>:
+        <pre>${esc(SNIPPET)}</pre>
+        Then post task outcomes (CI result, test run, human rating) to <code>/v1/feedback</code> as you already do. Read the result here or with <code>firstpass experiment</code>. Typical length: a few thousand sessions for a close call, a few hundred for a clearly worse model.</div>`;
+    }
+    return cards.join('');
+  }
+
+  // ---- receipts -------------------------------------------------------------------------------
+  function servedAttempt(r) { return (r.attempts || []).find(a => a.rung === r.served_rung); }
+  function servedVerdict(r) { const a = servedAttempt(r); return a ? String(a.verdict).toLowerCase() : 'none'; }
+  function armOf(r) { return r.experiment ? r.experiment.arm : 'none'; }
+  function visible() {
+    const fr = $('f-rung').value, fv = $('f-verdict').value, fa = $('f-arm').value;
+    return state.receipts.filter(r =>
+      (fr === '' || String(r.served_rung ?? 'none') === fr) && (fv === '' || servedVerdict(r) === fv) && (fa === '' || armOf(r) === fa));
+  }
+  function h_badge(r) {
+    return r.experiment ? `<span class="badge ${esc(r.experiment.arm)}">experiment: ${esc(r.experiment.arm)}</span>` : '';
+  }
+  function h_rows(list) {
+    return list.map(r => `<button class="row" type="button" data-id="${esc(r.trace_id)}" aria-label="Open receipt ${esc(r.trace_id)}">
+        <span class="id mono">${esc(r.trace_id)}</span>
+        <span class="meta">${esc(usd(r.total_cost_usd))} of ${esc(usd(r.baseline_usd))}</span>
+        <span>${esc(r.served_model ?? 'nothing served')} <span class="${cls(servedVerdict(r))}">${esc(servedVerdict(r).toUpperCase())}</span> ${h_badge(r)}</span>
+        <span class="meta">rung ${esc(r.served_rung ?? '-')} | ${esc(r.escalations)} esc | ${esc(num(r.total_latency_ms))}ms</span>
+      </button>`).join('');
+  }
+  function renderRows() {
+    const rungs = [...new Set(state.receipts.map(r => String(r.served_rung ?? 'none')))].sort();
+    const sel = $('f-rung'), cur = sel.value;
+    sel.innerHTML = '<option value="">any</option>' + rungs.map(g => `<option value="${esc(g)}">${esc(g === 'none' ? 'none served' : 'rung ' + g)}</option>`).join('');
+    sel.value = rungs.includes(cur) ? cur : '';
+    const list = visible();
+    $('f-count').textContent = list.length + ' of ' + state.receipts.length + ' shown (newest 200)';
+    const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.id : null;
+    $('rows').innerHTML = state.receipts.length
+      ? (list.length ? h_rows(list) : '<div class="empty">No receipts match these filters.</div>')
+      : '<div class="empty"><h3>No receipts yet</h3>Send a request through the proxy: try <code>firstpass kiosk</code>.</div>';
+    if (focused) { const el = $('rows').querySelector('[data-id="' + CSS.escape(focused) + '"]'); if (el) el.focus(); }
+  }
+
+  const h_served = (a, r) => (a.rung === r.served_rung ? '<span class="badge">served</span>' : '');
+  const h_gate = g => `<div class="mono" style="font-size:12px">gate ${esc(g.gate_id)}: <span class="${cls(g.verdict)}">${esc(String(g.verdict).toUpperCase())}</span>${h_score(g)}${h_reason(g)}</div>`;
+  const h_score = g => (g.score === null || g.score === undefined ? '' : ' score ' + esc(Number(g.score).toFixed(3)));
+  const h_reason = g => (g.reason ? ' (' + esc(g.reason) + ')' : '');
+  const h_gates = a => (a.gates || []).map(h_gate).join('');
+  function h_attempts(r) {
+    return (r.attempts || []).map(a => `<div class="att">
+        <div><b>rung ${esc(a.rung)}</b> <span class="mono">${esc(a.model)}</span> <span class="${cls(a.verdict)}">${esc(String(a.verdict).toUpperCase())}</span>
+          ${h_served(a, r)}</div>
+        <div class="lede" style="margin:0">${esc(usd(a.cost_usd))} | ${esc(num(a.latency_ms))}ms</div>
+        ${h_gates(a)}
+      </div>`).join('');
+  }
+  const h_exp = r => (r.experiment ? h_badge(r) + ' ' + esc(r.experiment.percent) + '% of sessions, bucket ' + esc(r.experiment.bucket) : 'none: this route has no challenger');
+  const h_deferred = r => ((r.deferred || []).length ? '<h2>Outcome feedback</h2>' + r.deferred.map(d => `<div class="mono" style="font-size:12px">${esc(d.gate_id)}: <span class="${cls(d.verdict)}">${esc(String(d.verdict).toUpperCase())}</span> by ${esc(d.reporter)}</div>`).join('') : '');
+  function openDrawer(id) {
+    const r = state.receipts.find(x => x.trace_id === id);
+    if (!r) return;
+    state.openId = id;
+    $('drawer-body').innerHTML = `
+      <dl class="kv">
+        <dt>trace id</dt><dd class="mono">${esc(r.trace_id)}</dd>
+        <dt>time</dt><dd>${esc(r.ts)}</dd>
+        <dt>session</dt><dd class="mono">${esc(r.session_id)}</dd>
+        <dt>served</dt><dd>rung ${esc(r.served_rung ?? '-')} | ${esc(r.served_model ?? 'nothing')} | from ${esc(r.served_from)}</dd>
+        <dt>cost</dt><dd>${esc(usd(r.total_cost_usd))} vs ${esc(usd(r.baseline_usd))} baseline (saved ${esc(usd(r.savings_usd))})</dd>
+        <dt>latency</dt><dd>${esc(num(r.total_latency_ms))}ms | ${esc(r.escalations)} escalations</dd>
+        <dt>experiment arm</dt><dd>${h_exp(r)}</dd>
+        <dt>prev_hash</dt><dd class="hash">${esc(r.prev_hash)}</dd>
+        <dt>hash</dt><dd class="hash">${esc(r.hash ?? 'unavailable')}</dd>
+      </dl>
+      <p class="lede" style="margin:8px 0">Re-derive the chain yourself with <code>firstpass verify</code>.</p>
+      <h2>Attempts</h2>${h_attempts(r)}
+      ${h_deferred(r)}`;
+    $('drawer').hidden = false;
+    $('drawer').focus();
+  }
+  function closeDrawer() {
+    const id = state.openId;
+    state.openId = null;
+    $('drawer').hidden = true;
+    if (id) { const el = $('rows').querySelector('[data-id="' + CSS.escape(id) + '"]'); if (el) el.focus(); }
+  }
+
+  // ---- shell ----------------------------------------------------------------------------------
+  function render() {
+    h_overview();
+    $('exp-list').innerHTML = h_experiments();
+    renderRows();
+  }
+  function show(view) {
+    state.view = view;
+    for (const b of document.querySelectorAll('nav [role=tab]')) {
+      const on = b.dataset.view === view;
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+      b.tabIndex = on ? 0 : -1;
+      $('view-' + b.dataset.view).classList.toggle('hidden', !on);
+    }
+    if (location.hash !== '#' + view) history.replaceState(null, '', '#' + view);
+  }
+  document.querySelector('nav').addEventListener('click', ev => { const b = ev.target.closest('[data-view]'); if (b) show(b.dataset.view); });
+  document.querySelector('nav').addEventListener('keydown', ev => {
+    const tabs = [...document.querySelectorAll('nav [role=tab]')];
+    const i = tabs.findIndex(t => t.dataset.view === state.view);
+    const j = ev.key === 'ArrowRight' ? (i + 1) % tabs.length : ev.key === 'ArrowLeft' ? (i + tabs.length - 1) % tabs.length : -1;
+    if (j >= 0) { ev.preventDefault(); show(tabs[j].dataset.view); tabs[j].focus(); }
+  });
+  $('rows').addEventListener('click', ev => { const b = ev.target.closest('[data-id]'); if (b) openDrawer(b.dataset.id); });
+  $('drawer-close').addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && !$('drawer').hidden) closeDrawer(); });
+  for (const id of ['f-rung', 'f-verdict', 'f-arm']) $(id).addEventListener('change', renderRows);
+  $('exp-list').addEventListener('click', async ev => {
+    const b = ev.target.closest('[data-copy]');
+    if (!b) return;
+    const text = $(b.dataset.copy).textContent;
+    try { await navigator.clipboard.writeText(text); b.textContent = 'Copied'; }
+    catch (e) {
+      const range = document.createRange(); range.selectNodeContents($(b.dataset.copy));
+      const s = getSelection(); s.removeAllRanges(); s.addRange(range); b.textContent = 'Press Ctrl+C';
+    }
+    setTimeout(() => { b.textContent = 'Copy'; }, 2000);
+  });
+
+  const start = (location.hash || '').slice(1);
+  show(['overview', 'experiments', 'receipts'].includes(start) ? start : 'overview');
   tick();
-  setInterval(tick, 2000);
 </script>
+</body>
+</html>

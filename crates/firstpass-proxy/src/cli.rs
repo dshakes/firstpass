@@ -894,9 +894,84 @@ pub fn format_traces(traces: &[Trace], limit: usize) -> String {
     }
 }
 
+/// What `firstpass experiment` prints when there is nothing to report: the SPECIFIC reason and the
+/// next step, instead of an empty table. `routing` is the loaded config, `db_exists` whether the
+/// receipt store file is on disk.
+#[must_use]
+pub fn experiment_next_step(
+    routing: Option<&firstpass_core::Config>,
+    db_path: &str,
+    db_exists: bool,
+) -> String {
+    const SNIPPET: &str = "  [[route]]\n  mode   = \"enforce\"\n  ladder = [\"anthropic/claude-opus-4-5\"]   # what you run today\n\n  [route.challenger]\n  ladder  = [\"openrouter/minimax-m2.5\"]    # what you would like to switch to\n  percent = 10                              # % of sessions served by it\n";
+    let challengers = routing.map_or(0, |c| {
+        c.routes.iter().filter(|r| r.challenger.is_some()).count()
+    });
+    if challengers == 0 {
+        let why = if routing.is_none() {
+            "no routing config is loaded (set FIRSTPASS_CONFIG=./firstpass.toml, or run \
+             `firstpass onboard`)"
+        } else {
+            "no route in the loaded config has a [route.challenger]"
+        };
+        return format!(
+            "No experiment to report: {why}.\n\nAdd a challenger to the route you want to \
+             re-evaluate, then restart the proxy:\n\n{SNIPPET}\nThen post task outcomes to \
+             POST /v1/feedback as you already do, and run `firstpass experiment` again.\n\
+             Guide: docs/guide/experiments.html\n"
+        );
+    }
+    let store = if db_exists {
+        format!("The receipt store ({db_path}) has no experiment traffic for this tenant yet.")
+    } else {
+        format!("No receipt store at {db_path} yet: the proxy has not served a request.")
+    };
+    format!(
+        "{challengers} route(s) have a [route.challenger], but there is nothing to report yet.\n\
+         {store}\n\nNext: send requests through the proxy (each session is randomized to an arm), \
+         then post one task outcome per session:\n\n  curl -s localhost:8080/v1/feedback -d \
+         '{{\"trace_id\":\"<id from the receipt>\",\"gate_id\":\"tests\",\"verdict\":\"pass\",\
+         \"reporter\":\"ci\"}}'\n\nThe panel at /panel shows the same evidence live. Nothing is \
+         adopted for you.\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experiment_next_step_names_the_missing_piece() {
+        // No config at all: say how to load one and show the snippet.
+        let none = experiment_next_step(None, "x.db", false);
+        assert!(none.contains("no routing config is loaded"));
+        assert!(none.contains("[route.challenger]"));
+
+        // Config without a challenger: a different reason, same snippet.
+        let plain = config_with(
+            Some(
+                "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-sonnet-5\"]\n",
+            ),
+            "x.db",
+        );
+        let r = experiment_next_step(plain.routing.as_ref(), "x.db", false);
+        assert!(r.contains("no route in the loaded config has a [route.challenger]"));
+
+        // Challenger configured: the next step is traffic + feedback, not config.
+        let with = config_with(
+            Some(
+                "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-sonnet-5\"]\n\
+                 [route.challenger]\nladder = [\"anthropic/claude-haiku-4-5\"]\npercent = 10.0\n",
+            ),
+            "x.db",
+        );
+        let r = experiment_next_step(with.routing.as_ref(), "x.db", false);
+        assert!(r.contains("1 route(s) have a [route.challenger]"));
+        assert!(r.contains("has not served a request"));
+        assert!(r.contains("/v1/feedback"));
+        let r = experiment_next_step(with.routing.as_ref(), "x.db", true);
+        assert!(r.contains("no experiment traffic"));
+    }
 
     fn config_with(toml: Option<&str>, db_path: &str) -> ProxyConfig {
         ProxyConfig::from_lookup(|k| match k {
