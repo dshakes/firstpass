@@ -1187,6 +1187,19 @@ impl Config {
                          both arms would serve the same models and the experiment could prove nothing"
                     )));
                 }
+                if ch.is_paired() {
+                    // A pass-everything gate makes gate-pass non-inferiority meaningless (finding 1
+                    // of ADR 0014): if every response passes, the challenger always "wins" and the
+                    // test certifies nothing useful. Require at least one gate beyond `non-empty`.
+                    let has_meaningful_gate = route.gates.iter().any(|g| g != "non-empty");
+                    if !has_meaningful_gate {
+                        return Err(Error::InvalidConfig(format!(
+                            "route[{i}]: paired challenger mode requires at least one gate other \
+                             than `non-empty` (e.g. `json-valid`, a judge, or a test gate) — \
+                             a pass-everything gate makes gate-pass non-inferiority meaningless"
+                        )));
+                    }
+                }
             }
         }
         if let Some(g) = &config.guardrail {
@@ -2607,7 +2620,7 @@ discount = 0.98
         assert!((c.margin - crate::select::DEFAULT_MARGIN).abs() < f64::EPSILON);
         assert!((c.alpha - crate::select::DEFAULT_ALPHA).abs() < f64::EPSILON);
 
-        let bad: [(&str, String); 12] = [
+        let bad: &[(&str, String)] = &[
             ("empty ladder", ch("ladder = []\npercent = 10.0")),
             (
                 "percent 0",
@@ -2658,7 +2671,7 @@ discount = 0.98
                 ),
             ),
         ];
-        for (why, toml) in &bad {
+        for (why, toml) in bad {
             assert!(Config::parse(toml).is_err(), "accepted: {why}");
         }
 
@@ -2670,6 +2683,52 @@ discount = 0.98
                  [[price]]\nmodel = \"groq/llama\"\ninput_per_mtok = 0.1\noutput_per_mtok = 0.1\n"
             ))
             .is_ok()
+        );
+
+        // Paired mode: valid when the route has a meaningful gate, invalid without one.
+        let gated = "[[route]]\nmatch = {}\nmode = \"enforce\"\n\
+                     ladder = [\"anthropic/claude-sonnet-5\"]\ngates = [\"json-valid\"]\n";
+        let paired_ok = format!(
+            "{gated}[route.challenger]\nladder = [\"anthropic/claude-haiku-4-5\"]\n\
+             mode = \"paired\"\nmax_usd_per_day = 5.0\n"
+        );
+        assert!(
+            Config::parse(&paired_ok).is_ok(),
+            "paired with json-valid gate"
+        );
+
+        // Paired mode rejected on non-empty-only route.
+        let no_gate = "[[route]]\nmatch = {}\nmode = \"enforce\"\n\
+                       ladder = [\"anthropic/claude-sonnet-5\"]\n";
+        let paired_no_gate = format!(
+            "{no_gate}[route.challenger]\nladder = [\"anthropic/claude-haiku-4-5\"]\n\
+             mode = \"paired\"\nmax_usd_per_day = 5.0\n"
+        );
+        assert!(
+            Config::parse(&paired_no_gate).is_err(),
+            "paired requires meaningful gate"
+        );
+
+        // Paired mode with only non-empty gate also rejected.
+        let only_nonempty = "[[route]]\nmatch = {}\nmode = \"enforce\"\n\
+                             ladder = [\"anthropic/claude-sonnet-5\"]\ngates = [\"non-empty\"]\n";
+        let paired_nonempty = format!(
+            "{only_nonempty}[route.challenger]\nladder = [\"anthropic/claude-haiku-4-5\"]\n\
+             mode = \"paired\"\nmax_usd_per_day = 5.0\n"
+        );
+        assert!(
+            Config::parse(&paired_nonempty).is_err(),
+            "paired with only non-empty gate rejected"
+        );
+
+        // Paired mode missing max_usd_per_day.
+        let paired_no_ceiling = format!(
+            "{gated}[route.challenger]\nladder = [\"anthropic/claude-haiku-4-5\"]\n\
+             mode = \"paired\"\n"
+        );
+        assert!(
+            Config::parse(&paired_no_ceiling).is_err(),
+            "paired without max_usd_per_day"
         );
     }
 }

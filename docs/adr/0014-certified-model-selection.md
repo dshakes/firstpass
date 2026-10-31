@@ -1,6 +1,7 @@
 # ADR 0014 — Certified model selection: choose the route's model from its own outcomes, with an anytime-valid guarantee
 
-Status: **accepted — stage 1 (live challenger arm, halt guard, `firstpass experiment` report)**.
+Status: **accepted — stage 2 (paired shadow mode, shared state via Redis, `observe_pair`)**.
+Stage 1: live challenger arm, halt guard, `firstpass experiment` report.
 Date: 2026-10-30.
 
 ## Context
@@ -113,11 +114,56 @@ and a fixed-sample test of a 4-point gap needs about the same order of sessions.
 - An operator without outcome feedback cannot use this. That is deliberate: without outcomes there
   is nothing to certify, and certifying on gate verdicts alone would repeat finding 1.
 
-## Follow-ons (not in stage 1)
+## Stage 2 — Paired shadow mode and shared state (this branch)
 
-- **Paired shadow mode for single-turn routes.** Run the challenger on the same request off the hot
-  path and gate both outputs. Pairing removes the between-task variance that dominates the sample
-  size above. It cannot work for agent sessions, which diverge after the first tool call.
+### Paired shadow mode (`mode = "paired"`)
+
+In paired mode no session is ever served by the challenger ladder. Instead, after the incumbent
+response is returned, a detached task re-runs the challenger ladder on **the same request**. The
+incumbent gate verdict (`x_inc`) and the challenger gate verdict (`x_ch`) form a pair:
+
+- `x_inc = 1.0` if the incumbent's final `served_from` is `Attempt` (gate passed)
+- `x_inc = 0.0` if `BestAttempt` (gate failed, served anyway)
+- `Cache` or `Error` → pair dropped (no fresh gate evaluation)
+- `x_ch = 1.0` if the challenger's ladder produced a gate-passing answer; `0.0` otherwise
+
+Each pair feeds `Experiment::observe_pair`, which bypasses the FIFO queuing used in live mode
+(both outcomes arrive simultaneously, so FIFO would introduce incorrect buffering).
+
+**Why this certifies gate-pass non-inferiority, not outcome non-inferiority.** The incumbent and
+challenger each run a gate (a deterministic function of the output), not a task outcome (which
+requires a human evaluation or a symbolic test that only exists for some workloads). The certificate
+therefore reads "the challenger's gate-pass rate is within ε of the incumbent's" — valid for
+single-turn routes where the gate is a meaningful quality proxy. For agentic sessions (finding 1 of
+the evidence above) where no gate is precise, live mode with real task outcomes is the right tool.
+
+**Why paired mode is only allowed on single-turn routes.** An agent session diverges after the first
+tool call: the challenger's second turn sees the incumbent's first-turn tool results, not its own.
+The gate verdicts of those turns are not comparable. The config validator rejects paired mode on any
+route whose gates are all `non-empty` (a pass-everything gate makes non-inferiority meaningless).
+
+**Spend ceiling is required.** Paired mode makes real model calls on every (sampled) enforce
+request. `max_usd_per_day` is enforced via the same `ShadowLedger` used by shadow scoring — it
+stops new evaluations for the rest of the UTC day once the ceiling is reached. The stop is logged,
+never silent.
+
+### Shared state across replicas (`redis_url`)
+
+When `redis_url` is set under `[route.challenger]`, every outcome (live mode) and pair (paired mode)
+is appended to a Redis list keyed `firstpass:exp:{tenant}:{route_ix}:{fingerprint}`. Each replica
+rebuilds its local `Experiment` from that list via `sync_from_backend`:
+
+- Called after every feedback event (outcome or pair)
+- Called on a background timer ≤ 5 s (`start_sync_task`)
+- Uses `LRANGE offset -1` so each call is cheap when there are no new records
+- Live mode session dedup is cross-replica: `SET NX` on a per-session key (1-day TTL) ensures
+  one session is counted at most once across all replicas
+
+Without `redis_url` behavior is unchanged (no append, no sync timer). The backend is behind the
+`redis-cache` Cargo feature; a URL set without that feature is rejected at startup.
+
+## Follow-ons (not in stage 2)
+
 - **Several challengers at once,** with an alpha split across them, or a best-arm-identification
   design.
 - **A live run.** Every number above comes from public recorded runs. A paid live experiment on a real

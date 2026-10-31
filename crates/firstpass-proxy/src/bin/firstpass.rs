@@ -701,7 +701,8 @@ fn cmd_experiment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let db = std::path::Path::new(&config.db_path);
     let traces = store::load_tenant_traces(db, &tenant).unwrap_or_default();
     let deferred = store::load_all_deferred(db).unwrap_or_default();
-    let reports = experiment::experiments_from_traces(&traces, &deferred, routing);
+    let pairs = store::load_all_experiment_pairs(db).unwrap_or_default();
+    let reports = experiment::experiments_from_traces(&traces, &deferred, &pairs, routing);
     let views = experiment::views(reports, routing);
     if args.iter().any(|a| a == "--json") {
         println!("{}", serde_json::to_string_pretty(&views)?);

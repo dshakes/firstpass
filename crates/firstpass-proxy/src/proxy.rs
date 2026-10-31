@@ -53,6 +53,9 @@ pub struct AppState {
     /// Per-(tenant, route) shadow spend for the current UTC day (ADR 0009 D2). Shadow makes real
     /// model calls, so the daily ceiling is enforced through this rather than trusted.
     pub shadow_ledger: Arc<crate::shadow::ShadowLedger>,
+    /// Per-(tenant, route) paired-challenger spend for the current UTC day. Paired mode runs the
+    /// challenger ladder off-path on real traffic; the daily ceiling is enforced through this.
+    pub paired_ledger: Arc<crate::shadow::ShadowLedger>,
     /// Certified-selection experiments (ADR 0014), one per `(tenant, route)` that has a
     /// `[route.challenger]`. Holds the evidence and is the halt guard the serving path consults.
     pub experiments: Arc<crate::experiment::ExperimentMonitor>,
@@ -1224,6 +1227,186 @@ async fn evaluate_shadow(
     }
 }
 
+/// Spawn a detached task that evaluates the challenger ladder on the SAME request that was just
+/// served by the incumbent, then records the (x_inc, x_ch) pair in the experiment monitor.
+///
+/// Called after the incumbent response has been returned (guaranteed by the call site in
+/// `enforce_pipeline_inner`). Nothing this task does can affect the served response, its bytes,
+/// or its latency. Every failure path returns silently; the spend ceiling is enforced before any
+/// model call is made.
+///
+/// `served_from` is the incumbent trace's final `served_from`; it is used to derive `x_inc`:
+/// - `Attempt` (gate passed): 1.0
+/// - `BestAttempt` (gate failed, served anyway): 0.0
+/// - `Cache` or `Error`: pair dropped — the cache path means we don't have a fresh gate
+///   evaluation for this request, and errors are not quality-comparable.
+#[allow(clippy::too_many_arguments)]
+fn spawn_paired_challenger(
+    state: &AppState,
+    route: &firstpass_core::Route,
+    challenger: &firstpass_core::Challenger,
+    fingerprint: String,
+    route_ix: usize,
+    body: bytes::Bytes,
+    auth: Auth,
+    features: firstpass_core::Features,
+    tenant: String,
+    session_id: String,
+    api: &str,
+    served_from: firstpass_core::ServedFrom,
+    incumbent_cost_usd: f64,
+) {
+    // Compute x_inc here so we don't need to pass served_from into the async closure.
+    let x_inc = match served_from {
+        firstpass_core::ServedFrom::Attempt => 1.0,
+        firstpass_core::ServedFrom::BestAttempt => 0.0,
+        firstpass_core::ServedFrom::Cache | firstpass_core::ServedFrom::Error => {
+            // Cache hit: no fresh gate eval → pair not comparable. Error: no valid output.
+            return;
+        }
+    };
+
+    let max_usd_per_day = match challenger.max_usd_per_day {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                tenant,
+                route = route_ix,
+                "paired challenger is missing max_usd_per_day; skipping evaluation"
+            );
+            return;
+        }
+    };
+
+    let state = state.clone();
+    let route = route.clone();
+    let challenger = challenger.clone();
+    let api = api.to_owned();
+
+    tokio::spawn(async move {
+        let now = jiff::Timestamp::now();
+        if !state
+            .paired_ledger
+            .may_spend(&tenant, route_ix, max_usd_per_day, now)
+        {
+            tracing::debug!(
+                tenant,
+                route = route_ix,
+                "paired challenger: daily budget exhausted, skipping"
+            );
+            return;
+        }
+
+        let Some(base_request) = parse_model_request(&body) else {
+            return;
+        };
+        let gate_defs = state
+            .config
+            .routing
+            .as_ref()
+            .map_or(&[][..], |cfg| &cfg.gate_defs);
+        let gates = resolve_gates(
+            &route.gates,
+            gate_defs,
+            &state.providers,
+            &auth,
+            &state.config.prices,
+            &state.http,
+        );
+        let (budget, max_rungs) = state
+            .config
+            .routing
+            .as_ref()
+            .map_or((None, u32::MAX), |cfg| {
+                (
+                    cfg.budget.per_request_usd,
+                    cfg.escalation.max_rungs_per_request,
+                )
+            });
+        let mut base_request = base_request;
+        base_request.cache_prefix = state
+            .config
+            .routing
+            .as_ref()
+            .is_some_and(|r| r.escalation.prompt_cache);
+
+        let ctx = EnforceCtx {
+            condense: routing_cfg_condense(&state),
+            ladder: &challenger.ladder,
+            gates: &gates,
+            health: &state.gate_health,
+            base_request: &base_request,
+            providers: &state.providers,
+            auth: &auth,
+            prices: &state.config.prices,
+            budget_per_request_usd: budget,
+            max_rungs,
+            speculation: 0,
+            serve_threshold: None,
+            elastic: None,
+            features,
+            start_rung: 0,
+            tenant_id: tenant.clone(),
+            session_id: session_id.clone(),
+            prompt_hash: prompt_hash(&state.config.prompt_salt, &body),
+            api: api.clone(),
+            policy_id: "paired-challenger@v0".to_owned(),
+        };
+
+        let (outcome, ch_trace) = route_enforce(ctx).await;
+        let challenger_cost = ch_trace.final_.total_cost_usd;
+        state
+            .paired_ledger
+            .debit(&tenant, route_ix, challenger_cost, now);
+
+        // x_ch = 1.0 if the challenger produced a gate-passing answer, 0.0 otherwise.
+        let x_ch = if matches!(outcome, crate::router::EngineOutcome::Served(_)) {
+            1.0_f64
+        } else {
+            0.0_f64
+        };
+
+        // Persist the pair to the store for startup rebuild and CLI replay.
+        let pair_row = crate::store::ExperimentPairRow {
+            tenant: tenant.clone(),
+            route_ix,
+            fingerprint: fingerprint.clone(),
+            trace_id: ch_trace.trace_id,
+            x_inc,
+            x_ch,
+            challenger_cost_usd: challenger_cost,
+            ts: now,
+        };
+        if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
+            tracing::warn!(%e, "paired challenger: failed to persist pair to store");
+        }
+
+        // Record the pair in the experiment monitor (updates local state and, if a log
+        // backend is configured, propagates to other replicas).
+        state
+            .experiments
+            .record_pair(
+                &tenant,
+                route_ix,
+                &fingerprint,
+                x_inc,
+                x_ch,
+                incumbent_cost_usd,
+                challenger_cost,
+            )
+            .await;
+
+        tracing::debug!(
+            tenant,
+            route = route_ix,
+            x_inc,
+            x_ch,
+            challenger_cost_usd = challenger_cost,
+            "paired challenger evaluation complete"
+        );
+    });
+}
+
 /// Per-request routing-mode override. Case-insensitive; unknown values are logged and ignored
 /// (fall through to route-level / global-default). Valid values: observe|cost|balanced|quality|latency|max.
 const MODE_PROFILE_HEADER: &str = "x-firstpass-mode";
@@ -1845,6 +2028,9 @@ async fn enforce_pipeline_inner(
     // generated just above, which the trace records — each unsessioned request is its own
     // session). If the experiment has been halted, challenger-assigned sessions are served by the
     // incumbent and recorded as incumbent, so per-arm cost is never blended.
+    //
+    // In **paired** mode the challenger never serves any session: arm is always Incumbent, and the
+    // challenger is evaluated off-path by `spawn_paired_challenger` after the response is returned.
     let experiment = route
         .challenger
         .as_ref()
@@ -1852,8 +2038,9 @@ async fn enforce_pipeline_inner(
         .map(|ch| {
             let bucket = firstpass_core::Challenger::bucket(&state.config.prompt_salt, &session_id);
             let assigned = ch.arm_of(bucket);
-            let arm = if assigned == firstpass_core::Arm::Challenger
-                && state.experiments.challenger_blocked(&tenant, route_ix)
+            let arm = if ch.is_paired()
+                || (assigned == firstpass_core::Arm::Challenger
+                    && state.experiments.challenger_blocked(&tenant, route_ix))
             {
                 firstpass_core::Arm::Incumbent
             } else {
@@ -2118,6 +2305,13 @@ async fn enforce_pipeline_inner(
         .routing
         .as_ref()
         .is_some_and(|r| r.escalation.prompt_cache);
+    // Paired challenger (ADR 0014): save clones BEFORE moving into EnforceCtx. Only when a paired
+    // challenger is active to avoid cloning on every enforce request.
+    let paired_spawn_data: Option<(Features, String, String)> = experiment
+        .as_ref()
+        .filter(|(ch, _)| ch.is_paired())
+        .map(|_| (features.clone(), tenant.clone(), session_id.clone()));
+
     let ctx = EnforceCtx {
         condense: routing_cfg_condense(state),
         ladder,
@@ -2407,6 +2601,36 @@ async fn enforce_pipeline_inner(
             )
             .await;
         metrics::counter!("firstpass_cache_stores_total").increment(1);
+    }
+
+    // Paired challenger (ADR 0014, Stage 2): run the challenger ladder on the same request in a
+    // detached task AFTER the response is built but BEFORE the trace is moved into `offer_trace`.
+    // `paired_spawn_data` was cloned before EnforceCtx took ownership of the originals.
+    if let Some((ch, rec)) = &experiment
+        && ch.is_paired()
+    {
+        let trace_id_str = trace.trace_id.to_string();
+        if ch.paired_sampled(&state.config.prompt_salt, &trace_id_str)
+            && let Some((spawn_feats, spawn_tenant, spawn_session)) = paired_spawn_data
+        {
+            let served_from = trace.final_.served_from;
+            let incumbent_cost = trace.final_.total_cost_usd;
+            spawn_paired_challenger(
+                state,
+                route,
+                ch,
+                rec.fingerprint.clone(),
+                route_ix,
+                body.clone(),
+                auth.clone(),
+                spawn_feats,
+                spawn_tenant,
+                spawn_session,
+                api,
+                served_from,
+                incumbent_cost,
+            );
+        }
     }
 
     // The trace is already built; enqueue it off-path (non-blocking `try_send`, so no spawn needed).
@@ -4656,6 +4880,7 @@ mod tests {
             providers,
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -4839,6 +5064,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -5256,6 +5482,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -5484,6 +5711,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -5858,6 +6086,7 @@ mod tests {
             providers: ProviderRegistry::from_map(providers),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -6287,6 +6516,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -6661,6 +6891,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -6783,6 +7014,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -7063,6 +7295,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -7157,6 +7390,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
@@ -7346,6 +7580,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments,
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,

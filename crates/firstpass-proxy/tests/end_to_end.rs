@@ -197,6 +197,7 @@ async fn spawn_proxy_with(
         providers,
         gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
         shadow_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        paired_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
         experiments: std::sync::Arc::default(),
         guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
         traces,

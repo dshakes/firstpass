@@ -502,7 +502,9 @@ three states. At any moment you read it, each conclusion is wrong with probabili
 
 Method, defaults and limits: [ADR 0014](docs/adr/0014-certified-model-selection.md). The halt state
 is per process and rebuilt from receipts at startup. With several replicas each halts on the outcomes
-it receives, so run the report against the store all replicas write to.
+it receives, so run the report against the store all replicas write to. For a global halt across
+replicas, set `redis_url` under `[route.challenger]` (requires the `redis-cache` Cargo feature and a
+shared Redis instance); all replicas then converge on the same halt/certify decision within ≤ 5 s.
 
 ### Running more than one replica
 
