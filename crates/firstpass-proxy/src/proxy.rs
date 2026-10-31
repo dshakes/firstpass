@@ -545,6 +545,8 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
         // Inside the authed group on purpose: receipts are per-tenant operational data, and a
         // panel is not a reason to hand one tenant another's routing history.
         .route("/v1/receipts", get(receipts))
+        // Same tenant scoping as receipts: an experiment is built from one tenant's outcomes only.
+        .route("/v1/experiments", get(experiments))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             tenant_rate_limit_middleware,
@@ -612,6 +614,7 @@ async fn receipts(
             // fresh deployment has no database yet, and that is not an error worth a 500.
             _ => Vec::new(),
         };
+    let summary = receipts_summary(&traces);
     let items: Vec<serde_json::Value> = traces
         .iter()
         .rev()
@@ -620,7 +623,10 @@ async fn receipts(
             let f = &t.final_;
             serde_json::json!({
                 "trace_id": t.trace_id,
+                "ts": t.ts,
+                "session_id": t.session_id,
                 "served_rung": f.served_rung,
+                "served_from": f.served_from,
                 // The attempt matching `served_rung`, NOT the last one recorded. Under speculative
                 // escalation the rungs resolve out of order, and under best-attempt fallback the
                 // served rung is not the final entry — so `attempts.last()` would name a model
@@ -634,14 +640,118 @@ async fn receipts(
                     "verdict": a.verdict,
                     "cost_usd": a.cost_usd,
                     "latency_ms": a.latency_ms,
+                    "gates": a.gates.iter().map(|g| serde_json::json!({
+                        "gate_id": g.gate_id,
+                        "verdict": g.verdict,
+                        "score": g.score,
+                        "reason": g.reason,
+                    })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
+                "escalations": f.escalations,
+                "total_latency_ms": f.total_latency_ms,
                 "total_cost_usd": f.total_cost_usd,
                 "baseline_usd": f.counterfactual_baseline_usd,
                 "savings_usd": f.savings_usd,
+                // The audit linkage, so an operator can see the chain a receipt sits in. `hash` is
+                // re-derived exactly as `firstpass verify` does; it is absent only if serializing
+                // the stored trace fails, and the panel shows absent rather than guessing.
+                "prev_hash": t.prev_hash,
+                "hash": t.hash().ok(),
+                // `{arm, percent, bucket}` when this request ran under a `[route.challenger]`.
+                "experiment": t.experiment.as_ref().map(|e| serde_json::json!({
+                    "arm": e.arm,
+                    "percent": e.percent,
+                    "bucket": e.bucket,
+                })),
+                "deferred": t.deferred.iter().map(|d| serde_json::json!({
+                    "gate_id": d.gate_id,
+                    "verdict": d.verdict,
+                    "reporter": d.reporter,
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();
-    axum::Json(serde_json::json!({ "receipts": items })).into_response()
+    axum::Json(serde_json::json!({ "receipts": items, "summary": summary })).into_response()
+}
+
+/// Totals over EVERY receipt the tenant has (not just the page returned), so the panel's overview
+/// does not change meaning with the page size.
+fn receipts_summary(traces: &[Trace]) -> serde_json::Value {
+    let (mut spent, mut baseline, mut first_pass, mut escalated) = (0.0_f64, 0.0_f64, 0u64, 0u64);
+    let (mut pass, mut fail, mut abstain) = (0u64, 0u64, 0u64);
+    for t in traces {
+        let f = &t.final_;
+        spent += f.total_cost_usd;
+        baseline += f.counterfactual_baseline_usd;
+        first_pass += u64::from(f.served_rung == Some(0));
+        escalated += u64::from(f.escalations > 0);
+        for a in &t.attempts {
+            for g in &a.gates {
+                match g.verdict {
+                    Verdict::Pass => pass += 1,
+                    Verdict::Fail => fail += 1,
+                    Verdict::Abstain => abstain += 1,
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "requests": traces.len(),
+        "spent_usd": spent,
+        "baseline_usd": baseline,
+        // Signed, never floored: escalating past the top rung genuinely costs more than going
+        // straight there, and the panel shows that loss rather than minting a saving.
+        "saved_usd": baseline - spent,
+        "first_pass": first_pass,
+        "escalated": escalated,
+        "gates": { "pass": pass, "fail": fail, "abstain": abstain },
+    })
+}
+
+/// `GET /v1/experiments` — the caller's certified-selection experiments (ADR 0014), straight from
+/// the live monitor, for the panel. Scoped to the authenticated tenant exactly like [`receipts`]:
+/// the monitor is keyed by `(tenant, route)` and nothing here reads another tenant's entry.
+///
+/// `experiments` holds one report per route that has recorded evidence; `configured` lists every
+/// route that HAS a `[route.challenger]`, so the panel can tell "no challenger configured" (teach
+/// the config) from "configured, no outcomes yet" (teach the feedback call). `unavailable` marks a
+/// challenger the serving path refuses to use because its history could not be read at startup.
+async fn experiments(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant)): Extension<TenantId>,
+) -> Response {
+    let Some(routing) = state.config.routing.as_ref() else {
+        return axum::Json(serde_json::json!({ "experiments": [], "configured": [] }))
+            .into_response();
+    };
+    let snaps: Vec<_> = state
+        .experiments
+        .reports()
+        .into_iter()
+        .filter(|s| s.tenant == tenant)
+        .collect();
+    let views = crate::experiment::views(snaps, routing);
+    let configured: Vec<serde_json::Value> = routing
+        .routes
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, r)| r.challenger.as_ref().map(|c| (ix, r, c)))
+        .map(|(ix, r, c)| {
+            let status = state.experiments.status(&tenant, ix);
+            serde_json::json!({
+                "route_ix": ix,
+                "incumbent_ladder": r.ladder,
+                "challenger_ladder": c.ladder,
+                "percent": c.percent,
+                "margin": c.margin,
+                "alpha": c.alpha,
+                "unavailable": state.experiments.challenger_blocked(&tenant, ix)
+                    && status != firstpass_core::ExperimentStatus::Halted,
+            })
+        })
+        .collect();
+    axum::Json(serde_json::json!({ "experiments": views, "configured": configured }))
+        .into_response()
 }
 
 /// Query string for [`receipts`].
@@ -7757,5 +7867,308 @@ mod tests {
             trace.attempts.last().unwrap().verdict,
             firstpass_core::Verdict::Pass
         );
+    }
+
+    // ---- Operator UX: /v1/experiments and the panel that renders it ----------------------------
+
+    /// A challenger route behind real per-tenant auth (two tenants), backed by a temp store.
+    fn ux_state(db: &str) -> AppState {
+        let (mut state, _rx) = challenger_state(50.0, db);
+        // Same routing TOML as `challenger_state` (so the monitor's fingerprint still matches),
+        // plus auth on and two keyed tenants.
+        let hash_a = crate::tenant_auth::TenantKeys::hash_key("key-a").unwrap();
+        let hash_b = crate::tenant_auth::TenantKeys::hash_key("key-b").unwrap();
+        let keys = format!("{{\"tenant-a\": {hash_a:?}, \"tenant-b\": {hash_b:?}}}");
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"non-empty\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\npercent = 50\n"
+        );
+        let db = db.to_owned();
+        state.config = Arc::new(
+            ProxyConfig::from_lookup(|k| match k {
+                "FIRSTPASS_CONFIG_TOML" => Some(toml.clone()),
+                "FIRSTPASS_MODE" => Some("enforce".to_owned()),
+                "FIRSTPASS_DB" => Some(db.clone()),
+                "FIRSTPASS_REQUIRE_AUTH" => Some("true".to_owned()),
+                "FIRSTPASS_TENANT_KEYS_JSON" => Some(keys.clone()),
+                _ => None,
+            })
+            .unwrap(),
+        );
+        // `challenger_state` dropped its receiver with `_rx`; give the state a live channel.
+        let (traces, rx) = mpsc::channel(256);
+        std::mem::forget(rx);
+        state.traces = traces;
+        state
+    }
+
+    fn ux_get(uri: &str, bearer: Option<&str>) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder().method("GET").uri(uri);
+        if let Some(k) = bearer {
+            b = b.header("authorization", format!("Bearer {k}"));
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    /// End to end, through the real router and auth: sessions across both arms, outcomes posted to
+    /// `/v1/feedback`, then `/v1/experiments` reports the per-arm counts, only to the owning
+    /// tenant, and only with a key.
+    #[tokio::test]
+    async fn experiments_endpoint_reports_per_arm_counts_scoped_to_the_tenant() {
+        use firstpass_core::Arm;
+        use tower::ServiceExt;
+        let db = std::env::temp_dir().join(format!("firstpass-ux-{}.db", Uuid::now_v7()));
+        let mut state = ux_state(&db.to_string_lossy());
+        // Capture the receipts the handlers enqueue so they can be persisted for the feedback path.
+        let (traces_tx, mut traces_rx) = mpsc::channel(256);
+        state.traces = traces_tx;
+        let router = app(state.clone()).expect("router");
+
+        // Six sessions per arm, all as tenant-a.
+        let mut sessions = Vec::new();
+        for arm in [Arm::Incumbent, Arm::Challenger] {
+            for n in 0..6 {
+                sessions.push((arm, session_in_arm(&state, arm, n)));
+            }
+        }
+        for (_, session) in &sessions {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer tenant-a.key-a")
+                .header("x-firstpass-session", session.as_str())
+                .body(Body::from(user_body()))
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        }
+        let mut traces = Vec::new();
+        while let Ok(t) = traces_rx.try_recv() {
+            traces.push(t);
+        }
+        assert_eq!(traces.len(), 12);
+
+        // Persist them the way the writer would (feedback looks the trace up by tenant).
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        for t in &traces {
+            tx.try_send(t.clone()).unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        // Outcomes: every incumbent session passes; the challenger fails two of its six.
+        let mut challenger_seen = 0;
+        for t in &traces {
+            let arm = t.experiment.as_ref().unwrap().arm;
+            let verdict = if arm == Arm::Challenger {
+                challenger_seen += 1;
+                if challenger_seen <= 2 { "fail" } else { "pass" }
+            } else {
+                "pass"
+            };
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/feedback")
+                .header("authorization", "Bearer tenant-a.key-a")
+                .body(Body::from(
+                    serde_json::json!({
+                        "trace_id": t.trace_id, "gate_id": "tests",
+                        "verdict": verdict, "reporter": "ci"
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
+        }
+
+        // Tenant A sees its experiment with exact per-arm counts.
+        let resp = router
+            .clone()
+            .oneshot(ux_get("/v1/experiments", Some("tenant-a.key-a")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let a = body_json(resp).await;
+        let exps = a["experiments"].as_array().unwrap();
+        assert_eq!(exps.len(), 1, "{a}");
+        let r = &exps[0]["report"];
+        assert_eq!(r["status"], "undecided");
+        assert_eq!(r["pairs"], 6);
+        assert_eq!(r["incumbent"]["requests"], 6);
+        assert_eq!(r["incumbent"]["outcomes"], 6);
+        assert_eq!(r["incumbent"]["outcome_sum"], 6.0);
+        assert_eq!(r["challenger"]["requests"], 6);
+        assert_eq!(r["challenger"]["outcomes"], 6);
+        assert_eq!(r["challenger"]["outcome_sum"], 4.0);
+        assert_eq!(exps[0]["challenger_ladder"][0], CHALLENGER);
+        assert_eq!(exps[0]["recommendation"], "keep_running");
+        assert_eq!(a["configured"][0]["unavailable"], false);
+
+        // Tenant B has sent nothing: no experiment evidence, and nothing of A's leaks in.
+        let resp = router
+            .clone()
+            .oneshot(ux_get("/v1/experiments", Some("tenant-b.key-b")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let b = body_json(resp).await;
+        assert_eq!(b["experiments"].as_array().unwrap().len(), 0, "{b}");
+        assert!(!b.to_string().contains("tenant-a"));
+
+        // Receipts carry the experiment arm, the hash linkage and an all-time summary; B sees none.
+        let resp = router
+            .clone()
+            .oneshot(ux_get("/v1/receipts?limit=3", Some("tenant-a.key-a")))
+            .await
+            .unwrap();
+        let ra = body_json(resp).await;
+        assert_eq!(ra["receipts"].as_array().unwrap().len(), 3);
+        assert_eq!(ra["summary"]["requests"], 12, "summary spans all receipts");
+        let first = &ra["receipts"][0];
+        assert!(first["experiment"]["arm"].is_string());
+        assert_eq!(first["hash"].as_str().unwrap().len(), 64);
+        assert!(first["prev_hash"].is_string());
+        assert!(first["attempts"][0]["gates"][0]["gate_id"].is_string());
+        let resp = router
+            .clone()
+            .oneshot(ux_get("/v1/receipts", Some("tenant-b.key-b")))
+            .await
+            .unwrap();
+        let rb = body_json(resp).await;
+        assert_eq!(rb["receipts"].as_array().unwrap().len(), 0);
+        assert_eq!(rb["summary"]["requests"], 0);
+
+        // Auth is required: no key and a wrong key are both 401, for experiments as for receipts.
+        for bearer in [None, Some("tenant-a.wrong")] {
+            let resp = router
+                .clone()
+                .oneshot(ux_get("/v1/experiments", bearer))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// The summary the overview tiles read: rung-0 serves, escalations and the gate mix, with the
+    /// saving kept signed (a loss is never floored to zero).
+    #[test]
+    fn receipts_summary_counts_first_pass_escalations_and_keeps_losses_signed() {
+        let cfg = ProxyConfig::from_lookup(|_| None).unwrap();
+        let mut ok = build_error_trace(&cfg, &Bytes::from_static(b"{}"), 5, None);
+        ok.final_.served_rung = Some(0);
+        ok.final_.total_cost_usd = 1.0;
+        ok.final_.counterfactual_baseline_usd = 3.0;
+        let mut escalated = ok.clone();
+        escalated.final_.served_rung = Some(1);
+        escalated.final_.escalations = 1;
+        escalated.final_.total_cost_usd = 5.0;
+        escalated.final_.counterfactual_baseline_usd = 3.0;
+        let s = receipts_summary(&[ok, escalated]);
+        assert_eq!(s["requests"], 2);
+        assert_eq!(s["first_pass"], 1);
+        assert_eq!(s["escalated"], 1);
+        // Spent 6 against a baseline of 6: the escalated request lost 2 and the other saved 2.
+        assert!((s["saved_usd"].as_f64().unwrap()).abs() < 1e-9);
+        let loss = receipts_summary(&[{
+            let mut t = build_error_trace(&cfg, &Bytes::from_static(b"{}"), 5, None);
+            t.final_.total_cost_usd = 5.0;
+            t.final_.counterfactual_baseline_usd = 3.0;
+            t
+        }]);
+        assert!(
+            loss["saved_usd"].as_f64().unwrap() < 0.0,
+            "loss stays negative"
+        );
+    }
+
+    /// Panel markup: the experiments view is wired to its endpoint, and nothing in it reaches off
+    /// the machine.
+    #[test]
+    fn panel_wires_the_experiments_view_and_has_no_external_references() {
+        assert!(
+            PANEL_HTML.contains("/v1/experiments"),
+            "fetches the endpoint"
+        );
+        assert!(PANEL_HTML.contains("id=\"view-experiments\""));
+        assert!(PANEL_HTML.contains("id=\"exp-list\""));
+        assert!(
+            PANEL_HTML.contains("[route.challenger]"),
+            "empty state teaches the config"
+        );
+        assert!(
+            PANEL_HTML.contains("data-copy"),
+            "adopt snippet has a copy button"
+        );
+        assert!(
+            PANEL_HTML.contains("document.hidden"),
+            "polling pauses in a hidden tab"
+        );
+        assert!(PANEL_HTML.contains("prefers-reduced-motion"));
+        assert!(PANEL_HTML.contains("prefers-color-scheme: dark"));
+        // No external origin of any kind: no scheme URLs, no protocol-relative URLs, no external
+        // script/stylesheet/image sources, no @import.
+        for needle in [
+            "http://",
+            "https://",
+            "src=\"//",
+            "href=\"//",
+            "@import",
+            "<link",
+        ] {
+            assert!(!PANEL_HTML.contains(needle), "external reference: {needle}");
+        }
+        for tag in ["<script", "<img", "<iframe", "<source"] {
+            for (i, _) in PANEL_HTML.match_indices(tag) {
+                let end = PANEL_HTML[i..]
+                    .find('>')
+                    .map_or(PANEL_HTML.len(), |e| i + e);
+                assert!(
+                    !PANEL_HTML[i..end].contains("src="),
+                    "{tag} loads an external source: {}",
+                    &PANEL_HTML[i..end]
+                );
+            }
+        }
+    }
+
+    /// Stored-XSS discipline for the whole panel: every `${...}` interpolated into a template is
+    /// either escaped, a numeric formatter, or a sub-renderer named `h_*` (itself held to the same
+    /// rule). A new field interpolated bare fails here.
+    #[test]
+    fn panel_interpolates_only_escaped_or_numeric_values() {
+        let start = PANEL_HTML.find("<script>").expect("script") + "<script>".len();
+        let js = &PANEL_HTML[start..PANEL_HTML.find("</script>").expect("end")];
+        let bytes = js.as_bytes();
+        let mut i = 0;
+        let mut count = 0;
+        while let Some(off) = js[i..].find("${") {
+            let begin = i + off + 2;
+            let (mut depth, mut j) = (1, begin);
+            while depth > 0 && j < bytes.len() {
+                match bytes[j] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let expr = js[begin..j - 1].trim();
+            assert!(
+                ["esc(", "usd(", "num(", "pct(", "cls(", "h_"]
+                    .iter()
+                    .any(|p| expr.starts_with(p)),
+                "unescaped interpolation in the panel: ${{{expr}}}"
+            );
+            count += 1;
+            i = begin;
+        }
+        assert!(
+            count > 40,
+            "the scan must actually see the templates ({count})"
+        );
+        assert!(js.contains("const esc ="), "the escaper must exist");
     }
 }

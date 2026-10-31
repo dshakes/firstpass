@@ -694,17 +694,30 @@ fn cmd_experiment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use firstpass_proxy::experiment;
     let config = ProxyConfig::from_env()?;
     let tenant = tenant_arg(args, &config);
+    let db = std::path::Path::new(&config.db_path);
+    let json = args.iter().any(|a| a == "--json");
     let Some(routing) = config.routing.as_ref() else {
-        println!("{}", experiment::render(&[]));
+        if json {
+            println!("[]");
+        } else {
+            print!(
+                "{}",
+                cli::experiment_next_step(None, &config.db_path, db.exists())
+            );
+        }
         return Ok(());
     };
-    let db = std::path::Path::new(&config.db_path);
     let traces = store::load_tenant_traces(db, &tenant).unwrap_or_default();
     let deferred = store::load_all_deferred(db).unwrap_or_default();
     let reports = experiment::experiments_from_traces(&traces, &deferred, routing);
     let views = experiment::views(reports, routing);
-    if args.iter().any(|a| a == "--json") {
+    if json {
         println!("{}", serde_json::to_string_pretty(&views)?);
+    } else if views.is_empty() {
+        print!(
+            "{}",
+            cli::experiment_next_step(Some(routing), &config.db_path, db.exists())
+        );
     } else {
         print!("{}", experiment::render(&views));
     }

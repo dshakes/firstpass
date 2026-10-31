@@ -50,6 +50,7 @@
 <div class="grp"><p class="grp-t">Research &amp; data</p>
 <a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
 <a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
+<a href="experiments.html"><span class="num">16</span>Choose by proof</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -136,6 +137,18 @@ firstpass calibrate --method conformal --alpha 0.10 --delta 0.05</code></pre></d
 <div class="note"><span class="nt">Key idea</span> You don't need new live traffic to test a policy change. <code>ope</code> uses your existing receipts as a dataset and importance-weights them to correct for the fact that your current policy selected which requests ran where. This means you can safely evaluate "what if I added a second rung" or "what if I raised the gate threshold" without any live experiment.</div>
 <div class="recap"><b><code>ope</code></b> gives you evidence before you ship a policy change; <b><code>modes</code></b> tells you what the current config actually resolves to.</div>
 
+<h2 id="experiment">Experiments<a class="anchor" href="#experiment" aria-label="Link to this section">#</a></h2>
+<div class="tldr"><b><code>firstpass experiment</code></b> reports certified model selection: for each route with a <code>[route.challenger]</code>, the live non-inferiority test (<b>certified</b> / <b>halted</b> / <b>undecided</b>), each arm's success rate and $/request, and what to do next. It only reports; adopting a challenger is always your edit.</div>
+<div class="tblwrap"><table>
+  <thead><tr><th>Command</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>firstpass experiment</code></td><td>Replay receipts and feedback through the test and print the state per route. With no config, no challenger, or no traffic yet it prints the specific next step instead of an empty table.</td></tr>
+    <tr><td><code>firstpass experiment --json</code></td><td>Same data as JSON (an empty array when there is nothing to report).</td></tr>
+    <tr><td><code>firstpass experiment --tenant ID</code></td><td>Scope to one tenant; experiments are never pooled across tenants.</td></tr>
+  </tbody>
+</table></div>
+<div class="recap">Full walkthrough in <a href="experiments.html">Choose your model by proof</a>; the same evidence is live in the panel's Experiments tab.</div>
+
 <h2 id="mcp">MCP server<a class="anchor" href="#mcp" aria-label="Link to this section">#</a></h2>
 <div class="tldr"><b><code>firstpass mcp</code></b> starts a stdio MCP server exposing routing decisions, savings, evals, and receipts as tools. This is a <b>receipts-audit surface</b> — it runs alongside the proxy, not on the routed traffic path.</div>
 <p><code>firstpass mcp</code> starts a stdio MCP server so an agent can inspect routing, savings, evals, and receipts as tools. See <a href="api.html#mcp">API &amp; MCP</a> for the tool list.</p>
@@ -144,7 +157,7 @@ firstpass calibrate --method conformal --alpha 0.10 --delta 0.05</code></pre></d
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="configuration.html"><span class="dir">← Previous</span><span class="t">Configuration</span></a><a class="next" href="api.html"><span class="dir">Next →</span><span class="t">API & MCP</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#install" class="">Install</a><a href="#lifecycle" class="">Lifecycle</a><a href="#inspect" class="">Inspect</a><a href="#audit" class="">Audit &amp; calibrate</a><a href="#rehearse" class="">Rehearse &amp; modes</a><a href="#mcp" class="">MCP server</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#install" class="">Install</a><a href="#lifecycle" class="">Lifecycle</a><a href="#inspect" class="">Inspect</a><a href="#audit" class="">Audit &amp; calibrate</a><a href="#rehearse" class="">Rehearse &amp; modes</a><a href="#experiment" class="">Experiments</a><a href="#mcp" class="">MCP server</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">

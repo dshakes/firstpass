@@ -50,6 +50,7 @@
 <div class="grp"><p class="grp-t">Research &amp; data</p>
 <a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
 <a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
+<a href="experiments.html"><span class="num">16</span>Choose by proof</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -123,7 +124,7 @@ gates  = [&quot;non-empty&quot;]</code></pre></div>
     <tr><td><code>routing_mode</code></td><td>mode name</td><td><code>None</code></td><td>Per-route preset; see <a href="#modes">Routing modes</a>.</td></tr>
     <tr><td><code>rollout</code></td><td><code>[route.rollout]</code></td><td><code>None</code></td><td>Percentage ramp; see <a href="#progressive">Progressive delivery</a>.</td></tr>
     <tr><td><code>shadow</code></td><td><code>[route.shadow]</code></td><td><code>None</code></td><td>Off-hot-path measurement; see <a href="#progressive">Progressive delivery</a>.</td></tr>
-    <tr><td><code>challenger</code></td><td><code>[route.challenger]</code></td><td><code>None</code></td><td>Certified model selection (ADR 0014): serve <code>percent</code> (0&lt;p&lt;100) of <em>sessions</em> from a challenger <code>ladder</code> (enforce routes only; gates still run), collect task outcomes via <code>/v1/feedback</code>, and let an anytime-valid non-inferiority test (<code>margin</code> default 0.05, <code>alpha</code> default 0.05) decide. A proven-worse challenger stops being served automatically; a certified one is adopted by you, never automatically. Read the verdict with <code>firstpass experiment</code>.</td></tr>
+    <tr><td><code>challenger</code></td><td><code>[route.challenger]</code></td><td><code>None</code></td><td>Certified model selection (ADR 0014; <a href="experiments.html">guide</a>): serve a share of <em>sessions</em> from a challenger ladder (enforce routes only; gates still run), collect task outcomes via <code>/v1/feedback</code>, and let an anytime-valid non-inferiority test decide. A proven-worse challenger stops being served automatically; a certified one is adopted by you, never automatically. Read the verdict with <code>firstpass experiment</code> or the panel. Keys, all inside the table:<ul><li><code>ladder</code> (required): list of <code>provider/model</code>, cheapest first. Every rung needs a provider and a price.</li><li><code>percent</code> (required): percent of sessions served by the challenger, strictly between 0 and 100.</li><li><code>margin</code> (default <code>0.05</code>): how much worse in task success rate it may be and still certify.</li><li><code>alpha</code> (default <code>0.05</code>): error rate of each conclusion. Changing either ladder, <code>margin</code> or <code>alpha</code> starts a fresh experiment.</li></ul>Unknown keys are rejected at parse.</td></tr>
   </tbody>
 </table></div>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[route]]
