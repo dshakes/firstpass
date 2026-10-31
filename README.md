@@ -500,6 +500,14 @@ three states. At any moment you read it, each conclusion is wrong with probabili
 - **undecided:** keep running. On the replay, good challengers certified after a median of about
   3.6k sessions at a 50/50 split, and a 20-point-worse model halted after about 220.
 
+**Single-turn routes decide 3–4× faster in paired mode** (`mode = "paired"`). No caller ever sees
+the challenger. On a sampled share of requests it runs on the *same* request off the hot path, under
+its own daily spend cap, and both answers go through your gates. On real paid MBPP calls (974 tasks),
+paired mode decided after about 76–127 requests, where live mode needed 222–425. The visible-test gate
+reached the same decision as the hidden-test oracle every time
+([evidence](docs/benchmarks/certified-selection.md)). It needs a real gate: a route whose only gate
+is `non-empty` is rejected.
+
 Method, defaults and limits: [ADR 0014](docs/adr/0014-certified-model-selection.md). The halt state
 is per process and rebuilt from receipts at startup. With several replicas each halts on the outcomes
 it receives, so run the report against the store all replicas write to. For a global halt across

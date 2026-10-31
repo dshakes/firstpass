@@ -168,3 +168,10 @@ Without `redis_url` behavior is unchanged (no append, no sync timer). The backen
   design.
 - **A live run.** Every number above comes from public recorded runs. A paid live experiment on a real
   route is the claim's final proof and needs the operator's spend approval.
+
+### Stage 2 evidence
+
+On real paid MBPP calls, paired mode decided 3–4× sooner than live mode (median 76–127 requests vs
+222–425), and the visible-test gate reached the hidden-test oracle's decision on every pair tested.
+Tables and limits: [`docs/benchmarks/certified-selection.md`](../benchmarks/certified-selection.md),
+reproducible with `scripts/sim-certified-selection-mbpp.py`.
