@@ -1319,12 +1319,15 @@ pub fn builtin_key_env(id: &str) -> Option<&'static str> {
 impl ProviderRegistry {
     /// One HTTP client shared by every provider. The enforce path is request/response (never
     /// streamed through the adapter), so it carries a total request timeout as well as a connect
-    /// timeout — a hung or slow upstream can't pin a routing decision indefinitely. Falls back to a
-    /// default client if the builder fails (only on TLS backend init, which is fatal anyway).
+    /// timeout — a hung or slow upstream can't pin a routing decision indefinitely. The total is
+    /// 600 s, the Anthropic SDK's own default: a long generation (12k output tokens) legitimately
+    /// runs past two minutes, and a shorter cap turns it into a provider error on every rung.
+    /// Falls back to a default client if the builder fails (only on TLS backend init, which is
+    /// fatal anyway).
     fn build_http_client() -> reqwest::Client {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(600))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     }
