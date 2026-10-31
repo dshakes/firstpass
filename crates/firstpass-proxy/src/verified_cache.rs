@@ -589,6 +589,7 @@ mod tests {
             rollout: None,
             shadow: None,
             route_ix: None,
+            experiment: None,
         }
     }
 

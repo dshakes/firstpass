@@ -56,6 +56,10 @@ USAGE:
                                    evaluate a candidate policy against logged traffic before enforcing
     firstpass ope --start-rung N [--db <path>] [--tenant <id>]
                                    IPS/SNIPS/DR estimate for a fixed start-rung (requires propensity-logged traffic)
+    firstpass experiment [--json] [--tenant ID]
+                                   certified model selection: per route with a [route.challenger],
+                                   the live non-inferiority test (certified / halted / undecided),
+                                   each arm's success rate and $/request, and what to do next
     firstpass modes               list routing-mode profiles, what each sets, and honest tradeoffs
     firstpass mcp                 serve MCP over stdio (agent reads traces + submits feedback)
     firstpass --help | --version
@@ -100,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "verify" => cmd_verify(&args),
         "calibrate" => cmd_calibrate(&args),
         "ope" => cmd_ope(&args),
+        "experiment" => cmd_experiment(&args),
         "modes" => cmd_modes(),
         "mcp" => {
             // Synchronous stdio server; run it off the async runtime so nothing else contends.
@@ -677,6 +682,31 @@ fn cmd_calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let report = calibrate_from_store(&config.db_path, &tenant, alpha, delta, min_n)?;
             print!("{}", report.render());
         }
+    }
+    Ok(())
+}
+
+/// `firstpass experiment [--json] [--tenant ID]` — replay this tenant's receipts and feedback
+/// through the certified-selection test (ADR 0014) and say what the evidence supports. Adopting a
+/// certified challenger is always a human edit of the config; this only reports. No challenger
+/// configured, or no traffic yet, prints the empty state and exits 0.
+fn cmd_experiment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use firstpass_proxy::experiment;
+    let config = ProxyConfig::from_env()?;
+    let tenant = tenant_arg(args, &config);
+    let Some(routing) = config.routing.as_ref() else {
+        println!("{}", experiment::render(&[]));
+        return Ok(());
+    };
+    let db = std::path::Path::new(&config.db_path);
+    let traces = store::load_tenant_traces(db, &tenant).unwrap_or_default();
+    let deferred = store::load_all_deferred(db).unwrap_or_default();
+    let reports = experiment::experiments_from_traces(&traces, &deferred, routing);
+    let views = experiment::views(reports, routing);
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&views)?);
+    } else {
+        print!("{}", experiment::render(&views));
     }
     Ok(())
 }

@@ -482,6 +482,12 @@ pub struct Route {
     /// why `max_usd_per_day` is required rather than defaulted.
     #[serde(default)]
     pub shadow: Option<crate::rollout::Shadow>,
+    /// Certified model selection (ADR 0014): serve a randomized fraction of *sessions* from a
+    /// challenger ladder, collect task outcomes through the feedback API, and let a sequential
+    /// non-inferiority test decide certified / halted / undecided. Requires `mode = "enforce"`.
+    /// Absent (the default) leaves the route exactly as it was.
+    #[serde(default)]
+    pub challenger: Option<crate::rollout::Challenger>,
 }
 
 /// Predicate over a request's [`Features`]. Every present field is an AND-constraint; absent
@@ -1166,6 +1172,22 @@ impl Config {
                 sh.validate()
                     .map_err(|e| Error::InvalidConfig(format!("route[{i}]: {e}")))?;
             }
+            if let Some(ch) = &route.challenger {
+                ch.validate()
+                    .map_err(|e| Error::InvalidConfig(format!("route[{i}]: {e}")))?;
+                if route.mode != Mode::Enforce {
+                    return Err(Error::InvalidConfig(format!(
+                        "route[{i}]: route.challenger requires mode = \"enforce\" — a challenger \
+                         is served through the enforce path, and observe never runs a ladder"
+                    )));
+                }
+                if ch.ladder == route.ladder {
+                    return Err(Error::InvalidConfig(format!(
+                        "route[{i}]: route.challenger.ladder is identical to the route ladder — \
+                         both arms would serve the same models and the experiment could prove nothing"
+                    )));
+                }
+            }
         }
         if let Some(g) = &config.guardrail {
             g.validate().map_err(Error::InvalidConfig)?;
@@ -1279,6 +1301,7 @@ impl Config {
             }
         }
         config.validate_ladders_are_priced()?;
+        config.validate_challenger_ladders()?;
         if let Some(b) = &config.escalation.bandit {
             if !b.exploration.is_finite() || b.exploration < 0.0 {
                 return Err(Error::InvalidConfig(format!(
@@ -1457,6 +1480,43 @@ impl Config {
                     },
                 )
             })
+    }
+
+    /// Every challenger rung must be a well-formed `provider/model` whose provider resolves
+    /// (built-in `anthropic` / `openai`, or a `[[provider]]` block) and whose price is known, for
+    /// the same reason route rungs must be priced: an unpriced rung would record $0.00 receipts
+    /// and make the experiment's cost comparison — the whole point of adopting a challenger —
+    /// meaningless.
+    fn validate_challenger_ladders(&self) -> Result<()> {
+        let prices = self.price_table();
+        for (i, route) in self.routes.iter().enumerate() {
+            let Some(ch) = &route.challenger else {
+                continue;
+            };
+            for rung in &ch.ladder {
+                let m = ModelRef::parse(rung).map_err(|_| {
+                    Error::InvalidConfig(format!(
+                        "route[{i}] challenger rung {rung:?} is not a `provider/model` string"
+                    ))
+                })?;
+                let builtin = matches!(m.provider.as_str(), "anthropic" | "openai");
+                if !builtin && !self.providers.iter().any(|p| p.id == m.provider) {
+                    return Err(Error::InvalidConfig(format!(
+                        "route[{i}] challenger rung {rung:?}: provider {:?} is not built in \
+                         (only `anthropic` and `openai` are) and has no `[[provider]]` block",
+                        m.provider
+                    )));
+                }
+                if prices.get(rung).is_none() {
+                    return Err(Error::InvalidConfig(format!(
+                        "route[{i}] challenger rung {rung:?} has no price. Declare it:\n\n\
+                         [[price]]\nmodel = {rung:?}\ninput_per_mtok = 0.0\noutput_per_mtok = 0.0\n\n\
+                         (0.0 is correct only for a model you host yourself)"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every ladder rung must resolve to a price.
@@ -2527,5 +2587,89 @@ discount = 0.98
         .unwrap();
         assert!((ok.routes[0].rollout.unwrap().percent - 5.0).abs() < f64::EPSILON);
         assert!(Config::parse(&format!("{base}[route.rollout]\npercent = 140.0\n")).is_err());
+    }
+
+    /// `[route.challenger]` (ADR 0014): one accept and every rejection the brief names.
+    #[test]
+    fn challenger_config_parses_and_rejects_incoherent_setups() {
+        let route =
+            "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-sonnet-5\"]\n";
+        let obs =
+            "[[route]]\nmatch = {}\nmode = \"observe\"\nladder = [\"anthropic/claude-sonnet-5\"]\n";
+        let ch = |body: &str| format!("{route}[route.challenger]\n{body}\n");
+
+        assert!(Config::parse(route).unwrap().routes[0].challenger.is_none());
+        let ok = Config::parse(&ch(
+            "ladder = [\"anthropic/claude-haiku-4-5\"]\npercent = 10.0",
+        ))
+        .unwrap();
+        let c = ok.routes[0].challenger.as_ref().expect("parsed");
+        assert!((c.margin - crate::select::DEFAULT_MARGIN).abs() < f64::EPSILON);
+        assert!((c.alpha - crate::select::DEFAULT_ALPHA).abs() < f64::EPSILON);
+
+        let bad: [(&str, String); 12] = [
+            ("empty ladder", ch("ladder = []\npercent = 10.0")),
+            (
+                "percent 0",
+                ch("ladder = [\"anthropic/claude-haiku-4-5\"]\npercent = 0.0"),
+            ),
+            (
+                "percent 100 (no control arm)",
+                ch("ladder = [\"anthropic/claude-haiku-4-5\"]\npercent = 100.0"),
+            ),
+            (
+                "percent > 100",
+                ch("ladder = [\"anthropic/claude-haiku-4-5\"]\npercent = 101.0"),
+            ),
+            (
+                "margin 0",
+                ch("ladder = [\"anthropic/claude-haiku-4-5\"]\npercent = 10.0\nmargin = 0.0"),
+            ),
+            (
+                "alpha 0.5",
+                ch("ladder = [\"anthropic/claude-haiku-4-5\"]\npercent = 10.0\nalpha = 0.5"),
+            ),
+            (
+                "unknown key",
+                ch(
+                    "ladder = [\"anthropic/claude-haiku-4-5\"]\npercent = 10.0\nmax_escalations = 3",
+                ),
+            ),
+            (
+                "same ladder as the route",
+                ch("ladder = [\"anthropic/claude-sonnet-5\"]\npercent = 10.0"),
+            ),
+            (
+                "unpriced rung",
+                ch("ladder = [\"anthropic/not-a-priced-model\"]\npercent = 10.0"),
+            ),
+            (
+                "unresolvable provider",
+                format!(
+                    "{route}[route.challenger]\nladder = [\"groq/llama\"]\npercent = 10.0\n\
+                     [[price]]\nmodel = \"groq/llama\"\ninput_per_mtok = 0.1\noutput_per_mtok = 0.1\n"
+                ),
+            ),
+            ("malformed rung", ch("ladder = [\"haiku\"]\npercent = 10.0")),
+            (
+                "observe route",
+                format!(
+                    "{obs}[route.challenger]\nladder = [\"anthropic/claude-haiku-4-5\"]\npercent = 10.0\n"
+                ),
+            ),
+        ];
+        for (why, toml) in &bad {
+            assert!(Config::parse(toml).is_err(), "accepted: {why}");
+        }
+
+        // A declared provider + price makes a custom rung acceptable.
+        assert!(
+            Config::parse(&format!(
+                "{route}[route.challenger]\nladder = [\"groq/llama\"]\npercent = 10.0\n\
+                 [[provider]]\nid = \"groq\"\ndialect = \"openai\"\nbase_url = \"https://api.groq.com/openai\"\n\
+                 [[price]]\nmodel = \"groq/llama\"\ninput_per_mtok = 0.1\noutput_per_mtok = 0.1\n"
+            ))
+            .is_ok()
+        );
     }
 }

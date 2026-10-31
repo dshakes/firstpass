@@ -53,6 +53,9 @@ pub struct AppState {
     /// Per-(tenant, route) shadow spend for the current UTC day (ADR 0009 D2). Shadow makes real
     /// model calls, so the daily ceiling is enforced through this rather than trusted.
     pub shadow_ledger: Arc<crate::shadow::ShadowLedger>,
+    /// Certified-selection experiments (ADR 0014), one per `(tenant, route)` that has a
+    /// `[route.challenger]`. Holds the evidence and is the halt guard the serving path consults.
+    pub experiments: Arc<crate::experiment::ExperimentMonitor>,
     /// Per-(tenant, route) guardrail state (ADR 0009 D3): the trailing window of resolved
     /// outcomes and whether a route is currently demoted.
     pub guardrails: Arc<crate::guard::GuardrailRegistry>,
@@ -192,6 +195,7 @@ fn cache_hit_trace(
         rollout: None,
         shadow: None,
         route_ix: None,
+        experiment: None,
     }
 }
 
@@ -993,6 +997,41 @@ async fn feedback(
                     crate::guard::Reaction::None => {}
                 }
             }
+            // Certified model selection (ADR 0014): a resolved task outcome on a challenger route
+            // is the evidence the experiment runs on. Best effort by construction — a failed
+            // lookup is logged and skipped, never surfaced: the outcome is already durably
+            // recorded above, and the monitor can always be rebuilt from receipts. Skipped
+            // entirely (no extra store read) when no route runs an experiment.
+            if state.experiments.is_active() {
+                let (db_x, ten_x, tid_x) = (
+                    state.config.db_path.clone(),
+                    tenant.clone(),
+                    trace_id.clone(),
+                );
+                match tokio::task::spawn_blocking(move || {
+                    store::trace_experiment(&db_x, &ten_x, &tid_x)
+                })
+                .await
+                {
+                    Ok(Ok(Some((session, route_ix, rec)))) => {
+                        state.experiments.observe_outcome(
+                            &tenant,
+                            route_ix,
+                            &rec.fingerprint,
+                            rec.arm,
+                            &session,
+                            verdict,
+                        );
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(%e, "feedback: experiment attribution lookup failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "feedback: experiment attribution task failed");
+                    }
+                }
+            }
             (
                 axum::http::StatusCode::ACCEPTED,
                 Json(serde_json::json!({ "status": "recorded", "trace_id": trace_id })),
@@ -1324,11 +1363,11 @@ async fn messages(
                     return resp;
                 }
             }
-            if enforce_can_handle(
+            if enforce_can_handle_route(
                 &features,
                 &body,
                 routing.escalation.enforce_structured,
-                &route.ladder,
+                &route,
                 &state.providers,
                 Dialect::Anthropic,
             ) {
@@ -1369,6 +1408,36 @@ async fn messages(
 ///
 /// `enforce_structured == false` restores the pre-ADR-0005 behavior: structured requests always
 /// fall back to transparent observe passthrough.
+/// [`enforce_can_handle`] for a whole route: the incumbent ladder AND the challenger ladder, if
+/// any, must both be able to carry the request. If either cannot, the request is passed through
+/// regardless of which arm it would have been in, so the exclusion is arm-independent.
+fn enforce_can_handle_route(
+    features: &Features,
+    body: &[u8],
+    enforce_structured: bool,
+    route: &Route,
+    providers: &crate::provider::ProviderRegistry,
+    inbound: Dialect,
+) -> bool {
+    enforce_can_handle(
+        features,
+        body,
+        enforce_structured,
+        &route.ladder,
+        providers,
+        inbound,
+    ) && route.challenger.as_ref().is_none_or(|c| {
+        enforce_can_handle(
+            features,
+            body,
+            enforce_structured,
+            &c.ladder,
+            providers,
+            inbound,
+        )
+    })
+}
+
 fn enforce_can_handle(
     features: &Features,
     body: &[u8],
@@ -1751,6 +1820,10 @@ async fn enforce_pipeline_inner(
     api: &str,
     routing_mode: RoutingMode,
     route_ix: usize,
+    // Whether this request may be assigned to the route's challenger (ADR 0014). `false` serves
+    // the incumbent ladder unrecorded; callers set it from request properties only, never from
+    // the arm, so excluding a request cannot bias the comparison.
+    allow_challenger: bool,
 ) -> Result<ModelResponse, ProxyError> {
     let gate_defs = state
         .config
@@ -1766,6 +1839,45 @@ async fn enforce_pipeline_inner(
         &state.http,
     );
     let session_id = session_header.unwrap_or_else(|| Uuid::now_v7().to_string());
+
+    // Certified model selection (ADR 0014). A challenger route assigns each SESSION to an arm by a
+    // salted hash of its key (the `x-firstpass-session` header, else the fresh per-request id
+    // generated just above, which the trace records — each unsessioned request is its own
+    // session). If the experiment has been halted, challenger-assigned sessions are served by the
+    // incumbent and recorded as incumbent, so per-arm cost is never blended.
+    let experiment = route
+        .challenger
+        .as_ref()
+        .filter(|_| allow_challenger)
+        .map(|ch| {
+            let bucket = firstpass_core::Challenger::bucket(&state.config.prompt_salt, &session_id);
+            let assigned = ch.arm_of(bucket);
+            let arm = if assigned == firstpass_core::Arm::Challenger
+                && state.experiments.challenger_blocked(&tenant, route_ix)
+            {
+                firstpass_core::Arm::Incumbent
+            } else {
+                assigned
+            };
+            (
+                ch,
+                firstpass_core::trace::ExperimentRecord {
+                    arm,
+                    percent: ch.percent,
+                    bucket,
+                    fingerprint: ch.fingerprint(&route.ladder),
+                },
+            )
+        });
+    let on_challenger = experiment
+        .as_ref()
+        .is_some_and(|(_, rec)| rec.arm == firstpass_core::Arm::Challenger);
+    // The ladder this request actually runs. Everything below that indexes a rung (cache key,
+    // start-rung choice, probe, top-rung preset) uses it, not `route.ladder`.
+    let ladder: &[String] = match &experiment {
+        Some((ch, rec)) if rec.arm == firstpass_core::Arm::Challenger => &ch.ladder,
+        _ => &route.ladder,
+    };
     let (budget, max_rungs, speculation, serve_threshold, elastic) =
         match state.config.routing.as_ref() {
             Some(cfg) => (
@@ -1828,7 +1940,8 @@ async fn enforce_pipeline_inner(
     // start rung. `None` whenever `[escalation.prior]` is off (the default), the call errors,
     // times out, or comes back malformed — fetch_prior fails open, never blocks serving, and the
     // gate below still verifies every output regardless of what the prior said.
-    let decision_prior: Option<Vec<f64>> = match state.prior.as_ref() {
+    // Skipped on the challenger arm: the prior scores the incumbent ladder's rungs.
+    let decision_prior: Option<Vec<f64>> = match state.prior.as_ref().filter(|_| !on_challenger) {
         Some(prior_client) => {
             prior_client
                 .fetch(&crate::prior::query_text(&base_request))
@@ -1841,7 +1954,15 @@ async fn enforce_pipeline_inner(
     // (cold-start / no bandit and no prior).
     // Thompson sampling returns its own Monte-Carlo selection propensity (the policy is
     // stochastic by nature); UCB1 returns None and relies on the epsilon overlay as before.
-    let (greedy_rung, base_policy_id, ts_propensity) = {
+    //
+    // The challenger arm starts at rung 0 and skips ALL start-rung learning (bandit, prior,
+    // epsilon exploration, session promotion/affinity, the per-query predictor): that state is
+    // indexed by the INCUMBENT ladder's rungs, so reading it would start the challenger at a rung
+    // chosen for a different model, and writing to it would teach the incumbent's bandit about
+    // models it never ran. The gates still verify every output as usual.
+    let (greedy_rung, base_policy_id, ts_propensity) = if on_challenger {
+        (0, "challenger-ladder@v0".to_owned(), None)
+    } else {
         let (chosen, ts_p) = match state.bandit.as_ref() {
             Some(bandit) => bandit
                 .lock()
@@ -1890,7 +2011,8 @@ async fn enforce_pipeline_inner(
         .routing
         .as_ref()
         .and_then(|cfg| cfg.escalation.exploration.as_ref())
-        .map(|e| e.epsilon);
+        .map(|e| e.epsilon)
+        .filter(|_| !on_challenger);
 
     let (start_rung, policy_id, explore_flag, propensity) = if ts_propensity.is_some() {
         // Thompson IS the stochastic logging policy — its MC propensity is logged directly and
@@ -1903,7 +2025,7 @@ async fn enforce_pipeline_inner(
         }
         (greedy_rung, base_policy_id, false, ts_propensity)
     } else if let Some(epsilon) = exploration_epsilon {
-        let k = route.ladder.len().max(1);
+        let k = ladder.len().max(1);
         // Derive a per-request uniform draw from a fresh UUIDv7's bits — no new deps.
         let u = u01(Uuid::now_v7().as_u128());
         let (chosen, eps_branch) = if u < epsilon {
@@ -1923,7 +2045,7 @@ async fn enforce_pipeline_inner(
     // re-pay for the rung that already failed it — but if the bandit independently wants to start
     // higher, that is also evidence, so take the greater of the two. A downward probe lowers the
     // floor rather than forcing the start, for the same reason.
-    let promotion = state.promoter.as_ref().cloned();
+    let promotion = state.promoter.as_ref().filter(|_| !on_challenger).cloned();
     // Awaited outside the closure so the borrows of `tenant`/`session_id` end here — the ctx below
     // takes them by value.
     let promotion = match promotion {
@@ -1939,12 +2061,13 @@ async fn enforce_pipeline_inner(
     let promo_key = state
         .promoter
         .as_ref()
+        .filter(|_| !on_challenger)
         .map(|_| (tenant.clone(), session_id.clone()));
 
     // Apply start_at_top mode override: Max mode skips bandit/epsilon and jumps to top rung.
     // ponytail: if ladder is empty start_rung stays 0 (saturating_sub handles it).
     let start_rung = if preset.start_at_top {
-        route.ladder.len().saturating_sub(1) as u32
+        ladder.len().saturating_sub(1) as u32
     } else {
         start_rung
     };
@@ -1960,7 +2083,7 @@ async fn enforce_pipeline_inner(
         .as_ref()
         .and_then(|cfg| cfg.escalation.speculation_band)
     {
-        Some([lo, hi]) if speculation > 0 => {
+        Some([lo, hi]) if speculation > 0 && !on_challenger => {
             let estimate = state
                 .bandit
                 .as_ref()
@@ -1978,7 +2101,7 @@ async fn enforce_pipeline_inner(
     };
 
     // Emit metric whenever the bandit is configured (includes cold-start rung-0 choices).
-    if state.bandit.is_some() {
+    if state.bandit.is_some() && !on_challenger {
         metrics::counter!(
             "firstpass_bandit_start_rung",
             "rung" => start_rung.to_string()
@@ -1997,7 +2120,7 @@ async fn enforce_pipeline_inner(
         .is_some_and(|r| r.escalation.prompt_cache);
     let ctx = EnforceCtx {
         condense: routing_cfg_condense(state),
-        ladder: &route.ladder,
+        ladder,
         gates: &gates,
         health: &state.gate_health,
         base_request: &base_request,
@@ -2030,14 +2153,31 @@ async fn enforce_pipeline_inner(
                 &crate::verified_cache::VerifiedCache::compose_key(
                     &ctx.tenant_id,
                     &ctx.prompt_hash,
-                    &route.ladder,
+                    // The ladder that served: a challenger-arm request must neither replay an
+                    // incumbent answer nor leave one behind (the key is the ladder's identity).
+                    ladder,
                 ),
                 std::time::Instant::now(),
             )
             .await
     {
         metrics::counter!("firstpass_cache_hits_total").increment(1);
-        let trace = cache_hit_trace(&ctx, &entry, mode_now());
+        let mut trace = cache_hit_trace(&ctx, &entry, mode_now());
+        if let Some((_, rec)) = &experiment {
+            // A replay is still a request of that arm (it cost ~nothing, which is the honest
+            // per-request cost). `route_ix` is stamped here too — only for experiment routes, so
+            // other routes' receipts are unchanged — so feedback on this replay attributes to
+            // the right experiment.
+            trace.route_ix = Some(u32::try_from(route_ix).unwrap_or(0));
+            trace.experiment = Some(rec.clone());
+            state.experiments.observe_cost(
+                &trace.tenant_id,
+                route_ix,
+                &rec.fingerprint,
+                rec.arm,
+                trace.final_.total_cost_usd,
+            );
+        }
         offer_trace(&state.traces, state.spill.as_ref(), trace);
         return Ok(entry.response);
     }
@@ -2061,11 +2201,23 @@ async fn enforce_pipeline_inner(
     // None whenever `[escalation.prior]` is off — absent from JSON, byte-identical to before.
     trace.decision_prior = decision_prior;
     trace.risk = risk;
+    // Certified selection: stamp the arm on EVERY request of a challenger route (the incumbent arm
+    // is the control) and tally its cost.
+    if let Some((_, rec)) = &experiment {
+        state.experiments.observe_cost(
+            &trace.tenant_id,
+            route_ix,
+            &rec.fingerprint,
+            rec.arm,
+            trace.final_.total_cost_usd,
+        );
+        trace.experiment = Some(rec.clone());
+    }
 
     // Online bandit learning: feed back every gate verdict from this request so the bandit
     // refines its start-rung estimates. Cheap in-memory update; done before offer_trace so the
     // trace borrow is still live (we read attempts, then pass trace to offer_trace by value).
-    if let Some(bandit) = state.bandit.as_ref()
+    if let Some(bandit) = state.bandit.as_ref().filter(|_| !on_challenger)
         && let Ok(mut b) = bandit.lock()
     {
         for attempt in &trace.attempts {
@@ -2097,7 +2249,7 @@ async fn enforce_pipeline_inner(
     // on), then learn online from this request's attempts. Default-off (predictor = None):
     // trace.predicted_pass stays None → byte-identical to today. The predictor never touches
     // serving; it only writes a receipt field, updates in-memory weights, and emits a metric.
-    if let Some(predictor) = state.predictor.as_ref()
+    if let Some(predictor) = state.predictor.as_ref().filter(|_| !on_challenger)
         && let Ok(mut p) = predictor.lock()
     {
         // Read the routed features from the trace (the owned `features` was moved into the ctx).
@@ -2127,8 +2279,8 @@ async fn enforce_pipeline_inner(
         && u01(Uuid::now_v7().as_u128()) < probe_cfg.sample_rate
     {
         // Clamp start_rung to the ladder bounds (same as run_serial/run_speculative).
-        let probe_rung = (start_rung as usize).min(route.ladder.len().saturating_sub(1));
-        if let Some(probe_model_str) = route.ladder.get(probe_rung).cloned() {
+        let probe_rung = (start_rung as usize).min(ladder.len().saturating_sub(1));
+        if let Some(probe_model_str) = ladder.get(probe_rung).cloned() {
             let probe_provider = ModelRef::parse(&probe_model_str)
                 .ok()
                 .and_then(|m| state.providers.get(&m.provider));
@@ -2247,7 +2399,7 @@ async fn enforce_pipeline_inner(
                 &crate::verified_cache::VerifiedCache::compose_key(
                     &trace.tenant_id,
                     &trace.request.prompt_hash,
-                    &route.ladder,
+                    ladder,
                 ),
                 trace.trace_id,
                 crate::verified_cache::Entry::new(resp.clone(), &trace, now),
@@ -2299,6 +2451,7 @@ async fn enforce_pipeline(
         "anthropic.messages",
         routing_mode,
         route_ix,
+        true,
     )
     .await?;
     Ok(anthropic_response_json(&resp))
@@ -2359,12 +2512,23 @@ async fn enforce_pipeline_openai_as(
 ) -> Result<Value, ProxyError> {
     // Decide between verbatim raw-carry (all-OpenAI ladder) and translation (Anthropic ladder).
     let providers = &state.providers;
-    let all_openai = route.ladder.iter().all(|rung| {
-        let pid = rung.split('/').next().unwrap_or_default();
-        providers
-            .get(pid)
-            .is_some_and(|p| p.carries_structured_verbatim(Dialect::Openai))
-    });
+    let all_openai_of = |ladder: &[String]| {
+        ladder.iter().all(|rung| {
+            let pid = rung.split('/').next().unwrap_or_default();
+            providers
+                .get(pid)
+                .is_some_and(|p| p.carries_structured_verbatim(Dialect::Openai))
+        })
+    };
+    let all_openai = all_openai_of(&route.ladder);
+    // The request is parsed once, for the incumbent ladder's carry mode. A challenger whose carry
+    // mode differs could not be served from that parse faithfully, so such requests skip the
+    // experiment (they are served by the incumbent, unrecorded). The choice depends only on the
+    // two ladders, never on the arm, so it cannot bias the comparison.
+    let allow_challenger = route
+        .challenger
+        .as_ref()
+        .is_none_or(|c| all_openai_of(&c.ladder) == all_openai);
     let Some(base_request) = parse_openai_request(body, all_openai) else {
         return Err(ProxyError::BadRequest(
             "request body is not a valid OpenAI Chat Completions request".to_owned(),
@@ -2383,6 +2547,7 @@ async fn enforce_pipeline_openai_as(
         api,
         routing_mode,
         route_ix,
+        allow_challenger,
     )
     .await?;
     Ok(openai_response_json(&resp))
@@ -3048,6 +3213,7 @@ fn base_trace(
         decision_prior: None,
         elastic: None,
         risk: None,
+        experiment: None,
     }
 }
 
@@ -3758,11 +3924,11 @@ async fn chat_completions(
                 return observe_passthrough_openai(state, headers, body, session_header, tenant)
                     .await;
             }
-            if enforce_can_handle(
+            if enforce_can_handle_route(
                 &features,
                 &body,
                 routing.escalation.enforce_structured,
-                &route.ladder,
+                &route,
                 &state.providers,
                 Dialect::Openai,
             ) {
@@ -3859,11 +4025,11 @@ async fn responses(
             let route = route.clone();
             let routing_mode = resolve_mode(&headers, &route, &state.config);
             if routing_mode != RoutingMode::Observe
-                && enforce_can_handle(
+                && enforce_can_handle_route(
                     &features,
                     &chat_body,
                     routing.escalation.enforce_structured,
-                    &route.ladder,
+                    &route,
                     &state.providers,
                     Dialect::Openai,
                 )
@@ -4490,6 +4656,7 @@ mod tests {
             providers,
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
@@ -4672,6 +4839,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
@@ -4708,6 +4876,7 @@ mod tests {
             routing_mode: None,
             rollout: None,
             shadow: None,
+            challenger: None,
         }
     }
 
@@ -5087,6 +5256,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
@@ -5314,6 +5484,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
@@ -5687,6 +5858,7 @@ mod tests {
             providers: ProviderRegistry::from_map(providers),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
@@ -6115,6 +6287,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
@@ -6488,6 +6661,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
@@ -6609,6 +6783,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
@@ -6888,6 +7063,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
@@ -6981,6 +7157,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
             traces,
             adaptive: None,
@@ -7127,6 +7304,273 @@ mod tests {
             checked_enforced > 0 && checked_control > 0,
             "test saw only one arm ({checked_enforced} enforced, {checked_control} control)"
         );
+    }
+
+    // ---- Certified model selection (ADR 0014): the serving path --------------------------
+
+    const INCUMBENT: &str = "anthropic/claude-sonnet-5";
+    const CHALLENGER: &str = "anthropic/claude-haiku-4-5";
+
+    /// A route whose incumbent ladder is sonnet and whose challenger ladder is haiku, with
+    /// `percent` of sessions on the challenger. `db` is where feedback looks traces up.
+    fn challenger_state(percent: f64, db: &str) -> (AppState, mpsc::Receiver<Trace>) {
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"non-empty\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\npercent = {percent}\n"
+        );
+        let db = db.to_owned();
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.clone()),
+            "FIRSTPASS_MODE" => Some("enforce".to_owned()),
+            "FIRSTPASS_DB" => Some(db.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let mut outs = HashMap::new();
+        for m in [INCUMBENT, CHALLENGER] {
+            outs.insert(m.to_owned(), Ok(model_resp(m, "answer")));
+        }
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        let experiments = Arc::new(crate::experiment::ExperimentMonitor::from_config(
+            config.routing.as_ref().unwrap(),
+        ));
+        let (traces, rx) = mpsc::channel(64);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(map),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments,
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+        (state, rx)
+    }
+
+    async fn serve_session(
+        state: &AppState,
+        rx: &mut mpsc::Receiver<Trace>,
+        session: &str,
+    ) -> Trace {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-firstpass-session", session.parse().unwrap());
+        let resp = messages(
+            State(state.clone()),
+            Extension(TenantId("default".to_owned())),
+            headers,
+            user_body(),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        rx.try_recv().expect("trace enqueued")
+    }
+
+    /// A session key that lands in `want` under this state's salt.
+    fn session_in_arm(state: &AppState, want: firstpass_core::Arm, nth: usize) -> String {
+        let ch = state.config.routing.as_ref().unwrap().routes[0]
+            .challenger
+            .as_ref()
+            .unwrap();
+        (0..)
+            .map(|i| format!("sess-{i}"))
+            .filter(|k| ch.arm(&state.config.prompt_salt, k) == want)
+            .nth(nth)
+            .unwrap()
+    }
+
+    /// Both arms serve their own ladder through the real dispatch path, the arm matches what the
+    /// pure bucketing predicts, and EVERY request (control included) carries the record.
+    #[tokio::test]
+    async fn challenger_arm_serves_its_ladder_and_both_arms_are_recorded() {
+        use firstpass_core::Arm;
+        let (state, mut rx) = challenger_state(50.0, "unused.db");
+        for want in [Arm::Challenger, Arm::Incumbent] {
+            for n in 0..5 {
+                let session = session_in_arm(&state, want, n);
+                let t = serve_session(&state, &mut rx, &session).await;
+                let rec = t.experiment.as_ref().expect("experiment recorded");
+                assert_eq!(rec.arm, want, "{session}");
+                assert!((rec.percent - 50.0).abs() < f64::EPSILON);
+                let expect_model = if want == Arm::Challenger {
+                    CHALLENGER
+                } else {
+                    INCUMBENT
+                };
+                assert_eq!(t.attempts[0].model, expect_model, "{session}");
+                assert_eq!(t.route_ix, Some(0));
+                assert!(
+                    t.policy.id == "challenger-ladder@v0" || want == Arm::Incumbent,
+                    "challenger arm must not claim the incumbent's start-rung policy: {}",
+                    t.policy.id
+                );
+            }
+        }
+        let reports = state.experiments.reports();
+        assert_eq!(reports[0].report.challenger.requests, 5);
+        assert_eq!(reports[0].report.incumbent.requests, 5);
+    }
+
+    /// A halted experiment stops serving the challenger: its sessions fall back to the incumbent
+    /// ladder and are recorded as incumbent, so per-arm cost is never blended.
+    #[tokio::test]
+    async fn halted_experiment_stops_serving_the_challenger() {
+        use firstpass_core::{Arm, ExperimentStatus, Verdict};
+        let (state, mut rx) = challenger_state(50.0, "unused.db");
+        for i in 0..500 {
+            state.experiments.observe_outcome(
+                "default",
+                0,
+                state.experiments.fingerprint(0).unwrap(),
+                Arm::Incumbent,
+                &format!("i{i}"),
+                Verdict::Pass,
+            );
+            state.experiments.observe_outcome(
+                "default",
+                0,
+                state.experiments.fingerprint(0).unwrap(),
+                Arm::Challenger,
+                &format!("c{i}"),
+                Verdict::Fail,
+            );
+        }
+        assert_eq!(
+            state.experiments.status("default", 0),
+            ExperimentStatus::Halted
+        );
+        let session = session_in_arm(&state, Arm::Challenger, 0);
+        let t = serve_session(&state, &mut rx, &session).await;
+        assert_eq!(
+            t.attempts[0].model, INCUMBENT,
+            "halted challenger was still served"
+        );
+        assert_eq!(t.experiment.unwrap().arm, Arm::Incumbent);
+    }
+
+    /// If the store was unreadable at startup the monitor is built blocked: the challenger is not
+    /// served, the incumbent is, and the request is recorded as the incumbent arm.
+    #[tokio::test]
+    async fn unavailable_experiment_history_serves_the_incumbent_only() {
+        use firstpass_core::Arm;
+        let (mut state, mut rx) = challenger_state(50.0, "unused.db");
+        state.experiments = Arc::new(crate::experiment::ExperimentMonitor::unavailable(
+            state.config.routing.as_ref().unwrap(),
+        ));
+        for n in 0..3 {
+            let session = session_in_arm(&state, Arm::Challenger, n);
+            let t = serve_session(&state, &mut rx, &session).await;
+            assert_eq!(t.attempts[0].model, INCUMBENT);
+            assert_eq!(t.experiment.unwrap().arm, Arm::Incumbent);
+        }
+    }
+
+    /// The verified cache is keyed on ladder identity: a challenger-arm request can neither be
+    /// served from the incumbent's cache entry nor write one the incumbent would later replay.
+    #[tokio::test]
+    async fn challenger_arm_cannot_share_the_incumbents_cache_entry() {
+        use firstpass_core::Arm;
+        let (mut state, mut rx) = challenger_state(50.0, "unused.db");
+        state.verified_cache = Some(Arc::new(crate::verified_cache::VerifiedCache::new(
+            Duration::from_secs(60),
+            100,
+        )));
+        // Incumbent earns an entry for this prompt.
+        let a = serve_session(&state, &mut rx, &session_in_arm(&state, Arm::Incumbent, 0)).await;
+        assert!(!a.attempts.is_empty());
+        // Same prompt, challenger session: must run the challenger ladder, not replay the entry.
+        let b = serve_session(&state, &mut rx, &session_in_arm(&state, Arm::Challenger, 0)).await;
+        assert!(
+            !b.attempts.is_empty(),
+            "challenger replayed the incumbent's cached answer"
+        );
+        assert_eq!(b.attempts[0].model, CHALLENGER);
+        // A later incumbent session replays the incumbent's own entry (so the cache is live), and
+        // the replay still carries the experiment record and route.
+        let c = serve_session(&state, &mut rx, &session_in_arm(&state, Arm::Incumbent, 1)).await;
+        assert!(
+            c.attempts.is_empty(),
+            "incumbent should have been a cache hit"
+        );
+        assert_eq!(c.experiment.as_ref().unwrap().arm, Arm::Incumbent);
+        assert_eq!(c.route_ix, Some(0));
+        // And the challenger's own entry is now separate: a second challenger session hits it.
+        let d = serve_session(&state, &mut rx, &session_in_arm(&state, Arm::Challenger, 1)).await;
+        assert!(d.attempts.is_empty(), "challenger should hit its own entry");
+        assert_eq!(d.experiment.as_ref().unwrap().arm, Arm::Challenger);
+    }
+
+    /// `/v1/feedback` is the evidence path: the first outcome per session reaches the monitor under
+    /// the arm that served it, later ones are ignored, and the feedback response is unchanged.
+    #[tokio::test]
+    async fn feedback_feeds_the_experiment_once_per_session() {
+        use firstpass_core::Arm;
+        let db = std::env::temp_dir().join(format!("firstpass-exp-{}.db", Uuid::now_v7()));
+        let (state, mut rx) = challenger_state(50.0, &db.to_string_lossy());
+        let session = session_in_arm(&state, Arm::Challenger, 0);
+        let t = serve_session(&state, &mut rx, &session).await;
+        let trace_id = t.trace_id.to_string();
+
+        // Persist the receipt the way the writer would, so the feedback path can look it up.
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        tx.try_send(t).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let send = |verdict: &'static str| {
+            let state = state.clone();
+            let body = Bytes::from(
+                serde_json::json!({
+                    "trace_id": trace_id, "gate_id": "tests", "verdict": verdict, "reporter": "ci"
+                })
+                .to_string(),
+            );
+            async move {
+                feedback(
+                    State(state),
+                    Extension(TenantId("default".to_owned())),
+                    body,
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            send("pass").await.status(),
+            axum::http::StatusCode::ACCEPTED
+        );
+        // A contradicting second report for the same session is recorded but not counted.
+        assert_eq!(
+            send("fail").await.status(),
+            axum::http::StatusCode::ACCEPTED
+        );
+        // Abstain carries no information.
+        assert_eq!(
+            send("abstain").await.status(),
+            axum::http::StatusCode::ACCEPTED
+        );
+
+        let r = &state.experiments.reports()[0].report;
+        assert_eq!(r.challenger.outcomes, 1);
+        assert!(
+            (r.challenger.outcome_sum - 1.0).abs() < f64::EPSILON,
+            "first outcome (pass) counts"
+        );
+        assert_eq!(r.incumbent.outcomes, 0);
+        let _ = std::fs::remove_file(&db);
     }
 
     // ---- Verified predictive routing: end-to-end through the enforce handler --------------

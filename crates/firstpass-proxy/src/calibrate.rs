@@ -293,7 +293,9 @@ pub fn calibrate_from_store_eprocess(
     delta: f64,
 ) -> Result<EProcessReport, StoreError> {
     let db_path = db_path.as_ref();
-    let traces = store::load_tenant_traces(db_path, tenant).unwrap_or_default();
+    let mut traces = store::load_tenant_traces(db_path, tenant).unwrap_or_default();
+    // Challenger-arm traces index a different ladder and score differently; see `is_incumbent_trace`.
+    traces.retain(crate::experiment::is_incumbent_trace);
     let mut pairs = Vec::with_capacity(traces.len());
     for trace in &traces {
         let deferred = store::load_deferred(db_path, &trace.trace_id.to_string())?;
@@ -317,7 +319,9 @@ pub fn calibrate_from_store_ltt(
     delta: f64,
     min_n: usize,
 ) -> Result<LttReport, StoreError> {
-    let traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    let mut traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    // Challenger-arm traces index a different ladder and score differently; see `is_incumbent_trace`.
+    traces.retain(crate::experiment::is_incumbent_trace);
     let mut pairs = Vec::with_capacity(traces.len());
     for trace in &traces {
         let deferred = store::load_deferred(&db_path, &trace.trace_id.to_string())?;
@@ -346,7 +350,9 @@ pub fn calibrate_from_store(
     // Tenant-scoped (ADR 0004 §D3): a tenant only ever calibrates against its own feedback. The
     // per-trace `load_deferred` below is safe unscoped because every `trace` here already belongs
     // to `tenant`.
-    let traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    let mut traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    // Challenger-arm traces index a different ladder and score differently; see `is_incumbent_trace`.
+    traces.retain(crate::experiment::is_incumbent_trace);
     let mut pairs = Vec::with_capacity(traces.len());
     for trace in &traces {
         let deferred = store::load_deferred(&db_path, &trace.trace_id.to_string())?;
@@ -435,6 +441,7 @@ mod tests {
             decision_prior: None,
             elastic: None,
             risk: None,
+            experiment: None,
         };
         trace.recompute_savings();
         trace
@@ -552,6 +559,62 @@ mod tests {
             "tenant-b must not see tenant-a's feedback"
         );
 
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// A challenger-arm trace's gate score means something different (another model), so none of
+    /// the three calibration methods may pool it with the incumbent's.
+    #[tokio::test]
+    async fn calibration_excludes_challenger_arm_traces() {
+        let db_path = std::env::temp_dir().join(format!(
+            "firstpass-calibrate-excl-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        let (tx, handle) = store::open(&db_path).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..20u32 {
+            let mut t = trace_with_score(0.7 + f64::from(i % 10) * 0.01);
+            if i >= 8 {
+                t.experiment = Some(firstpass_core::trace::ExperimentRecord {
+                    arm: firstpass_core::Arm::Challenger,
+                    percent: 50.0,
+                    bucket: 0,
+                    fingerprint: "0123456789abcdef".to_owned(),
+                });
+            }
+            ids.push(t.trace_id.to_string());
+            tx.try_send(t).unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+        for id in &ids {
+            let dv = DeferredVerdict {
+                gate_id: "outcome".to_owned(),
+                verdict: Verdict::Pass,
+                score: None,
+                reported_at: jiff::Timestamp::now(),
+                reporter: "unit-test".to_owned(),
+            };
+            store::append_deferred(&db_path, id, &dv).unwrap();
+        }
+        assert_eq!(
+            calibrate_from_store(&db_path, "tenant-a", 0.2, 0.1, 5)
+                .unwrap()
+                .n_pairs,
+            8
+        );
+        assert_eq!(
+            calibrate_from_store_ltt(&db_path, "tenant-a", 0.2, 0.1, 5)
+                .unwrap()
+                .n_pairs,
+            8
+        );
+        assert_eq!(
+            calibrate_from_store_eprocess(&db_path, "tenant-a", 0.2, 0.1)
+                .unwrap()
+                .n_pairs,
+            8
+        );
         let _ = std::fs::remove_file(&db_path);
     }
 

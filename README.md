@@ -475,6 +475,35 @@ Agent sessions get long, and that breaks routers in ways that are invisible unti
   (`[escalation.condense]`, off by default) — but only once *every* rung has overflowed, where the
   choice is a degraded answer versus none at all.
 
+### Agent workloads: choose the model by proof, not by prediction
+
+On 500 real SWE-bench agent runs per model, no gate a router can check on a finished agent run was
+precise enough for per-request escalation to beat always-top. Choosing the right model for the
+*workload* is what won: the cheapest model on par with opus-4.5 resolved 374 vs 384 (difference not
+significant) for 71% less ([numbers](docs/benchmarks/agentic-real-runs.md)). A public benchmark
+cannot tell you which model that is for *your* traffic, so Firstpass measures it on your traffic:
+
+```toml
+[route.challenger]
+ladder  = ["openrouter/minimax-m2.5"]   # what you'd like to switch to
+percent = 10                             # % of sessions served by it, randomized per session
+```
+
+Post task outcomes to `/v1/feedback` as you already do. `firstpass experiment` then reports one of
+three states. At any moment you read it, each conclusion is wrong with probability at most `alpha`:
+
+- **certified:** the challenger is no worse than your current ladder by more than `margin`
+  (default 5 points). If it is also cheaper, the report prints the ladder to adopt. You adopt it;
+  Firstpass never switches models on its own.
+- **halted:** the challenger is worse by more than the margin. New sessions go back to your ladder
+  automatically.
+- **undecided:** keep running. On the replay, good challengers certified after a median of about
+  3.6k sessions at a 50/50 split, and a 20-point-worse model halted after about 220.
+
+Method, defaults and limits: [ADR 0014](docs/adr/0014-certified-model-selection.md). The halt state
+is per process and rebuilt from receipts at startup. With several replicas each halts on the outcomes
+it receives, so run the report against the store all replicas write to.
+
 ### Running more than one replica
 
 The verified cache and session promotion are **in-process by default**. Behind a load balancer that

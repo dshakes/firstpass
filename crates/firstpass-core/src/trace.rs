@@ -13,6 +13,7 @@ use crate::Result;
 use crate::config::Mode;
 use crate::features::Features;
 use crate::hashchain::{Chained, record_hash};
+use crate::select::Arm;
 use crate::verdict::{GateResult, Score, Verdict};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,26 @@ pub struct RolloutRecord {
     pub enforced: bool,
 }
 
+/// Which arm of a certified-selection experiment served this request (ADR 0014).
+///
+/// Present on every request of a route that has a `[route.challenger]`, in *both* arms: the
+/// incumbent arm is the control, and a log that only marked the challenger could not be split back
+/// into the two populations. `arm` is the ladder that actually served — once an experiment halts,
+/// sessions that would have gone to the challenger are served by the incumbent and are recorded
+/// as such, so per-arm cost is never blended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExperimentRecord {
+    /// The ladder that served this request.
+    pub arm: Arm,
+    /// Configured challenger percent at decision time.
+    pub percent: f64,
+    /// The session's bucket within `0..10_000` (domain-tagged `challenger`).
+    pub bucket: u32,
+    /// Identity of the experiment configuration this request ran under (ladders, margin, alpha;
+    /// see `Challenger::fingerprint`). Evidence is only pooled across receipts that share it.
+    pub fingerprint: String,
+}
+
 /// A single routing decision, start to finish.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trace {
@@ -215,6 +236,10 @@ pub struct Trace {
     /// byte-identical to earlier traces and hash-chain compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<RiskCertificate>,
+    /// Which certified-selection arm served this request (ADR 0014). Absent unless the route has
+    /// a `[route.challenger]` — byte-identical to earlier traces and hash-chain compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiment: Option<ExperimentRecord>,
 }
 
 /// Which controller supplied the serve threshold. Precedence is e-process > ACI > fixed
@@ -549,6 +574,7 @@ mod tests {
             decision_prior: None,
             elastic: None,
             risk: None,
+            experiment: None,
         };
         t.recompute_savings();
         t
@@ -598,6 +624,39 @@ mod tests {
         let j = serde_json::to_string(&t).unwrap();
         let back: Trace = serde_json::from_str(&j).unwrap();
         assert_eq!(t, back);
+    }
+
+    // ── experiment backward-compat ───────────────────────────────────────────
+
+    /// A trace without an experiment record must serialize without the key and hash exactly as it
+    /// did before the field existed; a trace with one must differ (it is inside the chain).
+    #[test]
+    fn experiment_none_is_absent_and_hash_neutral() {
+        let t = sample_trace(GENESIS_HASH, 1);
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(!j.contains("experiment"), "None must be omitted: {j}");
+        // Re-derive the hash from the pre-field wire form: same JSON, so same hash.
+        let mut v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert!(v.as_object_mut().unwrap().remove("experiment").is_none());
+        let back: Trace = serde_json::from_value(v).unwrap();
+        assert_eq!(back.hash().unwrap(), t.hash().unwrap());
+
+        let mut with = t.clone();
+        with.experiment = Some(ExperimentRecord {
+            arm: Arm::Challenger,
+            percent: 10.0,
+            bucket: 42,
+            fingerprint: "0123456789abcdef".to_owned(),
+        });
+        assert_ne!(with.hash().unwrap(), t.hash().unwrap());
+        let jw = serde_json::to_string(&with).unwrap();
+        assert!(jw.contains("\"arm\":\"challenger\""), "{jw}");
+        // The record's field names are the audit contract: a rename is a schema change.
+        for key in ["\"percent\":", "\"bucket\":", "\"fingerprint\":"] {
+            assert!(jw.contains(key), "missing {key} in {jw}");
+        }
+        let rt: Trace = serde_json::from_str(&jw).unwrap();
+        assert_eq!(rt, with);
     }
 
     // ── propensity backward-compat ────────────────────────────────────────────

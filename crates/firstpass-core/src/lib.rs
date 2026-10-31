@@ -38,6 +38,7 @@ pub mod ltt;
 pub mod predictor;
 pub mod prior;
 pub mod rollout;
+pub mod select;
 pub mod trace;
 pub mod verdict;
 
@@ -56,9 +57,10 @@ pub use hashchain::{Chained, GENESIS_HASH, canonical_json, record_hash, verify_c
 pub use ltt::{LttDiagnostic, LttResult};
 pub use predictor::PassPredictor;
 pub use prior::cumulative_pass;
-pub use rollout::{Rollout, RolloutDecision, RolloutKey};
+pub use rollout::{Challenger, Rollout, RolloutDecision, RolloutKey};
+pub use select::{Arm, Experiment, Report as ExperimentReport, Status as ExperimentStatus};
 pub use trace::{
-    Attempt, DeferredVerdict, ElasticAction, ElasticDecision, FinalOutcome, PolicyRef, ProbeRegime,
-    ProbeSignal, RequestInfo, ServedFrom, Trace,
+    Attempt, DeferredVerdict, ElasticAction, ElasticDecision, ExperimentRecord, FinalOutcome,
+    PolicyRef, ProbeRegime, ProbeSignal, RequestInfo, ServedFrom, Trace,
 };
 pub use verdict::{GateResult, Score, Verdict};

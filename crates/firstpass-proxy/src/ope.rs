@@ -363,7 +363,9 @@ pub fn ope_from_store(
     tenant: &str,
     policy: &CandidatePolicy,
 ) -> Result<OpeReport, StoreError> {
-    let traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    let mut traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    // Challenger-arm traces index a different ladder and score differently; see `is_incumbent_trace`.
+    traces.retain(crate::experiment::is_incumbent_trace);
     let n_traces = traces.len();
     let mut points: Vec<EvalPoint> = Vec::with_capacity(n_traces);
 
@@ -598,7 +600,9 @@ pub fn ips_from_store(
     tenant: &str,
     candidate_start_rung: u32,
 ) -> Result<IpsReport, StoreError> {
-    let traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    let mut traces = store::load_tenant_traces(&db_path, tenant).unwrap_or_default();
+    // Challenger-arm traces index a different ladder and score differently; see `is_incumbent_trace`.
+    traces.retain(crate::experiment::is_incumbent_trace);
     let n_traces = traces.len();
 
     struct IpsPoint {
@@ -806,6 +810,7 @@ mod tests {
             decision_prior: None,
             elastic: None,
             risk: None,
+            experiment: None,
         };
         trace.recompute_savings();
         trace
@@ -895,6 +900,7 @@ mod tests {
             decision_prior: None,
             elastic: None,
             risk: None,
+            experiment: None,
         };
         trace.recompute_savings();
         trace
@@ -1314,6 +1320,7 @@ serve_threshold = 0.75
             decision_prior: None,
             elastic: None,
             risk: None,
+            experiment: None,
         };
         trace.recompute_savings();
         trace
@@ -1420,6 +1427,47 @@ serve_threshold = 0.75
             report.ips_cost
         );
 
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Challenger-arm traces index a different ladder: neither DM replay nor IPS may see them.
+    #[tokio::test]
+    async fn ope_excludes_challenger_arm_traces() {
+        let db = tmp_db();
+        let (tx, handle) = store::open(&db).unwrap();
+        for i in 0..10 {
+            let mut t = make_propensity_trace("t", 1, 0.010, Some(1.0));
+            if i >= 4 {
+                t.experiment = Some(firstpass_core::trace::ExperimentRecord {
+                    arm: firstpass_core::Arm::Challenger,
+                    percent: 50.0,
+                    bucket: 0,
+                    fingerprint: "0123456789abcdef".to_owned(),
+                });
+            }
+            tx.try_send(t).unwrap();
+        }
+        for _ in 0..3 {
+            let mut t = make_trace("t", 0, "haiku", 0.8, 0.001);
+            t.experiment = Some(firstpass_core::trace::ExperimentRecord {
+                arm: firstpass_core::Arm::Challenger,
+                percent: 50.0,
+                bucket: 0,
+                fingerprint: "0123456789abcdef".to_owned(),
+            });
+            tx.try_send(t).unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let ips = ips_from_store(&db, "t", 1).unwrap();
+        assert_eq!(ips.n_traces, 4, "IPS saw challenger-arm traces");
+        let policy = CandidatePolicy {
+            ladder: vec!["haiku".to_owned()],
+            serve_threshold: None,
+        };
+        let dm = ope_from_store(&db, "t", &policy).unwrap();
+        assert_eq!(dm.n_traces, 4, "DM replay saw challenger-arm traces");
         let _ = std::fs::remove_file(&db);
     }
 

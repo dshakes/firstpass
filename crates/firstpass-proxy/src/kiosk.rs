@@ -336,6 +336,7 @@ async fn spawn(toml: &str, db: &Path) -> Result<(String, tokio::task::JoinHandle
         providers,
         gate_health: Arc::new(crate::gate::GateHealthRegistry::new()),
         shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+        experiments: Arc::default(),
         guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
         traces,
         adaptive: None,

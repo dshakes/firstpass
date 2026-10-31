@@ -33,6 +33,7 @@ pub mod consistency;
 pub mod decision;
 pub mod demo;
 pub mod error;
+pub mod experiment;
 pub mod gate;
 pub mod guard;
 pub mod judge;

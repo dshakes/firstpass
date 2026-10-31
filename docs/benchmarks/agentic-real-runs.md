@@ -48,6 +48,14 @@ labelled EXPLORATORY; it was then replicated on runs it was not chosen on.
   - One scaffold, one benchmark.
   - Selection was cross-fit within one scaffold era, not across eras.
 
+Built as [ADR 0014](../adr/0014-certified-model-selection.md) (`[route.challenger]`). Shadow runs cannot
+score an agent session, because the challenger's trajectory diverges after its first tool call, so the
+product randomizes live sessions instead. It then decides with an anytime-valid non-inferiority test on
+task outcomes. `scripts/sim-certified-selection.py` replays that design on these runs. At a 5-point margin
+it certifies minimax-2.5, gemini-3-flash and opus-4.6 against opus-4.5 in 99% of replays, after a median
+of about 3.6k–4.2k sessions. It halts haiku and gpt-5-mini in 99–100% of replays. At the null boundary it
+certifies in 4.5%, within its 5% error rate.
+
 ## Full output
 
 ```
