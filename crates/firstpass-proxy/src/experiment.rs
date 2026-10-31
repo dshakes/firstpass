@@ -1772,4 +1772,378 @@ mod tests {
             "both replicas should agree on outcome count"
         );
     }
+
+    // ── Redis-backed shared-log tests ────────────────────────────────────────────────────────
+
+    /// Connect to the test Redis, wipe all keys whose name contains `unique_tenant`, and return
+    /// the open connection for subsequent cleanup calls.
+    #[cfg(feature = "redis-cache")]
+    async fn redis_cleanup(url: &str, unique_tenant: &str) {
+        let client = redis::Client::open(url).expect("redis client");
+        let mut conn = redis::aio::ConnectionManager::new(client)
+            .await
+            .expect("redis connection for cleanup");
+        use redis::AsyncCommands as _;
+        // SCAN for all experiment keys that carry this tenant in their name.
+        let pattern = format!("firstpass:exp*{unique_tenant}*");
+        let keys: Vec<String> = {
+            let mut out = Vec::new();
+            let mut cursor: u64 = 0;
+            loop {
+                let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(100u64)
+                    .query_async(&mut conn)
+                    .await
+                    .expect("SCAN");
+                out.extend(batch);
+                cursor = next;
+                if cursor == 0 {
+                    break;
+                }
+            }
+            out
+        };
+        if !keys.is_empty() {
+            let _: () = conn.del(keys).await.expect("DEL cleanup");
+        }
+    }
+
+    /// Two `RedisExperimentLog`-backed monitors on the same key converge to identical reports
+    /// after sync.
+    ///
+    /// Requires `FIRSTPASS_TEST_REDIS` (e.g. `redis://127.0.0.1:56411/15`). **Absent, this
+    /// panics rather than skipping**: a green suite that silently tested nothing is worse than a
+    /// failing one.
+    ///
+    /// Mutation test: disabling `sync_from_backend` keeps replica_b `Undecided` and the
+    /// `Halted` assertion below fails.
+    #[cfg(feature = "redis-cache")]
+    #[tokio::test]
+    async fn redis_two_replicas_converge_to_identical_reports_after_sync() {
+        let url = std::env::var("FIRSTPASS_TEST_REDIS").unwrap_or_else(|_| {
+            panic!(
+                "set FIRSTPASS_TEST_REDIS (e.g. redis://127.0.0.1:56411/15) to run the \
+                 redis-cache tests. Not skipped on purpose: a green suite that tested nothing \
+                 is worse than a red one."
+            )
+        });
+        // Unique tenant prevents key collisions across concurrent or repeated test runs.
+        let unique_tenant = format!("t-conv-{}", Uuid::now_v7());
+        let log_a = Arc::new(
+            RedisExperimentLog::connect(&url)
+                .await
+                .expect("RedisExperimentLog::connect"),
+        );
+        let log_b = Arc::new(
+            RedisExperimentLog::connect(&url)
+                .await
+                .expect("RedisExperimentLog::connect"),
+        );
+        let cfg = config();
+        let fp_str = fp();
+
+        let replica_a = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log_a) as Arc<dyn ExperimentLogBackend>);
+        let replica_b = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log_b) as Arc<dyn ExperimentLogBackend>);
+
+        // All evidence through replica A.
+        for i in 0..400 {
+            replica_a
+                .record_outcome(
+                    &unique_tenant,
+                    0,
+                    &fp_str,
+                    Arm::Incumbent,
+                    &format!("i{i}"),
+                    Verdict::Pass,
+                    0.10,
+                )
+                .await;
+            replica_a
+                .record_outcome(
+                    &unique_tenant,
+                    0,
+                    &fp_str,
+                    Arm::Challenger,
+                    &format!("c{i}"),
+                    Verdict::Fail,
+                    0.02,
+                )
+                .await;
+        }
+
+        // B has not synced: still Undecided locally.
+        assert_eq!(
+            replica_b.status(&unique_tenant, 0),
+            ExperimentStatus::Undecided,
+            "replica_b must be Undecided before syncing"
+        );
+
+        // One sync makes B read the full log and reach the same decision.
+        replica_b
+            .sync_from_backend(&unique_tenant, 0, &fp_str)
+            .await;
+        assert_eq!(
+            replica_b.status(&unique_tenant, 0),
+            ExperimentStatus::Halted,
+            "replica_b must be Halted after syncing from Redis log"
+        );
+
+        let reps_a = replica_a.reports();
+        let reps_b = replica_b.reports();
+        assert_eq!(reps_a.len(), 1);
+        assert_eq!(reps_b.len(), 1);
+        assert_eq!(
+            reps_a[0].report.status, reps_b[0].report.status,
+            "both replicas must agree on status"
+        );
+        assert_eq!(
+            reps_a[0].report.pairs, reps_b[0].report.pairs,
+            "both replicas must agree on pair counts"
+        );
+
+        redis_cleanup(&url, &unique_tenant).await;
+    }
+
+    /// `claim_session` prevents the same session from being double-counted across replicas when
+    /// both receive the same feedback.
+    ///
+    /// Requires `FIRSTPASS_TEST_REDIS`. Panics when unset (same rationale as above).
+    ///
+    /// Mutation test: if `claim_session` always returns `true`, both replicas append the same
+    /// session and the outcome count doubles; the `== 1` assertion fails.
+    #[cfg(feature = "redis-cache")]
+    #[tokio::test]
+    async fn redis_cross_replica_session_dedup_via_claim_session_holds() {
+        let url = std::env::var("FIRSTPASS_TEST_REDIS").unwrap_or_else(|_| {
+            panic!(
+                "set FIRSTPASS_TEST_REDIS (e.g. redis://127.0.0.1:56411/15) to run the \
+                 redis-cache tests. Not skipped on purpose: a green suite that tested nothing \
+                 is worse than a red one."
+            )
+        });
+        let unique_tenant = format!("t-dedup-{}", Uuid::now_v7());
+        let log = Arc::new(
+            RedisExperimentLog::connect(&url)
+                .await
+                .expect("RedisExperimentLog::connect"),
+        );
+        let cfg = config();
+        let fp_str = fp();
+
+        let replica_a = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+        let replica_b = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+
+        // Both replicas receive the same session feedback.
+        replica_a
+            .record_outcome(
+                &unique_tenant,
+                0,
+                &fp_str,
+                Arm::Incumbent,
+                "session-x",
+                Verdict::Pass,
+                0.10,
+            )
+            .await;
+        replica_b
+            .record_outcome(
+                &unique_tenant,
+                0,
+                &fp_str,
+                Arm::Incumbent,
+                "session-x",
+                Verdict::Pass,
+                0.10,
+            )
+            .await;
+
+        // Sync both.
+        replica_a
+            .sync_from_backend(&unique_tenant, 0, &fp_str)
+            .await;
+        replica_b
+            .sync_from_backend(&unique_tenant, 0, &fp_str)
+            .await;
+
+        let reps_a = replica_a.reports();
+        let reps_b = replica_b.reports();
+        assert_eq!(
+            reps_a[0].report.incumbent.outcomes, 1,
+            "session must be counted exactly once on replica A"
+        );
+        assert_eq!(
+            reps_b[0].report.incumbent.outcomes, 1,
+            "session must be counted exactly once on replica B"
+        );
+
+        redis_cleanup(&url, &unique_tenant).await;
+    }
+
+    /// A halt driven on replica A is propagated to replica B after one sync, blocking the
+    /// challenger there too.
+    ///
+    /// Requires `FIRSTPASS_TEST_REDIS`. Panics when unset.
+    ///
+    /// Mutation test: removing the `sync_from_backend` call means B never learns of the halt,
+    /// and the `challenger_blocked` assertion at the end fails.
+    #[cfg(feature = "redis-cache")]
+    #[tokio::test]
+    async fn redis_halt_on_one_replica_blocks_challenger_on_other() {
+        let url = std::env::var("FIRSTPASS_TEST_REDIS").unwrap_or_else(|_| {
+            panic!(
+                "set FIRSTPASS_TEST_REDIS (e.g. redis://127.0.0.1:56411/15) to run the \
+                 redis-cache tests. Not skipped on purpose: a green suite that tested nothing \
+                 is worse than a red one."
+            )
+        });
+        let unique_tenant = format!("t-halt-{}", Uuid::now_v7());
+        let log = Arc::new(
+            RedisExperimentLog::connect(&url)
+                .await
+                .expect("RedisExperimentLog::connect"),
+        );
+        let cfg = config();
+        let fp_str = fp();
+
+        let replica_a = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+        let replica_b = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+
+        // B starts unblocked.
+        assert!(
+            !replica_b.challenger_blocked(&unique_tenant, 0),
+            "replica_b must be unblocked before any evidence"
+        );
+
+        // Drive A to Halted.
+        let mut halted = false;
+        for i in 0..500 {
+            replica_a
+                .record_outcome(
+                    &unique_tenant,
+                    0,
+                    &fp_str,
+                    Arm::Incumbent,
+                    &format!("i{i}"),
+                    Verdict::Pass,
+                    0.10,
+                )
+                .await;
+            replica_a
+                .record_outcome(
+                    &unique_tenant,
+                    0,
+                    &fp_str,
+                    Arm::Challenger,
+                    &format!("c{i}"),
+                    Verdict::Fail,
+                    0.02,
+                )
+                .await;
+            if replica_a.status(&unique_tenant, 0) == ExperimentStatus::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "experiment never halted on replica A");
+
+        // B still does not know: it hasn't synced.
+        assert!(
+            !replica_b.challenger_blocked(&unique_tenant, 0),
+            "replica_b must not block before syncing"
+        );
+
+        // After one sync, B learns the halt and blocks.
+        replica_b
+            .sync_from_backend(&unique_tenant, 0, &fp_str)
+            .await;
+        assert!(
+            replica_b.challenger_blocked(&unique_tenant, 0),
+            "replica_b must block the challenger after syncing the halt from Redis"
+        );
+
+        redis_cleanup(&url, &unique_tenant).await;
+    }
+
+    /// Keys are isolated per tenant: evidence written under `tenant_a` is invisible to a monitor
+    /// reading under `tenant_b`.
+    ///
+    /// Requires `FIRSTPASS_TEST_REDIS`. Panics when unset.
+    ///
+    /// Mutation test: if the key omits the tenant and both monitors share one list, B would
+    /// gain outcomes after sync and the `Undecided` assertion fails.
+    #[cfg(feature = "redis-cache")]
+    #[tokio::test]
+    async fn redis_keys_are_isolated_per_tenant() {
+        let url = std::env::var("FIRSTPASS_TEST_REDIS").unwrap_or_else(|_| {
+            panic!(
+                "set FIRSTPASS_TEST_REDIS (e.g. redis://127.0.0.1:56411/15) to run the \
+                 redis-cache tests. Not skipped on purpose: a green suite that tested nothing \
+                 is worse than a red one."
+            )
+        });
+        let run_id = Uuid::now_v7();
+        let tenant_a = format!("t-iso-a-{run_id}");
+        let tenant_b = format!("t-iso-b-{run_id}");
+        let log = Arc::new(
+            RedisExperimentLog::connect(&url)
+                .await
+                .expect("RedisExperimentLog::connect"),
+        );
+        let cfg = config();
+        let fp_str = fp();
+
+        let monitor_a = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+        let monitor_b = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+
+        // Feed evidence only under tenant_a.
+        for i in 0..5 {
+            monitor_a
+                .record_outcome(
+                    &tenant_a,
+                    0,
+                    &fp_str,
+                    Arm::Incumbent,
+                    &format!("s{i}"),
+                    Verdict::Pass,
+                    0.10,
+                )
+                .await;
+        }
+
+        // Prove storage-level isolation: load_since for tenant_b returns nothing.
+        let records = log.load_since(&tenant_b, 0, &fp_str, 0).await;
+        assert!(
+            records.is_empty(),
+            "backend must return no records for tenant_b"
+        );
+
+        // monitor_b reads under tenant_b via status() (does not create an entry) and sees
+        // Undecided, confirming no cross-tenant contamination.
+        assert_eq!(
+            monitor_b.status(&tenant_b, 0),
+            ExperimentStatus::Undecided,
+            "evidence written under tenant_a must not appear under tenant_b"
+        );
+
+        // monitor_a still has its own evidence.
+        let reps = monitor_a.reports();
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0].report.incumbent.outcomes, 5);
+
+        // Clean up both tenants' keys.
+        redis_cleanup(&url, &tenant_a).await;
+        redis_cleanup(&url, &tenant_b).await;
+    }
 }
