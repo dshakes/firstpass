@@ -597,7 +597,7 @@ pub fn trace_experiment(
     db_path: impl AsRef<Path>,
     tenant: &str,
     trace_id: &str,
-) -> Result<Option<(String, usize, firstpass_core::trace::ExperimentRecord)>, StoreError> {
+) -> Result<Option<(String, usize, firstpass_core::trace::ExperimentRecord, f64)>, StoreError> {
     let conn = connect(db_path.as_ref())?;
     let body: Option<String> = conn
         .query_row(
@@ -608,12 +608,14 @@ pub fn trace_experiment(
         .optional()?;
     let Some(body) = body else { return Ok(None) };
     let trace: Trace = serde_json::from_str(&body)?;
+    let cost_usd = trace.final_.total_cost_usd;
     Ok(trace.experiment.map(|rec| {
         (
             trace.session_id,
             // Same fallback as the guardrail: a trace with no recorded route is route 0.
             trace.route_ix.map_or(0, |r| r as usize),
             rec,
+            cost_usd,
         )
     }))
 }

@@ -217,14 +217,27 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
 
     // Certified-selection experiments: rebuilt from receipts, so a restart cannot re-serve a
     // challenger that was already proven worse. A no-op unless some route has a challenger.
-    let experiments = Arc::new(
-        config
+    //
+    // Optional shared log (redis-cache feature): if any challenger route sets `redis_url`, all
+    // replicas sync through the same Redis list so halt/certify is a cluster-wide decision.
+    // `build_experiment_log` fails fast on a missing or unreachable Redis rather than silently
+    // falling back to per-replica state — the same policy as `verified_cache` and `promoter`.
+    let experiment_log = crate::proxy::build_experiment_log(&config).await?;
+    let experiments = Arc::new({
+        let monitor = config
             .routing
             .as_ref()
             .map_or_else(Default::default, |routing| {
                 crate::experiment::build_monitor(&config.db_path, routing)
-            }),
-    );
+            });
+        if let Some(log) = experiment_log {
+            monitor.with_log(log)
+        } else {
+            monitor
+        }
+    });
+    // Background sync keeps all replicas ≤ 5 s stale. No-op when no log backend is configured.
+    experiments.start_sync_task(std::time::Duration::from_secs(5));
 
     let state = AppState {
         config: Arc::new(config),

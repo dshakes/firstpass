@@ -775,6 +775,14 @@ impl ExperimentMonitor {
         verdict: Verdict,
         cost_usd: f64,
     ) -> bool {
+        // Filter Abstain before claim_session: an abstain carries no evidence, and burning the
+        // session slot would prevent a later non-Abstain verdict for the same session from being
+        // counted across replicas.
+        let outcome = match verdict {
+            Verdict::Pass => 1.0,
+            Verdict::Fail => 0.0,
+            Verdict::Abstain => return false,
+        };
         let Some(log) = self.log.as_ref().cloned() else {
             return self.observe_outcome(tenant, route_ix, fingerprint, arm, session_id, verdict);
         };
@@ -785,11 +793,6 @@ impl ExperimentMonitor {
         {
             return false;
         }
-        let outcome = match verdict {
-            Verdict::Pass => 1.0,
-            Verdict::Fail => 0.0,
-            Verdict::Abstain => return false,
-        };
         log.append(
             tenant,
             route_ix,
@@ -1770,6 +1773,56 @@ mod tests {
         assert_eq!(
             reps_b[0].report.incumbent.outcomes, 1,
             "both replicas should agree on outcome count"
+        );
+    }
+
+    /// Abstain must not burn the session slot: if a session's first feedback is Abstain,
+    /// a subsequent Pass/Fail for the same session must still be accepted.
+    ///
+    /// Mutation test: if Abstain is filtered AFTER `claim_session` (the pre-fix behaviour),
+    /// Abstain claims the slot and the subsequent Pass returns `false`; the `== 1` assertion
+    /// below fails.
+    #[tokio::test]
+    async fn abstain_does_not_burn_session_slot_before_claim() {
+        let shared = Arc::new(InMemoryExperimentLog::new());
+        let cfg = config();
+        let fp_str = fp();
+
+        let monitor = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+
+        // First feedback for this session is Abstain — must not claim the session slot.
+        let counted = monitor
+            .record_outcome(
+                "t",
+                0,
+                &fp_str,
+                Arm::Incumbent,
+                "session-abstain",
+                Verdict::Abstain,
+                0.10,
+            )
+            .await;
+        assert!(!counted, "Abstain must not be counted");
+
+        // Second feedback for the SAME session: Pass — must be accepted.
+        let counted = monitor
+            .record_outcome(
+                "t",
+                0,
+                &fp_str,
+                Arm::Incumbent,
+                "session-abstain",
+                Verdict::Pass,
+                0.10,
+            )
+            .await;
+        assert!(counted, "Pass after Abstain must be counted");
+
+        let reps = monitor.reports();
+        assert_eq!(
+            reps[0].report.incumbent.outcomes, 1,
+            "exactly one outcome must have been counted"
         );
     }
 

@@ -270,6 +270,71 @@ pub async fn build_promoter_async(
     Ok(Some(Arc::new(promoter)))
 }
 
+/// Build the shared experiment-log backend from `[route.challenger] redis_url`.
+///
+/// If no challenger route sets `redis_url`, returns `Ok(None)` (single-replica / in-process
+/// behaviour unchanged). If any route sets it:
+///
+/// - All routes that set `redis_url` must agree on the same URL (one shared Redis instance
+///   serves all experiments, since keys are already namespaced by tenant + route + fingerprint).
+///   Two different URLs is rejected at startup rather than silently misrouting experiment events.
+/// - Requires the `redis-cache` build feature; a URL without it is a hard startup error (same
+///   policy as `[escalation.verified_cache] redis_url`).
+/// - The connection is verified with PING before returning — an unreachable Redis is a startup
+///   failure, not a silent per-process fallback.
+///
+/// # Errors
+/// Returns a descriptive `String` on any of the above conditions.
+pub async fn build_experiment_log(
+    config: &ProxyConfig,
+) -> Result<Option<Arc<dyn crate::experiment::ExperimentLogBackend>>, String> {
+    use std::collections::HashSet;
+
+    let urls: HashSet<&str> = config
+        .routing
+        .iter()
+        .flat_map(|r| &r.routes)
+        .filter_map(|r| r.challenger.as_ref()?.redis_url.as_deref())
+        .collect();
+
+    // Destructure into (first_url, rest) without unwrap: the set is non-empty at this point.
+    let mut url_iter = urls.into_iter();
+    let Some(url) = url_iter.next() else {
+        return Ok(None); // unreachable (is_empty checked above), but keeps the compiler happy
+    };
+    if let Some(other) = url_iter.next() {
+        let mut found = vec![url, other];
+        found.extend(url_iter);
+        found.sort_unstable();
+        return Err(format!(
+            "[route.challenger] multiple distinct redis_url values across routes are not \
+             supported — all experiment logs must share one Redis instance (keys are namespaced \
+             by tenant + route + fingerprint). URLs found: {found:?}"
+        ));
+    }
+
+    #[cfg(feature = "redis-cache")]
+    {
+        // `RedisExperimentLog::connect` already has a 5s timeout; no extra wrapper needed.
+        let log = crate::experiment::RedisExperimentLog::connect(url).await?;
+        tracing::info!("experiment log: shared via redis");
+        Ok(Some(
+            Arc::new(log) as Arc<dyn crate::experiment::ExperimentLogBackend>
+        ))
+    }
+
+    #[cfg(not(feature = "redis-cache"))]
+    {
+        let _ = url;
+        Err(
+            "[route.challenger] redis_url is set, but this binary was built without the \
+             `redis-cache` feature. Rebuild with `--features redis-cache`, or remove redis_url \
+             from all [route.challenger] sections to keep experiment state in-process."
+                .to_owned(),
+        )
+    }
+}
+
 #[must_use]
 pub fn build_tenant_rate_limiter(
     config: &ProxyConfig,
@@ -1114,8 +1179,9 @@ async fn feedback(
             // is the evidence the experiment runs on. Best effort by construction — a failed
             // lookup is logged and skipped, never surfaced: the outcome is already durably
             // recorded above, and the monitor can always be rebuilt from receipts. Skipped
-            // entirely (no extra store read) when no route runs an experiment.
-            if state.experiments.is_active() {
+            // entirely (no extra store read) when no route runs an experiment or when the verdict
+            // is Abstain (carries no evidence and must not burn the cross-replica session slot).
+            if state.experiments.is_active() && verdict != Verdict::Abstain {
                 let (db_x, ten_x, tid_x) = (
                     state.config.db_path.clone(),
                     tenant.clone(),
@@ -1126,15 +1192,19 @@ async fn feedback(
                 })
                 .await
                 {
-                    Ok(Ok(Some((session, route_ix, rec)))) => {
-                        state.experiments.observe_outcome(
-                            &tenant,
-                            route_ix,
-                            &rec.fingerprint,
-                            rec.arm,
-                            &session,
-                            verdict,
-                        );
+                    Ok(Ok(Some((session, route_ix, rec, cost_usd)))) => {
+                        state
+                            .experiments
+                            .record_outcome(
+                                &tenant,
+                                route_ix,
+                                &rec.fingerprint,
+                                rec.arm,
+                                &session,
+                                verdict,
+                                cost_usd,
+                            )
+                            .await;
                     }
                     Ok(Ok(None)) => {}
                     Ok(Err(e)) => {
@@ -7805,6 +7875,111 @@ mod tests {
             "halted challenger was still served"
         );
         assert_eq!(t.experiment.unwrap().arm, Arm::Incumbent);
+    }
+
+    /// Shared-log wiring: when two AppStates (two "replicas") are built with an
+    /// `InMemoryExperimentLog` — the way `run.rs` wires a Redis-backed log — feedback processed
+    /// by replica A propagates to replica B after one `sync_from_backend`, halting the experiment
+    /// cluster-wide, and a session that would normally serve the challenger is rerouted to the
+    /// incumbent on replica B.
+    ///
+    /// Mutation test: remove `.with_log(...)` from replica B's monitor → `sync_from_backend`
+    /// is a no-op → `challenger_blocked` stays `false` after "sync" → the session IS served
+    /// by the challenger → the final `arm == Incumbent` assertion fails.
+    #[tokio::test]
+    async fn shared_log_wiring_halt_propagates_to_replica_b() {
+        use firstpass_core::{Arm, ExperimentStatus, Verdict};
+
+        let shared_log = Arc::new(crate::experiment::InMemoryExperimentLog::new());
+
+        // Replica A — with shared log (the way run.rs wires a Redis-backed log).
+        // `_rx_a`: replica A never serves requests in this test; we drive it via record_outcome.
+        let (mut state_a, _rx_a) = challenger_state(50.0, "unused-a.db");
+        {
+            let monitor = crate::experiment::ExperimentMonitor::from_config(
+                state_a.config.routing.as_ref().unwrap(),
+            )
+            .with_log(Arc::clone(&shared_log) as Arc<dyn crate::experiment::ExperimentLogBackend>);
+            state_a.experiments = Arc::new(monitor);
+        }
+
+        // Replica B — same shared log.
+        // MUTATION TEST: remove the `.with_log(...)` call below; the final assertions fail.
+        let (mut state_b, mut rx_b) = challenger_state(50.0, "unused-b.db");
+        {
+            let monitor = crate::experiment::ExperimentMonitor::from_config(
+                state_b.config.routing.as_ref().unwrap(),
+            )
+            .with_log(Arc::clone(&shared_log) as Arc<dyn crate::experiment::ExperimentLogBackend>);
+            state_b.experiments = Arc::new(monitor);
+        }
+
+        let fp = state_a.experiments.fingerprint(0).unwrap().to_owned();
+
+        // Drive experiment to Halted via record_outcome — the same function the HTTP feedback
+        // handler calls. Incumbent always passes; challenger always fails.
+        let mut halted = false;
+        for i in 0..500 {
+            state_a
+                .experiments
+                .record_outcome(
+                    "default",
+                    0,
+                    &fp,
+                    Arm::Incumbent,
+                    &format!("i{i}"),
+                    Verdict::Pass,
+                    0.10,
+                )
+                .await;
+            state_a
+                .experiments
+                .record_outcome(
+                    "default",
+                    0,
+                    &fp,
+                    Arm::Challenger,
+                    &format!("c{i}"),
+                    Verdict::Fail,
+                    0.02,
+                )
+                .await;
+            if state_a.experiments.status("default", 0) == ExperimentStatus::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "experiment never halted on replica A");
+
+        // Replica B has not synced yet — unaware of the halt.
+        assert!(
+            !state_b.experiments.challenger_blocked("default", 0),
+            "replica B must not block before syncing"
+        );
+
+        // One sync makes B read the shared log and reach the same Halted decision.
+        state_b
+            .experiments
+            .sync_from_backend("default", 0, &fp)
+            .await;
+        assert!(
+            state_b.experiments.challenger_blocked("default", 0),
+            "replica B must block the challenger after syncing the halt from the shared log"
+        );
+
+        // A session that would normally land on the challenger arm is rerouted to the incumbent.
+        // This verifies the block gate in the serve path (proxy.rs arm-assignment logic).
+        let ch_session = session_in_arm(&state_b, Arm::Challenger, 999);
+        let t = serve_session(&state_b, &mut rx_b, &ch_session).await;
+        assert_eq!(
+            t.experiment.as_ref().unwrap().arm,
+            Arm::Incumbent,
+            "a halted challenger-arm session must be rerouted to the incumbent on replica B"
+        );
+        assert_eq!(
+            t.attempts[0].model, INCUMBENT,
+            "the incumbent model must have been called, not the challenger"
+        );
     }
 
     /// If the store was unreadable at startup the monitor is built blocked: the challenger is not
