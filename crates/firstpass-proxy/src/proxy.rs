@@ -270,6 +270,42 @@ pub async fn build_promoter_async(
     Ok(Some(Arc::new(promoter)))
 }
 
+/// The paired-challenger spend ledger, seeded with today's spend from the persisted pairs.
+///
+/// The ledger itself is in memory, so without this a restart would reset `max_usd_per_day` to
+/// zero spent and a crash-looping or redeployed proxy could exceed its daily cap many times over.
+/// Only touches the store when some route has a paired challenger. An unreadable store seeds
+/// nothing: the experiment monitor already fails closed on the same read, and a blocked
+/// challenger never runs.
+#[must_use]
+pub fn build_paired_ledger(config: &ProxyConfig) -> crate::shadow::ShadowLedger {
+    let ledger = crate::shadow::ShadowLedger::new();
+    let any_paired = config.routing.as_ref().is_some_and(|r| {
+        r.routes
+            .iter()
+            .any(|route| route.challenger.as_ref().is_some_and(|c| c.is_paired()))
+    });
+    if !any_paired {
+        return ledger;
+    }
+    match crate::store::load_all_experiment_pairs(&config.db_path) {
+        Ok(rows) => {
+            let now = jiff::Timestamp::now();
+            for row in &rows {
+                ledger.seed(
+                    &row.tenant,
+                    row.route_ix,
+                    row.challenger_cost_usd,
+                    row.ts,
+                    now,
+                );
+            }
+        }
+        Err(e) => tracing::warn!(%e, "paired ledger: could not read today's spend from the store"),
+    }
+    ledger
+}
+
 /// Build the shared experiment-log backend from `[route.challenger] redis_url`.
 ///
 /// If no challenger route sets `redis_url`, returns `Ok(None)` (single-replica / in-process
@@ -673,20 +709,24 @@ async fn receipts(
     // Cap the page: an unbounded read of a long-lived store would be a trivial memory amplifier.
     let limit = q.limit.unwrap_or(20).clamp(1, 200);
     let db = state.config.db_path.clone();
-    let traces =
-        match tokio::task::spawn_blocking(move || crate::store::load_tenant_traces(&db, &tenant))
-            .await
-        {
-            Ok(Ok(t)) => t,
-            // Forgiving on an unreadable store, exactly like `firstpass trace` and the MCP tools: a
-            // fresh deployment has no database yet, and that is not an error worth a 500.
-            _ => Vec::new(),
-        };
-    let summary = receipts_summary(&traces);
+    // One page of rows plus a SQL aggregate: the panel polls this every two seconds, and loading a
+    // tenant's whole history per poll grew linearly with the store.
+    let (traces, summary) = match tokio::task::spawn_blocking(move || {
+        Ok::<_, crate::store::StoreError>((
+            crate::store::load_recent_tenant_traces(&db, &tenant, limit)?,
+            crate::store::tenant_receipts_summary(&db, &tenant)?,
+        ))
+    })
+    .await
+    {
+        Ok(Ok(t)) => t,
+        // Forgiving on an unreadable store, exactly like `firstpass trace` and the MCP tools: a
+        // fresh deployment has no database yet, and that is not an error worth a 500.
+        _ => (Vec::new(), crate::store::ReceiptsSummary::default()),
+    };
+    let summary = summary_json(&summary);
     let items: Vec<serde_json::Value> = traces
         .iter()
-        .rev()
-        .take(limit)
         .map(|t| {
             let f = &t.final_;
             serde_json::json!({
@@ -744,34 +784,17 @@ async fn receipts(
 
 /// Totals over EVERY receipt the tenant has (not just the page returned), so the panel's overview
 /// does not change meaning with the page size.
-fn receipts_summary(traces: &[Trace]) -> serde_json::Value {
-    let (mut spent, mut baseline, mut first_pass, mut escalated) = (0.0_f64, 0.0_f64, 0u64, 0u64);
-    let (mut pass, mut fail, mut abstain) = (0u64, 0u64, 0u64);
-    for t in traces {
-        let f = &t.final_;
-        spent += f.total_cost_usd;
-        baseline += f.counterfactual_baseline_usd;
-        first_pass += u64::from(f.served_rung == Some(0));
-        escalated += u64::from(f.escalations > 0);
-        for a in &t.attempts {
-            for g in &a.gates {
-                match g.verdict {
-                    Verdict::Pass => pass += 1,
-                    Verdict::Fail => fail += 1,
-                    Verdict::Abstain => abstain += 1,
-                }
-            }
-        }
-    }
+fn summary_json(s: &crate::store::ReceiptsSummary) -> serde_json::Value {
+    let [pass, fail, abstain] = s.gates;
     serde_json::json!({
-        "requests": traces.len(),
-        "spent_usd": spent,
-        "baseline_usd": baseline,
+        "requests": s.requests,
+        "spent_usd": s.spent_usd,
+        "baseline_usd": s.baseline_usd,
         // Signed, never floored: escalating past the top rung genuinely costs more than going
         // straight there, and the panel shows that loss rather than minting a saving.
-        "saved_usd": baseline - spent,
-        "first_pass": first_pass,
-        "escalated": escalated,
+        "saved_usd": s.baseline_usd - s.spent_usd,
+        "first_pass": s.first_pass,
+        "escalated": s.escalated,
         "gates": { "pass": pass, "fail": fail, "abstain": abstain },
     })
 }
@@ -806,10 +829,25 @@ async fn experiments(
         .filter_map(|(ix, r)| r.challenger.as_ref().map(|c| (ix, r, c)))
         .map(|(ix, r, c)| {
             let status = state.experiments.status(&tenant, ix);
+            // Paired runs the challenger off-path on sampled requests under a daily cap, so the
+            // panel shows that cap and today's spend against it instead of a session percent.
+            let paired = c.is_paired().then(|| {
+                serde_json::json!({
+                    "sample_rate": c.sample_rate,
+                    "max_usd_per_day": c.max_usd_per_day,
+                    "spent_today_usd": state.paired_ledger.spent_today(
+                        &tenant,
+                        ix,
+                        jiff::Timestamp::now(),
+                    ),
+                })
+            });
             serde_json::json!({
                 "route_ix": ix,
                 "incumbent_ladder": r.ladder,
                 "challenger_ladder": c.ladder,
+                "mode": if c.is_paired() { "paired" } else { "live" },
+                "paired": paired,
                 "percent": c.percent,
                 "margin": c.margin,
                 "alpha": c.alpha,
@@ -836,9 +874,70 @@ struct ReceiptsQuery {
 /// front of an operator's routing data.
 async fn panel() -> impl IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8".to_owned(),
+            ),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                PANEL_CSP.clone(),
+            ),
+            (
+                axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                "nosniff".to_owned(),
+            ),
+            (
+                axum::http::header::REFERRER_POLICY,
+                "no-referrer".to_owned(),
+            ),
+        ],
         PANEL_HTML,
     )
+}
+
+/// The panel's Content-Security-Policy: the escaper is the first line of defence against a
+/// planted `model` string, and this is the second. Only the one inline script whose SHA-256 matches
+/// the compiled-in panel may run, so injected markup that slipped past `esc` still cannot execute
+/// (no inline handlers, no `<script>`, no `javascript:` URLs). Fetches go to this origin only, and
+/// the page may not be framed. Styles stay `'unsafe-inline'`: the bars are sized by `style=`
+/// attributes, and CSS cannot run code or exfiltrate under `default-src 'none'`.
+static PANEL_CSP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use sha2::Digest as _;
+    let script = PANEL_HTML
+        .split_once("<script>")
+        .and_then(|(_, rest)| rest.split_once("</script>"))
+        .map_or("", |(body, _)| body);
+    let digest = sha2::Sha256::digest(script.as_bytes());
+    format!(
+        "default-src 'none'; script-src 'sha256-{}'; style-src 'unsafe-inline'; \
+         connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; \
+         frame-ancestors 'none'",
+        base64_std(&digest)
+    )
+});
+
+/// Standard, padded base64 (RFC 4648 §4), the encoding CSP hash sources require. Twenty lines
+/// here instead of a new direct dependency for one call site.
+fn base64_std(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for (i, shift) in [18u32, 12, 6, 0].into_iter().enumerate() {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> shift) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
@@ -8313,6 +8412,101 @@ mod tests {
         state
     }
 
+    /// A restart must not reset the paired daily cap: the ledger is rebuilt from today's persisted
+    /// pairs (and only today's), per tenant.
+    #[tokio::test]
+    async fn paired_ledger_is_seeded_from_todays_pairs_at_startup() {
+        let db = std::env::temp_dir().join(format!("firstpass-ledger-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let now = jiff::Timestamp::now();
+        let row = |tenant: &str, usd: f64, ts: jiff::Timestamp| crate::store::ExperimentPairRow {
+            tenant: tenant.to_owned(),
+            route_ix: 0,
+            fingerprint: "fp".to_owned(),
+            trace_id: Uuid::now_v7(),
+            x_inc: 1.0,
+            x_ch: 1.0,
+            challenger_cost_usd: usd,
+            ts,
+        };
+        let two_days_ago = now - jiff::SignedDuration::from_hours(48);
+        for r in [
+            row("tenant-a", 0.40, now),
+            row("tenant-a", 0.70, now),
+            row("tenant-a", 9.00, two_days_ago),
+            row("tenant-b", 0.10, now),
+        ] {
+            crate::store::append_experiment_pair(&db, &r).unwrap();
+        }
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 1.0\n"
+        );
+        let db_s = db.to_string_lossy().into_owned();
+        let cfg = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.clone()),
+            "FIRSTPASS_DB" => Some(db_s.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let ledger = build_paired_ledger(&cfg);
+        assert!((ledger.spent_today("tenant-a", 0, now) - 1.10).abs() < 1e-9);
+        assert!((ledger.spent_today("tenant-b", 0, now) - 0.10).abs() < 1e-9);
+        assert!(
+            !ledger.may_spend("tenant-a", 0, 1.0, now),
+            "cap survives restart"
+        );
+        assert!(ledger.may_spend("tenant-b", 0, 1.0, now));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A paired challenger reports its mode, sample rate, daily cap and the CALLER's spend today,
+    /// never another tenant's.
+    #[tokio::test]
+    async fn experiments_endpoint_reports_paired_mode_and_tenant_spend() {
+        use tower::ServiceExt;
+        let db = std::env::temp_dir().join(format!("firstpass-ux-paired-{}.db", Uuid::now_v7()));
+        let mut state = ux_state(&db.to_string_lossy());
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             sample_rate = 0.25\nmax_usd_per_day = 2.0\n"
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
+        state.config = Arc::new(cfg);
+        let now = jiff::Timestamp::now();
+        state.paired_ledger.debit("tenant-a", 0, 0.5, now);
+        state.paired_ledger.debit("tenant-b", 0, 1.25, now);
+        let router = app(state).expect("router");
+
+        let resp = router
+            .clone()
+            .oneshot(ux_get("/v1/experiments", Some("tenant-a.key-a")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let a = body_json(resp).await;
+        let c = &a["configured"][0];
+        assert_eq!(c["mode"], "paired", "{a}");
+        assert_eq!(c["paired"]["sample_rate"], 0.25);
+        assert_eq!(c["paired"]["max_usd_per_day"], 2.0);
+        assert_eq!(c["paired"]["spent_today_usd"], 0.5, "tenant-a's spend only");
+
+        let resp = router
+            .oneshot(ux_get("/v1/experiments", Some("tenant-b.key-b")))
+            .await
+            .unwrap();
+        let b = body_json(resp).await;
+        assert_eq!(b["configured"][0]["paired"]["spent_today_usd"], 1.25);
+        let _ = std::fs::remove_file(&db);
+    }
+
     fn ux_get(uri: &str, bearer: Option<&str>) -> axum::http::Request<Body> {
         let mut b = axum::http::Request::builder().method("GET").uri(uri);
         if let Some(k) = bearer {
@@ -8415,6 +8609,8 @@ mod tests {
         assert_eq!(exps[0]["challenger_ladder"][0], CHALLENGER);
         assert_eq!(exps[0]["recommendation"], "keep_running");
         assert_eq!(a["configured"][0]["unavailable"], false);
+        assert_eq!(a["configured"][0]["mode"], "live");
+        assert!(a["configured"][0]["paired"].is_null());
 
         // Tenant B has sent nothing: no experiment evidence, and nothing of A's leaks in.
         let resp = router
@@ -8465,33 +8661,89 @@ mod tests {
     /// The summary the overview tiles read: rung-0 serves, escalations and the gate mix, with the
     /// saving kept signed (a loss is never floored to zero).
     #[test]
-    fn receipts_summary_counts_first_pass_escalations_and_keeps_losses_signed() {
-        let cfg = ProxyConfig::from_lookup(|_| None).unwrap();
-        let mut ok = build_error_trace(&cfg, &Bytes::from_static(b"{}"), 5, None);
-        ok.final_.served_rung = Some(0);
-        ok.final_.total_cost_usd = 1.0;
-        ok.final_.counterfactual_baseline_usd = 3.0;
-        let mut escalated = ok.clone();
-        escalated.final_.served_rung = Some(1);
-        escalated.final_.escalations = 1;
-        escalated.final_.total_cost_usd = 5.0;
-        escalated.final_.counterfactual_baseline_usd = 3.0;
-        let s = receipts_summary(&[ok, escalated]);
+    fn receipts_summary_json_keeps_losses_signed() {
+        let s = summary_json(&crate::store::ReceiptsSummary {
+            requests: 2,
+            spent_usd: 6.0,
+            baseline_usd: 6.0,
+            first_pass: 1,
+            escalated: 1,
+            gates: [3, 1, 2],
+        });
         assert_eq!(s["requests"], 2);
         assert_eq!(s["first_pass"], 1);
         assert_eq!(s["escalated"], 1);
-        // Spent 6 against a baseline of 6: the escalated request lost 2 and the other saved 2.
+        assert_eq!(s["gates"]["pass"], 3);
+        assert_eq!(s["gates"]["fail"], 1);
+        assert_eq!(s["gates"]["abstain"], 2);
         assert!((s["saved_usd"].as_f64().unwrap()).abs() < 1e-9);
-        let loss = receipts_summary(&[{
-            let mut t = build_error_trace(&cfg, &Bytes::from_static(b"{}"), 5, None);
-            t.final_.total_cost_usd = 5.0;
-            t.final_.counterfactual_baseline_usd = 3.0;
-            t
-        }]);
+        let loss = summary_json(&crate::store::ReceiptsSummary {
+            spent_usd: 5.0,
+            baseline_usd: 3.0,
+            ..Default::default()
+        });
         assert!(
             loss["saved_usd"].as_f64().unwrap() < 0.0,
             "loss stays negative"
         );
+    }
+
+    /// The panel must not be able to run injected script: the CSP pins the one inline script by
+    /// hash, and that hash must be the hash of the script actually served.
+    #[tokio::test]
+    async fn panel_is_served_with_a_csp_pinning_its_own_script() {
+        use sha2::Digest as _;
+        let resp = panel().await.into_response();
+        let csp = resp
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .expect("panel sets a CSP")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = PANEL_HTML.split_once("<script>").unwrap().1;
+        let script = body.split_once("</script>").unwrap().0;
+        // If the tag ever gains an attribute, extraction would fall back to "" and both sides
+        // would agree on the hash of nothing while every browser refused the real script.
+        assert!(script.len() > 1000, "extracted the panel script");
+        let want = format!(
+            "script-src 'sha256-{}'",
+            base64_std(&sha2::Sha256::digest(script.as_bytes()))
+        );
+        assert!(csp.contains(&want), "{csp}");
+        for directive in [
+            "default-src 'none'",
+            "connect-src 'self'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(csp.contains(directive), "{directive} missing: {csp}");
+        }
+        assert!(!csp.contains("unsafe-eval") && !csp.contains("script-src 'unsafe-inline'"));
+        assert_eq!(
+            PANEL_HTML.matches("<script").count(),
+            1,
+            "one inline script"
+        );
+        assert_eq!(
+            resp.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+    }
+
+    #[test]
+    fn base64_std_matches_rfc4648_vectors() {
+        for (input, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_std(input.as_bytes()), want, "{input:?}");
+        }
+        assert_eq!(base64_std(&[0xfb, 0xff]), "+/8=");
     }
 
     /// Panel markup: the experiments view is wired to its endpoint, and nothing in it reaches off

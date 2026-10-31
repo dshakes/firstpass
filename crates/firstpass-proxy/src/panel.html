@@ -150,7 +150,7 @@
 
   <section id="view-experiments" role="tabpanel" aria-labelledby="tab-experiments" class="hidden">
     <h2>Experiments</h2>
-    <p class="lede">A route with a <code>[route.challenger]</code> sends a random share of sessions to a cheaper model and measures task outcomes against your current one. Firstpass never switches models on its own: it stops sending traffic to a challenger that is proven worse, and shows you the change to make when one is proven good enough.</p>
+    <p class="lede">A route with a <code>[route.challenger]</code> tests a cheaper model against your current one: in live mode a random share of sessions is served by it and you report task outcomes; in paired mode it re-runs sampled requests off-path and your gates grade both answers. Firstpass never switches models on its own: it stops sending traffic to a challenger that is proven worse, and shows you the change to make when one is proven good enough.</p>
     <div id="exp-list"></div>
   </section>
 
@@ -304,7 +304,14 @@
     halted: 'The challenger is worse than your current model by more than the margin. Firstpass has already stopped sending it new sessions (automatic: it only ever moves traffic back to your ladder). Nothing for you to do.',
     unavailable: 'The receipt history could not be read at startup, so Firstpass cannot tell whether this challenger was already halted. It fails closed: every session is served by your current ladder until the store is readable and the proxy restarted.',
   };
-  const EVIDENCE = 'Evidence is an e-value: a running bet against "the challenger is too different". It starts at 1 and the test decides when it reaches 1/alpha (20 at the default alpha 0.05). The bar is log scale. Because it is anytime-valid you may read it as often as you like without inflating the error rate.';
+  // Paired mode has no feedback call and never serves a session from the challenger, so the two
+  // states whose advice is about sessions and outcomes read differently there.
+  const EXPLAIN_PAIRED = {
+    undecided: 'Not enough evidence either way yet. Keep sending traffic: each sampled request adds one pair, graded by your gates. Nothing is decided and nothing changes.',
+    halted: 'The challenger is worse than your current model by more than the margin. Firstpass has already stopped re-running it on your requests. Nothing for you to do.',
+  };
+  const explain = (status, conf) => (isPaired(conf) && EXPLAIN_PAIRED[status]) || EXPLAIN[status] || '';
+  const EVIDENCE ='Evidence is an e-value: a running bet against "the challenger is too different". It starts at 1 and the test decides when it reaches 1/alpha (20 at the default alpha 0.05). The bar is log scale. Because it is anytime-valid you may read it as often as you like without inflating the error rate.';
 
   function h_evbar(label, e, target, kind) {
     const v = Number(e) || 0;
@@ -344,9 +351,10 @@
     return `<article class="box card" aria-label="Experiment, route ${esc(v.route_ix)}">
       <div class="hd"><h3>Route ${esc(v.route_ix)}</h3><span class="pill ${esc(status)}">${esc(status)}</span></div>
       <div class="ladder">current: ${esc((conf ? conf.incumbent_ladder : []).join(' > ') || 'your ladder')} &nbsp;|&nbsp; challenger: ${esc((v.challenger_ladder || []).join(' > '))}</div>
-      <p style="margin:0 0 8px">${esc(EXPLAIN[status] || '')}</p>
-      <div class="wrap"><table><caption class="lede" style="text-align:left;margin:0">${esc(num(r.pairs))} matched pairs. Margin ${esc(r.margin)}, alpha ${esc(r.alpha)}.</caption>
-        <thead><tr><th>arm</th><th>sessions with outcome</th><th>success</th><th>requests</th><th>$/request</th></tr></thead>
+      ${h_mode(conf)}
+      <p style="margin:0 0 8px">${esc(explain(status, conf))}</p>
+      <div class="wrap"><table><caption class="lede" style="text-align:left;margin:0">${esc(num(r.pairs))} matched pairs. Margin ${esc(r.margin)}, alpha ${esc(r.alpha)}.${esc(isPaired(conf) ? ' Success is gate pass on the same request.' : '')}</caption>
+        <thead><tr><th>arm</th><th>${esc(isPaired(conf) ? 'requests compared' : 'sessions with outcome')}</th><th>success</th><th>requests</th><th>$/request</th></tr></thead>
         <tbody>${h_arm('current', r.incumbent)}${h_arm('challenger', r.challenger)}</tbody></table></div>
       ${h_evbar('Evidence the challenger is good enough', r.e_certify, target, 'cert')}
       ${h_evbar('Evidence the challenger is too weak', r.e_halt, target, 'halt')}
@@ -354,13 +362,27 @@
       ${h_rec}${h_stale}
     </article>`;
   }
-  const h_feedbackpre = conf => (conf.unavailable ? '' : `<pre>${esc(FEEDBACK)}</pre>`);
+  const isPaired = conf => !!conf && conf.mode === 'paired';
+  // How the challenger gets its evidence, in one line: a share of sessions (live) or a sample of
+  // requests re-run off-path under a daily cap (paired).
+  function modeLine(conf) {
+    if (!conf) return '';
+    if (!isPaired(conf)) return 'live: ' + Number(conf.percent) + '% of sessions served by the challenger';
+    const p = conf.paired || {};
+    const cap = p.max_usd_per_day === null || p.max_usd_per_day === undefined ? 'no cap' : usd(p.max_usd_per_day);
+    return 'paired: ' + Math.round(Number(p.sample_rate) * 100) + '% of requests re-run on the challenger, ' + usd(p.spent_today_usd) + ' of ' + cap + ' spent today (UTC)';
+  }
+  const h_mode = conf => (conf ? `<div class="ladder">${esc(modeLine(conf))}</div>` : '');
+  const h_feedbackpre = conf => (conf.unavailable || isPaired(conf) ? '' : `<pre>${esc(FEEDBACK)}</pre>`);
+  const WAIT_LIVE = 'Configured, but no outcomes have been recorded yet. Send traffic, then post one task outcome per session to the feedback endpoint:';
+  const WAIT_PAIRED = 'Configured in paired mode, no pairs yet. After each sampled request is answered, the challenger runs on the same request and both are graded by your gates. No feedback call is needed, and no caller is ever served by the challenger.';
   function h_waiting(conf) {
     const status = conf.unavailable ? 'unavailable' : 'undecided';
     return `<article class="box card" aria-label="Experiment, route ${esc(conf.route_ix)}">
       <div class="hd"><h3>Route ${esc(conf.route_ix)}</h3><span class="pill ${esc(status)}">${esc(status)}</span></div>
-      <div class="ladder">current: ${esc(conf.incumbent_ladder.join(' > '))} &nbsp;|&nbsp; challenger: ${esc(conf.challenger_ladder.join(' > '))} (${esc(conf.percent)}% of sessions)</div>
-      <p style="margin:0 0 8px">${esc(conf.unavailable ? EXPLAIN.unavailable : 'Configured, but no outcomes have been recorded yet. Send traffic, then post one task outcome per session to the feedback endpoint:')}</p>
+      <div class="ladder">current: ${esc(conf.incumbent_ladder.join(' > '))} &nbsp;|&nbsp; challenger: ${esc(conf.challenger_ladder.join(' > '))}</div>
+      ${h_mode(conf)}
+      <p style="margin:0 0 8px">${esc(conf.unavailable ? EXPLAIN.unavailable : (isPaired(conf) ? WAIT_PAIRED : WAIT_LIVE))}</p>
       ${h_feedbackpre(conf)}
     </article>`;
   }
@@ -426,7 +448,11 @@
         ${h_gates(a)}
       </div>`).join('');
   }
-  const h_exp = r => (r.experiment ? h_badge(r) + ' ' + esc(r.experiment.percent) + '% of sessions, bucket ' + esc(r.experiment.bucket) : 'none: this route has no challenger');
+  // Live mode requires 0 < percent < 100, so a recorded percent of 0 is a paired experiment: the
+  // caller was always served by the current ladder and the challenger only ever ran off-path.
+  const h_exp = r => (!r.experiment ? 'none: this route has no challenger'
+    : Number(r.experiment.percent) === 0 ? esc('paired: served by your ladder; the challenger may also have run on this request off-path, if sampled')
+      : h_badge(r) + ' ' + esc(r.experiment.percent) + '% of sessions, bucket ' + esc(r.experiment.bucket));
   const h_deferred = r => ((r.deferred || []).length ? '<h2>Outcome feedback</h2>' + r.deferred.map(d => `<div class="mono" style="font-size:12px">${esc(d.gate_id)}: <span class="${cls(d.verdict)}">${esc(String(d.verdict).toUpperCase())}</span> by ${esc(d.reporter)}</div>`).join('') : '');
   function openDrawer(id) {
     const r = state.receipts.find(x => x.trace_id === id);
@@ -496,8 +522,15 @@
     setTimeout(() => { b.textContent = 'Copy'; }, 2000);
   });
 
+  const VIEWS = ['overview', 'experiments', 'receipts'];
   const start = (location.hash || '').slice(1);
-  show(['overview', 'experiments', 'receipts'].includes(start) ? start : 'overview');
+  show(VIEWS.includes(start) ? start : 'overview');
+  // A pasted link, back/forward, or an edited hash changes only the fragment: no reload, so follow
+  // it here or the page would show one view while the address bar names another.
+  window.addEventListener('hashchange', () => {
+    const v = (location.hash || '').slice(1);
+    if (VIEWS.includes(v) && v !== state.view) show(v);
+  });
   tick();
 </script>
 </body>

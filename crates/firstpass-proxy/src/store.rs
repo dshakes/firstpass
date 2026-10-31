@@ -397,6 +397,160 @@ pub fn load_tenant_traces(
     Ok(traces)
 }
 
+/// **Tenant-scoped** page: the tenant's `limit` most recent traces, newest first. Reads only the
+/// rows it returns (the `(tenant, seq)` index serves the order), so a panel polling a long-lived
+/// store pays for one page, not for the whole history.
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] on a database error, or [`StoreError::Json`] if a stored
+/// row is not valid trace JSON.
+pub fn load_recent_tenant_traces(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+    limit: usize,
+) -> Result<Vec<Trace>, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let mut stmt =
+        conn.prepare("SELECT body FROM traces WHERE tenant = ?1 ORDER BY seq DESC LIMIT ?2")?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = stmt.query_map(rusqlite::params![tenant, limit], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut traces = Vec::new();
+    for row in rows {
+        traces.push(serde_json::from_str(&row?)?);
+    }
+    Ok(traces)
+}
+
+/// All-time totals over a tenant's receipts, for the panel's overview tiles.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReceiptsSummary {
+    /// Number of receipts.
+    pub requests: u64,
+    /// Sum of `final.total_cost_usd`.
+    pub spent_usd: f64,
+    /// Sum of `final.counterfactual_baseline_usd`.
+    pub baseline_usd: f64,
+    /// Receipts served at rung 0.
+    pub first_pass: u64,
+    /// Receipts that climbed at least one rung.
+    pub escalated: u64,
+    /// Gate verdicts across every attempt: pass, fail, abstain.
+    pub gates: [u64; 3],
+}
+
+impl ReceiptsSummary {
+    fn merged(&self, d: &Self) -> Self {
+        Self {
+            requests: self.requests + d.requests,
+            spent_usd: self.spent_usd + d.spent_usd,
+            baseline_usd: self.baseline_usd + d.baseline_usd,
+            first_pass: self.first_pass + d.first_pass,
+            escalated: self.escalated + d.escalated,
+            gates: [
+                self.gates[0] + d.gates[0],
+                self.gates[1] + d.gates[1],
+                self.gates[2] + d.gates[2],
+            ],
+        }
+    }
+}
+
+/// Per-(store, tenant) running totals and the last `seq` folded into them.
+type SummaryCache = std::collections::HashMap<(std::path::PathBuf, String), (i64, ReceiptsSummary)>;
+static SUMMARY_CACHE: std::sync::LazyLock<std::sync::Mutex<SummaryCache>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// **Tenant-scoped** aggregate over every stored receipt, computed inside SQLite and kept
+/// incrementally.
+///
+/// The panel polls this every two seconds, so it must not re-read the whole history each time.
+/// Receipts are append-only (the hash chain forbids rewriting one), so the totals up to a `seq`
+/// never change: each call folds in only the rows after the last `seq` it saw. A store whose
+/// newest `seq` is below the cached one was replaced, and is recounted from zero.
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] on a database error.
+pub fn tenant_receipts_summary(
+    db_path: impl AsRef<Path>,
+    tenant: &str,
+) -> Result<ReceiptsSummary, StoreError> {
+    let conn = connect(db_path.as_ref())?;
+    let key = (db_path.as_ref().to_path_buf(), tenant.to_owned());
+    let hi: i64 = conn.query_row(
+        "SELECT coalesce(max(seq), 0) FROM traces WHERE tenant = ?1",
+        [tenant],
+        |r| r.get(0),
+    )?;
+    let cached = SUMMARY_CACHE
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&key).cloned())
+        .filter(|(seen, _)| *seen <= hi);
+    let (after, base) = cached.unwrap_or_default();
+    if after == hi {
+        return Ok(base);
+    }
+    let total = base.merged(&summary_between(&conn, tenant, after, hi)?);
+    if let Ok(mut c) = SUMMARY_CACHE.lock() {
+        // Bounded: dropping the cache only costs one full recount per tenant, never correctness.
+        if c.len() >= 4096 {
+            c.clear();
+        }
+        c.insert(key, (hi, total.clone()));
+    }
+    Ok(total)
+}
+
+/// Totals over the tenant's rows with `after < seq <= hi`. Both queries share the same upper
+/// bound, so a write landing between them cannot be counted in one and not the other.
+fn summary_between(
+    conn: &Connection,
+    tenant: &str,
+    after: i64,
+    hi: i64,
+) -> Result<ReceiptsSummary, StoreError> {
+    let mut s = conn.query_row(
+        "SELECT count(*),
+                total(json_extract(body, '$.final.total_cost_usd')),
+                total(json_extract(body, '$.final.counterfactual_baseline_usd')),
+                coalesce(sum(json_extract(body, '$.final.served_rung') = 0), 0),
+                coalesce(sum(json_extract(body, '$.final.escalations') > 0), 0)
+         FROM traces WHERE tenant = ?1 AND seq > ?2 AND seq <= ?3",
+        rusqlite::params![tenant, after, hi],
+        |r| {
+            Ok(ReceiptsSummary {
+                requests: u64::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
+                spent_usd: r.get(1)?,
+                baseline_usd: r.get(2)?,
+                first_pass: u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+                escalated: u64::try_from(r.get::<_, i64>(4)?).unwrap_or(0),
+                gates: [0; 3],
+            })
+        },
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(g.value, '$.verdict'), count(*)
+         FROM traces t, json_each(t.body, '$.attempts') a, json_each(a.value, '$.gates') g
+         WHERE t.tenant = ?1 AND t.seq > ?2 AND t.seq <= ?3 GROUP BY 1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![tenant, after, hi], |r| {
+        Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (verdict, n) = row?;
+        let slot = match verdict.as_deref() {
+            Some("pass") => 0,
+            Some("fail") => 1,
+            Some("abstain") => 2,
+            _ => continue,
+        };
+        s.gates[slot] += u64::try_from(n).unwrap_or(0);
+    }
+    Ok(s)
+}
+
 /// Whether a trace with `trace_id` exists **and is owned by `tenant`** — used to reject feedback
 /// for unknown traces and, crucially, to deny cross-tenant feedback (ADR 0004 §D3/§D4). A trace
 /// owned by another tenant is indistinguishable from a non-existent one here, so the caller can
@@ -823,6 +977,134 @@ mod tests {
         };
         trace.recompute_savings();
         trace
+    }
+
+    /// The SQL aggregate must equal a plain Rust fold over the same receipts, including traces
+    /// with no served rung, escalations, mixed gate verdicts, and another tenant's rows mixed in.
+    /// The page must be the newest `limit` rows of this tenant only, newest first.
+    #[tokio::test]
+    async fn summary_aggregate_matches_a_rust_fold_and_page_is_newest_first() {
+        use firstpass_core::GateResult;
+        let db_path =
+            std::env::temp_dir().join(format!("firstpass-store-sum-{}.db", uuid::Uuid::now_v7()));
+        let gate = |v: Verdict| GateResult {
+            gate_id: "tests".to_owned(),
+            verdict: v,
+            score: None,
+            cost_usd: 0.0,
+            ms: 1,
+            reason: None,
+            evidence_ref: None,
+        };
+        let mut mine = Vec::new();
+        for i in 0..23u32 {
+            let mut t = sample_trace("tenant-a", &format!("s{i}"));
+            t.final_.total_cost_usd = 0.01 * f64::from(i + 1);
+            t.final_.counterfactual_baseline_usd = 0.05;
+            t.final_.escalations = i % 3;
+            t.final_.served_rung = match i % 5 {
+                0 => None,
+                k => Some(k % 3), // rung 0, 1 and 2 in unequal counts
+            };
+            t.attempts[0].gates = (0..i % 4)
+                .map(|k| {
+                    gate([Verdict::Pass, Verdict::Fail, Verdict::Abstain][(k + i) as usize % 3])
+                })
+                .collect();
+            if i % 2 == 0 {
+                let mut second = t.attempts[0].clone();
+                second.rung = 1;
+                second.gates = vec![gate(Verdict::Pass)];
+                t.attempts.push(second);
+            }
+            mine.push(t);
+        }
+        let (tx, handle) = open(&db_path).unwrap();
+        for (i, t) in mine.iter().enumerate() {
+            tx.send(t.clone()).await.unwrap();
+            if i % 4 == 0 {
+                let mut other = sample_trace("tenant-b", "x");
+                other.final_.total_cost_usd = 100.0;
+                other.attempts[0].gates = vec![gate(Verdict::Fail)];
+                tx.send(other).await.unwrap();
+            }
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let mut want = ReceiptsSummary {
+            requests: mine.len() as u64,
+            ..Default::default()
+        };
+        for t in &mine {
+            want.spent_usd += t.final_.total_cost_usd;
+            want.baseline_usd += t.final_.counterfactual_baseline_usd;
+            want.first_pass += u64::from(t.final_.served_rung == Some(0));
+            want.escalated += u64::from(t.final_.escalations > 0);
+            for g in t.attempts.iter().flat_map(|a| &a.gates) {
+                want.gates[match g.verdict {
+                    Verdict::Pass => 0,
+                    Verdict::Fail => 1,
+                    Verdict::Abstain => 2,
+                }] += 1;
+            }
+        }
+        let got = tenant_receipts_summary(&db_path, "tenant-a").unwrap();
+        assert_eq!(got.requests, want.requests);
+        assert_eq!(got.first_pass, want.first_pass);
+        assert_eq!(got.escalated, want.escalated);
+        assert_eq!(got.gates, want.gates);
+        assert!(want.first_pass > 0 && want.escalated > 0 && want.gates.iter().all(|&n| n > 0));
+        assert!(
+            (got.spent_usd - want.spent_usd).abs() < 1e-9,
+            "{got:?} {want:?}"
+        );
+        assert!((got.baseline_usd - want.baseline_usd).abs() < 1e-9);
+        assert_eq!(
+            tenant_receipts_summary(&db_path, "nobody").unwrap(),
+            ReceiptsSummary::default()
+        );
+
+        let page = load_recent_tenant_traces(&db_path, "tenant-a", 5).unwrap();
+        let ids: Vec<_> = page.iter().map(|t| t.trace_id).collect();
+        let newest: Vec<_> = mine.iter().rev().take(5).map(|t| t.trace_id).collect();
+        assert_eq!(ids, newest);
+
+        // Incremental: rows appended after a read are folded in exactly once.
+        let (tx, handle) = open(&db_path).unwrap();
+        for _ in 0..4 {
+            let mut t = sample_trace("tenant-a", "late");
+            t.final_.served_rung = Some(0);
+            t.attempts[0].gates = vec![gate(Verdict::Abstain)];
+            tx.send(t).await.unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+        let again = tenant_receipts_summary(&db_path, "tenant-a").unwrap();
+        assert_eq!(again.requests, want.requests + 4);
+        assert_eq!(again.first_pass, want.first_pass + 4);
+        assert_eq!(
+            again.gates,
+            [want.gates[0], want.gates[1], want.gates[2] + 4]
+        );
+        assert_eq!(
+            tenant_receipts_summary(&db_path, "tenant-a").unwrap(),
+            again
+        );
+
+        // A store replaced at the same path (newest seq below the cached one) is recounted.
+        let _ = std::fs::remove_file(&db_path);
+        let (tx, handle) = open(&db_path).unwrap();
+        tx.send(sample_trace("tenant-a", "fresh")).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        assert_eq!(
+            tenant_receipts_summary(&db_path, "tenant-a")
+                .unwrap()
+                .requests,
+            1
+        );
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[tokio::test]
