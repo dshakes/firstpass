@@ -640,6 +640,26 @@ mod tests {
         assert_eq!(t, back);
     }
 
+    /// A trace with no upstream provider recorded serializes without the key and hashes exactly as
+    /// a receipt written before the field existed; one that carries it hashes differently.
+    #[test]
+    fn upstream_provider_empty_is_absent_and_hash_neutral() {
+        let t = sample_trace(GENESIS_HASH, 1);
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(
+            !j.contains("upstream_provider"),
+            "empty must be omitted: {j}"
+        );
+        let back: Trace = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.hash().unwrap(), t.hash().unwrap());
+        let mut with = t.clone();
+        with.upstream_provider = "openai".to_owned();
+        assert_ne!(with.hash().unwrap(), t.hash().unwrap());
+        let rt: Trace = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(rt.upstream_provider, "openai");
+        assert_eq!(rt.hash().unwrap(), with.hash().unwrap());
+    }
+
     /// An attempt that was not cut off serializes without `truncated` and hashes exactly as a
     /// receipt written before the field existed; a cut-off one carries it inside the chain.
     #[test]
