@@ -663,6 +663,7 @@ mod tests {
             latency_ms: 10,
             gates: vec![],
             verdict,
+            truncated: false,
         }
     }
 

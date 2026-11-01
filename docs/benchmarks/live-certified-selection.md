@@ -54,9 +54,10 @@ tested, and merged before any number above was taken.
   truncated. At 4096, 14 of 974 still were. At 12000 on APPS, 26 of 150 still were (25 of them
   among the 33 longest problems). The runs above use 4096 on MBPP and 12000 on APPS for both arms. A cap is a property of the workload,
   and it can favour the terser model.
-- **A dropped pair is invisible.** When the incumbent errors, the pair is skipped. With the timeout
-  fixed this is rare, but `/v1/experiments` does not yet count skipped pairs. The #246 PR proposes
-  that as a follow-up.
+- **Dropped pairs and cut-off answers.** When the incumbent errors, the pair is skipped. Since this
+  run, each experiment reports per-arm `health` (errors and answers cut off at `max_tokens`), the
+  panel warns when either is non-zero, and a challenger error counts as a failed pair rather than a
+  skipped one.
 - **Small APPS sample.** 150 problems (119 interview, 31 competition: the first 150 of a seeded
   300-problem draw), chosen for the $30 budget. At this gap, a decision needs a larger sample.
 - **Same vendor, one pair of models.** This measures the selection mechanism on one model pair, not

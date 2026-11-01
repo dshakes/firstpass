@@ -346,6 +346,11 @@ pub struct Attempt {
     pub gates: Vec<GateResult>,
     /// The attempt's overall verdict (the aggregate that drove escalate-or-serve).
     pub verdict: Verdict,
+    /// The model stopped at the request's output-token limit, so the answer is cut off and a gate
+    /// failure on it may describe the cap rather than the model. Skipped when false, so a receipt
+    /// written before this field existed still re-derives the same hash.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// `skip_serializing_if` helper: keeps zero-valued cache fields out of the canonical JSON, so a
@@ -539,6 +544,7 @@ mod tests {
                     latency_ms: 900,
                     gates: vec![GateResult::deterministic("cargo-test", Verdict::Fail, 3100)],
                     verdict: Verdict::Fail,
+                    truncated: false,
                 },
                 Attempt {
                     rung: 1,
@@ -552,6 +558,7 @@ mod tests {
                     latency_ms: 1200,
                     gates: vec![GateResult::deterministic("cargo-test", Verdict::Pass, 2950)],
                     verdict: Verdict::Pass,
+                    truncated: false,
                 },
             ],
             deferred: vec![],
@@ -624,6 +631,26 @@ mod tests {
         let j = serde_json::to_string(&t).unwrap();
         let back: Trace = serde_json::from_str(&j).unwrap();
         assert_eq!(t, back);
+    }
+
+    /// An attempt that was not cut off serializes without `truncated` and hashes exactly as a
+    /// receipt written before the field existed; a cut-off one carries it inside the chain.
+    #[test]
+    fn truncated_false_is_absent_and_hash_neutral() {
+        let t = sample_trace(GENESIS_HASH, 1);
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(!j.contains("truncated"), "false must be omitted: {j}");
+        let back: Trace = serde_json::from_str(&j).unwrap();
+        assert!(!back.attempts[0].truncated);
+        assert_eq!(back.hash().unwrap(), t.hash().unwrap());
+
+        let mut cut = t.clone();
+        cut.attempts[0].truncated = true;
+        assert_ne!(cut.hash().unwrap(), t.hash().unwrap());
+        let jc = serde_json::to_string(&cut).unwrap();
+        assert!(jc.contains("\"truncated\":true"), "{jc}");
+        let rt: Trace = serde_json::from_str(&jc).unwrap();
+        assert_eq!(rt.hash().unwrap(), cut.hash().unwrap());
     }
 
     // ── experiment backward-compat ───────────────────────────────────────────

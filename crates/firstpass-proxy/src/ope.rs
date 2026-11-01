@@ -770,6 +770,7 @@ mod tests {
                 evidence_ref: None,
             }],
             verdict,
+            truncated: false,
         };
         let mut trace = Trace {
             trace_id: uuid::Uuid::now_v7(),
@@ -838,6 +839,7 @@ mod tests {
                 evidence_ref: None,
             }],
             verdict: Verdict::Fail,
+            truncated: false,
         };
         let sonnet = firstpass_core::Attempt {
             rung: 1,
@@ -859,6 +861,7 @@ mod tests {
                 evidence_ref: None,
             }],
             verdict: Verdict::Pass,
+            truncated: false,
         };
         let total = haiku_cost + sonnet_cost;
         let mut trace = Trace {
@@ -1280,6 +1283,7 @@ serve_threshold = 0.75
             latency_ms: 5,
             gates: vec![],
             verdict: Verdict::Pass,
+            truncated: false,
         };
         let mut trace = Trace {
             trace_id: uuid::Uuid::now_v7(),

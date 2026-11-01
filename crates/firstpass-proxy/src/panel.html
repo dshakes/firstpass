@@ -267,6 +267,10 @@
   function tile(k, v, s, tone) {
     return `<div class="tile"><div class="k">${esc(k)}</div><div class="v ${esc(tone || '')}">${esc(v)}</div><div class="s">${esc(s || '')}</div></div>`;
   }
+  // A fail on an answer that stopped at max_tokens may describe the cap rather than the model.
+  const h_cut = n => (Number(n) > 0
+    ? `<div class="lede" style="margin:8px 0 0">${esc(num(n))} answers stopped at the output-token limit (max_tokens). A gate fail on a cut-off answer may describe the cap, not the model.</div>` : '');
+
   function h_overview() {
     const s = state.summary;
     if (!s || !s.requests) {
@@ -294,7 +298,7 @@
         <span class="p" style="width:${h_w(g.pass)}%"></span><span class="f" style="width:${h_w(g.fail)}%"></span><span class="a" style="width:${h_w(g.abstain)}%"></span></div>
       <div class="legend"><span class="pass">pass ${esc(num(g.pass))} (${esc(pct(g.pass, total))})</span>
         <span class="fail">fail ${esc(num(g.fail))} (${esc(pct(g.fail, total))})</span>
-        <span class="abstain">abstain ${esc(num(g.abstain))} (${esc(pct(g.abstain, total))})</span></div>`;
+        <span class="abstain">abstain ${esc(num(g.abstain))} (${esc(pct(g.abstain, total))})</span></div>${h_cut(s.truncated)}`;
   }
 
   // ---- experiments ----------------------------------------------------------------------------
@@ -348,6 +352,12 @@
     }
     const h_stale = v.ignored_stale > 0
       ? `<div class="note">${esc(num(v.ignored_stale))} receipts from an earlier experiment configuration were ignored. Changing either ladder, the margin or alpha starts a fresh experiment.</div>` : '';
+    const hh = v.health || {};
+    const h_lines = [['current', hh.incumbent], ['challenger', hh.challenger]]
+      .filter(([, a]) => a && (a.errors > 0 || a.truncated > 0))
+      .map(([name, a]) => name + ': ' + num(a.errors) + ' errors, ' + num(a.truncated) + ' answers cut off at max_tokens');
+    const h_health = h_lines.length
+      ? `<div class="note"><b>Check before trusting the rates.</b> ${esc(h_lines.join('; '))}. Errors and cut-off answers cluster on long, hard requests, so neither is random. A current-model error drops its pair, a challenger error counts as a failure, and a cut-off answer is graded as it is.${esc(isPaired(conf) ? ' Challenger counts cover this process only.' : '')}</div>` : '';
     return `<article class="box card" aria-label="Experiment, route ${esc(v.route_ix)}">
       <div class="hd"><h3>Route ${esc(v.route_ix)}</h3><span class="pill ${esc(status)}">${esc(status)}</span></div>
       <div class="ladder">current: ${esc((conf ? conf.incumbent_ladder : []).join(' > ') || 'your ladder')} &nbsp;|&nbsp; challenger: ${esc((v.challenger_ladder || []).join(' > '))}</div>
@@ -359,7 +369,7 @@
       ${h_evbar('Evidence the challenger is good enough', r.e_certify, target, 'cert')}
       ${h_evbar('Evidence the challenger is too weak', r.e_halt, target, 'halt')}
       <details><summary>What is evidence?</summary><div class="lede">${esc(EVIDENCE)}</div></details>
-      ${h_rec}${h_stale}
+      ${h_rec}${h_health}${h_stale}
     </article>`;
   }
   const isPaired = conf => !!conf && conf.mode === 'paired';

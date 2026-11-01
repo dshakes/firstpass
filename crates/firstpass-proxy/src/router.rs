@@ -492,6 +492,7 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                     latency_ms: ms,
                     gates: gate_results,
                     verdict,
+                    truncated: resp.truncated(),
                 });
                 best = Some((idx, resp));
 
@@ -691,6 +692,7 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                     latency_ms: ms,
                     gates: gate_results,
                     verdict,
+                    truncated: resp.truncated(),
                 });
                 best = Some((idx as u32, resp));
 
@@ -787,6 +789,7 @@ fn abstain_attempt(rung: u32, model: &str, provider: &str, reason: &str, ms: u64
         latency_ms: ms,
         gates: vec![GateResult::abstain(provider, reason, ms)],
         verdict: Verdict::Abstain,
+        truncated: false,
     }
 }
 

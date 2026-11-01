@@ -438,6 +438,8 @@ pub struct ReceiptsSummary {
     pub escalated: u64,
     /// Gate verdicts across every attempt: pass, fail, abstain.
     pub gates: [u64; 3],
+    /// Attempts whose answer stopped at the output-token limit.
+    pub truncated: u64,
 }
 
 impl ReceiptsSummary {
@@ -453,6 +455,7 @@ impl ReceiptsSummary {
                 self.gates[1] + d.gates[1],
                 self.gates[2] + d.gates[2],
             ],
+            truncated: self.truncated + d.truncated,
         }
     }
 }
@@ -527,9 +530,18 @@ fn summary_between(
                 first_pass: u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
                 escalated: u64::try_from(r.get::<_, i64>(4)?).unwrap_or(0),
                 gates: [0; 3],
+                truncated: 0,
             })
         },
     )?;
+    let truncated: i64 = conn.query_row(
+        "SELECT count(*) FROM traces t, json_each(t.body, '$.attempts') a
+         WHERE t.tenant = ?1 AND t.seq > ?2 AND t.seq <= ?3
+           AND json_extract(a.value, '$.truncated') = 1",
+        rusqlite::params![tenant, after, hi],
+        |r| r.get(0),
+    )?;
+    s.truncated = u64::try_from(truncated).unwrap_or(0);
     let mut stmt = conn.prepare(
         "SELECT json_extract(g.value, '$.verdict'), count(*)
          FROM traces t, json_each(t.body, '$.attempts') a, json_each(a.value, '$.gates') g
@@ -933,6 +945,7 @@ mod tests {
             latency_ms: 12,
             gates: vec![],
             verdict: Verdict::Pass,
+            truncated: false,
         };
         let mut trace = Trace {
             trace_id: uuid::Uuid::now_v7(),
@@ -1011,10 +1024,12 @@ mod tests {
                     gate([Verdict::Pass, Verdict::Fail, Verdict::Abstain][(k + i) as usize % 3])
                 })
                 .collect();
+            t.attempts[0].truncated = i % 3 == 0;
             if i % 2 == 0 {
                 let mut second = t.attempts[0].clone();
                 second.rung = 1;
                 second.gates = vec![gate(Verdict::Pass)];
+                second.truncated = i % 4 == 0;
                 t.attempts.push(second);
             }
             mine.push(t);
@@ -1026,6 +1041,7 @@ mod tests {
                 let mut other = sample_trace("tenant-b", "x");
                 other.final_.total_cost_usd = 100.0;
                 other.attempts[0].gates = vec![gate(Verdict::Fail)];
+                other.attempts[0].truncated = true;
                 tx.send(other).await.unwrap();
             }
         }
@@ -1041,6 +1057,7 @@ mod tests {
             want.baseline_usd += t.final_.counterfactual_baseline_usd;
             want.first_pass += u64::from(t.final_.served_rung == Some(0));
             want.escalated += u64::from(t.final_.escalations > 0);
+            want.truncated += t.attempts.iter().filter(|a| a.truncated).count() as u64;
             for g in t.attempts.iter().flat_map(|a| &a.gates) {
                 want.gates[match g.verdict {
                     Verdict::Pass => 0,
@@ -1054,6 +1071,11 @@ mod tests {
         assert_eq!(got.first_pass, want.first_pass);
         assert_eq!(got.escalated, want.escalated);
         assert_eq!(got.gates, want.gates);
+        assert_eq!(
+            got.truncated, want.truncated,
+            "only this tenant's cut-off attempts"
+        );
+        assert!(want.truncated > 0);
         assert!(want.first_pass > 0 && want.escalated > 0 && want.gates.iter().all(|&n| n > 0));
         assert!(
             (got.spent_usd - want.spent_usd).abs() < 1e-9,
