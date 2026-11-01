@@ -568,6 +568,7 @@ mod tests {
                 latency_ms: 100,
                 gates: vec![GateResult::deterministic("non-empty", verdict, 1)],
                 verdict,
+                truncated: false,
             }],
             final_: FinalOutcome {
                 served_rung: Some(0),

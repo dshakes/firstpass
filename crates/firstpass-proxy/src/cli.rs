@@ -1145,6 +1145,7 @@ mod tests {
                 latency_ms: 12,
                 gates: vec![],
                 verdict: Verdict::Pass,
+                truncated: false,
             }],
             deferred: Vec::new(),
             final_: FinalOutcome {
@@ -1259,6 +1260,7 @@ mod tests {
                         *gate_ms,
                     )],
                     verdict: Verdict::Pass,
+                    truncated: false,
                 })
                 .collect(),
             final_: FinalOutcome {
@@ -1381,6 +1383,7 @@ mod tests {
                 latency_ms: 7,
                 gates: vec![GateResult::deterministic("non-empty", Verdict::Pass, 0)],
                 verdict: Verdict::Pass,
+                truncated: false,
             }],
             final_: FinalOutcome {
                 served_rung: Some(1),
@@ -1462,6 +1465,7 @@ mod tests {
                     latency_ms: 5,
                     gates: vec![GateResult::deterministic("non-empty", Verdict::Fail, 0)],
                     verdict: Verdict::Fail,
+                    truncated: false,
                 },
                 Attempt {
                     rung: 1,
@@ -1475,6 +1479,7 @@ mod tests {
                     latency_ms: 9,
                     gates: vec![GateResult::deterministic("non-empty", Verdict::Pass, 0)],
                     verdict: Verdict::Pass,
+                    truncated: false,
                 },
             ],
             deferred: Vec::new(),

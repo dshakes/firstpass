@@ -362,6 +362,8 @@ struct Entry {
     experiment: Experiment,
     /// Receipts seen from a previous experiment configuration and therefore not counted.
     ignored_stale: u64,
+    /// Errors and cut-off answers per arm, for the operator to judge what the pairs left out.
+    health: Health,
     /// Hashes of sessions whose outcome was already counted. A 64-bit collision merely drops one
     /// legitimate outcome, which costs power and never validity.
     sessions: HashSet<u64>,
@@ -500,6 +502,7 @@ impl ExperimentMonitor {
                     v.insert(Entry {
                         experiment,
                         ignored_stale: 0,
+                        health: Health::default(),
                         sessions: HashSet::new(),
                         saturated_logged: false,
                         remote_log_offset: 0,
@@ -546,6 +549,32 @@ impl ExperimentMonitor {
             } else {
                 e.ignored_stale += 1;
             }
+        }
+    }
+
+    /// Tally one request of `arm` that errored and/or produced answers cut off at the output-token
+    /// limit (`truncated` counts attempts). Stale fingerprints are ignored: `observe_cost` already
+    /// counts the receipt once.
+    pub fn observe_health(
+        &self,
+        tenant: &str,
+        route_ix: usize,
+        fingerprint: &str,
+        arm: Arm,
+        errored: bool,
+        truncated: u64,
+    ) {
+        if (!errored && truncated == 0) || self.fingerprint(route_ix) != Some(fingerprint) {
+            return;
+        }
+        let mut map = self.lock();
+        if let Some(e) = self.entry(&mut map, tenant, route_ix) {
+            let h = match arm {
+                Arm::Incumbent => &mut e.health.incumbent,
+                Arm::Challenger => &mut e.health.challenger,
+            };
+            h.errors += u64::from(errored);
+            h.truncated += truncated;
         }
     }
 
@@ -646,6 +675,7 @@ impl ExperimentMonitor {
                     route_ix: *ix,
                     report: e.experiment.report(),
                     ignored_stale: e.ignored_stale,
+                    health: e.health,
                 })
             })
             .collect();
@@ -944,6 +974,37 @@ pub struct Snapshot {
     pub report: ExperimentReport,
     /// Receipts from a previous experiment configuration that were ignored.
     pub ignored_stale: u64,
+    /// Errors and cut-off answers per arm.
+    pub health: Health,
+}
+
+/// Requests an arm could not answer cleanly. Neither kind is random: errors (timeouts above all)
+/// and output-limit cut-offs cluster on long, hard requests. An incumbent error drops its pair, so
+/// many of them mean the pass rates describe an easier workload than the route serves; a
+/// challenger error counts as a failed pair. Truncated answers are graded as they are, so a high
+/// count says the route's `max_tokens` may be deciding the comparison.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ArmHealth {
+    /// Requests that ended in an error, with no output to grade.
+    pub errors: u64,
+    /// Attempts whose answer stopped at the output-token limit.
+    pub truncated: u64,
+}
+
+/// [`ArmHealth`] for both arms. For a **paired** challenger the counts cover this process's
+/// lifetime only: its off-path answers are not written as receipts, so they cannot be rebuilt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Health {
+    /// The incumbent arm (rebuilt from receipts at startup).
+    pub incumbent: ArmHealth,
+    /// The challenger arm.
+    pub challenger: ArmHealth,
+}
+
+/// Number of attempts in `t` that stopped at the output-token limit.
+#[must_use]
+pub fn truncated_attempts(t: &Trace) -> u64 {
+    t.attempts.iter().filter(|a| a.truncated).count() as u64
 }
 
 /// Whether a trace may be used for rung-indexed or threshold analyses (`ope`, `calibrate`).
@@ -990,6 +1051,14 @@ pub fn monitor_from_traces(
             &rec.fingerprint,
             rec.arm,
             t.final_.total_cost_usd,
+        );
+        monitor.observe_health(
+            &t.tenant_id,
+            route_ix,
+            &rec.fingerprint,
+            rec.arm,
+            t.final_.served_from == firstpass_core::ServedFrom::Error,
+            truncated_attempts(t),
         );
         by_id.insert(t.trace_id, t);
     }
@@ -1144,6 +1213,8 @@ pub struct ExperimentView {
     pub report: ExperimentReport,
     /// Receipts from a previous experiment configuration that were ignored.
     pub ignored_stale: u64,
+    /// Errors and cut-off answers per arm.
+    pub health: Health,
     /// What to do about it.
     pub recommendation: Recommendation,
     /// The challenger ladder under test, so `adopt` is actionable without re-reading the config.
@@ -1158,6 +1229,7 @@ pub fn views(reports: Vec<Snapshot>, config: &Config) -> Vec<ExperimentView> {
         .map(|s| ExperimentView {
             recommendation: recommend(&s.report),
             ignored_stale: s.ignored_stale,
+            health: s.health,
             challenger_ladder: config
                 .routes
                 .get(s.route_ix)
@@ -1220,6 +1292,19 @@ pub fn render(views: &[ExperimentView]) -> String {
                 "  {} receipts from a previous experiment configuration ignored",
                 v.ignored_stale
             );
+        }
+        for (name, h) in [
+            ("incumbent", &v.health.incumbent),
+            ("challenger", &v.health.challenger),
+        ] {
+            if h.errors > 0 || h.truncated > 0 {
+                let _ = writeln!(
+                    out,
+                    "  {name}: {} errors, {} answers cut off at max_tokens (neither is random: \
+                     check them before trusting the rates)",
+                    h.errors, h.truncated
+                );
+            }
         }
         match v.recommendation {
             Recommendation::Adopt => {
@@ -1322,6 +1407,56 @@ mod tests {
                 fingerprint: fp(),
             }),
         }
+    }
+
+    /// Errors and cut-off answers are rebuilt from receipts, per arm, and receipts from an older
+    /// experiment configuration contribute nothing.
+    #[test]
+    fn arm_health_is_rebuilt_from_receipts() {
+        let attempt = |truncated| firstpass_core::trace::Attempt {
+            rung: 0,
+            model: "anthropic/claude-sonnet-5".to_owned(),
+            provider: "anthropic".to_owned(),
+            in_tokens: 1,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 1,
+            cost_usd: 0.0,
+            latency_ms: 1,
+            gates: vec![],
+            verdict: Verdict::Pass,
+            truncated,
+        };
+        let mut errored = trace("t", "a", Arm::Incumbent, 0.01);
+        errored.final_.served_from = ServedFrom::Error;
+        let mut cut = trace("t", "b", Arm::Incumbent, 0.01);
+        cut.attempts = vec![attempt(true), attempt(true), attempt(false)];
+        let mut ch_cut = trace("t", "c", Arm::Challenger, 0.01);
+        ch_cut.attempts = vec![attempt(true)];
+        let mut stale = trace("t", "d", Arm::Incumbent, 0.01);
+        stale.final_.served_from = ServedFrom::Error;
+        if let Some(rec) = stale.experiment.as_mut() {
+            rec.fingerprint = "an-older-config".to_owned();
+        }
+        let snaps = experiments_from_traces(&[errored, cut, ch_cut, stale], &[], &[], &config());
+        let h = snaps[0].health;
+        assert_eq!(
+            h.incumbent,
+            ArmHealth {
+                errors: 1,
+                truncated: 2
+            },
+            "{h:?}"
+        );
+        assert_eq!(
+            h.challenger,
+            ArmHealth {
+                errors: 0,
+                truncated: 1
+            },
+            "{h:?}"
+        );
+        assert_eq!(snaps[0].ignored_stale, 1);
     }
 
     #[test]
@@ -1489,6 +1624,7 @@ mod tests {
             route_ix: 0,
             recommendation: recommend(&report),
             ignored_stale: 0,
+            health: Health::default(),
             report,
             challenger_ladder: vec!["anthropic/claude-haiku-4-5".to_owned()],
         }

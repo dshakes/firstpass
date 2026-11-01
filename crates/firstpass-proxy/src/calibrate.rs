@@ -401,6 +401,7 @@ mod tests {
                 evidence_ref: None,
             }],
             verdict,
+            truncated: false,
         };
         let mut trace = Trace {
             trace_id: uuid::Uuid::now_v7(),

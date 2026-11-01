@@ -796,6 +796,7 @@ fn summary_json(s: &crate::store::ReceiptsSummary) -> serde_json::Value {
         "first_pass": s.first_pass,
         "escalated": s.escalated,
         "gates": { "pass": pass, "fail": fail, "abstain": abstain },
+        "truncated": s.truncated,
     })
 }
 
@@ -1508,10 +1509,10 @@ async fn evaluate_shadow(
     }
 }
 
-/// A paired arm's outcome: 1.0 when a rung passed its gates, 0.0 when only a best attempt (every
-/// rung failed) was served. `None` when the pair is not comparable: a cache hit had no fresh gate
-/// run, and an error produced no output. Skipping errors can only withhold evidence, so a
-/// challenger that errors stays undecided rather than being certified.
+/// The incumbent's outcome in a pair: 1.0 when a rung passed its gates, 0.0 when only a best
+/// attempt (every rung failed) was served. `None` when the pair is not comparable: a cache hit had
+/// no fresh gate run, and an error produced no output. Dropping incumbent errors is not neutral
+/// (they cluster on hard requests), so they are counted in the experiment's `health` instead.
 fn pair_outcome(served_from: firstpass_core::ServedFrom) -> Option<f64> {
     match served_from {
         firstpass_core::ServedFrom::Attempt => Some(1.0),
@@ -1528,7 +1529,7 @@ fn pair_outcome(served_from: firstpass_core::ServedFrom) -> Option<f64> {
 /// or its latency. Every failure path returns silently; the spend ceiling is enforced before any
 /// model call is made.
 ///
-/// Both arms are graded by [`pair_outcome`] on their trace's final `served_from`.
+/// The incumbent is graded by [`pair_outcome`]; the challenger passes only on a gate pass.
 #[allow(clippy::too_many_arguments)]
 fn spawn_paired_challenger(
     state: &AppState,
@@ -1647,11 +1648,22 @@ fn spawn_paired_challenger(
             .paired_ledger
             .debit(&tenant, route_ix, challenger_cost, now);
 
-        // Graded exactly like the incumbent. `Served` is not success: a ladder whose every rung
-        // failed its gates still serves its best attempt, and counting that as a pass would
-        // certify a challenger that never passed a gate.
-        let Some(x_ch) = pair_outcome(ch_trace.final_.served_from) else {
-            return;
+        state.experiments.observe_health(
+            &tenant,
+            route_ix,
+            &fingerprint,
+            firstpass_core::Arm::Challenger,
+            ch_trace.final_.served_from == firstpass_core::ServedFrom::Error,
+            crate::experiment::truncated_attempts(&ch_trace),
+        );
+        // Only a gate pass is success. `Served` is not: a ladder whose every rung failed its gates
+        // still serves its best attempt. And an error is a failure, not a skipped pair: errors
+        // cluster on hard requests, so skipping them would flatter the challenger toward a
+        // certification it has not earned.
+        let x_ch = if ch_trace.final_.served_from == firstpass_core::ServedFrom::Attempt {
+            1.0
+        } else {
+            0.0
         };
 
         // Persist the pair to the store for startup rebuild and CLI replay.
@@ -2693,6 +2705,14 @@ async fn enforce_pipeline_inner(
             rec.arm,
             trace.final_.total_cost_usd,
         );
+        state.experiments.observe_health(
+            &trace.tenant_id,
+            route_ix,
+            &rec.fingerprint,
+            rec.arm,
+            trace.final_.served_from == firstpass_core::ServedFrom::Error,
+            crate::experiment::truncated_attempts(&trace),
+        );
         trace.experiment = Some(rec.clone());
     }
 
@@ -3578,6 +3598,8 @@ fn build_trace(
         latency_ms,
         gates: Vec::new(),
         verdict: Verdict::Pass,
+        truncated: serde_json::from_slice::<Value>(resp_body)
+            .is_ok_and(|v| crate::provider::hit_output_limit(&v)),
     };
 
     let mut trace = base_trace(config, req_body, latency_ms, session_header);
@@ -3625,6 +3647,7 @@ fn build_stream_trace(
         latency_ms,
         gates: Vec::new(),
         verdict: Verdict::Pass,
+        truncated: false,
     };
 
     let mut trace = base_trace(config, req_body, latency_ms, session_header);
@@ -5977,6 +6000,7 @@ mod tests {
             latency_ms: 5,
             gates: vec![],
             verdict: Verdict::Pass,
+            truncated: false,
         });
         let trace_id = trace.trace_id.to_string();
         if served {
@@ -8583,6 +8607,76 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
+    /// A challenger error is a failed pair, never a skipped one (errors cluster on hard requests),
+    /// and each arm's errors and cut-off answers are reported on the experiment.
+    #[tokio::test]
+    async fn paired_challenger_error_is_a_failure_and_arm_health_is_reported() {
+        use tower::ServiceExt;
+        let db = std::env::temp_dir().join(format!("firstpass-paired-err-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let (mut state, _rx) = challenger_state(50.0, &db.to_string_lossy());
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 5.0\n"
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
+        state.experiments = Arc::new(crate::experiment::ExperimentMonitor::from_config(
+            cfg.routing.as_ref().unwrap(),
+        ));
+        state.config = Arc::new(cfg);
+        // The incumbent's answer passes the gate but stopped at max_tokens.
+        let mut cut = model_resp(INCUMBENT, "{\"ok\": 1}");
+        cut.raw = serde_json::json!({"stop_reason": "max_tokens"});
+        let mut outs = HashMap::new();
+        outs.insert(INCUMBENT.to_owned(), Ok(cut));
+        outs.insert(
+            CHALLENGER.to_owned(),
+            Err(ProviderError::Transport("timed out".into())),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        state.providers = ProviderRegistry::from_map(map);
+        let monitor = state.experiments.clone();
+        let router = app(state).expect("router");
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(user_body()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let mut pairs = Vec::new();
+        for _ in 0..200 {
+            pairs = crate::store::load_all_experiment_pairs(&db).unwrap_or_default();
+            if !pairs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            pairs.len(),
+            1,
+            "the challenger's error still records a pair"
+        );
+        assert_eq!(pairs[0].x_inc, 1.0);
+        assert_eq!(pairs[0].x_ch, 0.0, "an error is a failure");
+        let health = monitor.reports()[0].health;
+        assert_eq!(health.incumbent.truncated, 1, "{health:?}");
+        assert_eq!(health.incumbent.errors, 0, "{health:?}");
+        assert_eq!(health.challenger.errors, 1, "{health:?}");
+        let _ = std::fs::remove_file(&db);
+    }
+
     /// Once a paired experiment halts, the challenger is not run again: no pair, no spend.
     #[tokio::test]
     async fn halted_paired_challenger_stops_spending() {
@@ -8864,8 +8958,10 @@ mod tests {
             first_pass: 1,
             escalated: 1,
             gates: [3, 1, 2],
+            truncated: 4,
         });
         assert_eq!(s["requests"], 2);
+        assert_eq!(s["truncated"], 4);
         assert_eq!(s["first_pass"], 1);
         assert_eq!(s["escalated"], 1);
         assert_eq!(s["gates"]["pass"], 3);

@@ -104,6 +104,26 @@ pub struct ModelResponse {
     pub raw: Value,
 }
 
+impl ModelResponse {
+    /// Whether the model stopped at the request's output-token limit. See [`hit_output_limit`].
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        hit_output_limit(&self.raw)
+    }
+}
+
+/// Whether a raw provider response says generation stopped at the output-token limit:
+/// Anthropic `stop_reason: "max_tokens"`, OpenAI Chat `finish_reason: "length"`, OpenAI Responses
+/// `incomplete_details.reason: "max_output_tokens"`, Gemini `finishReason: "MAX_TOKENS"`.
+#[must_use]
+pub fn hit_output_limit(raw: &Value) -> bool {
+    let is = |ptr: &str, want: &str| raw.pointer(ptr).and_then(Value::as_str) == Some(want);
+    is("/stop_reason", "max_tokens")
+        || is("/choices/0/finish_reason", "length")
+        || is("/incomplete_details/reason", "max_output_tokens")
+        || is("/candidates/0/finishReason", "MAX_TOKENS")
+}
+
 /// Failure modes of a provider call.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderError {
@@ -1515,6 +1535,30 @@ impl Provider for MockProvider {
 
 #[cfg(test)]
 mod tests {
+    /// Every provider's way of saying "stopped at the output-token limit" is recognised, and a
+    /// normal stop or an unknown shape is not.
+    #[test]
+    fn output_limit_is_detected_across_providers() {
+        use serde_json::json;
+        for raw in [
+            json!({"stop_reason": "max_tokens"}),
+            json!({"choices": [{"finish_reason": "length"}]}),
+            json!({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}),
+            json!({"candidates": [{"finishReason": "MAX_TOKENS"}]}),
+        ] {
+            assert!(hit_output_limit(&raw), "{raw}");
+        }
+        for raw in [
+            json!({"stop_reason": "end_turn"}),
+            json!({"choices": [{"finish_reason": "stop"}]}),
+            json!({"incomplete_details": {"reason": "content_filter"}}),
+            json!({"candidates": [{"finishReason": "STOP"}]}),
+            serde_json::Value::Null,
+        ] {
+            assert!(!hit_output_limit(&raw), "{raw}");
+        }
+    }
+
     use super::*;
 
     fn obj(v: Value) -> serde_json::Map<String, Value> {
