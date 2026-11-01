@@ -512,6 +512,7 @@ a wrong promotion costs money, never correctness — and the probe bounds even t
       // so pre-cache receipts hash identically. True prompt size = the sum of all three.
       "in_tokens": 8123, "cache_write_tokens": 0, "cache_read_tokens": 0, "out_tokens": 512,
       "cost_usd": 0.0031, "latency_ms": 1740,
+      // `truncated`: present (true) only when the model stopped at the output-token limit.
       "gates": [
         { "gate_id": "schema@v1",     "verdict": "pass", "score": 1.0,  "cost_usd": 0, "ms": 2 },
         { "gate_id": "judge-diff@v2", "verdict": "fail", "score": 0.31, "cost_usd": 0.004, "ms": 2600,
@@ -531,6 +532,9 @@ a wrong promotion costs money, never correctness — and the probe bounds even t
     "total_latency_ms": 6400, "escalations": 1,
     "counterfactual_baseline_usd": 0.0410   // what always-top-rung would have cost → savings math
   }
+  // An observe-mode error receipt with no attempt (e.g. an upstream 429) also carries
+  // "upstream_provider": "anthropic" | "openai", naming the provider that failed. It is omitted
+  // when empty, so older receipts hash identically.
 }
 ```
 

@@ -240,6 +240,12 @@ pub struct Trace {
     /// a `[route.challenger]` — byte-identical to earlier traces and hash-chain compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experiment: Option<ExperimentRecord>,
+    /// The upstream provider that was contacted when the request ended in an error and there
+    /// are no attempts to read the provider from. Absent (empty) on successful traces — the
+    /// provider is then authoritative on the attempt. `skip_serializing_if` keeps old hashes
+    /// intact: an absent field serializes as absent, not as `""`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub upstream_provider: String,
 }
 
 /// Which controller supplied the serve threshold. Precedence is e-process > ACI > fixed
@@ -582,6 +588,7 @@ mod tests {
             elastic: None,
             risk: None,
             experiment: None,
+            upstream_provider: String::new(),
         };
         t.recompute_savings();
         t
@@ -631,6 +638,26 @@ mod tests {
         let j = serde_json::to_string(&t).unwrap();
         let back: Trace = serde_json::from_str(&j).unwrap();
         assert_eq!(t, back);
+    }
+
+    /// A trace with no upstream provider recorded serializes without the key and hashes exactly as
+    /// a receipt written before the field existed; one that carries it hashes differently.
+    #[test]
+    fn upstream_provider_empty_is_absent_and_hash_neutral() {
+        let t = sample_trace(GENESIS_HASH, 1);
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(
+            !j.contains("upstream_provider"),
+            "empty must be omitted: {j}"
+        );
+        let back: Trace = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.hash().unwrap(), t.hash().unwrap());
+        let mut with = t.clone();
+        with.upstream_provider = "openai".to_owned();
+        assert_ne!(with.hash().unwrap(), t.hash().unwrap());
+        let rt: Trace = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(rt.upstream_provider, "openai");
+        assert_eq!(rt.hash().unwrap(), with.hash().unwrap());
     }
 
     /// An attempt that was not cut off serializes without `truncated` and hashes exactly as a

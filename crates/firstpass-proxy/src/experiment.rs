@@ -1406,6 +1406,7 @@ mod tests {
                 bucket: 0,
                 fingerprint: fp(),
             }),
+            upstream_provider: String::new(),
         }
     }
 

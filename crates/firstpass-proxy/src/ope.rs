@@ -812,6 +812,7 @@ mod tests {
             elastic: None,
             risk: None,
             experiment: None,
+            upstream_provider: String::new(),
         };
         trace.recompute_savings();
         trace
@@ -904,6 +905,7 @@ mod tests {
             elastic: None,
             risk: None,
             experiment: None,
+            upstream_provider: String::new(),
         };
         trace.recompute_savings();
         trace
@@ -1325,6 +1327,7 @@ serve_threshold = 0.75
             elastic: None,
             risk: None,
             experiment: None,
+            upstream_provider: String::new(),
         };
         trace.recompute_savings();
         trace

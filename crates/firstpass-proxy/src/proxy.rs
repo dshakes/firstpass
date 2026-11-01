@@ -201,6 +201,7 @@ fn cache_hit_trace(
         shadow: None,
         route_ix: None,
         experiment: None,
+        upstream_provider: String::new(),
     }
 }
 
@@ -504,10 +505,21 @@ fn record_trace_metrics(trace: &Trace) {
         // something broke but not which upstream, which is the first question during an incident.
         // The last attempt is the one that gave up. `sum(...)` over the label reproduces the old
         // undimensioned total, so existing queries keep their meaning.
+        // The last attempt's provider is authoritative; for error traces with no attempts
+        // (e.g. a non-2xx buffered observe response that was never dispatched to a model)
+        // fall back to `upstream_provider` recorded on the trace, then "unknown".
         let provider = trace
             .attempts
             .last()
-            .map_or_else(|| "unknown".to_owned(), |a| a.provider.clone());
+            .map(|a| a.provider.clone())
+            .or_else(|| {
+                if trace.upstream_provider.is_empty() {
+                    None
+                } else {
+                    Some(trace.upstream_provider.clone())
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
         metrics::counter!("firstpass_upstream_failures_total", "provider" => provider).increment(1);
     }
 
@@ -3374,13 +3386,15 @@ async fn observe_passthrough(
 
     match result {
         Ok((status, resp_headers, resp_body)) => {
-            // Build + record the trace on a detached task so neither JSON parsing nor the
-            // channel send touches the response path: observe mode adds zero latency to what
-            // the caller sees (SPEC §7.1a). `Bytes` clones are cheap (refcounted).
+            // Non-2xx: record an error trace; we still relay the upstream response unchanged.
+            // 2xx: record token usage from the body.
+            // Build + record on a detached task so JSON parsing doesn't touch the response path
+            // (SPEC §7.1a). `Bytes` clones are cheap (refcounted).
+            let for_trace = status.is_success().then_some(resp_body.clone());
             spawn_trace(
                 &state,
                 body,
-                Some(resp_body.clone()),
+                for_trace,
                 latency_ms,
                 session_header,
                 tenant,
@@ -3434,6 +3448,7 @@ async fn observe_stream(
                 session_header,
                 tenant,
                 "anthropic",
+                status.is_success(),
             );
             let tap = SseTap::new(response.bytes_stream(), on_done);
             let stream_body = Body::from_stream(tap);
@@ -3455,8 +3470,11 @@ async fn observe_stream(
 }
 
 /// Build the `on_done` closure that [`SseTap`] fires when the stream ends or is dropped.
-/// Captures the state needed to build and enqueue the observe-mode trace, then spawns a
-/// background task so neither JSON parsing nor the channel send touches the response path.
+/// Runs inline (not spawned) so it is safe to call from `SseTap::drop`, which may run outside
+/// a Tokio runtime during shutdown. The work is cheap and non-blocking.
+///
+/// `upstream_success` is `true` when the upstream HTTP status was 2xx. For non-2xx responses
+/// we record an error trace even if the stream delivered some bytes.
 fn stream_trace_callback(
     state: &AppState,
     req_body: Bytes,
@@ -3464,22 +3482,84 @@ fn stream_trace_callback(
     session_header: Option<String>,
     tenant: String,
     provider: &'static str,
-) -> impl FnOnce(SseUsage) + Send + 'static {
+    upstream_success: bool,
+) -> impl FnOnce(SseUsage, SseEndReason) + Send + 'static {
     let config = state.config.clone();
     let traces = state.traces.clone();
     let spill = state.spill.clone();
-    // Runs inline, not in a spawned task: it may fire from `SseTap::drop`, which can run outside
-    // a Tokio runtime (e.g. during shutdown), where `tokio::spawn` would panic. The work is cheap
-    // and non-blocking: build the trace, then `offer_trace`'s non-blocking `try_send`.
-    move |usage: SseUsage| {
-        let mut trace = build_stream_trace_from_usage(
-            &config,
-            &req_body,
-            latency_ms,
-            session_header.as_deref(),
-            usage,
-            provider,
-        );
+    move |usage: SseUsage, reason: SseEndReason| {
+        let mut trace = if !upstream_success {
+            // Non-2xx HTTP status: the upstream returned an error response (e.g. 429, 500).
+            // No model call usage to record.
+            build_error_trace(
+                &config,
+                &req_body,
+                latency_ms,
+                session_header.as_deref(),
+                provider,
+            )
+        } else {
+            match reason {
+                SseEndReason::UpstreamError => {
+                    // Transport error mid-stream: the upstream closed the connection
+                    // unexpectedly. Tokens that were received and parsed were already billed,
+                    // so we record the usage on the attempt (with `Verdict::Abstain` and
+                    // `ServedFrom::Error` to signal the response was incomplete) so the cost
+                    // appears in the audit trace rather than being silently discarded.
+                    build_stream_trace_from_usage(
+                        &config,
+                        &req_body,
+                        latency_ms,
+                        session_header.as_deref(),
+                        usage,
+                        provider,
+                        StreamOutcome::MidStreamError,
+                    )
+                }
+                SseEndReason::Dropped => {
+                    // Client disconnected. Only a stream that reached its terminal event was
+                    // fully delivered; an earlier drop (even after `message_start`, which already
+                    // names the model and input tokens) is a partial serve: billed usage kept,
+                    // never a pass, and not an upstream failure.
+                    let outcome = if usage.completed {
+                        StreamOutcome::Served
+                    } else {
+                        StreamOutcome::Partial
+                    };
+                    build_stream_trace_from_usage(
+                        &config,
+                        &req_body,
+                        latency_ms,
+                        session_header.as_deref(),
+                        usage,
+                        provider,
+                        outcome,
+                    )
+                }
+                SseEndReason::Eof => {
+                    // The upstream closed cleanly. If events were seen but never the terminal one,
+                    // it closed early: a partial, not a pass. If nothing was parsed at all (e.g. a
+                    // JSON body on a streaming request) there is no evidence either way, so it is
+                    // recorded as served, as before.
+                    let saw_events =
+                        usage.model.is_some() || usage.in_tokens > 0 || usage.out_tokens > 0;
+                    let outcome = if usage.completed || !saw_events {
+                        StreamOutcome::Served
+                    } else {
+                        StreamOutcome::Partial
+                    };
+                    build_stream_trace_from_usage(
+                        &config,
+                        &req_body,
+                        latency_ms,
+                        session_header.as_deref(),
+                        usage,
+                        provider,
+                        outcome,
+                    )
+                }
+            }
+        };
         // Stamp the resolved tenant identity — never the config default nor anything
         // request-borne.
         trace.tenant_id = tenant;
@@ -3492,6 +3572,17 @@ fn stream_trace_callback(
 /// Byte capacity of the per-line buffer inside [`SseTap`]. A `data:` line that overflows
 /// this cap is dropped from parsing but still forwarded to the client byte-for-byte.
 const SSE_LINE_BUF_CAP: usize = 64 * 1024; // 64 KiB
+
+/// How the [`SseTap`] stream ended, passed to `on_done` alongside the accumulated usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseEndReason {
+    /// The inner stream ended normally (`poll_next` returned `None`).
+    Eof,
+    /// The inner stream yielded an `Err` (upstream transport error mid-stream).
+    UpstreamError,
+    /// The tap was dropped before the stream finished (e.g. client disconnected).
+    Dropped,
+}
 
 /// Token usage accumulated by tapping SSE events during streaming relay.
 /// Fields default to zero / `None` when no matching event was seen — honest fallback
@@ -3506,6 +3597,9 @@ struct SseUsage {
     /// `"max_tokens"` for Anthropic, `"length"` for OpenAI — either means the output was
     /// truncated at the token limit.
     stop_reason: Option<String>,
+    /// The stream reached its terminal event (Anthropic `message_stop` or a `stop_reason`;
+    /// OpenAI a non-empty `finish_reason` or `[DONE]`): the answer was fully delivered.
+    completed: bool,
 }
 
 /// Stream adapter that relays every upstream byte to the client unchanged while tapping SSE
@@ -3528,13 +3622,13 @@ struct SseTap {
     /// True while the current in-progress line has already overflowed `SSE_LINE_BUF_CAP`.
     overflow: bool,
     usage: SseUsage,
-    on_done: Option<Box<dyn FnOnce(SseUsage) + Send>>,
+    on_done: Option<Box<dyn FnOnce(SseUsage, SseEndReason) + Send>>,
 }
 
 impl SseTap {
     fn new(
         inner: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-        on_done: impl FnOnce(SseUsage) + Send + 'static,
+        on_done: impl FnOnce(SseUsage, SseEndReason) + Send + 'static,
     ) -> Self {
         Self {
             inner: Box::pin(inner),
@@ -3542,14 +3636,6 @@ impl SseTap {
             overflow: false,
             usage: SseUsage::default(),
             on_done: Some(Box::new(on_done)),
-        }
-    }
-
-    /// Fire the callback with accumulated usage. Called at most once; subsequent calls are
-    /// no-ops. Takes `usage` out of `self` to avoid a copy.
-    fn fire_done(&mut self) {
-        if let Some(on_done) = self.on_done.take() {
-            on_done(std::mem::take(&mut self.usage));
         }
     }
 }
@@ -3573,11 +3659,15 @@ impl Stream for SseTap {
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(e))) => {
-                this.fire_done();
+                if let Some(on_done) = this.on_done.take() {
+                    on_done(std::mem::take(&mut this.usage), SseEndReason::UpstreamError);
+                }
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(None) => {
-                this.fire_done();
+                if let Some(on_done) = this.on_done.take() {
+                    on_done(std::mem::take(&mut this.usage), SseEndReason::Eof);
+                }
                 Poll::Ready(None)
             }
         }
@@ -3586,11 +3676,10 @@ impl Stream for SseTap {
 
 impl Drop for SseTap {
     fn drop(&mut self) {
-        // Fires when the stream is dropped before exhaustion (e.g. client disconnect).
-        // When the stream ends normally via `poll_next → None`, `on_done` is already `None`
-        // and this becomes a no-op.
-        if self.on_done.is_some() {
-            self.fire_done();
+        // Fires when the tap is dropped before the stream is exhausted (e.g. client disconnect).
+        // When poll_next reaches None or Err first, on_done is already None and this is a no-op.
+        if let Some(on_done) = self.on_done.take() {
+            on_done(std::mem::take(&mut self.usage), SseEndReason::Dropped);
         }
     }
 }
@@ -3629,8 +3718,11 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
     let Some(data) = line.strip_prefix(b"data: ") else {
         return;
     };
+    // Tolerate CRLF line endings: the line splitter only strips `\n`.
+    let data = data.strip_suffix(b"\r").unwrap_or(data);
     // OpenAI uses `data: [DONE]` as a stream sentinel — not JSON, safe to skip.
     if data == b"[DONE]" {
+        usage.completed = true;
         return;
     }
     let Ok(json) = serde_json::from_slice::<Value>(data) else {
@@ -3663,8 +3755,10 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
             }
             if let Some(stop) = json.pointer("/delta/stop_reason").and_then(Value::as_str) {
                 usage.stop_reason = Some(stop.to_owned());
+                usage.completed = true;
             }
         }
+        Some("message_stop") => usage.completed = true,
         _ => {
             // OpenAI-compatible: final usage chunk (only populated when
             // `stream_options.include_usage` was set in the request).
@@ -3690,6 +3784,7 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
                 .filter(|fr| !fr.is_empty())
             {
                 usage.stop_reason = Some(fr.to_owned());
+                usage.completed = true;
             }
         }
     }
@@ -3721,7 +3816,13 @@ fn spawn_trace(
                 session_header.as_deref(),
                 provider,
             ),
-            None => build_error_trace(&config, &req_body, latency_ms, session_header.as_deref()),
+            None => build_error_trace(
+                &config,
+                &req_body,
+                latency_ms,
+                session_header.as_deref(),
+                provider,
+            ),
         };
         // Stamp the resolved tenant identity — never the config default nor anything request-borne.
         trace.tenant_id = tenant;
@@ -3831,22 +3932,58 @@ fn build_trace(
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
     let usage = response_usage(resp_body);
-    let (resp_model, in_tokens, out_tokens) = (usage.model, usage.in_tokens, usage.out_tokens);
     let (cache_write_tokens, cache_read_tokens) =
         (usage.cache_write_tokens, usage.cache_read_tokens);
-    let model = resp_model
-        .or(req_model)
-        .unwrap_or_else(|| "unknown".to_owned());
+    let (in_tokens, out_tokens) = (usage.in_tokens, usage.out_tokens);
+    // Prefer the response model (authoritative); fall back to the request model, then "unknown".
+    let model = usage
+        .model
+        .as_deref()
+        .or(req_model.as_deref())
+        .unwrap_or("unknown")
+        .to_owned();
 
     let cost_usd = config
         .prices
         .cost_usd_with_cache(
-            &format!("{provider}/{model}"),
+            // A model already written as `{provider}/name` must not become `{provider}/{provider}/name`.
+            &format!(
+                "{provider}/{}",
+                model
+                    .strip_prefix(&format!("{provider}/"))
+                    .unwrap_or(&model)
+            ),
             in_tokens,
             cache_write_tokens,
             cache_read_tokens,
             out_tokens,
         )
+        .or_else(|_| {
+            // Dated model snapshot (e.g. `claude-haiku-4-5-20251001`) may have no price entry;
+            // fall back to the request model only when the response model is a recognised
+            // date-versioned snapshot of it. An unrelated unpriced response model stays at $0.
+            //
+            // Strip a leading `{provider}/` from both sides so `"openai/gpt-4.1-mini"` in the
+            // request body does not produce a double-prefixed key `"openai/openai/gpt-4.1-mini"`.
+            let bare_req = req_model.as_deref().unwrap_or("unknown");
+            let bare_req = bare_req
+                .strip_prefix(&format!("{provider}/"))
+                .unwrap_or(bare_req);
+            let bare_resp = model
+                .strip_prefix(&format!("{provider}/"))
+                .unwrap_or(&model);
+            if is_snapshot_of(bare_resp, bare_req) {
+                config.prices.cost_usd_with_cache(
+                    &format!("{provider}/{bare_req}"),
+                    in_tokens,
+                    cache_write_tokens,
+                    cache_read_tokens,
+                    out_tokens,
+                )
+            } else {
+                Err(firstpass_core::error::Error::UnknownModel(model.clone()))
+            }
+        })
         .unwrap_or(0.0);
 
     let attempt = Attempt {
@@ -3889,6 +4026,25 @@ fn build_trace(
 /// [`SseTap`] from the in-flight SSE events. If no usage events were seen (e.g. the stream
 /// errored before `message_start`), the attempt is recorded with zero tokens and zero cost —
 /// honest fallback rather than invented numbers.
+/// Whether the stream ended successfully or with a mid-stream transport error.
+///
+/// Passed to [`build_stream_trace_from_usage`] to control the attempt verdict and
+/// whether the outcome is recorded as a served response or a billing-only error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    /// Stream completed normally or client disconnected after receiving data.
+    /// Attempt verdict: `Pass`; `final_.served_from`: `Attempt`.
+    Served,
+    /// Transport error mid-stream: tokens were consumed and billed but the response
+    /// was not fully delivered. Attempt verdict: `Abstain`;
+    /// `final_.served_from`: `Error`; `final_.served_rung`: `None`.
+    MidStreamError,
+    /// The client disconnected before the stream's terminal event: whatever was relayed was
+    /// served and billed, but nothing says the answer was complete. Attempt verdict: `Abstain`;
+    /// `final_.served_from`: `Attempt`. Not an upstream failure.
+    Partial,
+}
+
 fn build_stream_trace_from_usage(
     config: &ProxyConfig,
     req_body: &Bytes,
@@ -3896,31 +4052,68 @@ fn build_stream_trace_from_usage(
     session_header: Option<&str>,
     usage: SseUsage,
     provider: &str,
+    outcome: StreamOutcome,
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
-    // Prefer the model name seen in the SSE events (authoritative); fall back to the
-    // request-side model field, then "unknown".
-    let model = usage
-        .model
-        .or(req_model)
-        .unwrap_or_else(|| "unknown".to_owned());
-
     let (in_tokens, cache_write_tokens, cache_read_tokens, out_tokens) = (
         usage.in_tokens,
         usage.cache_write_tokens,
         usage.cache_read_tokens,
         usage.out_tokens,
     );
+    // Prefer the model name seen in the SSE events (authoritative); fall back to the
+    // request-side model field, then "unknown".
+    let model = usage
+        .model
+        .as_deref()
+        .or(req_model.as_deref())
+        .unwrap_or("unknown")
+        .to_owned();
 
     let cost_usd = config
         .prices
         .cost_usd_with_cache(
-            &format!("{provider}/{model}"),
+            // A model already written as `{provider}/name` must not become `{provider}/{provider}/name`.
+            &format!(
+                "{provider}/{}",
+                model
+                    .strip_prefix(&format!("{provider}/"))
+                    .unwrap_or(&model)
+            ),
             in_tokens,
             cache_write_tokens,
             cache_read_tokens,
             out_tokens,
         )
+        .or_else(|_| {
+            // Dated model snapshot (e.g. `claude-haiku-4-5-20251001`) may have no price entry;
+            // fall back to the request model only when the response model is a recognised
+            // date-versioned snapshot of it (e.g. `claude-haiku-4-5-20251001` is a snapshot of
+            // `claude-haiku-4-5`). An unrelated unpriced model does NOT get billed at the request
+            // model's price — it stays at $0 so the discrepancy is visible in the audit trace.
+            //
+            // Also strip a leading `{provider}/` from the request model so a caller that writes
+            // `"model": "openai/gpt-4.1-mini"` does not produce a double-prefixed lookup key.
+            let bare_req = req_model.as_deref().unwrap_or("unknown");
+            let bare_req = bare_req
+                .strip_prefix(&format!("{provider}/"))
+                .unwrap_or(bare_req);
+            // Strip provider prefix from response model too (same defence).
+            let bare_resp = model
+                .strip_prefix(&format!("{provider}/"))
+                .unwrap_or(&model);
+            if is_snapshot_of(bare_resp, bare_req) {
+                config.prices.cost_usd_with_cache(
+                    &format!("{provider}/{bare_req}"),
+                    in_tokens,
+                    cache_write_tokens,
+                    cache_read_tokens,
+                    out_tokens,
+                )
+            } else {
+                Err(firstpass_core::error::Error::UnknownModel(model.clone()))
+            }
+        })
         .unwrap_or(0.0);
 
     // `"max_tokens"` is Anthropic's stop_reason; `"length"` is OpenAI's finish_reason for
@@ -3929,6 +4122,12 @@ fn build_stream_trace_from_usage(
         usage.stop_reason.as_deref(),
         Some("max_tokens") | Some("length")
     );
+
+    let (verdict, served_from, served_rung) = match outcome {
+        StreamOutcome::Served => (Verdict::Pass, ServedFrom::Attempt, Some(0u32)),
+        StreamOutcome::MidStreamError => (Verdict::Abstain, ServedFrom::Error, None),
+        StreamOutcome::Partial => (Verdict::Abstain, ServedFrom::Attempt, Some(0u32)),
+    };
 
     let attempt = Attempt {
         rung: 0,
@@ -3941,7 +4140,7 @@ fn build_stream_trace_from_usage(
         cost_usd,
         latency_ms,
         gates: Vec::new(),
-        verdict: Verdict::Pass,
+        verdict,
         truncated,
     };
 
@@ -3951,8 +4150,8 @@ fn build_stream_trace_from_usage(
     trace.request.features.has_images = has_images;
     trace.attempts.push(attempt);
     trace.final_ = FinalOutcome {
-        served_rung: Some(0),
-        served_from: ServedFrom::Attempt,
+        served_rung,
+        served_from,
         total_cost_usd: cost_usd,
         gate_cost_usd: 0.0,
         total_latency_ms: latency_ms,
@@ -3965,6 +4164,39 @@ fn build_stream_trace_from_usage(
     trace
 }
 
+/// Returns `true` when `resp_model` is a recognised date-versioned snapshot of `req_model`.
+///
+/// A snapshot has the form `{req_model}-{date_suffix}` where the suffix is either 8 ASCII
+/// digits (`YYYYMMDD`) or the ISO 8601 form `YYYY-MM-DD`.
+///
+/// This is intentionally narrow: an arbitrary unpriced response model must NOT be billed at
+/// the request model's price — only a confirmed snapshot of the same base model may fall back.
+fn is_snapshot_of(resp_model: &str, req_model: &str) -> bool {
+    let Some(suffix) = resp_model.strip_prefix(&format!("{req_model}-")) else {
+        return false;
+    };
+    is_date_version_suffix(suffix)
+}
+
+/// Returns `true` when `s` looks like a date/version suffix produced by model snapshot
+/// naming conventions: 8 consecutive ASCII digits (`YYYYMMDD`) or `YYYY-MM-DD`.
+fn is_date_version_suffix(s: &str) -> bool {
+    // 8 digits: YYYYMMDD
+    if s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // YYYY-MM-DD: 4 digits, dash, 2 digits, dash, 2 digits
+    if s.len() == 10 {
+        let b = s.as_bytes();
+        return b[4] == b'-'
+            && b[7] == b'-'
+            && b[..4].iter().all(|c| c.is_ascii_digit())
+            && b[5..7].iter().all(|c| c.is_ascii_digit())
+            && b[8..].iter().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
 /// Build the observe-mode trace for a request whose upstream call failed outright (no
 /// response to report usage from). Recorded with `served_from: Error` and no attempts —
 /// keep the audit trail honest that nothing was served.
@@ -3973,11 +4205,13 @@ fn build_error_trace(
     req_body: &Bytes,
     latency_ms: u64,
     session_header: Option<&str>,
+    provider: &str,
 ) -> Trace {
     let (_, tool_count, has_images) = request_features(req_body);
     let mut trace = base_trace(config, req_body, latency_ms, session_header);
     trace.request.features.tool_count = tool_count;
     trace.request.features.has_images = has_images;
+    trace.upstream_provider = provider.to_owned();
     trace.final_ = FinalOutcome {
         served_rung: None,
         served_from: ServedFrom::Error,
@@ -4045,6 +4279,7 @@ fn base_trace(
         elastic: None,
         risk: None,
         experiment: None,
+        upstream_provider: String::new(),
     }
 }
 
@@ -4672,10 +4907,11 @@ async fn observe_passthrough_openai_path(
     let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     match result {
         Ok((status, resp_headers, resp_body)) => {
+            let for_trace = status.is_success().then_some(resp_body.clone());
             spawn_trace(
                 &state,
                 body,
-                Some(resp_body.clone()),
+                for_trace,
                 latency_ms,
                 session_header,
                 tenant,
@@ -4721,8 +4957,15 @@ async fn observe_stream_openai_path(
     let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     match result {
         Ok((status, resp_headers, response)) => {
-            let on_done =
-                stream_trace_callback(&state, body, latency_ms, session_header, tenant, "openai");
+            let on_done = stream_trace_callback(
+                &state,
+                body,
+                latency_ms,
+                session_header,
+                tenant,
+                "openai",
+                status.is_success(),
+            );
             let tap = SseTap::new(response.bytes_stream(), on_done);
             let stream_body = Body::from_stream(tap);
             (status, resp_headers, stream_body).into_response()
@@ -5405,7 +5648,7 @@ mod tests {
         let config = test_config();
         let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5"}"#);
 
-        let trace = build_error_trace(&config, &req, 7, None);
+        let trace = build_error_trace(&config, &req, 7, None, "anthropic");
 
         assert!(trace.attempts.is_empty());
         assert_eq!(trace.final_.served_from, ServedFrom::Error);
@@ -6347,6 +6590,7 @@ mod tests {
             &Bytes::from_static(b"{}"),
             5,
             Some("sess-fb"),
+            "anthropic",
         );
         trace.attempts.push(Attempt {
             rung: 0,
@@ -9537,7 +9781,7 @@ mod tests {
 
         let stream = TestStream::from_ok(vec![c1, c2]);
         let (tx, rx) = tokio::sync::oneshot::channel::<SseUsage>();
-        let tap = SseTap::new(stream, move |u| {
+        let tap = SseTap::new(stream, move |u, _reason| {
             let _ = tx.send(u);
         });
 
@@ -9575,7 +9819,15 @@ mod tests {
         // `truncated` flows through `build_stream_trace_from_usage`.
         let config = test_config();
         let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
-        let trace = build_stream_trace_from_usage(&config, &req, 10, None, usage, "anthropic");
+        let trace = build_stream_trace_from_usage(
+            &config,
+            &req,
+            10,
+            None,
+            usage,
+            "anthropic",
+            StreamOutcome::Served,
+        );
         assert!(
             trace.attempts[0].truncated,
             "max_tokens stop_reason must set truncated=true"
@@ -9593,6 +9845,85 @@ mod tests {
     /// Mutation checks run by the author:
     /// - Replaced `SseTap::new(...)` with the old `spawn_stream_trace(...)` call → `in_tokens`
     ///   and `cost_usd` assertions both failed (reverted to confirm they pass again).
+    /// An upstream 429 is relayed to the caller byte-for-byte and recorded as an error, never as a
+    /// served pass, on both the buffered and the streaming observe paths.
+    #[tokio::test]
+    async fn observe_records_an_upstream_429_as_an_error_on_both_paths() {
+        const ERR: &str =
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    ERR,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some(base_url.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let (traces, mut rx) = mpsc::channel(4);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(HashMap::new()),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+        for body in [
+            &br#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}"#[..],
+            &br#"{"model":"claude-haiku-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}"#[..],
+        ] {
+            let resp = observe_passthrough(
+                state.clone(),
+                HeaderMap::new(),
+                Bytes::from_static(body),
+                None,
+                "default".to_owned(),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+            let relayed = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(relayed.as_ref(), ERR.as_bytes(), "relayed byte-for-byte");
+            let trace = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("trace within 5s")
+                .expect("a trace");
+            assert_eq!(
+                trace.final_.served_from,
+                ServedFrom::Error,
+                "stream={}",
+                String::from_utf8_lossy(body).contains("stream")
+            );
+            assert!(trace.attempts.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn observe_stream_receipt_has_sse_usage_and_non_zero_cost() {
         // SSE payload: 100 input, 50 output, stop_reason=max_tokens → truncated.
@@ -9740,5 +10071,561 @@ mod tests {
             Some("m"),
             "model must be extracted from the valid event"
         );
+    }
+
+    // ── Finding 1: SseEndReason is propagated correctly ────────────────────────
+
+    /// A stream that yields one OK chunk then a transport error fires `on_done` with
+    /// `SseEndReason::UpstreamError`, not `Eof`.
+    ///
+    /// Mutation checks run by the author:
+    /// - Changed `SseEndReason::UpstreamError` arm to call `on_done` with `Eof`
+    ///   → assertion `reason == UpstreamError` failed.
+    /// - Removed the `Poll::Ready(Some(Err(_)))` arm in `SseTap::poll_next` entirely
+    ///   → `on_done` was never called (rx.await timed out) and the error was swallowed.
+    #[tokio::test]
+    async fn sse_tap_upstream_error_fires_done_with_upstream_error_reason() {
+        // Build a reqwest::Error without a network call by asking for a URL that fails parsing.
+        let err: reqwest::Error = reqwest::Client::new().get("not-a-url").build().unwrap_err();
+
+        let ok_chunk: &'static [u8] =
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":5,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n";
+
+        let stream = TestStream {
+            chunks: [Ok(Bytes::from_static(ok_chunk)), Err(err)]
+                .into_iter()
+                .collect(),
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<SseEndReason>();
+        let tap = SseTap::new(stream, move |_u, reason| {
+            let _ = tx.send(reason);
+        });
+
+        // Drain the stream; it returns Some(Ok(..)) then Some(Err(..)).
+        let _ = axum::body::to_bytes(Body::from_stream(tap), usize::MAX).await;
+
+        let reason = rx.await.expect("on_done must fire");
+        assert_eq!(
+            reason,
+            SseEndReason::UpstreamError,
+            "transport error mid-stream must produce UpstreamError, not Eof"
+        );
+    }
+
+    /// A stream that ends normally fires `on_done` with `SseEndReason::Eof`.
+    ///
+    /// Mutation check: Changed `SseEndReason::Eof` to `Dropped` in the `Poll::Ready(None)` arm
+    /// → assertion failed.
+    #[tokio::test]
+    async fn sse_tap_normal_end_fires_done_with_eof_reason() {
+        let (c1, c2) = anthropic_sse_bytes();
+        let stream = TestStream::from_ok(vec![c1, c2]);
+        let (tx, rx) = tokio::sync::oneshot::channel::<SseEndReason>();
+        let tap = SseTap::new(stream, move |_u, reason| {
+            let _ = tx.send(reason);
+        });
+
+        let _ = axum::body::to_bytes(Body::from_stream(tap), usize::MAX)
+            .await
+            .unwrap();
+
+        let reason = rx.await.expect("on_done must fire");
+        assert_eq!(
+            reason,
+            SseEndReason::Eof,
+            "normal stream end must produce Eof, not Dropped or UpstreamError"
+        );
+    }
+
+    // ── Finding 3: dated model snapshot falls back to request model for pricing ─
+
+    /// A response model like `claude-haiku-4-5-20251001` (a dated snapshot not in the price
+    /// table) produces a non-zero cost by falling back to the request model `claude-haiku-4-5`,
+    /// while keeping the snapshot name on the attempt for auditability.
+    ///
+    /// Mutation checks run by the author:
+    /// - Removed the `.or_else(|_| ...)` fallback branch in `build_trace`
+    ///   → `cost_usd` fell to 0.0 and the `cost_usd > 0` assertion failed.
+    /// - Changed the `attempt.model` check to look for the request model instead of the
+    ///   snapshot → assertion failed (snapshot is what must appear on the attempt).
+    #[test]
+    fn build_trace_dated_snapshot_falls_back_to_request_model_for_pricing() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        // Response carries the dated snapshot name, which is not in the price table.
+        let resp = Bytes::from_static(
+            br#"{"model":"claude-haiku-4-5-20251001","usage":{"input_tokens":500,"output_tokens":100}}"#,
+        );
+        let trace = build_trace(&config, &req, &resp, 10, None, "anthropic");
+        let attempt = &trace.attempts[0];
+
+        // Cost must be non-zero (priced via the canonical request model).
+        assert!(
+            attempt.cost_usd > 0.0,
+            "dated snapshot model must fall back to request model for pricing; got $0"
+        );
+        // The attempt must record the snapshot name as seen on the wire, not the fallback.
+        assert_eq!(
+            attempt.model, "claude-haiku-4-5-20251001",
+            "attempt model must be the dated snapshot name, not the canonical request model"
+        );
+    }
+
+    /// Same fallback for the streaming path (`build_stream_trace_from_usage`).
+    ///
+    /// Mutation check: Removed the `.or_else(|_| ...)` branch in
+    /// `build_stream_trace_from_usage` → `cost_usd` dropped to 0.0 and the assertion failed.
+    #[test]
+    fn build_stream_trace_dated_snapshot_falls_back_to_request_model_for_pricing() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        // SseUsage carries the dated snapshot model name from the SSE events.
+        let usage = SseUsage {
+            model: Some("claude-haiku-4-5-20251001".to_owned()),
+            in_tokens: 500,
+            out_tokens: 100,
+            ..Default::default()
+        };
+        let trace = build_stream_trace_from_usage(
+            &config,
+            &req,
+            10,
+            None,
+            usage,
+            "anthropic",
+            StreamOutcome::Served,
+        );
+        let attempt = &trace.attempts[0];
+
+        assert!(
+            attempt.cost_usd > 0.0,
+            "dated snapshot model must fall back to request model for pricing; got $0"
+        );
+        assert_eq!(
+            attempt.model, "claude-haiku-4-5-20251001",
+            "attempt model must be the dated snapshot name, not the canonical request model"
+        );
+    }
+
+    // ── Snapshot-fallback edge cases ────────────────────────────────────────────
+
+    /// An unrelated unpriced response model (e.g. `gpt-99-turbo`) must NOT be billed at the
+    /// request model's price. Only a confirmed snapshot of the same base model may fall back.
+    ///
+    /// Drives `build_trace` directly — verifies the `is_snapshot_of` guard in the `.or_else`
+    /// fallback branch.
+    #[test]
+    fn price_fallback_does_not_apply_to_unrelated_unpriced_model() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        // `gpt-99-turbo` is unpriced AND is not a snapshot of `claude-haiku-4-5`.
+        let resp = Bytes::from_static(
+            br#"{"model":"gpt-99-turbo","usage":{"input_tokens":500,"output_tokens":100}}"#,
+        );
+        let trace = build_trace(&config, &req, &resp, 10, None, "anthropic");
+        let attempt = &trace.attempts[0];
+        assert_eq!(
+            attempt.cost_usd, 0.0,
+            "an unrelated unpriced response model must NOT fall back to the request model's price"
+        );
+        assert_eq!(
+            attempt.model, "gpt-99-turbo",
+            "the unpriced response model name must still appear on the attempt"
+        );
+    }
+
+    /// A request body where `model` already includes the provider prefix (e.g.
+    /// `"openai/gpt-4.1-mini"`) must not produce a double-prefixed price key
+    /// (`"openai/openai/gpt-4.1-mini"`).
+    ///
+    /// Drives `build_stream_trace_from_usage` with a snapshot model derived from the
+    /// full-prefixed request model — verifies the `strip_prefix` guard in the fallback.
+    #[test]
+    fn price_fallback_strips_provider_prefix_from_request_model() {
+        let config = test_config();
+        // Caller wrote the full provider/model form in the request body.
+        let req = Bytes::from_static(br#"{"model":"openai/gpt-4.1-mini","messages":[]}"#);
+        // SSE reports a dated snapshot of the same model.
+        let usage = SseUsage {
+            model: Some("gpt-4.1-mini-20250514".to_owned()),
+            in_tokens: 300,
+            out_tokens: 50,
+            ..Default::default()
+        };
+        let trace = build_stream_trace_from_usage(
+            &config,
+            &req,
+            10,
+            None,
+            usage,
+            "openai",
+            StreamOutcome::Served,
+        );
+        let attempt = &trace.attempts[0];
+        // Should fall back to `openai/gpt-4.1-mini`, not `openai/openai/gpt-4.1-mini`.
+        assert!(
+            attempt.cost_usd > 0.0,
+            "snapshot of request model must be priced correctly even with provider-prefix in req body"
+        );
+        assert_eq!(
+            attempt.model, "gpt-4.1-mini-20250514",
+            "attempt model must be the snapshot name from SSE, not the canonical request model"
+        );
+    }
+
+    // ── stream_trace_callback: real closure driving tests ──────────────────────
+
+    /// Helper: create a minimal AppState wired to an mpsc channel so tests can read traces.
+    fn test_state_with_channel() -> (AppState, tokio::sync::mpsc::Receiver<firstpass_core::Trace>) {
+        let config = test_config();
+        let (traces, rx) = mpsc::channel(4);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(HashMap::new()),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+        (state, rx)
+    }
+
+    /// `stream_trace_callback` with `UpstreamError`: tokens billed mid-stream are recorded on
+    /// the attempt, outcome is `ServedFrom::Error`, attempt verdict is `Abstain`.
+    ///
+    /// Drives `stream_trace_callback` → `build_stream_trace_from_usage` with
+    /// `StreamOutcome::MidStreamError` — this is the real code path, not a direct call to a
+    /// helper.
+    #[tokio::test]
+    async fn stream_callback_upstream_error_records_billed_usage_as_error() {
+        let (state, mut rx) = test_state_with_channel();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        let usage = SseUsage {
+            model: Some("claude-haiku-4-5".to_owned()),
+            in_tokens: 200,
+            out_tokens: 40,
+            ..Default::default()
+        };
+        // upstream_success=true, reason=UpstreamError → billed usage, ServedFrom::Error.
+        let cb = stream_trace_callback(
+            &state,
+            req,
+            15,
+            None,
+            "default".to_owned(),
+            "anthropic",
+            true,
+        );
+        cb(usage, SseEndReason::UpstreamError);
+
+        let trace = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("trace within 5s")
+            .expect("a trace");
+        assert_eq!(
+            trace.final_.served_from,
+            ServedFrom::Error,
+            "UpstreamError must produce ServedFrom::Error"
+        );
+        assert_eq!(trace.attempts.len(), 1, "one attempt with billed usage");
+        let attempt = &trace.attempts[0];
+        assert_eq!(
+            attempt.verdict,
+            Verdict::Abstain,
+            "UpstreamError attempt must be Abstain, not Pass"
+        );
+        assert!(
+            attempt.cost_usd > 0.0,
+            "billed tokens must produce non-zero cost in the error trace"
+        );
+        assert_eq!(attempt.in_tokens, 200);
+    }
+
+    /// Drive `stream_trace_callback` with `Dropped` and read the receipt it enqueues.
+    async fn dropped_receipt(usage: SseUsage) -> Trace {
+        let (state, mut rx) = test_state_with_channel();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        let cb = stream_trace_callback(
+            &state,
+            req,
+            5,
+            None,
+            "default".to_owned(),
+            "anthropic",
+            true,
+        );
+        cb(usage, SseEndReason::Dropped);
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("trace within 5s")
+            .expect("a trace")
+    }
+
+    /// A client that leaves before the stream's terminal event got a partial answer: the
+    /// receipt keeps the billed usage but never claims a pass, and it is not an upstream error.
+    /// This holds even after `message_start`, which already names the model and input tokens.
+    #[tokio::test]
+    async fn stream_callback_dropped_before_completion_is_a_partial_not_a_pass() {
+        for usage in [
+            SseUsage::default(),
+            SseUsage {
+                model: Some("claude-haiku-4-5".to_owned()),
+                in_tokens: 100,
+                out_tokens: 30,
+                ..Default::default()
+            },
+        ] {
+            let had_tokens = usage.in_tokens;
+            let trace = dropped_receipt(usage).await;
+            assert_eq!(trace.final_.served_from, ServedFrom::Attempt);
+            assert_eq!(trace.attempts.len(), 1);
+            assert_eq!(trace.attempts[0].verdict, Verdict::Abstain, "never a pass");
+            assert_eq!(trace.attempts[0].in_tokens, had_tokens, "billed usage kept");
+        }
+    }
+
+    /// A client that leaves after the terminal event received the whole answer: a served pass.
+    #[tokio::test]
+    async fn stream_callback_dropped_after_completion_is_a_served_pass() {
+        let trace = dropped_receipt(SseUsage {
+            model: Some("claude-haiku-4-5".to_owned()),
+            in_tokens: 100,
+            out_tokens: 30,
+            stop_reason: Some("end_turn".to_owned()),
+            completed: true,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(trace.final_.served_from, ServedFrom::Attempt);
+        assert_eq!(trace.attempts[0].verdict, Verdict::Pass);
+    }
+
+    /// An exact provider-qualified request model with no response model is priced, not `$0`.
+    #[test]
+    fn exact_provider_qualified_model_is_priced() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"openai/gpt-4.1-mini","messages":[]}"#);
+        let resp = Bytes::from_static(br#"{"usage":{"prompt_tokens":100,"completion_tokens":10}}"#);
+        let trace = build_trace(&config, &req, &resp, 1, None, "openai");
+        assert!(trace.attempts[0].cost_usd > 0.0, "{:?}", trace.attempts[0]);
+    }
+
+    /// A clean upstream close after events but before the terminal one is a partial, not a pass;
+    /// a close with the terminal event seen is a served pass.
+    #[tokio::test]
+    async fn stream_callback_eof_before_completion_is_a_partial() {
+        let (state, mut rx) = test_state_with_channel();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        for (completed, want) in [(false, Verdict::Abstain), (true, Verdict::Pass)] {
+            let cb = stream_trace_callback(
+                &state,
+                req.clone(),
+                5,
+                None,
+                "default".to_owned(),
+                "anthropic",
+                true,
+            );
+            cb(
+                SseUsage {
+                    model: Some("claude-haiku-4-5".to_owned()),
+                    in_tokens: 50,
+                    completed,
+                    ..Default::default()
+                },
+                SseEndReason::Eof,
+            );
+            let trace = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("trace within 5s")
+                .expect("a trace");
+            assert_eq!(trace.attempts[0].verdict, want, "completed={completed}");
+        }
+    }
+
+    /// `[DONE]` and JSON events are recognised on CRLF-terminated streams too.
+    #[test]
+    fn sse_parser_tolerates_crlf() {
+        let mut u = SseUsage::default();
+        let (mut buf, mut over) = (Vec::new(), false);
+        parse_sse_chunk_into(
+            b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":7}}}\r\ndata: [DONE]\r\n",
+            &mut buf,
+            &mut over,
+            &mut u,
+        );
+        assert_eq!(u.in_tokens, 7);
+        assert!(u.completed);
+    }
+
+    /// The SSE parser marks completion only on a terminal event, for both providers.
+    #[test]
+    fn sse_completion_is_set_only_by_terminal_events() {
+        let parse = |lines: &[&str]| {
+            let mut u = SseUsage::default();
+            let (mut buf, mut over) = (Vec::new(), false);
+            for l in lines {
+                parse_sse_chunk_into(format!("{l}\n").as_bytes(), &mut buf, &mut over, &mut u);
+            }
+            u.completed
+        };
+        assert!(!parse(&[
+            r#"data: {"type":"message_start","message":{"model":"m","usage":{"input_tokens":5}}}"#
+        ]));
+        assert!(parse(&[
+            r#"data: {"type":"message_delta","usage":{"output_tokens":3},"delta":{"stop_reason":"end_turn"}}"#
+        ]));
+        assert!(parse(&[r#"data: {"type":"message_stop"}"#]));
+        assert!(!parse(&[
+            r#"data: {"model":"gpt","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#
+        ]));
+        assert!(parse(&[
+            r#"data: {"model":"gpt","choices":[{"finish_reason":"stop"}]}"#
+        ]));
+        assert!(parse(&["data: [DONE]"]));
+    }
+
+    /// Dropping a `SseTap` before it exhausts its inner stream fires `on_done` with
+    /// `SseEndReason::Dropped`.
+    #[test]
+    fn sse_tap_drop_before_exhaustion_fires_dropped() {
+        use std::sync::{Arc, Mutex};
+        let (c1, _c2) = anthropic_sse_bytes();
+        // A stream with two chunks: drop the tap after the first poll.
+        let stream = TestStream::from_ok(vec![c1, b"more-data"]);
+        let captured = Arc::new(Mutex::new(None::<SseEndReason>));
+        let cap2 = captured.clone();
+        let tap = SseTap::new(stream, move |_u, reason| {
+            *cap2.lock().unwrap() = Some(reason);
+        });
+        // Drop the tap immediately without polling it to exhaustion.
+        drop(tap);
+        let reason = captured.lock().unwrap().expect("on_done must fire on drop");
+        assert_eq!(
+            reason,
+            SseEndReason::Dropped,
+            "tap dropped before stream ends must fire Dropped"
+        );
+    }
+
+    /// An error trace carries the provider name in `upstream_provider` so that
+    /// `record_trace_metrics` can emit an accurate `firstpass_upstream_failures_total` label
+    /// even when there are no attempts to read the provider from.
+    #[test]
+    fn error_trace_carries_upstream_provider() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        let trace = build_error_trace(&config, &req, 10, None, "anthropic");
+        assert_eq!(
+            trace.upstream_provider, "anthropic",
+            "error trace must record the provider for metrics even without an attempt"
+        );
+    }
+
+    // ── OpenAI 429 on both observe paths ───────────────────────────────────────
+
+    /// An upstream 429 from an OpenAI endpoint is relayed byte-for-byte and recorded as an
+    /// error on both the buffered and streaming observe paths.
+    ///
+    /// Drives `observe_passthrough_openai_path` with `FIRSTPASS_UPSTREAM_OPENAI` pointed at a
+    /// fake server that always returns 429 — the real function, not a stub.
+    #[tokio::test]
+    async fn observe_records_upstream_429_openai_both_paths() {
+        const ERR: &str = r#"{"error":{"message":"Rate limit reached","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#;
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    ERR,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_UPSTREAM_OPENAI" => Some(base_url.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let (traces, mut rx) = mpsc::channel(4);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(HashMap::new()),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+
+        for body in [
+            // buffered (no stream:true)
+            &br#"{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"hi"}]}"#[..],
+            // streaming (stream:true)
+            &br#"{"model":"gpt-4.1-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}"#[..],
+        ] {
+            let resp = observe_passthrough_openai_path(
+                state.clone(),
+                HeaderMap::new(),
+                Bytes::from_static(body),
+                None,
+                "default".to_owned(),
+                crate::upstream::OPENAI_CHAT_PATH,
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "upstream 429 must be relayed, stream={}",
+                String::from_utf8_lossy(body).contains("stream")
+            );
+            let relayed = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            assert_eq!(relayed.as_ref(), ERR.as_bytes(), "body relayed byte-for-byte");
+            let trace = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("trace within 5s")
+                .expect("a trace");
+            assert_eq!(
+                trace.final_.served_from,
+                ServedFrom::Error,
+                "OpenAI 429 must be ServedFrom::Error, stream={}",
+                String::from_utf8_lossy(body).contains("stream")
+            );
+            assert!(trace.attempts.is_empty(), "no attempts on 429");
+        }
     }
 }
