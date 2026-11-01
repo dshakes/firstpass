@@ -195,30 +195,40 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             challenger_cost_usd REAL NOT NULL,
             ch_error INTEGER NOT NULL DEFAULT 0,
             ch_truncated INTEGER NOT NULL DEFAULT 0,
-            ts TEXT NOT NULL
+            ts TEXT NOT NULL,
+            in_log INTEGER NOT NULL DEFAULT 1
         );
         CREATE INDEX IF NOT EXISTS exp_pairs_tenant_idx ON experiment_pairs(tenant, route_ix, fingerprint);",
     )?;
-    // Idempotent migration: add ch_error / ch_truncated to experiment_pairs tables that
-    // predate this change. PRAGMA table_info returns one row per column; column name is field 1.
+    // Idempotent migrations: each column is checked and added independently.
+    // PRAGMA table_info returns one row per column; column name is at index 1.
     // SQLite does not support "ALTER TABLE … ADD COLUMN IF NOT EXISTS", so we check first.
-    let has_ch_error: bool = {
+    let has_column = |name: &str| -> Result<bool, rusqlite::Error> {
         let mut stmt = conn.prepare("PRAGMA table_info(experiment_pairs)")?;
         let mut rows = stmt.query([])?;
-        let mut found = false;
         while let Some(row) = rows.next()? {
-            let name: String = row.get(1)?;
-            if name == "ch_error" {
-                found = true;
-                break;
+            let col: String = row.get(1)?;
+            if col == name {
+                return Ok(true);
             }
         }
-        found
+        Ok(false)
     };
-    if !has_ch_error {
+    if !has_column("ch_error")? {
         conn.execute_batch(
-            "ALTER TABLE experiment_pairs ADD COLUMN ch_error INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE experiment_pairs ADD COLUMN ch_truncated INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE experiment_pairs ADD COLUMN ch_error INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !has_column("ch_truncated")? {
+        conn.execute_batch(
+            "ALTER TABLE experiment_pairs ADD COLUMN ch_truncated INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    // `in_log = 1` for old rows: assume they were already pushed to the shared log (safe
+    // default — they will not be double-replayed on startup with shared_log=true).
+    if !has_column("in_log")? {
+        conn.execute_batch(
+            "ALTER TABLE experiment_pairs ADD COLUMN in_log INTEGER NOT NULL DEFAULT 1;",
         )?;
     }
     Ok(())
@@ -864,6 +874,13 @@ pub struct ExperimentPairRow {
     pub ch_truncated: u64,
     /// When the pair was recorded.
     pub ts: jiff::Timestamp,
+    /// Whether this pair was successfully appended to the shared Redis log at record time.
+    ///
+    /// `false` for pairs written to SQLite during a Redis outage that were never pushed to
+    /// the log. On restart with a shared log configured, these rows are replayed locally
+    /// (evidence + cost) so spend caps and halt decisions survive an outage + restart cycle.
+    /// Older rows default to `true` (assumed already in the log) via the schema default.
+    pub in_log: bool,
 }
 
 /// Append one experiment pair to the `experiment_pairs` table.
@@ -878,8 +895,8 @@ pub fn append_experiment_pair(
     conn.execute(
         "INSERT INTO experiment_pairs \
          (tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, \
-          ch_error, ch_truncated, ts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          ch_error, ch_truncated, ts, in_log) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             row.tenant,
             row.route_ix as i64,
@@ -891,6 +908,7 @@ pub fn append_experiment_pair(
             i64::from(row.ch_error),
             row.ch_truncated as i64,
             row.ts.to_string(),
+            i64::from(row.in_log),
         ],
     )?;
     Ok(())
@@ -909,7 +927,7 @@ pub fn load_all_experiment_pairs(
     let conn = connect(db_path.as_ref())?;
     let mut stmt = conn.prepare(
         "SELECT tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, \
-                ch_error, ch_truncated, ts \
+                ch_error, ch_truncated, ts, in_log \
          FROM experiment_pairs ORDER BY id ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -924,6 +942,7 @@ pub fn load_all_experiment_pairs(
             row.get::<_, i64>(7)?,
             row.get::<_, i64>(8)?,
             row.get::<_, String>(9)?,
+            row.get::<_, i64>(10)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -939,6 +958,7 @@ pub fn load_all_experiment_pairs(
             ch_error_i,
             ch_truncated_i,
             ts_s,
+            in_log_i,
         ) = row?;
         let Ok(trace_id) = trace_id_s.parse::<uuid::Uuid>() else {
             tracing::warn!(
@@ -965,6 +985,7 @@ pub fn load_all_experiment_pairs(
             ch_error: ch_error_i != 0,
             ch_truncated: u64::try_from(ch_truncated_i).unwrap_or(0),
             ts,
+            in_log: in_log_i != 0,
         });
     }
     Ok(out)

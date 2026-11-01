@@ -292,10 +292,6 @@ pub async fn build_promoter_async(
 #[must_use]
 pub fn build_paired_ledger(config: &ProxyConfig, shared_log: bool) -> crate::shadow::ShadowLedger {
     let ledger = crate::shadow::ShadowLedger::new();
-    if shared_log {
-        // Log sync seeds the ledger; see doc comment above.
-        return ledger;
-    }
     let any_paired = config.routing.as_ref().is_some_and(|r| {
         r.routes
             .iter()
@@ -307,7 +303,11 @@ pub fn build_paired_ledger(config: &ProxyConfig, shared_log: bool) -> crate::sha
     match crate::store::load_all_experiment_pairs(&config.db_path) {
         Ok(rows) => {
             let now = jiff::Timestamp::now();
-            for row in &rows {
+            // With a shared log, pairs that reached Redis (in_log=true) will be seeded by
+            // `apply_log_record` during the first sync; only seed from offline pairs
+            // (in_log=false) that were never pushed and need local replay.
+            // Without a shared log, seed from all pairs (original behaviour).
+            for row in rows.iter().filter(|r| !shared_log || !r.in_log) {
                 ledger.seed(
                     &row.tenant,
                     row.route_ix,
@@ -1732,25 +1732,10 @@ fn spawn_paired_challenger(
         };
 
         // Persist the pair to the store for startup rebuild and CLI replay.
-        let pair_row = crate::store::ExperimentPairRow {
-            tenant: tenant.clone(),
-            route_ix,
-            fingerprint: fingerprint.clone(),
-            trace_id: ch_trace.trace_id,
-            x_inc,
-            x_ch,
-            challenger_cost_usd: challenger_cost,
-            ch_error: ch_errored,
-            ch_truncated: ch_trunc,
-            ts: pair_ts,
-        };
-        if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
-            tracing::warn!(%e, "paired challenger: failed to persist pair to store");
-        }
-
-        // Record the pair in the experiment monitor (updates local state and, if a log
-        // backend is configured, propagates to other replicas and seeds health + ledger).
-        state
+        // Record the pair in the experiment monitor first so we know whether the shared-log
+        // append succeeded before writing the SQLite row. The `in_log` flag on the SQLite
+        // row tells startup which rows were never pushed to the log and must be replayed.
+        let appended = state
             .experiments
             .record_pair(
                 &tenant,
@@ -1765,6 +1750,24 @@ fn spawn_paired_challenger(
                 pair_ts.as_second(),
             )
             .await;
+
+        // Persist to SQLite for startup rebuild and CLI replay.
+        let pair_row = crate::store::ExperimentPairRow {
+            tenant: tenant.clone(),
+            route_ix,
+            fingerprint: fingerprint.clone(),
+            trace_id: ch_trace.trace_id,
+            x_inc,
+            x_ch,
+            challenger_cost_usd: challenger_cost,
+            ch_error: ch_errored,
+            ch_truncated: ch_trunc,
+            ts: pair_ts,
+            in_log: appended,
+        };
+        if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
+            tracing::warn!(%e, "paired challenger: failed to persist pair to store");
+        }
 
         tracing::debug!(
             tenant,
@@ -2410,17 +2413,22 @@ async fn enforce_pipeline_inner(
     // Paired challengers are excluded: they evaluate off-path in `spawn_paired_challenger`, which
     // calls `ensure_synced` itself. Calling it here too would block the user response on Redis.
     //
+    // Optimisation: compute the arm assignment synchronously first so we can skip `ensure_synced`
+    // entirely for incumbent-assigned sessions — they never serve the challenger and do not need
+    // cluster state. Only challenger-assigned sessions wait on Redis.
+    //
     // On sync failure (log error): fail closed — treat as halted (serve incumbent only).
-    let live_sync_ok = if let Some(fp) = route
+    let live_arm_info: Option<(firstpass_core::Arm, String)> = route
         .challenger
         .as_ref()
         .filter(|ch| allow_challenger && !ch.is_paired())
-        .map(|ch| ch.fingerprint(&route.ladder))
-    {
-        state
-            .experiments
-            .ensure_synced(&tenant, route_ix, &fp)
-            .await
+        .map(|ch| {
+            let bucket = firstpass_core::Challenger::bucket(&state.config.prompt_salt, &session_id);
+            (ch.arm_of(bucket), ch.fingerprint(&route.ladder))
+        });
+
+    let live_sync_ok = if let Some((firstpass_core::Arm::Challenger, ref fp)) = live_arm_info {
+        state.experiments.ensure_synced(&tenant, route_ix, fp).await
     } else {
         true
     };
@@ -2433,7 +2441,7 @@ async fn enforce_pipeline_inner(
             let bucket = firstpass_core::Challenger::bucket(&state.config.prompt_salt, &session_id);
             let assigned = ch.arm_of(bucket);
             let arm = if ch.is_paired()
-                || (!live_sync_ok && !ch.is_paired())
+                || (!live_sync_ok && !ch.is_paired() && assigned == firstpass_core::Arm::Challenger)
                 || (assigned == firstpass_core::Arm::Challenger
                     && state.experiments.challenger_blocked(&tenant, route_ix))
             {
@@ -8916,6 +8924,7 @@ mod tests {
             ch_error: false,
             ch_truncated: 0,
             ts,
+            in_log: true,
         };
         let two_days_ago = now - jiff::SignedDuration::from_hours(48);
         for r in [
@@ -8947,6 +8956,72 @@ mod tests {
             "cap survives restart"
         );
         assert!(ledger.may_spend("tenant-b", 0, 1.0, now));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// With a shared log configured, `build_paired_ledger` seeds spend from `in_log=false` rows
+    /// (written during an outage) and ignores `in_log=true` rows (they come from Redis on sync).
+    #[tokio::test]
+    async fn build_paired_ledger_seeds_offline_pairs_when_shared_log_is_true() {
+        let db =
+            std::env::temp_dir().join(format!("firstpass-offline-ledger-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let now = jiff::Timestamp::now();
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 2.0\n"
+        );
+        let db_s = db.to_string_lossy().into_owned();
+        let cfg = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.clone()),
+            "FIRSTPASS_DB" => Some(db_s.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+        // Write one offline row (in_log=false) and one log row (in_log=true).
+        let offline_row = crate::store::ExperimentPairRow {
+            tenant: "default".to_owned(),
+            route_ix: 0,
+            fingerprint: "fp".to_owned(),
+            trace_id: Uuid::now_v7(),
+            x_inc: 1.0,
+            x_ch: 0.0,
+            challenger_cost_usd: 0.7,
+            ch_error: false,
+            ch_truncated: 0,
+            ts: now,
+            in_log: false,
+        };
+        let log_row = crate::store::ExperimentPairRow {
+            in_log: true,
+            challenger_cost_usd: 0.4,
+            trace_id: Uuid::now_v7(),
+            ..offline_row.clone()
+        };
+        crate::store::append_experiment_pair(&db, &offline_row).unwrap();
+        crate::store::append_experiment_pair(&db, &log_row).unwrap();
+
+        // shared_log=true: only the offline row is seeded.
+        let ledger = build_paired_ledger(&cfg, true);
+        let spent = ledger.spent_today("default", 0, now);
+        assert!(
+            (spent - 0.7).abs() < 1e-9,
+            "only offline row seeded; got {spent}"
+        );
+
+        // shared_log=false: both rows are seeded.
+        let ledger2 = build_paired_ledger(&cfg, false);
+        let spent2 = ledger2.spent_today("default", 0, now);
+        assert!(
+            (spent2 - 1.1).abs() < 1e-9,
+            "both rows seeded with shared_log=false; got {spent2}"
+        );
+
         let _ = std::fs::remove_file(&db);
     }
 
