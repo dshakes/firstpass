@@ -33,8 +33,9 @@ pub struct Environment {
     pub bind: String,
 }
 
-/// Which provider the ladder opens on. Only `anthropic` and `openai` are built into the provider
-/// registry; the other two must carry a `[[provider]]` block or the config will not resolve.
+/// Which provider the ladder opens on. Of these four, `anthropic` and `openai` are built into the
+/// provider registry; Google (Gemini dialect) and a local server must carry a `[[provider]]` block
+/// or the config will not resolve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     /// Built in.
