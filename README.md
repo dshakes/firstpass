@@ -130,11 +130,11 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dshakes/firstpass/relea
 |---|---|
 | **pip / uvx** | `pip install firstpass` · `uvx --from firstpass firstpass-proxy` |
 | **Homebrew** | `brew install dshakes/tap/firstpass-proxy` |
+| **npm** | `npm i -g firstpass-proxy` <sub>(not `firstpass`: that npm name is an unrelated CLI)</sub> |
 | **Docker** | `docker run -p 8080:8080 -e FIRSTPASS_BIND=0.0.0.0:8080 ghcr.io/dshakes/firstpass:latest` (published on release tags) |
 | **Cargo** | `cargo install firstpass-proxy` (crates.io; needs a Rust toolchain) |
 | **Binaries** | macOS, Linux, Windows, checksummed — [Releases](https://github.com/dshakes/firstpass/releases) |
 
-npm is not published; do not `npm i` anything for Firstpass.
 
 ## Quickstart
 
