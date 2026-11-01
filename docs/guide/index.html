@@ -14,7 +14,7 @@
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <header class="topnav"><div class="bar">
-  <a class="brand" href="../index.html"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass <span class="ver">v0.4.0</span></a>
+  <a class="brand" href="../index.html"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass</a>
   <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
   <span class="nav-sp"></span>
   <div class="nav-right">
@@ -59,13 +59,13 @@
 <h1>Overview</h1>
 <p class="page-sub">Firstpass is an open-source adaptive LLM router. Every request opens on the cheapest model in a ladder; a gate checks the actual output; it serves the first output that passes and escalates one rung only on gate failure. Every decision gets a tamper-evident, hash-chained receipt.</p>
 
-<div class="tldr">Firstpass is an <b>open-source verification layer for LLM serving</b>, v0.4.0, pre-GA. Your own check runs on the real output of every request and only what passes is served; routing is the consequence, not the mechanism. Every request opens on the cheapest model; a gate <b>proves the real output</b> before serving it; on gate failure, it escalates exactly one rung. On 974 real coding tasks that recovered <b>+15.2 points</b> of quality over the cheap model alone and made <b>zero of those tasks worse</b> (<a href="benchmarks.html">artifacts</a>). Four moves — <b>Route → Prove → Escalate → Learn</b> — on every request. It sits as an HTTP reverse proxy between your agent and any provider; your agent code doesn't change.</div>
+<div class="tldr">Firstpass is an <b>open-source verification layer for LLM serving</b>. Your own check runs on the real output of every request and only what passes is served; routing is the consequence, not the mechanism. Every request opens on the cheapest model; a gate <b>proves the real output</b> before serving it; on gate failure, it escalates exactly one rung. On 974 real coding tasks that recovered <b>+15.2 points</b> of quality over the cheap model alone and made <b>zero of those tasks worse</b> (<a href="benchmarks.html">artifacts</a>). Four moves — <b>Route → Prove → Escalate → Learn</b> — on every request. It sits as an HTTP reverse proxy between your agent and any provider; your agent code doesn't change.</div>
 
 <div class="chips">
   <div class="chip good"><div class="cn">≤10<span class="u">%</span></div><div class="cl">served-failure, 95% conf.</div></div>
   <div class="chip"><div class="cn">82<span class="u">%</span></div><div class="cl">served from cheap tier</div></div>
   <div class="chip"><div class="cn">974</div><div class="cl">real tasks in the live bound</div></div>
-  <div class="chip"><div class="cn">v0.4.0</div><div class="cl">pre-GA, open source</div></div>
+  <div class="chip"><div class="cn">Apache-2.0</div><div class="cl">open source, Rust</div></div>
 </div>
 
 <h2 id="what">What Firstpass is<a class="anchor" href="#what" aria-label="Link to this section">#</a></h2>
@@ -149,7 +149,7 @@
 <p>A new class of "System One" decision models — TypeSafe's <strong>Jev</strong> — answers one cheap closed-form question per query ($0.042/M input tokens, no text generation) and routes a query to a model tier by asking it to pick the tier directly. Products built on it (<code>jev-router</code>, <code>prismhq/jev-router</code>) then <strong>serve that tier's output unverified</strong>.</p>
 <p>Firstpass takes the same cheap signal and puts it somewhere narrower: the existing start-rung bandit already had a slot for a per-query prior on <em>where the ladder opens</em>. The gate still runs on every attempt — a wrong prediction costs money or latency, never a wrong answer shipped.</p>
 <p class="subh">The measured gap (simulation, not live)</p>
-<p>Firstpass's own σ-sweep (<code>cargo run -p firstpass-bench</code>, n=500) puts a Jev-style unverified router's served-failure at <strong>50.6–56.2%</strong> across the noise levels tested, against Firstpass's own gated served-failure of <strong>15.8%</strong> on the same suite. Full numbers and both addenda: <a href="https://github.com/dshakes/firstpass/blob/main/docs/adr/0013-verified-predictive-routing.md" rel="noopener">ADR 0013</a>.</p>
+<p>In Firstpass's own simulation harness (<code>cargo run -p firstpass-bench</code>, a simulation, not a live result), a Jev-style router that serves unverified output shows a much higher served-failure rate than the gated arm across the noise levels tested. Methodology and addenda: <a href="https://github.com/dshakes/firstpass/blob/main/docs/adr/0013-verified-predictive-routing.md" rel="noopener">ADR 0013</a>.</p>
 <div class="note"><span class="nt">Status: simulation said STOP, real-data replay says PROCEED</span> The original pre-registered simulation (synthetic σ-sweep) found the fused arm tying plain Firstpass at σ=0 and losing at higher noise — that's history now. A second pre-registration replayed the same prior mechanism on 2,418 real recorded MBPP outcomes across three ladders, using <b>OpenJev</b> (Apache-2.0, run locally — <b>not</b> TypeSafe's hosted Jev) as the prior source: pooled $/success <b>$0.01126 → $0.01075 (−4.6%)</b>, CI of the difference <code>[-0.00074, -0.00031]</code> excludes 0, served-failure held (0.0786 → 0.0778). <b>Verdict: PROCEED.</b> The win is ladder-dependent (−6.3% haiku→sonnet, −2.4% haiku→opus, 0% on the ~20x-price-ratio gpt-4.1-mini→gpt-5.5 ladder) and OpenJev says nothing about hosted Jev's own accuracy. <code>[escalation.prior]</code> stays <b>default-off</b> — the replay is evidence about the prior mechanism, not about the hosted vendor. Full numbers: <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/openjev-prior-replay.md" rel="noopener">openjev-prior-replay.md</a>.</div>
 <div class="note"><span class="nt">Blending a learned signal in: BLEND-NEUTRAL</span> A third pre-registration tested whether blending traffic-learned pass rates into the prior beats the prior alone. Pooled (n=2418): <code>prior+learned</code> <b>$0.01094</b> vs <code>prior</code> <b>$0.01075</b> — paired diff <b>+0.00019 [+0.00004, +0.00036]</b>, excludes 0, the blend is worse. <b>Verdict: BLEND-NEUTRAL</b> — the prior alone stays the recommendation. This run also traced an earlier "cost-aware learned-p" arm to a hindsight leak: it decided on each task's own realized cost, which only exists after generation, so its savings claim (including any earlier "~22% cheaper than first-pass" figure) is withdrawn — see <a href="https://github.com/dshakes/firstpass/blob/main/docs/adr/0013-verified-predictive-routing.md" rel="noopener">ADR 0013</a>. Full numbers: <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/prior-blend-replay.md" rel="noopener">prior-blend-replay.md</a>.</div>
 <p class="subh"><code>[escalation.prior]</code> — enabling it anyway</p>
@@ -186,8 +186,8 @@ decision = { provider = &quot;typesafe&quot;, model = &quot;jev-latest&quot;, th
 <div class="recap">Firstpass fits best when you have a definition of "good" you can run, and a cost problem you can see in the bill.</div>
 
 <h2 id="status">Status<a class="anchor" href="#status" aria-label="Link to this section">#</a></h2>
-<div class="tldr">v0.4.0 is <b>shipped and running</b>. The "Shipped &amp; verified" column is available and on by default. The "Next / research" column is gated on further validation — nothing there ships as a default, and every feature is <b>opt-in only</b>.</div>
-<p>Firstpass is <strong>v0.4.0, pre-GA</strong>, and honest about the line between shipped and researched.</p>
+<div class="tldr">Firstpass is <b>shipped and running</b> (0.9.x, pre-1.0). The "Shipped &amp; verified" column is available and on by default. The "Next / research" column is gated on further validation — nothing there ships as a default, and every feature is <b>opt-in only</b>.</div>
+<p>Firstpass is <strong>pre-1.0 (0.9.x)</strong>, and honest about the line between shipped and researched.</p>
 <p class="subh">Shipped vs. in progress</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Shipped &amp; verified</th><th>Next / research</th></tr></thead>
@@ -196,7 +196,7 @@ decision = { provider = &quot;typesafe&quot;, model = &quot;jev-latest&quot;, th
     <tr><td>All six gate kinds (incl. experimental, unmeasured <code>decision</code>)</td><td>Per-query difficulty prediction</td></tr>
     <tr><td>Start-rung bandit, speculation, failover</td><td>Session-level routing</td></tr>
     <tr><td>Conformal guarantee + Learn-then-Test</td><td>Hosted plane (gated on external audit)</td></tr>
-    <tr><td>Adaptive threshold, OPE, savings/evals</td><td>crates.io publish, 30-day soak</td></tr>
+    <tr><td>Adaptive threshold, OPE, savings/evals</td><td>30-day soak</td></tr>
     <tr><td>Receipts + export/verify + durable mode</td><td></td></tr>
     <tr><td>Modes, provider-smoke CI</td><td></td></tr>
   </tbody>
@@ -226,7 +226,7 @@ decision = { provider = &quot;typesafe&quot;, model = &quot;jev-latest&quot;, th
     <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
     <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
   </div>
-  <div class="legal"><span>Firstpass v0.4.0 · pre-GA · open source</span><span>Proof over prediction.</span></div>
+  <div class="legal"><span>Firstpass · Apache-2.0 · open source</span><span>Proof over prediction.</span></div>
 </div></footer>
 <script src="../assets/docs.js?v=5"></script>
 </body></html>
