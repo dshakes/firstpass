@@ -9130,6 +9130,144 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
+    /// A shared log whose first read succeeds and every later read fails, while appends succeed.
+    #[derive(Debug)]
+    struct FlakyReadLog {
+        inner: crate::experiment::InMemoryExperimentLog,
+        reads: std::sync::atomic::AtomicUsize,
+        always_fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::experiment::ExperimentLogBackend for FlakyReadLog {
+        async fn append(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            record: crate::experiment::LogRecord,
+        ) -> Result<u64, crate::experiment::LogError> {
+            if self.always_fail {
+                return Err(crate::experiment::LogError::Backend("down".into()));
+            }
+            self.inner
+                .append(tenant, route_ix, fingerprint, record)
+                .await
+        }
+        async fn load_since(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            offset: u64,
+        ) -> Result<Vec<crate::experiment::LogRecord>, crate::experiment::LogError> {
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.always_fail || n > 0 {
+                return Err(crate::experiment::LogError::Backend("down".into()));
+            }
+            self.inner
+                .load_since(tenant, route_ix, fingerprint, offset)
+                .await
+        }
+        async fn claim_session(&self, t: &str, r: usize, f: &str, s: &str) -> bool {
+            self.inner.claim_session(t, r, f, s).await
+        }
+    }
+
+    fn flaky_log(always_fail: bool) -> Arc<dyn crate::experiment::ExperimentLogBackend> {
+        Arc::new(FlakyReadLog {
+            inner: crate::experiment::InMemoryExperimentLog::new(),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            always_fail,
+        })
+    }
+
+    /// With a shared log attached, a paired challenger's spend is debited to this replica's
+    /// ledger at completion, even when reading its own record back from the log fails: the cap
+    /// must not depend on the read-back.
+    #[tokio::test]
+    async fn paired_spend_is_debited_locally_when_the_log_read_back_fails() {
+        use tower::ServiceExt;
+        let db = std::env::temp_dir().join(format!("firstpass-paired-flaky-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let (mut state, _rx) = challenger_state(50.0, &db.to_string_lossy());
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 5.0\n"
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
+        state.experiments = Arc::new(
+            crate::experiment::ExperimentMonitor::from_config(cfg.routing.as_ref().unwrap())
+                .with_log(flaky_log(false)),
+        );
+        state.config = Arc::new(cfg);
+        let mut outs = HashMap::new();
+        outs.insert(
+            INCUMBENT.to_owned(),
+            Ok(model_resp(INCUMBENT, "{\"ok\": 1}")),
+        );
+        outs.insert(
+            CHALLENGER.to_owned(),
+            Ok(model_resp(CHALLENGER, "{\"ok\": 1}")),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        state.providers = ProviderRegistry::from_map(map);
+        let ledger = state.paired_ledger.clone();
+        let router = app(state).expect("router");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(user_body()))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+        let mut pairs = Vec::new();
+        for _ in 0..200 {
+            pairs = crate::store::load_all_experiment_pairs(&db).unwrap_or_default();
+            if !pairs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pairs.len(), 1, "the challenger ran (first sync succeeded)");
+        let spent = ledger.spent_today("default", 0, jiff::Timestamp::now());
+        assert!(
+            spent > 0.0,
+            "challenger spend debited locally despite the failed read-back: {spent}"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A cold replica that cannot read the shared log does not serve a live challenger: without
+    /// the cluster state it cannot know the challenger was not already halted.
+    #[tokio::test]
+    async fn live_challenger_is_not_served_when_the_cold_start_sync_fails() {
+        use firstpass_core::Arm;
+        let (mut state, mut rx) = challenger_state(50.0, ":memory:");
+        let cfg = state.config.routing.clone().unwrap();
+        state.experiments = Arc::new(
+            crate::experiment::ExperimentMonitor::from_config(&cfg).with_log(flaky_log(true)),
+        );
+        let session = session_in_arm(&state, Arm::Challenger, 0);
+        let trace = serve_session(&state, &mut rx, &session).await;
+        let rec = trace
+            .experiment
+            .expect("experiment record on a challenger route");
+        assert_eq!(rec.arm, Arm::Incumbent, "fail closed: served the incumbent");
+        assert_eq!(trace.attempts[0].model, INCUMBENT);
+    }
+
     /// Once a paired experiment halts, the challenger is not run again: no pair, no spend.
     #[tokio::test]
     async fn halted_paired_challenger_stops_spending() {
