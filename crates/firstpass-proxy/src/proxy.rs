@@ -3517,31 +3517,24 @@ fn stream_trace_callback(
                     )
                 }
                 SseEndReason::Dropped => {
-                    // Client disconnected before the stream finished. If the SSE parser
-                    // saw any usage events (model name or token counts), something was
-                    // delivered and billed — record it as a partial served attempt.
-                    // If no usage was seen, nothing reached the client — record an error.
-                    let has_usage =
-                        usage.model.is_some() || usage.in_tokens > 0 || usage.out_tokens > 0;
-                    if has_usage {
-                        build_stream_trace_from_usage(
-                            &config,
-                            &req_body,
-                            latency_ms,
-                            session_header.as_deref(),
-                            usage,
-                            provider,
-                            StreamOutcome::Served,
-                        )
+                    // Client disconnected. Only a stream that reached its terminal event was
+                    // fully delivered; an earlier drop (even after `message_start`, which already
+                    // names the model and input tokens) is a partial serve: billed usage kept,
+                    // never a pass, and not an upstream failure.
+                    let outcome = if usage.completed {
+                        StreamOutcome::Served
                     } else {
-                        build_error_trace(
-                            &config,
-                            &req_body,
-                            latency_ms,
-                            session_header.as_deref(),
-                            provider,
-                        )
-                    }
+                        StreamOutcome::Partial
+                    };
+                    build_stream_trace_from_usage(
+                        &config,
+                        &req_body,
+                        latency_ms,
+                        session_header.as_deref(),
+                        usage,
+                        provider,
+                        outcome,
+                    )
                 }
                 SseEndReason::Eof => {
                     // Normal stream completion.
@@ -3594,6 +3587,9 @@ struct SseUsage {
     /// `"max_tokens"` for Anthropic, `"length"` for OpenAI — either means the output was
     /// truncated at the token limit.
     stop_reason: Option<String>,
+    /// The stream reached its terminal event (Anthropic `message_stop` or a `stop_reason`;
+    /// OpenAI a non-empty `finish_reason` or `[DONE]`): the answer was fully delivered.
+    completed: bool,
 }
 
 /// Stream adapter that relays every upstream byte to the client unchanged while tapping SSE
@@ -3714,6 +3710,7 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
     };
     // OpenAI uses `data: [DONE]` as a stream sentinel — not JSON, safe to skip.
     if data == b"[DONE]" {
+        usage.completed = true;
         return;
     }
     let Ok(json) = serde_json::from_slice::<Value>(data) else {
@@ -3746,8 +3743,10 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
             }
             if let Some(stop) = json.pointer("/delta/stop_reason").and_then(Value::as_str) {
                 usage.stop_reason = Some(stop.to_owned());
+                usage.completed = true;
             }
         }
+        Some("message_stop") => usage.completed = true,
         _ => {
             // OpenAI-compatible: final usage chunk (only populated when
             // `stream_options.include_usage` was set in the request).
@@ -3773,6 +3772,7 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
                 .filter(|fr| !fr.is_empty())
             {
                 usage.stop_reason = Some(fr.to_owned());
+                usage.completed = true;
             }
         }
     }
@@ -3934,7 +3934,13 @@ fn build_trace(
     let cost_usd = config
         .prices
         .cost_usd_with_cache(
-            &format!("{provider}/{model}"),
+            // A model already written as `{provider}/name` must not become `{provider}/{provider}/name`.
+            &format!(
+                "{provider}/{}",
+                model
+                    .strip_prefix(&format!("{provider}/"))
+                    .unwrap_or(&model)
+            ),
             in_tokens,
             cache_write_tokens,
             cache_read_tokens,
@@ -4021,6 +4027,10 @@ enum StreamOutcome {
     /// was not fully delivered. Attempt verdict: `Abstain`;
     /// `final_.served_from`: `Error`; `final_.served_rung`: `None`.
     MidStreamError,
+    /// The client disconnected before the stream's terminal event: whatever was relayed was
+    /// served and billed, but nothing says the answer was complete. Attempt verdict: `Abstain`;
+    /// `final_.served_from`: `Attempt`. Not an upstream failure.
+    Partial,
 }
 
 fn build_stream_trace_from_usage(
@@ -4051,7 +4061,13 @@ fn build_stream_trace_from_usage(
     let cost_usd = config
         .prices
         .cost_usd_with_cache(
-            &format!("{provider}/{model}"),
+            // A model already written as `{provider}/name` must not become `{provider}/{provider}/name`.
+            &format!(
+                "{provider}/{}",
+                model
+                    .strip_prefix(&format!("{provider}/"))
+                    .unwrap_or(&model)
+            ),
             in_tokens,
             cache_write_tokens,
             cache_read_tokens,
@@ -4098,6 +4114,7 @@ fn build_stream_trace_from_usage(
     let (verdict, served_from, served_rung) = match outcome {
         StreamOutcome::Served => (Verdict::Pass, ServedFrom::Attempt, Some(0u32)),
         StreamOutcome::MidStreamError => (Verdict::Abstain, ServedFrom::Error, None),
+        StreamOutcome::Partial => (Verdict::Abstain, ServedFrom::Attempt, Some(0u32)),
     };
 
     let attempt = Attempt {
@@ -10325,14 +10342,10 @@ mod tests {
         assert_eq!(attempt.in_tokens, 200);
     }
 
-    /// `stream_trace_callback` with `Dropped` and no usage: nothing was delivered, so the
-    /// outcome is `ServedFrom::Error` with no attempts.
-    #[tokio::test]
-    async fn stream_callback_dropped_no_usage_records_error_trace() {
+    /// Drive `stream_trace_callback` with `Dropped` and read the receipt it enqueues.
+    async fn dropped_receipt(usage: SseUsage) -> Trace {
         let (state, mut rx) = test_state_with_channel();
         let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
-        // Empty usage: no model, no tokens — nothing was delivered.
-        let usage = SseUsage::default();
         let cb = stream_trace_callback(
             &state,
             req,
@@ -10343,56 +10356,86 @@ mod tests {
             true,
         );
         cb(usage, SseEndReason::Dropped);
-
-        let trace = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("trace within 5s")
-            .expect("a trace");
-        assert_eq!(
-            trace.final_.served_from,
-            ServedFrom::Error,
-            "Dropped with no usage must produce ServedFrom::Error"
-        );
-        assert!(
-            trace.attempts.is_empty(),
-            "no attempts when nothing was delivered"
-        );
+            .expect("a trace")
     }
 
-    /// `stream_trace_callback` with `Dropped` and real usage: something was delivered and
-    /// billed, so the outcome is `ServedFrom::Attempt`.
+    /// A client that leaves before the stream's terminal event got a partial answer: the
+    /// receipt keeps the billed usage but never claims a pass, and it is not an upstream error.
+    /// This holds even after `message_start`, which already names the model and input tokens.
     #[tokio::test]
-    async fn stream_callback_dropped_with_usage_records_served_attempt() {
-        let (state, mut rx) = test_state_with_channel();
-        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
-        let usage = SseUsage {
+    async fn stream_callback_dropped_before_completion_is_a_partial_not_a_pass() {
+        for usage in [
+            SseUsage::default(),
+            SseUsage {
+                model: Some("claude-haiku-4-5".to_owned()),
+                in_tokens: 100,
+                out_tokens: 30,
+                ..Default::default()
+            },
+        ] {
+            let had_tokens = usage.in_tokens;
+            let trace = dropped_receipt(usage).await;
+            assert_eq!(trace.final_.served_from, ServedFrom::Attempt);
+            assert_eq!(trace.attempts.len(), 1);
+            assert_eq!(trace.attempts[0].verdict, Verdict::Abstain, "never a pass");
+            assert_eq!(trace.attempts[0].in_tokens, had_tokens, "billed usage kept");
+        }
+    }
+
+    /// A client that leaves after the terminal event received the whole answer: a served pass.
+    #[tokio::test]
+    async fn stream_callback_dropped_after_completion_is_a_served_pass() {
+        let trace = dropped_receipt(SseUsage {
             model: Some("claude-haiku-4-5".to_owned()),
             in_tokens: 100,
             out_tokens: 30,
+            stop_reason: Some("end_turn".to_owned()),
+            completed: true,
             ..Default::default()
-        };
-        let cb = stream_trace_callback(
-            &state,
-            req,
-            8,
-            None,
-            "default".to_owned(),
-            "anthropic",
-            true,
-        );
-        cb(usage, SseEndReason::Dropped);
-
-        let trace = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("trace within 5s")
-            .expect("a trace");
-        assert_eq!(
-            trace.final_.served_from,
-            ServedFrom::Attempt,
-            "Dropped with usage must produce ServedFrom::Attempt (something was delivered)"
-        );
-        assert_eq!(trace.attempts.len(), 1);
+        })
+        .await;
+        assert_eq!(trace.final_.served_from, ServedFrom::Attempt);
         assert_eq!(trace.attempts[0].verdict, Verdict::Pass);
+    }
+
+    /// An exact provider-qualified request model with no response model is priced, not `$0`.
+    #[test]
+    fn exact_provider_qualified_model_is_priced() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"openai/gpt-4.1-mini","messages":[]}"#);
+        let resp = Bytes::from_static(br#"{"usage":{"prompt_tokens":100,"completion_tokens":10}}"#);
+        let trace = build_trace(&config, &req, &resp, 1, None, "openai");
+        assert!(trace.attempts[0].cost_usd > 0.0, "{:?}", trace.attempts[0]);
+    }
+
+    /// The SSE parser marks completion only on a terminal event, for both providers.
+    #[test]
+    fn sse_completion_is_set_only_by_terminal_events() {
+        let parse = |lines: &[&str]| {
+            let mut u = SseUsage::default();
+            let (mut buf, mut over) = (Vec::new(), false);
+            for l in lines {
+                parse_sse_chunk_into(format!("{l}\n").as_bytes(), &mut buf, &mut over, &mut u);
+            }
+            u.completed
+        };
+        assert!(!parse(&[
+            r#"data: {"type":"message_start","message":{"model":"m","usage":{"input_tokens":5}}}"#
+        ]));
+        assert!(parse(&[
+            r#"data: {"type":"message_delta","usage":{"output_tokens":3},"delta":{"stop_reason":"end_turn"}}"#
+        ]));
+        assert!(parse(&[r#"data: {"type":"message_stop"}"#]));
+        assert!(!parse(&[
+            r#"data: {"model":"gpt","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#
+        ]));
+        assert!(parse(&[
+            r#"data: {"model":"gpt","choices":[{"finish_reason":"stop"}]}"#
+        ]));
+        assert!(parse(&["data: [DONE]"]));
     }
 
     /// Dropping a `SseTap` before it exhausts its inner stream fires `on_done` with
