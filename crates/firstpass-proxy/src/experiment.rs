@@ -451,12 +451,6 @@ struct Entry {
     applied_pair_ids: HashSet<Uuid>,
     /// How many records have been consumed from the shared log so far (incremental LRANGE).
     remote_log_offset: u64,
-    /// Whether this entry has completed at least one full `sync_from_backend` pass since the
-    /// process started. Used by `ensure_synced` to gate the cold-start pull: a fresh replica must
-    /// see cluster state (halt decisions, spend) before it checks caps, so the very first request
-    /// per `(tenant, route_ix)` per process triggers one synchronous sync. Subsequent requests see
-    /// `synced_once = true` and skip the extra round-trip.
-    synced_once: bool,
     /// Whether a `tracing::warn!` has already been emitted for a failed cold-start sync on this
     /// entry. Guards against per-request log spam when the backend is persistently unreachable.
     sync_warn_logged: bool,
@@ -524,7 +518,7 @@ pub struct ExperimentMonitor {
     ///
     /// All concurrent first-request callers for a fresh entry block on the same
     /// `tokio::sync::Mutex`. Only one calls the backend (LRANGE); subsequent waiters re-check
-    /// `synced_once` and return immediately once the winner sets it. The outer `Mutex` protects
+    /// `last_synced_at` and return immediately once the winner has synced. The outer `Mutex` protects
     /// the map; the inner async `Mutex` serialises the cold-start burst without holding the outer
     /// lock across an await.
     sync_gates: SyncGates,
@@ -626,7 +620,7 @@ impl ExperimentMonitor {
     ///
     /// **Burst coalescing.** A per-entry `tokio::sync::Mutex` gate serialises concurrent
     /// first-request callers so exactly one LRANGE is issued per burst. Subsequent waiters
-    /// re-check `synced_once` after acquiring the gate and return immediately. `synced_once` is
+    /// re-check `last_synced_at` after acquiring the gate and return immediately. `last_synced_at` is
     /// set only on success; on failure it stays false (so the next burst retries), but a warning
     /// is logged only once per entry to avoid spam during a persistent outage.
     ///
@@ -711,7 +705,7 @@ impl ExperimentMonitor {
 
         match sync_result {
             Ok(Ok(())) => {
-                // sync_from_backend sets last_synced_at and synced_once on success.
+                // sync_from_backend sets last_synced_at on success.
                 // Once synced, remove the gate so subsequent callers take the quick path
                 // instead of re-acquiring an Arc that will never be needed again (Issue 6b).
                 let mut gates = self
@@ -806,7 +800,6 @@ impl ExperimentMonitor {
                         saturated_logged: false,
                         applied_pair_ids: HashSet::new(),
                         remote_log_offset: 0,
-                        synced_once: false,
                         sync_warn_logged: false,
                         sync_failed_at: None,
                         last_synced_at: None,
@@ -1148,8 +1141,9 @@ impl ExperimentMonitor {
             // sync spares the first explicit request from a cold-start LRANGE.
             let mut map = self.lock();
             if let Some(e) = map.get_mut(tenant).and_then(|r| r.get_mut(&route_ix)) {
-                e.synced_once = true;
                 e.last_synced_at = Some(tokio::time::Instant::now());
+                // A recovered log re-arms the once-per-outage warning for the next outage.
+                e.sync_warn_logged = false;
             }
             return Ok(());
         }
@@ -1200,8 +1194,9 @@ impl ExperimentMonitor {
         // Mark synced: a successful background sync spares the first explicit request from
         // a cold-start LRANGE and marks the state as fresh for the staleness bound.
         if let Some(e) = map.get_mut(tenant).and_then(|r| r.get_mut(&route_ix)) {
-            e.synced_once = true;
             e.last_synced_at = Some(tokio::time::Instant::now());
+            // A recovered log re-arms the once-per-outage warning for the next outage.
+            e.sync_warn_logged = false;
         }
         Ok(())
     }

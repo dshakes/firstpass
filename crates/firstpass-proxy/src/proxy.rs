@@ -283,9 +283,10 @@ pub async fn build_promoter_async(
 ///
 /// When `shared_log` is `true` (a Redis or in-memory log backend is attached), the log is the
 /// authoritative cluster-wide record: the `ExperimentMonitor`'s `apply_log_record` seeds the
-/// ledger from `LogRecord::Pair.ts_unix` as records arrive. Seeding from the local SQLite here
-/// would double-debit this replica's own today's pairs (the log also carries them). So with a
-/// shared log the returned ledger is empty; the first log sync seeds it correctly.
+/// ledger from `LogRecord::Pair.ts_unix` as records arrive. Rows marked `InLog` are therefore not
+/// seeded here (that would double-debit them). Rows the log never received (`NotInLog`, written
+/// during an outage) and legacy rows of unknown status (`Unknown`) ARE seeded: their spend must
+/// survive a restart, and over-counting a legacy row can only make the cap stricter.
 ///
 /// Staleness: the cluster can overshoot the cap by at most one sync interval (~5 s) of spend,
 /// because `may_spend` is checked before the call and the ledger is updated from the log
