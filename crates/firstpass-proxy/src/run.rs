@@ -223,27 +223,30 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error>
     // `build_experiment_log` fails fast on a missing or unreachable Redis rather than silently
     // falling back to per-replica state — the same policy as `verified_cache` and `promoter`.
     let experiment_log = crate::proxy::build_experiment_log(&config).await?;
+    let shared_log = experiment_log.is_some();
+    // Today's paired-challenger spend survives a restart, so the daily cap is a daily cap.
+    // With a shared log, seeding from local SQLite would double-debit this replica's own today's
+    // pairs (the log also carries them); the first log sync handles seeding instead.
+    let paired_ledger = Arc::new(crate::proxy::build_paired_ledger(&config, shared_log));
     let experiments = Arc::new({
         let monitor = config
             .routing
             .as_ref()
             .map_or_else(Default::default, |routing| {
-                crate::experiment::build_monitor_with(
-                    &config.db_path,
-                    routing,
-                    experiment_log.is_some(),
-                )
+                crate::experiment::build_monitor_with(&config.db_path, routing, shared_log)
             });
         if let Some(log) = experiment_log {
-            monitor.with_log(log)
+            // Attach both the shared log (for cross-replica halt/certify) and the paired ledger
+            // (so apply_log_record can seed cluster-wide spend on every sync).
+            monitor
+                .with_log(log)
+                .with_paired_ledger(Arc::clone(&paired_ledger))
         } else {
             monitor
         }
     });
     // Background sync keeps all replicas ≤ 5 s stale. No-op when no log backend is configured.
     experiments.start_sync_task(std::time::Duration::from_secs(5));
-    // Today's paired-challenger spend survives a restart, so the daily cap is a daily cap.
-    let paired_ledger = Arc::new(crate::proxy::build_paired_ledger(&config));
 
     let state = AppState {
         config: Arc::new(config),

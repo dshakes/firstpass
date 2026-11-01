@@ -277,9 +277,23 @@ pub async fn build_promoter_async(
 /// Only touches the store when some route has a paired challenger. An unreadable store seeds
 /// nothing: the experiment monitor already fails closed on the same read, and a blocked
 /// challenger never runs.
+///
+/// When `shared_log` is `true` (a Redis or in-memory log backend is attached), the log is the
+/// authoritative cluster-wide record: the `ExperimentMonitor`'s `apply_log_record` seeds the
+/// ledger from `LogRecord::Pair.ts_unix` as records arrive. Seeding from the local SQLite here
+/// would double-debit this replica's own today's pairs (the log also carries them). So with a
+/// shared log the returned ledger is empty; the first log sync seeds it correctly.
+///
+/// Staleness: the cluster can overshoot the cap by at most one sync interval (~5 s) of spend,
+/// because `may_spend` is checked before the call and the ledger is updated from the log
+/// asynchronously. This is documented in docs/guide/experiments.html.
 #[must_use]
-pub fn build_paired_ledger(config: &ProxyConfig) -> crate::shadow::ShadowLedger {
+pub fn build_paired_ledger(config: &ProxyConfig, shared_log: bool) -> crate::shadow::ShadowLedger {
     let ledger = crate::shadow::ShadowLedger::new();
+    if shared_log {
+        // Log sync seeds the ledger; see doc comment above.
+        return ledger;
+    }
     let any_paired = config.routing.as_ref().is_some_and(|r| {
         r.routes
             .iter()
@@ -1644,18 +1658,26 @@ fn spawn_paired_challenger(
 
         let (_, ch_trace) = route_enforce(ctx).await;
         let challenger_cost = ch_trace.final_.total_cost_usd;
-        state
-            .paired_ledger
-            .debit(&tenant, route_ix, challenger_cost, now);
+        let ch_errored = ch_trace.final_.served_from == firstpass_core::ServedFrom::Error;
+        let ch_trunc = crate::experiment::truncated_attempts(&ch_trace);
 
-        state.experiments.observe_health(
-            &tenant,
-            route_ix,
-            &fingerprint,
-            firstpass_core::Arm::Challenger,
-            ch_trace.final_.served_from == firstpass_core::ServedFrom::Error,
-            crate::experiment::truncated_attempts(&ch_trace),
-        );
+        // Health and ledger are only tallied directly when no shared log is attached. When a log
+        // IS attached, `apply_log_record` handles both from the `LogRecord::Pair` fields, so the
+        // originating replica does not double-count (health once from live + once from log replay).
+        if !state.experiments.has_log() {
+            state
+                .paired_ledger
+                .debit(&tenant, route_ix, challenger_cost, now);
+            state.experiments.observe_health(
+                &tenant,
+                route_ix,
+                &fingerprint,
+                firstpass_core::Arm::Challenger,
+                ch_errored,
+                ch_trunc,
+            );
+        }
+
         // Only a gate pass is success. `Served` is not: a ladder whose every rung failed its gates
         // still serves its best attempt. And an error is a failure, not a skipped pair: errors
         // cluster on hard requests, so skipping them would flatter the challenger toward a
@@ -1677,6 +1699,8 @@ fn spawn_paired_challenger(
             x_inc,
             x_ch,
             challenger_cost_usd: challenger_cost,
+            ch_error: ch_errored,
+            ch_truncated: ch_trunc,
             ts: now,
         };
         if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
@@ -1684,7 +1708,7 @@ fn spawn_paired_challenger(
         }
 
         // Record the pair in the experiment monitor (updates local state and, if a log
-        // backend is configured, propagates to other replicas).
+        // backend is configured, propagates to other replicas and seeds health + ledger).
         state
             .experiments
             .record_pair(
@@ -1695,6 +1719,9 @@ fn spawn_paired_challenger(
                 x_ch,
                 incumbent_cost_usd,
                 challenger_cost,
+                ch_errored,
+                ch_trunc,
+                now.as_second(),
             )
             .await;
 
@@ -8465,6 +8492,8 @@ mod tests {
             x_inc: 1.0,
             x_ch: 1.0,
             challenger_cost_usd: usd,
+            ch_error: false,
+            ch_truncated: 0,
             ts,
         };
         let two_days_ago = now - jiff::SignedDuration::from_hours(48);
@@ -8489,7 +8518,7 @@ mod tests {
             _ => None,
         })
         .unwrap();
-        let ledger = build_paired_ledger(&cfg);
+        let ledger = build_paired_ledger(&cfg, false);
         assert!((ledger.spent_today("tenant-a", 0, now) - 1.10).abs() < 1e-9);
         assert!((ledger.spent_today("tenant-b", 0, now) - 0.10).abs() < 1e-9);
         assert!(
@@ -8708,7 +8737,18 @@ mod tests {
             }
             state
                 .experiments
-                .record_pair("default", 0, &fingerprint, 1.0, 0.0, 0.01, 0.001)
+                .record_pair(
+                    "default",
+                    0,
+                    &fingerprint,
+                    1.0,
+                    0.0,
+                    0.01,
+                    0.001,
+                    false,
+                    0,
+                    0,
+                )
                 .await;
         }
         assert!(

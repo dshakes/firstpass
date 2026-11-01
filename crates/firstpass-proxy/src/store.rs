@@ -193,10 +193,34 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             x_inc REAL NOT NULL,
             x_ch REAL NOT NULL,
             challenger_cost_usd REAL NOT NULL,
+            ch_error INTEGER NOT NULL DEFAULT 0,
+            ch_truncated INTEGER NOT NULL DEFAULT 0,
             ts TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS exp_pairs_tenant_idx ON experiment_pairs(tenant, route_ix, fingerprint);",
     )?;
+    // Idempotent migration: add ch_error / ch_truncated to experiment_pairs tables that
+    // predate this change. PRAGMA table_info returns one row per column; column name is field 1.
+    // SQLite does not support "ALTER TABLE … ADD COLUMN IF NOT EXISTS", so we check first.
+    let has_ch_error: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info(experiment_pairs)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "ch_error" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_ch_error {
+        conn.execute_batch(
+            "ALTER TABLE experiment_pairs ADD COLUMN ch_error INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE experiment_pairs ADD COLUMN ch_truncated INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     Ok(())
 }
 
@@ -834,6 +858,10 @@ pub struct ExperimentPairRow {
     pub x_ch: f64,
     /// USD spent by the challenger on this pair.
     pub challenger_cost_usd: f64,
+    /// Whether the challenger call ended in an error with no output.
+    pub ch_error: bool,
+    /// Number of challenger attempts whose answer was cut off at the output-token limit.
+    pub ch_truncated: u64,
     /// When the pair was recorded.
     pub ts: jiff::Timestamp,
 }
@@ -849,8 +877,9 @@ pub fn append_experiment_pair(
     let conn = connect(db_path.as_ref())?;
     conn.execute(
         "INSERT INTO experiment_pairs \
-         (tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, ts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, \
+          ch_error, ch_truncated, ts) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             row.tenant,
             row.route_ix as i64,
@@ -859,6 +888,8 @@ pub fn append_experiment_pair(
             row.x_inc,
             row.x_ch,
             row.challenger_cost_usd,
+            i64::from(row.ch_error),
+            row.ch_truncated as i64,
             row.ts.to_string(),
         ],
     )?;
@@ -877,7 +908,8 @@ pub fn load_all_experiment_pairs(
 ) -> Result<Vec<ExperimentPairRow>, StoreError> {
     let conn = connect(db_path.as_ref())?;
     let mut stmt = conn.prepare(
-        "SELECT tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, ts \
+        "SELECT tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, \
+                ch_error, ch_truncated, ts \
          FROM experiment_pairs ORDER BY id ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -889,12 +921,25 @@ pub fn load_all_experiment_pairs(
             row.get::<_, f64>(4)?,
             row.get::<_, f64>(5)?,
             row.get::<_, f64>(6)?,
-            row.get::<_, String>(7)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, String>(9)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (tenant, route_ix, fingerprint, trace_id_s, x_inc, x_ch, ch_cost, ts_s) = row?;
+        let (
+            tenant,
+            route_ix,
+            fingerprint,
+            trace_id_s,
+            x_inc,
+            x_ch,
+            ch_cost,
+            ch_error_i,
+            ch_truncated_i,
+            ts_s,
+        ) = row?;
         let Ok(trace_id) = trace_id_s.parse::<uuid::Uuid>() else {
             tracing::warn!(
                 %trace_id_s,
@@ -917,6 +962,8 @@ pub fn load_all_experiment_pairs(
             x_inc,
             x_ch,
             challenger_cost_usd: ch_cost,
+            ch_error: ch_error_i != 0,
+            ch_truncated: u64::try_from(ch_truncated_i).unwrap_or(0),
             ts,
         });
     }
@@ -1391,5 +1438,54 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&spill_p);
+    }
+
+    /// An existing `experiment_pairs` table without `ch_error`/`ch_truncated` columns gets
+    /// those columns added by `migrate()`, and old rows load with defaults of `false`/`0`.
+    ///
+    /// Mutation test: if the `ALTER TABLE` branch is removed from `migrate`, the load panics on
+    /// a missing column or returns a wrong index — either way this assertion fails.
+    #[tokio::test]
+    async fn experiment_pairs_migration_adds_columns_to_old_schema() {
+        let db_path = std::env::temp_dir().join(format!(
+            "firstpass-pairs-migrate-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        // Create an old-schema DB (no ch_error / ch_truncated).
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE experiment_pairs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant TEXT NOT NULL,
+                    route_ix INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    trace_id TEXT NOT NULL,
+                    x_inc REAL NOT NULL,
+                    x_ch REAL NOT NULL,
+                    challenger_cost_usd REAL NOT NULL,
+                    ts TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO experiment_pairs \
+                 (tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, ts) \
+                 VALUES ('t', 0, 'fp', '00000000-0000-0000-0000-000000000001', 0.5, 0.5, 0.01, \
+                         '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        // Open via `open()` so `migrate()` runs and adds the missing columns, then close.
+        let (tx, handle) = open(&db_path).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        // Now load: old row must have default values for the new columns.
+        let rows = load_all_experiment_pairs(&db_path).unwrap();
+        assert_eq!(rows.len(), 1, "old row must be readable after migration");
+        assert!(!rows[0].ch_error, "old row defaults ch_error = false");
+        assert_eq!(rows[0].ch_truncated, 0, "old row defaults ch_truncated = 0");
+        let _ = std::fs::remove_file(&db_path);
     }
 }

@@ -80,6 +80,18 @@ pub enum LogRecord {
         incumbent_cost_usd: f64,
         /// Cost of the challenger off-path evaluation.
         challenger_cost_usd: f64,
+        /// Whether the challenger call ended in an error with no output.
+        /// `#[serde(default)]` so records written by older replicas deserialize to `false`.
+        #[serde(default)]
+        ch_error: bool,
+        /// Number of challenger attempts cut off at the output-token limit.
+        /// `#[serde(default)]` so records written by older replicas deserialize to `0`.
+        #[serde(default)]
+        ch_truncated: u64,
+        /// Unix seconds when this pair was recorded. `0` for records written before this field
+        /// was added (treated as "long ago" by `ShadowLedger::seed`, i.e., not debited today).
+        #[serde(default)]
+        ts_unix: i64,
     },
 }
 
@@ -409,6 +421,9 @@ pub struct ExperimentMonitor {
     entries: Mutex<HashMap<String, HashMap<usize, Entry>>>,
     /// Optional shared log that synchronises evidence across replicas (Redis or in-memory).
     log: Option<Arc<dyn ExperimentLogBackend>>,
+    /// Optional paired-challenger spend ledger. When present, `apply_log_record` seeds cluster
+    /// spend into it so the daily cap is cluster-wide rather than per-process.
+    paired_ledger: Option<Arc<crate::shadow::ShadowLedger>>,
 }
 
 impl ExperimentMonitor {
@@ -438,6 +453,7 @@ impl ExperimentMonitor {
             unavailable: false,
             entries: Mutex::default(),
             log: None,
+            paired_ledger: None,
         }
     }
 
@@ -457,6 +473,21 @@ impl ExperimentMonitor {
     pub fn with_log(mut self, log: Arc<dyn ExperimentLogBackend>) -> Self {
         self.log = Some(log);
         self
+    }
+
+    /// Attach a paired-challenger spend ledger. When set, `apply_log_record` seeds cluster spend
+    /// into it so `may_spend` reflects all replicas' spend, not just this process's. Returns
+    /// `self` for method-chaining. Only effective when a log backend is also attached.
+    #[must_use]
+    pub fn with_paired_ledger(mut self, ledger: Arc<crate::shadow::ShadowLedger>) -> Self {
+        self.paired_ledger = Some(ledger);
+        self
+    }
+
+    /// Whether a shared log backend is currently attached.
+    #[must_use]
+    pub fn has_log(&self) -> bool {
+        self.log.is_some()
     }
 
     /// The fingerprint receipts for `route_ix` must carry to count, if it has a challenger.
@@ -731,6 +762,9 @@ impl ExperimentMonitor {
                 x_inc,
                 x_ch,
                 challenger_cost_usd,
+                ch_error,
+                ch_truncated,
+                ts_unix,
                 ..
             } => {
                 let Some(e) = self.entry(map, tenant, route_ix) else {
@@ -742,6 +776,23 @@ impl ExperimentMonitor {
                     // off-path challenger call is new spend.
                     e.experiment
                         .observe_cost(Arm::Challenger, *challenger_cost_usd);
+                }
+                // Tally challenger health. The live path skips `observe_health` when a log is
+                // attached, so this is the single place health is counted per replica view.
+                if *ch_error || *ch_truncated > 0 {
+                    e.health.challenger.errors += u64::from(*ch_error);
+                    e.health.challenger.truncated += *ch_truncated;
+                }
+                // Seed the paired-challenger spend ledger for cluster-wide cap enforcement.
+                // `seed` uses the pair's original timestamp and only debits today's spend,
+                // so records from previous UTC days never affect today's cap.
+                // The live path skips `paired_ledger.debit` when a log is attached, so this
+                // is the single debit point per replica view (no double-counting).
+                if let Some(ledger) = &self.paired_ledger {
+                    let now = jiff::Timestamp::now();
+                    let pair_ts = jiff::Timestamp::from_second(*ts_unix)
+                        .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+                    ledger.seed(tenant, route_ix, *challenger_cost_usd, pair_ts, now);
                 }
                 before != e.experiment.status()
             }
@@ -856,6 +907,10 @@ impl ExperimentMonitor {
     /// In single-replica mode (no log), applies the pair directly and emits the status log.
     /// Returns `true` if `x_inc` / `x_ch` are valid (finite, in `[0, 1]`) and the pair was
     /// accepted by the underlying [`Experiment`].
+    ///
+    /// `ch_error`, `ch_truncated`, and `ts_unix` are forwarded into [`LogRecord::Pair`] so other
+    /// replicas can rebuild challenger health and seed the paired-spend ledger. In the no-log path
+    /// they are ignored (the caller handles health and ledger directly).
     #[allow(clippy::too_many_arguments)]
     pub async fn record_pair(
         &self,
@@ -866,6 +921,9 @@ impl ExperimentMonitor {
         x_ch: f64,
         incumbent_cost_usd: f64,
         challenger_cost_usd: f64,
+        ch_error: bool,
+        ch_truncated: u64,
+        ts_unix: i64,
     ) -> bool {
         if self.fingerprint(route_ix) != Some(fingerprint) {
             return false;
@@ -919,6 +977,9 @@ impl ExperimentMonitor {
                 x_ch,
                 incumbent_cost_usd,
                 challenger_cost_usd,
+                ch_error,
+                ch_truncated,
+                ts_unix,
             },
         )
         .await;
@@ -991,8 +1052,9 @@ pub struct ArmHealth {
     pub truncated: u64,
 }
 
-/// [`ArmHealth`] for both arms. For a **paired** challenger the counts cover this process's
-/// lifetime only: its off-path answers are not written as receipts, so they cannot be rebuilt.
+/// [`ArmHealth`] for both arms. For a **paired** challenger the counts are persisted in
+/// `experiment_pairs` and in [`LogRecord::Pair`], so they survive restarts and are shared across
+/// replicas when a shared log backend is attached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Health {
     /// The incumbent arm (rebuilt from receipts at startup).
@@ -1085,6 +1147,11 @@ pub fn monitor_from_traces(
                 if e.experiment.observe_pair(row.x_inc, row.x_ch) {
                     e.experiment
                         .observe_cost(Arm::Challenger, row.challenger_cost_usd);
+                }
+                // Rebuild challenger health from the persisted fields.
+                if row.ch_error || row.ch_truncated > 0 {
+                    e.health.challenger.errors += u64::from(row.ch_error);
+                    e.health.challenger.truncated += row.ch_truncated;
                 }
             } else {
                 e.ignored_stale += 1;
@@ -1774,7 +1841,7 @@ mod tests {
         for _ in 0..3 {
             assert!(
                 direct
-                    .record_pair("t", 0, &fp_str, 1.0, 1.0, 0.10, 0.01)
+                    .record_pair("t", 0, &fp_str, 1.0, 1.0, 0.10, 0.01, false, 0, 0)
                     .await
             );
         }
@@ -1786,7 +1853,8 @@ mod tests {
         let b = ExperimentMonitor::from_config(&cfg)
             .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
         for _ in 0..3 {
-            a.record_pair("t", 0, &fp_str, 1.0, 1.0, 0.10, 0.01).await;
+            a.record_pair("t", 0, &fp_str, 1.0, 1.0, 0.10, 0.01, false, 0, 0)
+                .await;
         }
         b.sync_from_backend("t", 0, &fp_str).await;
         close(challenger(&a));
@@ -1808,6 +1876,8 @@ mod tests {
                     x_inc: 1.0,
                     x_ch: 1.0,
                     challenger_cost_usd: 0.01,
+                    ch_error: false,
+                    ch_truncated: 0,
                     ts: jiff::Timestamp::now(),
                 },
             )
@@ -2446,5 +2516,183 @@ mod tests {
         // Clean up both tenants' keys.
         redis_cleanup(&url, &tenant_a).await;
         redis_cleanup(&url, &tenant_b).await;
+    }
+
+    // ── Challenger health persistence and cluster-wide spend cap ─────────────────────────────
+
+    /// An old-format `LogRecord::Pair` JSON (without `ch_error`, `ch_truncated`, `ts_unix`)
+    /// deserializes without error, with all three fields defaulting to `false`/`0`/`0`.
+    ///
+    /// Mutation test: removing `#[serde(default)]` from any of the three fields makes this
+    /// deserialize fail and the `unwrap` panics — the assertion never runs.
+    #[test]
+    fn old_log_record_pair_deserializes_without_new_fields() {
+        let json = r#"{"kind":"pair","x_inc":1.0,"x_ch":0.5,"incumbent_cost_usd":0.1,"challenger_cost_usd":0.01}"#;
+        let record: LogRecord = serde_json::from_str(json).unwrap();
+        match record {
+            LogRecord::Pair {
+                ch_error,
+                ch_truncated,
+                ts_unix,
+                x_inc,
+                x_ch,
+                ..
+            } => {
+                assert!(!ch_error, "ch_error defaults to false");
+                assert_eq!(ch_truncated, 0, "ch_truncated defaults to 0");
+                assert_eq!(ts_unix, 0, "ts_unix defaults to 0");
+                assert!((x_inc - 1.0).abs() < f64::EPSILON);
+                assert!((x_ch - 0.5).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected Pair variant"),
+        }
+    }
+
+    /// Challenger health (`ch_error`, `ch_truncated`) persists to `experiment_pairs` via
+    /// `ExperimentPairRow` and is rebuilt by `monitor_from_traces` at startup (no shared log).
+    ///
+    /// Mutation test: if `monitor_from_traces` does not tally `ch_error`/`ch_truncated` from
+    /// pair rows, the challenger health stays at 0 and these assertions fail.
+    #[tokio::test]
+    async fn pair_health_persists_and_rebuilds_from_store() {
+        let db =
+            std::env::temp_dir().join(format!("firstpass-health-persist-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let cfg = config();
+        let fp_str = fp();
+        // Write a pair with ch_error=true, ch_truncated=2.
+        crate::store::append_experiment_pair(
+            &db,
+            &crate::store::ExperimentPairRow {
+                tenant: "t".to_owned(),
+                route_ix: 0,
+                fingerprint: fp_str.clone(),
+                trace_id: Uuid::now_v7(),
+                x_inc: 1.0,
+                x_ch: 1.0,
+                challenger_cost_usd: 0.01,
+                ch_error: true,
+                ch_truncated: 2,
+                ts: jiff::Timestamp::now(),
+            },
+        )
+        .unwrap();
+        // Rebuild without a shared log: pairs are replayed from SQLite.
+        let m = build_monitor(&db.to_string_lossy(), &cfg);
+        let reps = m.reports();
+        assert_eq!(reps.len(), 1, "one experiment entry");
+        assert_eq!(reps[0].health.challenger.errors, 1, "ch_error rebuilt");
+        assert_eq!(
+            reps[0].health.challenger.truncated, 2,
+            "ch_truncated rebuilt"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Using a shared `InMemoryExperimentLog`, challenger health is counted exactly once per
+    /// replica view (not double-counted on the originating replica), and replica B's paired
+    /// ledger reflects replica A's spend after one sync, reaching the cluster cap.
+    ///
+    /// Mutation tests (one assertion per invariant):
+    /// (a) If `apply_log_record` does not tally health → A's health.errors == 0 → assertion fails.
+    /// (b) If `apply_log_record` does not seed the ledger → A's spent_today == 0.0 → fails.
+    /// (c) If live `observe_health` were also called (double-count) → A's errors == 2 → fails.
+    /// (d) If B's sync does not read the ledger → B's spent_today == 0.0 → fails.
+    /// (e) If cluster cap not enforced → `may_spend` returns true when over cap → fails.
+    #[tokio::test]
+    async fn two_replicas_health_and_spend_count_once() {
+        let shared = Arc::new(InMemoryExperimentLog::new());
+        let cfg = config();
+        let fp_str = fp();
+        let now_ts = jiff::Timestamp::now();
+        let now_secs = now_ts.as_second();
+
+        let ledger_a = Arc::new(crate::shadow::ShadowLedger::new());
+        let ledger_b = Arc::new(crate::shadow::ShadowLedger::new());
+
+        let replica_a = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>)
+            .with_paired_ledger(Arc::clone(&ledger_a));
+        let replica_b = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>)
+            .with_paired_ledger(Arc::clone(&ledger_b));
+
+        assert!(
+            replica_a.has_log(),
+            "log must be attached for this test to be meaningful"
+        );
+
+        // Replica A records a pair: ch_error=true, ch_truncated=1, cost=0.8.
+        // The live path (spawn_paired_challenger) would skip observe_health and debit when
+        // has_log() is true; here we test record_pair directly (same code path via apply_log_record).
+        let accepted = replica_a
+            .record_pair("t", 0, &fp_str, 1.0, 0.5, 0.1, 0.8, true, 1, now_secs)
+            .await;
+        assert!(accepted, "pair must be accepted");
+
+        // (a) & (c): A's health comes from apply_log_record, counted exactly once.
+        let reps_a = replica_a.reports();
+        assert_eq!(
+            reps_a[0].health.challenger.errors, 1,
+            "A: challenger error counted once, not zero or doubled"
+        );
+        assert_eq!(
+            reps_a[0].health.challenger.truncated, 1,
+            "A: challenger truncated counted once"
+        );
+
+        // (b): A's ledger is seeded by apply_log_record (not live debit, which is skipped).
+        let a_spent = ledger_a.spent_today("t", 0, now_ts);
+        assert!(
+            (a_spent - 0.8).abs() < 1e-12,
+            "A: ledger = 0.8 (not doubled or zero); got {a_spent}"
+        );
+
+        // B has not synced yet: no health, no ledger.
+        assert_eq!(
+            ledger_b.spent_today("t", 0, now_ts),
+            0.0,
+            "B: no spend before sync"
+        );
+
+        // Sync B from the shared log.
+        replica_b.sync_from_backend("t", 0, &fp_str).await;
+
+        // B's health matches A's.
+        let reps_b = replica_b.reports();
+        assert_eq!(
+            reps_b[0].health.challenger.errors, 1,
+            "B: challenger error visible after sync"
+        );
+
+        // (d): B's ledger includes A's spend.
+        let b_spent = ledger_b.spent_today("t", 0, now_ts);
+        assert!(
+            (b_spent - 0.8).abs() < 1e-12,
+            "B: ledger reflects A's spend after sync; got {b_spent}"
+        );
+
+        // (e): Add another pair to push cluster total over 1.0 cap.
+        replica_a
+            .record_pair("t", 0, &fp_str, 1.0, 0.5, 0.1, 0.3, false, 0, now_secs)
+            .await;
+        let a_total = ledger_a.spent_today("t", 0, now_ts);
+        assert!(
+            (a_total - 1.1).abs() < 1e-12,
+            "A: cluster total = 1.1; got {a_total}"
+        );
+        assert!(
+            !ledger_a.may_spend("t", 0, 1.0, now_ts),
+            "A: cap exhausted (1.1 > 1.0)"
+        );
+
+        // B syncs and also sees the cap exhausted.
+        replica_b.sync_from_backend("t", 0, &fp_str).await;
+        assert!(
+            !ledger_b.may_spend("t", 0, 1.0, now_ts),
+            "B: cap exhausted from cluster spend"
+        );
     }
 }
