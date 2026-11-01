@@ -968,21 +968,45 @@ impl ExperimentMonitor {
         {
             return false;
         }
-        log.append(
-            tenant,
-            route_ix,
-            fingerprint,
-            LogRecord::Pair {
-                x_inc,
-                x_ch,
-                incumbent_cost_usd,
-                challenger_cost_usd,
+        let appended = log
+            .append(
+                tenant,
+                route_ix,
+                fingerprint,
+                LogRecord::Pair {
+                    x_inc,
+                    x_ch,
+                    incumbent_cost_usd,
+                    challenger_cost_usd,
+                    ch_error,
+                    ch_truncated,
+                    ts_unix,
+                },
+            )
+            .await;
+        if appended == 0 {
+            // The shared log did not take the record (e.g. Redis RPUSH failed). Its evidence is
+            // withheld, which only delays a decision. Its spend and health must still count here:
+            // the live path skipped them because the log was meant to deliver them, and leaving
+            // them out would switch the daily cap off exactly while the log is unreachable.
+            if let Some(ledger) = &self.paired_ledger {
+                ledger.debit(
+                    tenant,
+                    route_ix,
+                    challenger_cost_usd,
+                    jiff::Timestamp::now(),
+                );
+            }
+            self.observe_health(
+                tenant,
+                route_ix,
+                fingerprint,
+                Arm::Challenger,
                 ch_error,
                 ch_truncated,
-                ts_unix,
-            },
-        )
-        .await;
+            );
+            return false;
+        }
         self.sync_from_backend(tenant, route_ix, fingerprint).await;
         true
     }
@@ -2601,6 +2625,50 @@ mod tests {
     /// (c) If live `observe_health` were also called (double-count) → A's errors == 2 → fails.
     /// (d) If B's sync does not read the ledger → B's spent_today == 0.0 → fails.
     /// (e) If cluster cap not enforced → `may_spend` returns true when over cap → fails.
+    /// A shared log that is down: every append fails (returns 0, as the Redis backend does on a
+    /// failed RPUSH) and nothing can be read back.
+    #[derive(Debug)]
+    struct DownLog;
+
+    #[async_trait::async_trait]
+    impl ExperimentLogBackend for DownLog {
+        async fn append(&self, _: &str, _: usize, _: &str, _: LogRecord) -> u64 {
+            0
+        }
+        async fn load_since(&self, _: &str, _: usize, _: &str, _: u64) -> Vec<LogRecord> {
+            vec![]
+        }
+        async fn claim_session(&self, _: &str, _: usize, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// With the shared log unreachable, a paired challenger's spend still counts against the cap
+    /// and its health is still tallied: the live path defers both to the log, so a failed append
+    /// must not silently drop them.
+    #[tokio::test]
+    async fn paired_spend_counts_against_the_cap_when_the_shared_log_is_down() {
+        let ledger = Arc::new(crate::shadow::ShadowLedger::new());
+        let m = ExperimentMonitor::from_config(&config())
+            .with_log(Arc::new(DownLog) as Arc<dyn ExperimentLogBackend>)
+            .with_paired_ledger(Arc::clone(&ledger));
+        let now = jiff::Timestamp::now();
+        let accepted = m
+            .record_pair("t", 0, &fp(), 1.0, 0.0, 0.1, 0.7, true, 2, now.as_second())
+            .await;
+        assert!(!accepted, "nothing reached the log");
+        assert!(
+            (ledger.spent_today("t", 0, now) - 0.7).abs() < 1e-9,
+            "spend debited locally"
+        );
+        assert!(
+            !ledger.may_spend("t", 0, 0.5, now),
+            "cap enforced during the outage"
+        );
+        let h = m.reports()[0].health.challenger;
+        assert_eq!((h.errors, h.truncated), (1, 2), "{h:?}");
+    }
+
     #[tokio::test]
     async fn two_replicas_health_and_spend_count_once() {
         let shared = Arc::new(InMemoryExperimentLog::new());
