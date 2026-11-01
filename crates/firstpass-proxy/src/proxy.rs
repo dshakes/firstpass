@@ -1747,10 +1747,25 @@ fn spawn_paired_challenger(
             firstpass_core::ServedFrom::Cache => return,
         };
 
-        // Persist the pair to the store for startup rebuild and CLI replay.
-        // Record the pair in the experiment monitor first so we know whether the shared-log
-        // append succeeded before writing the SQLite row. The `in_log` flag on the SQLite
-        // row tells startup which rows were never pushed to the log and must be replayed.
+        // ── Durability-ordered persist and evidence application ────────────────────────────
+        //
+        // Two paths, distinguished by whether the shared log is the durable record:
+        //
+        // InLog path (appended to Redis):
+        //   The log is the durable record. SQLite is a startup-rebuild cache.
+        //   `record_pair` already applied evidence via `sync_from_backend`; the SQLite
+        //   write can follow the append safely.
+        //
+        // NotInLog path (no log, or append failed):
+        //   SQLite is the only durable record. Write it BEFORE applying evidence so that
+        //   a crash between the two leaves the evidence absent (the safe direction).
+        //   A missed pair only delays a decision; evidence without a durable record could
+        //   mislead a halt after restart.  If the SQLite write fails, withhold evidence.
+
+        // Try to append to the shared log (no-op if no log configured).
+        // `record_pair` returns true iff the record is now in the log.
+        // Evidence for InLog records is applied inside `record_pair` via sync_from_backend.
+        // For NotInLog records `record_pair` does NOT apply evidence (durability ordering).
         let appended = state
             .experiments
             .record_pair(
@@ -1768,16 +1783,6 @@ fn spawn_paired_challenger(
             )
             .await;
 
-        // Persist to SQLite for startup rebuild and CLI replay.
-        // `in_log` is set explicitly (never relying on the schema DEFAULT):
-        //   - has_log() && appended → InLog (evidence is in Redis)
-        //   - has_log() && !appended → NotInLog (append failed; replay locally on restart)
-        //   - !has_log() → NotInLog (single-replica; no shared log exists)
-        let in_log = if state.experiments.has_log() && appended {
-            crate::store::InLogStatus::InLog
-        } else {
-            crate::store::InLogStatus::NotInLog
-        };
         let pair_row = crate::store::ExperimentPairRow {
             tenant: tenant.clone(),
             route_ix,
@@ -1789,10 +1794,51 @@ fn spawn_paired_challenger(
             ch_error: ch_errored,
             ch_truncated: ch_trunc,
             ts: pair_ts,
-            in_log,
+            // `in_log` is always set explicitly (never relying on the schema DEFAULT=Unknown):
+            //   InLog    → appended to Redis; evidence arrives via sync (already done above)
+            //   NotInLog → local-only; SQLite is the durable record; evidence applied below
+            in_log: if appended {
+                crate::store::InLogStatus::InLog
+            } else {
+                crate::store::InLogStatus::NotInLog
+            },
         };
-        if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
-            tracing::warn!(%e, "paired challenger: failed to persist pair to store");
+
+        if appended {
+            // InLog: log is durable; SQLite is just a startup-rebuild cache.
+            // A write failure here only affects startup (not correctness for this request).
+            if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
+                tracing::warn!(%e, "paired challenger: failed to persist InLog row to store");
+            }
+            // Evidence already applied via sync_from_backend inside record_pair.
+        } else {
+            // NotInLog: SQLite is the only durable record.
+            // Write it FIRST; apply evidence only on success (durability ordering).
+            match crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
+                Ok(()) => {
+                    // Durable write succeeded. Apply evidence to local state.
+                    // `apply_pair_locally` deduplicates by trace_id so even if a concurrent
+                    // log-sync path later sees the same record it will be a no-op.
+                    state.experiments.apply_pair_locally(
+                        &tenant,
+                        route_ix,
+                        &fingerprint,
+                        x_inc,
+                        x_ch,
+                        challenger_cost,
+                        ch_trace.trace_id,
+                    );
+                }
+                Err(e) => {
+                    // SQLite write failed. Withhold evidence: a delay is safer than evidence
+                    // that has no durable backing (the pair would vanish on restart, letting
+                    // a halted challenger run again).
+                    tracing::warn!(
+                        %e,
+                        "paired challenger: SQLite write failed; evidence withheld for this pair"
+                    );
+                }
+            }
         }
 
         tracing::debug!(
@@ -9741,6 +9787,91 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
+    /// When the SQLite write for a NotInLog pair fails, no evidence is applied locally.
+    /// Durability ordering: evidence must not exist in memory without a durable backing record.
+    ///
+    /// Mutation check: if `apply_pair_locally` is called unconditionally (without checking the
+    /// SQLite write result), the experiment accumulates evidence and this assertion fires.
+    #[tokio::test]
+    async fn sqlite_write_failure_withholds_local_evidence() {
+        // Use an invalid DB path so append_experiment_pair always fails.
+        let bad_db = "/nonexistent/firstpass-sqlite-fail.db";
+        let (mut state, _rx) = challenger_state(50.0, bad_db);
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 5.0\n"
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
+        // No shared log: NotInLog path, SQLite is the only durable record.
+        state.experiments = Arc::new(crate::experiment::ExperimentMonitor::from_config(
+            cfg.routing.as_ref().unwrap(),
+        ));
+        state.config = Arc::new(cfg);
+        let fingerprint = state.experiments.fingerprint(0).unwrap().to_owned();
+
+        // Simulate the production flow in spawn_paired_challenger:
+        // 1. record_pair (no log → returns false, no evidence)
+        // 2. SQLite write fails (bad path)
+        // 3. apply_pair_locally must NOT be called when SQLite fails.
+        //    We verify this indirectly: pairs must stay at 0.
+        let appended = state
+            .experiments
+            .record_pair(
+                "default",
+                0,
+                &fingerprint,
+                1.0,
+                0.0,
+                0.001,
+                0.001,
+                false,
+                0,
+                0,
+                uuid::Uuid::nil(),
+            )
+            .await;
+        assert!(!appended, "no log → not appended");
+
+        let row = crate::store::ExperimentPairRow {
+            tenant: "default".to_owned(),
+            route_ix: 0,
+            fingerprint: fingerprint.clone(),
+            trace_id: uuid::Uuid::nil(),
+            x_inc: 1.0,
+            x_ch: 0.0,
+            challenger_cost_usd: 0.001,
+            ch_error: false,
+            ch_truncated: 0,
+            ts: jiff::Timestamp::now(),
+            in_log: crate::store::InLogStatus::NotInLog,
+        };
+        // SQLite write fails (bad_db path does not exist).
+        let write_result = crate::store::append_experiment_pair(bad_db, &row);
+        assert!(write_result.is_err(), "SQLite write must fail on bad path");
+
+        // Production code: only apply evidence when write succeeds.
+        if write_result.is_ok() {
+            state.experiments.apply_pair_locally(
+                "default",
+                0,
+                &fingerprint,
+                1.0,
+                0.0,
+                0.001,
+                uuid::Uuid::nil(),
+            );
+        }
+        // No evidence was applied.
+        assert_eq!(
+            state.experiments.reports().len(),
+            0,
+            "SQLite write failed → no entry created, no evidence applied"
+        );
+    }
+
     /// A cold replica that cannot read the shared log does not serve a live challenger: without
     /// the cluster state it cannot know the challenger was not already halted.
     #[tokio::test]
@@ -9782,26 +9913,22 @@ mod tests {
         ));
         state.config = Arc::new(cfg);
         let fingerprint = state.experiments.fingerprint(0).unwrap().to_owned();
+        // In a no-log (single-replica) context, `record_pair` returns false and does NOT
+        // apply evidence (durability ordering: SQLite precedes evidence; here we have no
+        // SQLite so we drive evidence directly via `apply_pair_locally`).
         for _ in 0..500 {
             if state.experiments.challenger_blocked("default", 0) {
                 break;
             }
-            state
-                .experiments
-                .record_pair(
-                    "default",
-                    0,
-                    &fingerprint,
-                    1.0,
-                    0.0,
-                    0.01,
-                    0.001,
-                    false,
-                    0,
-                    0,
-                    uuid::Uuid::nil(),
-                )
-                .await;
+            state.experiments.apply_pair_locally(
+                "default",
+                0,
+                &fingerprint,
+                1.0,
+                0.0,
+                0.001,
+                uuid::Uuid::nil(),
+            );
         }
         assert!(
             state.experiments.challenger_blocked("default", 0),

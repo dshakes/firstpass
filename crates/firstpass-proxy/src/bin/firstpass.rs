@@ -707,6 +707,21 @@ fn cmd_experiment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     };
+    // Issue 5a: do not create or migrate a DB that does not exist.  The "No receipt store
+    // yet" message must remain reachable for a fresh install; migration is only safe on an
+    // existing file (ALTER TABLE on a brand-new empty file would succeed but obscure the
+    // "no data yet" state and leave a stray empty DB behind).
+    if !db.exists() {
+        if json {
+            println!("[]");
+        } else {
+            print!(
+                "{}",
+                cli::experiment_next_step(Some(routing), &config.db_path, false)
+            );
+        }
+        return Ok(());
+    }
     // Ensure the schema is up to date before reading; callers may have an older DB
     // that predates the `in_log` column.  Errors here are surfaced, not swallowed.
     store::ensure_migrated(db)?;
@@ -715,6 +730,24 @@ fn cmd_experiment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let pairs = store::load_all_experiment_pairs(db)?;
     let reports = experiment::experiments_from_traces(&traces, &deferred, &pairs, routing);
     let views = experiment::views(reports, routing);
+
+    // Issue 5b: when the config has a shared log (redis_url on a challenger), this report
+    // is from the local store only.  The log-replicated state lives in Redis; a restarted or
+    // fresh replica may not have synced all of it yet.  Print a clear caveat so an operator
+    // reading the CLI output knows to consult the cluster-authoritative source.
+    let has_shared_log = routing
+        .routes
+        .iter()
+        .any(|r| r.challenger.as_ref().is_some_and(|c| c.redis_url.is_some()));
+    if has_shared_log && !json {
+        eprintln!(
+            "Note: this report is from the local receipt store only.\n\
+             Cluster-authoritative state (shared Redis log) is visible at\n\
+             GET /v1/experiments or in the panel.  The numbers below may be\n\
+             incomplete if this replica has not yet synced all log records.\n"
+        );
+    }
+
     if json {
         println!("{}", serde_json::to_string_pretty(&views)?);
     } else if views.is_empty() {

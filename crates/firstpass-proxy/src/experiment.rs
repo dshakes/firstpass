@@ -60,6 +60,18 @@ const MAX_TRACKED_SESSIONS: usize = 1_000_000;
 /// fast-fail. The cooldown resets once the window expires and the next retry succeeds.
 const SYNC_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// `ensure_synced` returns `true` (state is fresh) only while the last successful sync was within
+/// this bound. 30 s = 6 × the 5 s background-sync interval: a single missed tick does not
+/// trigger a re-sync; two consecutive failures do. Once the bound is exceeded, the next
+/// `ensure_synced` call re-attempts a sync (subject to the failure cooldown above).
+const SYNC_STALENESS_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hard ceiling on the time `ensure_synced` may block waiting for the backend. A hung Redis
+/// connection (e.g., half-open TCP) would otherwise stall live request processing for minutes.
+/// 500 ms is generous (one LRANGE of a small list) but short enough to keep tail latency
+/// acceptable. On timeout, `ensure_synced` fails closed (same as any other backend error).
+const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 // ── Shared log (optional Redis / in-memory backend) ───────────────────────────────────────────
 
 /// An error returned by [`ExperimentLogBackend`] operations.
@@ -355,8 +367,12 @@ mod redis_log {
             let key = Self::list_key(tenant, route_ix, fingerprint);
             let mut conn = self.conn.lock().await;
             use redis::AsyncCommands as _;
+            // Saturating cast: a list with > isize::MAX entries is unreachable in practice
+            // (Redis is bounded by memory long before that), but the cast must not wrap to a
+            // negative index (which LRANGE would interpret as "from the end").
+            let start = isize::try_from(offset).unwrap_or(isize::MAX);
             let raw: Vec<String> = conn
-                .lrange(&key, offset as isize, -1)
+                .lrange(&key, start, -1)
                 .await
                 .map_err(|e| super::LogError::Backend(format!("LRANGE {key}: {e}")))?;
             // Preserve positions: None for malformed entries so sync_from_backend advances
@@ -421,7 +437,8 @@ struct Entry {
     /// Prevents a pair from being counted twice when an append times out after Redis applied
     /// the record (the append returns `Err` but the record is in the log). The apply-once
     /// rule covers three paths:
-    /// - Local append-failure in `record_pair` (evidence applied there + id inserted here).
+    /// - `apply_pair_locally` called by `spawn_paired_challenger` after a SQLite write
+    ///   (inserts the id so a later log-sync sees it as already applied).
     /// - SQLite replay at startup (`monitor_from_traces` inserts ids for `NotInLog` rows).
     /// - Log sync in `apply_log_record` (skips evidence if id already present).
     ///
@@ -449,6 +466,11 @@ struct Entry {
     /// re-issuing a backend read, so a Redis outage cannot turn N concurrent requests into
     /// N × backend-timeout of user-visible latency.
     sync_failed_at: Option<tokio::time::Instant>,
+    /// Tokio instant of the last *successful* `sync_from_backend`. Used by `ensure_synced` to
+    /// enforce the staleness bound: state is considered fresh only while this is within
+    /// `SYNC_STALENESS_BOUND`. Beyond it, a new sync is attempted; callers that arrive during a
+    /// Redis outage will keep failing closed until connectivity is restored.
+    last_synced_at: Option<tokio::time::Instant>,
 }
 
 fn session_hash(session_id: &str) -> u64 {
@@ -614,13 +636,31 @@ impl ExperimentMonitor {
             return true; // no log = always "synced" (local is authoritative)
         }
 
-        // Quick check: already synced? Avoids allocating a gate key on the fast path.
+        // ── Quick path: inspect current state without acquiring the async gate ──────────────
+        // Done first so the common steady-state case never touches sync_gates.
         {
             let mut map = self.lock();
             match self.entry(&mut map, tenant, route_ix) {
-                Some(e) if e.synced_once => return true,
                 None => return true, // no challenger on this route
-                Some(_) => {}        // needs sync — fall through
+                Some(e) => {
+                    // State is fresh: last successful sync was within the staleness bound.
+                    // 30 s = 6 × the 5 s background interval, so one missed tick is fine.
+                    if e.last_synced_at
+                        .is_some_and(|t| t.elapsed() <= SYNC_STALENESS_BOUND)
+                    {
+                        return true;
+                    }
+                    // Cooldown: a recent failure means Redis is likely still down.
+                    // Return false *before* touching sync_gates to avoid lock contention
+                    // during an outage (Issue 6a: fast-fail before acquiring the gate).
+                    if e.sync_failed_at
+                        .is_some_and(|t| t.elapsed() < SYNC_FAILURE_COOLDOWN)
+                    {
+                        return false;
+                    }
+                    // Otherwise: state is stale (or never synced) and not in cooldown.
+                    // Fall through to the gated sync path below.
+                }
             }
         }
 
@@ -637,20 +677,21 @@ impl ExperimentMonitor {
                 .clone()
         };
 
-        // All concurrent first-request callers block here on the same gate.
-        // Only one issues the LRANGE; the others wait and then re-check synced_once.
+        // All concurrent callers block here on the same gate.
+        // Only one calls the backend; the others re-check after the winner finishes.
         let _guard = gate.lock().await;
 
-        // Re-check after acquiring the gate: a concurrent caller may have completed the sync
-        // while we waited, or the failure cooldown may still be active.
+        // Re-check after acquiring the gate: a concurrent caller may have synced while we
+        // waited, or the failure cooldown may now be active.
         {
             let map = self.lock();
             if let Some(entry) = map.get(tenant).and_then(|r| r.get(&route_ix)) {
-                if entry.synced_once {
+                if entry
+                    .last_synced_at
+                    .is_some_and(|t| t.elapsed() <= SYNC_STALENESS_BOUND)
+                {
                     return true;
                 }
-                // Cooldown: if the last attempt failed recently, return false immediately
-                // instead of hammering a Redis that is likely still down.
                 if entry
                     .sync_failed_at
                     .is_some_and(|t| t.elapsed() < SYNC_FAILURE_COOLDOWN)
@@ -660,19 +701,27 @@ impl ExperimentMonitor {
             }
         }
 
-        // Perform the cold-start sync. Set synced_once only on success.
-        match self.sync_from_backend(tenant, route_ix, fingerprint).await {
-            Ok(()) => {
-                // sync_from_backend already set synced_once on success; set it here too
-                // in case the entry was just created and the background task hasn't run yet.
-                let mut map = self.lock();
-                if let Some(e) = self.entry(&mut map, tenant, route_ix) {
-                    e.synced_once = true;
-                }
+        // Perform the sync with a hard timeout so a hung Redis cannot stall live requests.
+        // On timeout we fail closed (same as any backend error) and activate the cooldown.
+        let sync_result = tokio::time::timeout(
+            SYNC_TIMEOUT,
+            self.sync_from_backend(tenant, route_ix, fingerprint),
+        )
+        .await;
+
+        match sync_result {
+            Ok(Ok(())) => {
+                // sync_from_backend sets last_synced_at and synced_once on success.
+                // Once synced, remove the gate so subsequent callers take the quick path
+                // instead of re-acquiring an Arc that will never be needed again (Issue 6b).
+                let mut gates = self
+                    .sync_gates
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                gates.remove(&(tenant.to_owned(), route_ix));
                 true
             }
-            Err(e) => {
-                // Record failure time for the cooldown; log once per entry.
+            Ok(Err(e)) => {
                 let mut map = self.lock();
                 if let Some(entry) = self.entry(&mut map, tenant, route_ix) {
                     entry.sync_failed_at = Some(tokio::time::Instant::now());
@@ -682,8 +731,25 @@ impl ExperimentMonitor {
                             tenant,
                             route = route_ix,
                             error = %e,
-                            "shared log unreachable on cold start; halt guard and spend cap \
-                             may use stale (empty) state — serving incumbent only for this request"
+                            "shared log unreachable; halt guard and spend cap may use stale \
+                             state — serving incumbent only for this request"
+                        );
+                    }
+                }
+                false
+            }
+            Err(_elapsed) => {
+                // Backend timed out: fail closed + activate cooldown.
+                let mut map = self.lock();
+                if let Some(entry) = self.entry(&mut map, tenant, route_ix) {
+                    entry.sync_failed_at = Some(tokio::time::Instant::now());
+                    if !entry.sync_warn_logged {
+                        entry.sync_warn_logged = true;
+                        tracing::warn!(
+                            tenant,
+                            route = route_ix,
+                            "shared log sync timed out (>{} ms); serving incumbent only",
+                            SYNC_TIMEOUT.as_millis()
                         );
                     }
                 }
@@ -743,6 +809,7 @@ impl ExperimentMonitor {
                         synced_once: false,
                         sync_warn_logged: false,
                         sync_failed_at: None,
+                        last_synced_at: None,
                     });
                 }
                 Err(e) => {
@@ -1012,12 +1079,16 @@ impl ExperimentMonitor {
                         }
                     }
                 }
-                // Health and spend are tallied on the originating replica in
-                // `spawn_paired_challenger` (always, regardless of log state). For remote
-                // records (different replica_id, or nil for old replicas), tally them here.
-                // Skipping own records prevents double-counting.
+                // Health and spend for remote records are nested inside `!already_applied`:
+                // if `already_applied` is true, the originating replica counted them locally
+                // before restart (via SQLite replay in `monitor_from_traces` which rebuilds
+                // health from persisted ch_error/ch_truncated and spend via build_paired_ledger).
+                // Applying them again here would double-count health and spend.
+                //
+                // Skipping own records (is_own) prevents double-counting on the live path:
+                // health and spend were tallied in `spawn_paired_challenger` before append.
                 let is_own = *record_replica_id == self.replica_id;
-                if !is_own {
+                if !already_applied && !is_own {
                     if *ch_error || *ch_truncated > 0 {
                         e.health.challenger.errors += u64::from(*ch_error);
                         e.health.challenger.truncated += *ch_truncated;
@@ -1078,6 +1149,7 @@ impl ExperimentMonitor {
             let mut map = self.lock();
             if let Some(e) = map.get_mut(tenant).and_then(|r| r.get_mut(&route_ix)) {
                 e.synced_once = true;
+                e.last_synced_at = Some(tokio::time::Instant::now());
             }
             return Ok(());
         }
@@ -1126,9 +1198,10 @@ impl ExperimentMonitor {
             }
         }
         // Mark synced: a successful background sync spares the first explicit request from
-        // a cold-start LRANGE.
+        // a cold-start LRANGE and marks the state as fresh for the staleness bound.
         if let Some(e) = map.get_mut(tenant).and_then(|r| r.get_mut(&route_ix)) {
             e.synced_once = true;
+            e.last_synced_at = Some(tokio::time::Instant::now());
         }
         Ok(())
     }
@@ -1197,20 +1270,104 @@ impl ExperimentMonitor {
         true
     }
 
-    /// Record a paired shadow result to the shared log (if configured), then sync.
+    /// Apply a paired shadow result directly to local in-memory state.
     ///
-    /// In single-replica mode (no log), applies the pair directly and emits the status log.
-    /// Returns `true` if `x_inc` / `x_ch` are valid (finite, in `[0, 1]`) and the pair was
-    /// accepted by the underlying [`Experiment`].
+    /// **Call only after the pair has been durably recorded** (written to SQLite as `NotInLog`).
+    /// This ordering guarantee is what `spawn_paired_challenger` enforces: the SQLite row is the
+    /// only durable record for local-only pairs, and the evidence must not exist in memory without
+    /// it — otherwise a crash between the evidence apply and the write lets a halted challenger
+    /// run again on restart (it has evidence but no persisted state to replay the halt from).
+    ///
+    /// Deduplicates by `trace_id` so a pair is never counted twice even if this method is called
+    /// from both the local path and the log-sync path. `Uuid::nil()` bypasses dedup.
+    ///
+    /// Returns `true` if the pair was accepted by the underlying [`Experiment`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_pair_locally(
+        &self,
+        tenant: &str,
+        route_ix: usize,
+        fingerprint: &str,
+        x_inc: f64,
+        x_ch: f64,
+        challenger_cost_usd: f64,
+        trace_id: Uuid,
+    ) -> bool {
+        if self.fingerprint(route_ix) != Some(fingerprint) {
+            return false;
+        }
+        let mut map = self.lock();
+        let Some(e) = self.entry(&mut map, tenant, route_ix) else {
+            return false;
+        };
+        // Cross-source dedup: skip if this trace_id was already counted (e.g., via a concurrent
+        // log sync that saw the same record, or a previous local apply call).
+        let already_applied = !trace_id.is_nil() && e.applied_pair_ids.contains(&trace_id);
+        if already_applied {
+            return false;
+        }
+        if e.applied_pair_ids.len() >= MAX_TRACKED_SESSIONS {
+            if !e.saturated_logged {
+                e.saturated_logged = true;
+                tracing::warn!(
+                    tenant,
+                    route = route_ix,
+                    "experiment pair-id set is full; new pairs' evidence is skipped"
+                );
+            }
+            return false;
+        }
+        let before = e.experiment.status();
+        let ok = e.experiment.observe_pair(x_inc, x_ch);
+        if ok {
+            // Without this the challenger's $/request reads n/a, so a certified cheaper
+            // challenger could never be recommended for adoption.
+            e.experiment
+                .observe_cost(Arm::Challenger, challenger_cost_usd);
+        }
+        if !trace_id.is_nil() {
+            e.applied_pair_ids.insert(trace_id);
+        }
+        if ok && before != e.experiment.status() {
+            match e.experiment.status() {
+                ExperimentStatus::Halted => tracing::error!(
+                    tenant,
+                    route = route_ix,
+                    "EXPERIMENT HALTED: paired challenger worse than incumbent (local evidence)"
+                ),
+                ExperimentStatus::Certified => tracing::info!(
+                    tenant,
+                    route = route_ix,
+                    "experiment certified (paired, local evidence): challenger within margin"
+                ),
+                ExperimentStatus::Undecided => {}
+            }
+            Self::publish(&map, route_ix);
+        }
+        ok
+    }
+
+    /// Try to append a paired shadow result to the shared log (if configured), then sync.
+    ///
+    /// **Durability contract for `spawn_paired_challenger`:**
+    ///
+    /// - Returns `true` → the record is in the shared log (the durable record). Evidence is
+    ///   applied via `sync_from_backend` inside this call. Caller writes the SQLite row as
+    ///   `InLog` after this returns (the row is just a startup-rebuild cache; it can follow
+    ///   the log write safely).
+    /// - Returns `false` → NOT in the log (no log configured, or the append failed). Evidence
+    ///   is NOT applied here. The caller must write the SQLite row as `NotInLog` **first**,
+    ///   then call [`Self::apply_pair_locally`] only on success. This ordering ensures the
+    ///   durable record exists before evidence is in memory: a crash between the two would
+    ///   leave no evidence, which is the safe direction (a missed pair only slows the
+    ///   experiment; evidence without a durable record could mislead a halt).
     ///
     /// `ch_error`, `ch_truncated`, and `ts_unix` are forwarded into [`LogRecord::Pair`] so other
-    /// replicas can rebuild challenger health and seed the paired-spend ledger. In the no-log path
-    /// they are ignored (the caller handles health and ledger directly).
+    /// replicas can rebuild challenger health and seed the paired-spend ledger.
     ///
-    /// `trace_id` is the challenger's trace UUID and is used for cross-source dedup: if Redis
-    /// applied the record but the append returned `Err` (timeout), the next sync sees the same
-    /// trace_id and skips evidence it already counted locally. Pass `Uuid::nil()` in tests
-    /// that are not exercising dedup — nil is never inserted into the dedup set.
+    /// `trace_id` is used for cross-source dedup: if Redis applied the record but the append
+    /// returned `Err` (timeout), the next sync sees the same trace_id and skips evidence it
+    /// already counted locally. Pass `Uuid::nil()` in tests not exercising dedup.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_pair(
         &self,
@@ -1230,36 +1387,10 @@ impl ExperimentMonitor {
             return false;
         }
         let Some(log) = self.log.as_ref().cloned() else {
-            // Single-replica path: apply directly and publish.
-            let mut map = self.lock();
-            let Some(e) = self.entry(&mut map, tenant, route_ix) else {
-                return false;
-            };
-            let before = e.experiment.status();
-            let ok = e.experiment.observe_pair(x_inc, x_ch);
-            if ok {
-                // Without this the challenger's $/request reads n/a, and a certified, cheaper
-                // paired challenger could never be recommended for adoption.
-                e.experiment
-                    .observe_cost(Arm::Challenger, challenger_cost_usd);
-            }
-            if ok && before != e.experiment.status() {
-                match e.experiment.status() {
-                    ExperimentStatus::Halted => tracing::error!(
-                        tenant,
-                        route = route_ix,
-                        "EXPERIMENT HALTED: paired challenger worse than incumbent"
-                    ),
-                    ExperimentStatus::Certified => tracing::info!(
-                        tenant,
-                        route = route_ix,
-                        "experiment certified (paired): challenger within margin"
-                    ),
-                    ExperimentStatus::Undecided => {}
-                }
-                Self::publish(&map, route_ix);
-            }
-            return ok;
+            // No shared log: this replica is the only one; evidence is NOT applied here.
+            // The caller (spawn_paired_challenger) writes SQLite first, then calls
+            // apply_pair_locally so the durable record precedes the in-memory evidence.
+            return false;
         };
         // Validate before appending: an invalid record would permanently pollute the log.
         if !x_inc.is_finite()
@@ -1297,48 +1428,11 @@ impl ExperimentMonitor {
                 tenant,
                 route = route_ix,
                 error = %e,
-                "paired log append failed; evidence will not reach other replicas \
+                "paired log append failed; evidence withheld until SQLite write succeeds \
                  (local spend and health were already tallied)"
             );
-            // Apply evidence locally so the experiment can still make progress (halt/certify)
-            // during a Redis outage. This pair is written to SQLite with in_log=false and will
-            // be replayed on restart. Register the trace_id so that if Redis actually applied
-            // the record (append timed out after the write), the next sync does not double-count.
-            let mut map = self.lock();
-            if let Some(entry) = self.entry(&mut map, tenant, route_ix) {
-                let already_applied =
-                    !trace_id.is_nil() && entry.applied_pair_ids.contains(&trace_id);
-                if !already_applied {
-                    let before = entry.experiment.status();
-                    if entry.experiment.observe_pair(x_inc, x_ch) {
-                        entry
-                            .experiment
-                            .observe_cost(Arm::Challenger, challenger_cost_usd);
-                    }
-                    if !trace_id.is_nil() {
-                        entry.applied_pair_ids.insert(trace_id);
-                    }
-                    if before != entry.experiment.status() {
-                        match entry.experiment.status() {
-                            ExperimentStatus::Halted => tracing::error!(
-                                tenant,
-                                route = route_ix,
-                                "EXPERIMENT HALTED: paired challenger worse than incumbent \
-                                 (local evidence only — log append failed)"
-                            ),
-                            ExperimentStatus::Certified => tracing::info!(
-                                tenant,
-                                route = route_ix,
-                                "experiment certified (paired, local evidence): \
-                                 challenger within margin"
-                            ),
-                            ExperimentStatus::Undecided => {}
-                        }
-                        Self::publish(&map, route_ix);
-                    }
-                }
-            }
-            return false; // false = record is NOT in the shared log
+            // NOT in the log: caller writes SQLite (NotInLog) then calls apply_pair_locally.
+            return false;
         }
         // Sync to apply own record immediately (so this replica sees its own evidence) and
         // to pick up any remote records. A sync failure is non-fatal.
@@ -1374,9 +1468,29 @@ impl ExperimentMonitor {
                     v
                 };
                 for (tenant, route_ix, fingerprint) in keys {
-                    let _ = monitor
+                    if let Err(e) = monitor
                         .sync_from_backend(&tenant, route_ix, &fingerprint)
-                        .await;
+                        .await
+                    {
+                        // Record the failure time so `ensure_synced` sees the backend as
+                        // unavailable and transitions to stale → fail-closed once the
+                        // staleness bound is exceeded. Without this update the staleness
+                        // bound would tick down against `last_synced_at` from the last
+                        // success but the cooldown would never activate, causing every
+                        // `ensure_synced` caller to re-attempt the failing backend.
+                        let mut map = monitor.lock();
+                        if let Some(e_entry) =
+                            map.get_mut(&tenant).and_then(|r| r.get_mut(&route_ix))
+                        {
+                            e_entry.sync_failed_at = Some(tokio::time::Instant::now());
+                        }
+                        tracing::warn!(
+                            tenant,
+                            route = route_ix,
+                            error = %e,
+                            "background experiment sync failed"
+                        );
+                    }
                 }
             }
         });
@@ -2221,25 +2335,30 @@ mod tests {
             assert!((usd - 0.03).abs() < 1e-12, "{usd}");
         };
 
+        // Direct (no-log) path: record_pair returns false and does not apply evidence;
+        // the caller uses apply_pair_locally after a successful SQLite write.
         let direct = ExperimentMonitor::from_config(&cfg);
         for _ in 0..3 {
+            let ok = direct
+                .record_pair(
+                    "t",
+                    0,
+                    &fp_str,
+                    1.0,
+                    1.0,
+                    0.10,
+                    0.01,
+                    false,
+                    0,
+                    0,
+                    Uuid::nil(),
+                )
+                .await;
             assert!(
-                direct
-                    .record_pair(
-                        "t",
-                        0,
-                        &fp_str,
-                        1.0,
-                        1.0,
-                        0.10,
-                        0.01,
-                        false,
-                        0,
-                        0,
-                        Uuid::nil()
-                    )
-                    .await
+                !ok,
+                "no log → record_pair returns false (evidence via apply_pair_locally)"
             );
+            direct.apply_pair_locally("t", 0, &fp_str, 1.0, 1.0, 0.01, Uuid::nil());
         }
         close(challenger(&direct));
 
@@ -3826,13 +3945,14 @@ mod tests {
         );
     }
 
-    // ── Issue 3: record_pair applies evidence locally on append failure ───────────────────────
+    // ── Durability ordering: SQLite precedes local evidence (Issue 1) ────────────────────────
 
-    /// When the shared log append fails, `record_pair` applies evidence locally so the
-    /// experiment can still halt during a Redis outage. Enough losing pairs must cross the
-    /// halt threshold through the local path.
+    /// `record_pair` returns false when the log is down and does NOT apply evidence.
+    /// The caller (`spawn_paired_challenger`) writes SQLite first, then calls
+    /// `apply_pair_locally`. Here we verify the contract: `record_pair` returns false and
+    /// the experiment is still Undecided; only `apply_pair_locally` advances the state.
     #[tokio::test]
-    async fn record_pair_applies_evidence_locally_on_append_failure() {
+    async fn record_pair_does_not_apply_evidence_on_append_failure_caller_does() {
         let m = ExperimentMonitor::from_config(&config())
             .with_log(Arc::new(DownLog) as Arc<dyn ExperimentLogBackend>);
         let fp_str = fp();
@@ -3842,8 +3962,7 @@ mod tests {
             if m.challenger_blocked("t", 0) {
                 break;
             }
-            // Losing pair: x_inc=1.0 (pass), x_ch=0.0 (fail).
-            // Nil trace_id: not testing dedup, just local-evidence accumulation.
+            // record_pair returns false and does NOT apply evidence.
             let accepted = m
                 .record_pair(
                     "t",
@@ -3860,17 +3979,62 @@ mod tests {
                 )
                 .await;
             assert!(!accepted, "append failing log returns false");
+            // Caller writes SQLite (not modelled here), then applies evidence.
+            m.apply_pair_locally("t", 0, &fp_str, 1.0, 0.0, 0.01, Uuid::nil());
             pairs_applied += 1;
         }
 
-        // Evidence was applied locally: enough losing pairs must have halted the experiment.
+        // Evidence was applied locally via apply_pair_locally: enough losing pairs halted.
         assert!(
             m.challenger_blocked("t", 0),
-            "experiment must halt locally on append failure after {pairs_applied} pairs"
+            "experiment must halt locally after {pairs_applied} pairs via apply_pair_locally"
         );
         assert!(
             m.reports()[0].report.pairs > 0,
-            "pairs counted locally despite failed appends"
+            "pairs counted locally via apply_pair_locally"
+        );
+    }
+
+    /// `record_pair` in no-log mode returns false and leaves the experiment Undecided.
+    /// Only `apply_pair_locally` advances state. Mutation check: removing `apply_pair_locally`
+    /// keeps the experiment Undecided and the assertion fires.
+    #[tokio::test]
+    async fn record_pair_no_log_does_not_apply_evidence() {
+        let m = ExperimentMonitor::from_config(&config()); // no log
+        let fp_str = fp();
+
+        // Call record_pair many times — should never advance evidence without apply_pair_locally.
+        for _ in 0..10 {
+            let ok = m
+                .record_pair(
+                    "t",
+                    0,
+                    &fp_str,
+                    1.0,
+                    0.0,
+                    0.1,
+                    0.01,
+                    false,
+                    0,
+                    0,
+                    Uuid::nil(),
+                )
+                .await;
+            assert!(!ok, "no log → record_pair returns false");
+        }
+        // No entry was created: record_pair in no-log mode returns immediately.
+        assert_eq!(
+            m.reports().len(),
+            0,
+            "record_pair in no-log mode must not create an entry or advance evidence"
+        );
+
+        // Now apply via apply_pair_locally — entry created and evidence advances.
+        m.apply_pair_locally("t", 0, &fp_str, 1.0, 0.0, 0.01, Uuid::nil());
+        assert_eq!(
+            m.reports()[0].report.pairs,
+            1,
+            "apply_pair_locally counted the pair"
         );
     }
 
@@ -4098,9 +4262,11 @@ mod tests {
     }
 
     /// When `append` times out after Redis applied it, the evidence must count exactly once:
-    /// - `record_pair` applies locally (append returned Err) and inserts the trace_id.
-    /// - `sync_from_backend` sees the same trace_id in the log and skips it.
-    /// A restart with the same SQLite NotInLog row + the same record in the log also counts once.
+    /// - Caller writes SQLite (NotInLog) then calls `apply_pair_locally`.
+    /// - `sync_from_backend` sees the same trace_id in the log and skips the evidence dedup.
+    ///
+    /// Also covers the restart path (Issue 3): health and ledger are only applied once even
+    /// when the record was seen at startup from SQLite and later from the log.
     #[tokio::test]
     async fn trace_id_dedup_prevents_double_count_on_append_timeout() {
         let log = Arc::new(PushThenErrorLog {
@@ -4109,26 +4275,188 @@ mod tests {
         let cfg = config();
         let fp_str = fp();
         let tid = Uuid::now_v7();
+        let now_ts = jiff::Timestamp::now();
 
+        let ledger = Arc::new(crate::shadow::ShadowLedger::new());
         let m = ExperimentMonitor::from_config(&cfg)
-            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>)
+            .with_paired_ledger(Arc::clone(&ledger));
 
-        // record_pair: append fails (returns Err) but the record IS in the log.
+        // record_pair: append fails (Err) but the record IS in the log.
+        // With the new durability ordering, record_pair returns false and does NOT
+        // apply evidence — the caller (spawn_paired_challenger) does it after SQLite write.
         let appended = m
-            .record_pair("t", 0, &fp_str, 1.0, 1.0, 0.1, 0.05, false, 0, 0, tid)
+            .record_pair(
+                "t",
+                0,
+                &fp_str,
+                1.0,
+                1.0,
+                0.1,
+                0.05,
+                false,
+                1,
+                now_ts.as_second(),
+                tid,
+            )
             .await;
         assert!(!appended, "append returned Err → record_pair returns false");
+        // record_pair returns false and does NOT create an Entry or apply evidence.
+        // The entry is created lazily by apply_pair_locally or observe_* calls.
+        assert_eq!(
+            m.reports().len(),
+            0,
+            "no entry created yet by record_pair alone"
+        );
 
-        // Local evidence was applied: 1 pair.
-        assert_eq!(m.reports()[0].report.pairs, 1, "evidence applied locally");
+        // Caller simulates the SQLite write then calls apply_pair_locally.
+        // Also simulates spawn_paired_challenger's local health+ledger tally.
+        ledger.debit("t", 0, 0.05, now_ts);
+        m.observe_health("t", 0, &fp_str, Arm::Challenger, false, 1);
+        m.apply_pair_locally("t", 0, &fp_str, 1.0, 1.0, 0.05, tid);
+        assert_eq!(
+            m.reports()[0].report.pairs,
+            1,
+            "evidence applied via apply_pair_locally"
+        );
 
         // Sync: the record is in the log (PushThenErrorLog wrote it). Without dedup,
-        // apply_log_record would count it again (pairs → 2). With dedup, it skips.
+        // apply_log_record would count evidence + health + ledger again.  With dedup:
+        // - evidence is skipped (trace_id already in applied_pair_ids)
+        // - health and ledger are also skipped (Issue 3: nested under !already_applied)
         let _ = m.sync_from_backend("t", 0, &fp_str).await;
         assert_eq!(
             m.reports()[0].report.pairs,
             1,
             "after sync: pairs still 1 (trace_id dedup prevented double-count)"
+        );
+        let h = m.reports()[0].health.challenger;
+        assert_eq!(
+            (h.errors, h.truncated),
+            (0, 1),
+            "health counted exactly once (not re-applied by apply_log_record)"
+        );
+        assert!(
+            (ledger.spent_today("t", 0, now_ts) - 0.05).abs() < 1e-9,
+            "ledger spend counted exactly once (not re-seeded by apply_log_record)"
+        );
+    }
+
+    // ── Issue 2: Staleness bound ──────────────────────────────────────────────────────────────
+
+    /// `ensure_synced` returns true while the last sync was within `SYNC_STALENESS_BOUND`,
+    /// and returns false (and attempts a re-sync) once the bound is exceeded.
+    ///
+    /// Uses `tokio::time::pause` to advance time without real I/O.
+    #[tokio::test]
+    async fn ensure_synced_stale_after_bound_exceeded() {
+        tokio::time::pause();
+        let shared = Arc::new(InMemoryExperimentLog::new());
+        let m = Arc::new(
+            ExperimentMonitor::from_config(&config())
+                .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>),
+        );
+        let fp_str = fp();
+
+        // First sync succeeds: state is fresh.
+        assert!(
+            m.ensure_synced("t", 0, &fp_str).await,
+            "first sync must succeed"
+        );
+
+        // Advance time within the staleness bound (half-way).
+        tokio::time::advance(SYNC_STALENESS_BOUND / 2).await;
+        assert!(
+            m.ensure_synced("t", 0, &fp_str).await,
+            "still within staleness bound → true"
+        );
+
+        // Advance past the staleness bound.
+        tokio::time::advance(SYNC_STALENESS_BOUND).await;
+
+        // Now state is stale.  The log is reachable (InMemory) so the re-sync succeeds.
+        assert!(
+            m.ensure_synced("t", 0, &fp_str).await,
+            "stale but log reachable → sync succeeds → true"
+        );
+
+        // Swap to a failing log to simulate Redis going down.
+        // Replace the log: build a new monitor with the failing log but same entry state.
+        let m_down = Arc::new(ExperimentMonitor::from_config(&config()).with_log(Arc::new(
+            CountingFailLog {
+                load_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+        )
+            as Arc<dyn ExperimentLogBackend>));
+        // No prior sync → first ensure_synced attempt fails (backend down).
+        assert!(
+            !m_down.ensure_synced("t", 0, &fp_str).await,
+            "log down on first sync → false"
+        );
+        // Cooldown active: second call returns false without re-attempting.
+        assert!(
+            !m_down.ensure_synced("t", 0, &fp_str).await,
+            "cooldown active → false immediately"
+        );
+    }
+
+    // ── Issue 4: sync timeout ────────────────────────────────────────────────────────────────
+
+    /// A `load_since` that never completes (pending forever) must not stall `ensure_synced`.
+    /// With `tokio::time::pause`, the timeout fires instantly after advancing time.
+    #[tokio::test]
+    async fn ensure_synced_times_out_on_hung_backend() {
+        tokio::time::pause();
+
+        /// A backend whose `load_since` never completes (simulates a half-open TCP connection).
+        #[derive(Debug)]
+        struct HangingLog;
+
+        #[async_trait::async_trait]
+        impl ExperimentLogBackend for HangingLog {
+            async fn append(
+                &self,
+                _: &str,
+                _: usize,
+                _: &str,
+                _: LogRecord,
+            ) -> Result<u64, LogError> {
+                Err(LogError::Backend("down".to_owned()))
+            }
+            async fn load_since(
+                &self,
+                _: &str,
+                _: usize,
+                _: &str,
+                _: u64,
+            ) -> Result<Vec<Option<LogRecord>>, LogError> {
+                // Pend forever: never resolves.
+                std::future::pending::<Result<Vec<Option<LogRecord>>, LogError>>().await
+            }
+            async fn claim_session(&self, _: &str, _: usize, _: &str, _: &str) -> bool {
+                false
+            }
+        }
+
+        let m = Arc::new(
+            ExperimentMonitor::from_config(&config())
+                .with_log(Arc::new(HangingLog) as Arc<dyn ExperimentLogBackend>),
+        );
+        let fp_str = fp();
+
+        // ensure_synced wraps the sync in a timeout; the hanging load_since fires the timeout.
+        // We advance time past SYNC_TIMEOUT so the timeout elapses.
+        let result = tokio::select! {
+            r = m.ensure_synced("t", 0, &fp_str) => r,
+            _ = tokio::time::sleep(SYNC_TIMEOUT + std::time::Duration::from_millis(1)) => {
+                // Advance the mock clock past the timeout.
+                tokio::time::advance(SYNC_TIMEOUT + std::time::Duration::from_millis(10)).await;
+                m.ensure_synced("t", 0, &fp_str).await
+            }
+        };
+        assert!(
+            !result,
+            "ensure_synced must return false when load_since hangs (timeout fires)"
         );
     }
 }
