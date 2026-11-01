@@ -9324,6 +9324,100 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
+    /// A shared log that reads fine (empty) but rejects every append.
+    #[derive(Debug)]
+    struct AppendFailLog;
+
+    #[async_trait::async_trait]
+    impl crate::experiment::ExperimentLogBackend for AppendFailLog {
+        async fn append(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: crate::experiment::LogRecord,
+        ) -> Result<u64, crate::experiment::LogError> {
+            Err(crate::experiment::LogError::Backend("rpush failed".into()))
+        }
+        async fn load_since(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: u64,
+        ) -> Result<Vec<crate::experiment::LogRecord>, crate::experiment::LogError> {
+            Ok(vec![])
+        }
+        async fn claim_session(&self, _: &str, _: usize, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// A paired pair whose shared-log append failed is persisted with `in_log = false`, so a
+    /// restart replays it locally instead of losing its spend and evidence.
+    #[tokio::test]
+    async fn paired_pair_that_missed_the_log_is_persisted_as_offline() {
+        use tower::ServiceExt;
+        let db =
+            std::env::temp_dir().join(format!("firstpass-paired-offline-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let (mut state, _rx) = challenger_state(50.0, &db.to_string_lossy());
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 5.0\n"
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
+        state.experiments = Arc::new(
+            crate::experiment::ExperimentMonitor::from_config(cfg.routing.as_ref().unwrap())
+                .with_log(Arc::new(AppendFailLog)),
+        );
+        state.config = Arc::new(cfg);
+        let mut outs = HashMap::new();
+        outs.insert(
+            INCUMBENT.to_owned(),
+            Ok(model_resp(INCUMBENT, "{\"ok\": 1}")),
+        );
+        outs.insert(
+            CHALLENGER.to_owned(),
+            Ok(model_resp(CHALLENGER, "{\"ok\": 1}")),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        state.providers = ProviderRegistry::from_map(map);
+        let router = app(state).expect("router");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(user_body()))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+        let mut pairs = Vec::new();
+        for _ in 0..200 {
+            pairs = crate::store::load_all_experiment_pairs(&db).unwrap_or_default();
+            if !pairs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pairs.len(), 1);
+        assert!(
+            !pairs[0].in_log,
+            "the append failed, so the row must be marked offline"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
     /// A cold replica that cannot read the shared log does not serve a live challenger: without
     /// the cluster state it cannot know the challenger was not already halted.
     #[tokio::test]
