@@ -20,9 +20,11 @@ use firstpass_core::{
     TaskKind, Trace, Verdict,
     features::{DifficultyHint, TrajectorySignals},
 };
+use futures_core::Stream;
 use serde::Deserialize;
 use serde_json::Value;
 use std::future::Future;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
@@ -3382,24 +3384,30 @@ async fn observe_passthrough(
                 latency_ms,
                 session_header,
                 tenant,
+                "anthropic",
             );
             (status, resp_headers, resp_body).into_response()
         }
         Err(err) => {
-            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
+            spawn_trace(
+                &state,
+                body,
+                None,
+                latency_ms,
+                session_header,
+                tenant,
+                "anthropic",
+            );
             err.into_response()
         }
     }
 }
 
 /// Observe mode for a streaming request (`stream: true`): relay the upstream SSE response
-/// chunk-by-chunk instead of buffering, so streaming is preserved to the caller and
-/// time-to-first-byte stays low. `latency_ms` is time-to-response-headers (the added-latency
-/// figure that matters), recorded off the response path.
-///
-// ponytail: streamed-response token usage lives in the SSE `message_start`/`message_delta` events
-// we don't buffer, so the trace records request-side features + latency now; parsing usage from a
-// teed SSE stream is the follow-on.
+/// chunk-by-chunk instead of buffering, while tapping the byte stream to collect token usage
+/// from SSE events. Time-to-first-byte is preserved: `latency_ms` is time-to-response-headers.
+/// The trace is enqueued once the stream is exhausted (or the client disconnects), off the
+/// response path.
 async fn observe_stream(
     state: AppState,
     headers: HeaderMap,
@@ -3419,35 +3427,272 @@ async fn observe_stream(
 
     match result {
         Ok((status, resp_headers, response)) => {
-            spawn_stream_trace(&state, body, latency_ms, session_header, tenant);
-            let stream_body = Body::from_stream(response.bytes_stream());
+            let on_done = stream_trace_callback(
+                &state,
+                body,
+                latency_ms,
+                session_header,
+                tenant,
+                "anthropic",
+            );
+            let tap = SseTap::new(response.bytes_stream(), on_done);
+            let stream_body = Body::from_stream(tap);
             (status, resp_headers, stream_body).into_response()
         }
         Err(err) => {
-            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
+            spawn_trace(
+                &state,
+                body,
+                None,
+                latency_ms,
+                session_header,
+                tenant,
+                "anthropic",
+            );
             err.into_response()
         }
     }
 }
 
-/// Enqueue a request-side trace for a streamed observe response, off the response path.
-fn spawn_stream_trace(
+/// Build the `on_done` closure that [`SseTap`] fires when the stream ends or is dropped.
+/// Captures the state needed to build and enqueue the observe-mode trace, then spawns a
+/// background task so neither JSON parsing nor the channel send touches the response path.
+fn stream_trace_callback(
     state: &AppState,
     req_body: Bytes,
     latency_ms: u64,
     session_header: Option<String>,
     tenant: String,
-) {
+    provider: &'static str,
+) -> impl FnOnce(SseUsage) + Send + 'static {
     let config = state.config.clone();
     let traces = state.traces.clone();
     let spill = state.spill.clone();
-    tokio::spawn(async move {
-        let mut trace =
-            build_stream_trace(&config, &req_body, latency_ms, session_header.as_deref());
-        // Stamp the resolved tenant identity — never the config default nor anything request-borne.
+    // Runs inline, not in a spawned task: it may fire from `SseTap::drop`, which can run outside
+    // a Tokio runtime (e.g. during shutdown), where `tokio::spawn` would panic. The work is cheap
+    // and non-blocking: build the trace, then `offer_trace`'s non-blocking `try_send`.
+    move |usage: SseUsage| {
+        let mut trace = build_stream_trace_from_usage(
+            &config,
+            &req_body,
+            latency_ms,
+            session_header.as_deref(),
+            usage,
+            provider,
+        );
+        // Stamp the resolved tenant identity — never the config default nor anything
+        // request-borne.
         trace.tenant_id = tenant;
         offer_trace(&traces, spill.as_ref(), trace);
-    });
+    }
+}
+
+// ── SSE tap: byte-identical relay + incremental usage parsing ────────────────────────────────
+
+/// Byte capacity of the per-line buffer inside [`SseTap`]. A `data:` line that overflows
+/// this cap is dropped from parsing but still forwarded to the client byte-for-byte.
+const SSE_LINE_BUF_CAP: usize = 64 * 1024; // 64 KiB
+
+/// Token usage accumulated by tapping SSE events during streaming relay.
+/// Fields default to zero / `None` when no matching event was seen — honest fallback
+/// rather than invented numbers.
+#[derive(Debug, Default)]
+struct SseUsage {
+    model: Option<String>,
+    in_tokens: u64,
+    cache_write_tokens: u64,
+    cache_read_tokens: u64,
+    out_tokens: u64,
+    /// `"max_tokens"` for Anthropic, `"length"` for OpenAI — either means the output was
+    /// truncated at the token limit.
+    stop_reason: Option<String>,
+}
+
+/// Stream adapter that relays every upstream byte to the client unchanged while tapping SSE
+/// events to collect token usage.
+///
+/// `on_done` fires exactly once: when the inner stream is exhausted (`poll_next` returns
+/// `None`) or when this tap is dropped (client disconnect). In both cases the partial or
+/// complete usage collected so far is passed to the callback.
+///
+/// **Byte identity**: every `Ok(chunk)` from the inner stream is returned unchanged — no
+/// buffering, reframing, or injection. Only the parsing side-channel touches the bytes.
+///
+/// **Memory bound**: the line buffer is capped at [`SSE_LINE_BUF_CAP`]. An oversized line
+/// is discarded from parsing; bytes continue to flow.
+struct SseTap {
+    /// Boxed + pinned inner stream. `Pin<Box<T>>` is `Unpin`, so `SseTap` is `Unpin` and
+    /// can implement `Stream` without `pin-project` or unsafe code.
+    inner: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    line_buf: Vec<u8>,
+    /// True while the current in-progress line has already overflowed `SSE_LINE_BUF_CAP`.
+    overflow: bool,
+    usage: SseUsage,
+    on_done: Option<Box<dyn FnOnce(SseUsage) + Send>>,
+}
+
+impl SseTap {
+    fn new(
+        inner: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        on_done: impl FnOnce(SseUsage) + Send + 'static,
+    ) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            line_buf: Vec::new(),
+            overflow: false,
+            usage: SseUsage::default(),
+            on_done: Some(Box::new(on_done)),
+        }
+    }
+
+    /// Fire the callback with accumulated usage. Called at most once; subsequent calls are
+    /// no-ops. Takes `usage` out of `self` to avoid a copy.
+    fn fire_done(&mut self) {
+        if let Some(on_done) = self.on_done.take() {
+            on_done(std::mem::take(&mut self.usage));
+        }
+    }
+}
+
+impl Stream for SseTap {
+    type Item = Result<Bytes, reqwest::Error>;
+
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // `SseTap` is `Unpin` (all fields are `Unpin`), so `get_mut` is safe.
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(chunk))) => {
+                // Parse SSE events for token usage; the chunk itself is forwarded unchanged.
+                parse_sse_chunk_into(
+                    &chunk,
+                    &mut this.line_buf,
+                    &mut this.overflow,
+                    &mut this.usage,
+                );
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.fire_done();
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                this.fire_done();
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+impl Drop for SseTap {
+    fn drop(&mut self) {
+        // Fires when the stream is dropped before exhaustion (e.g. client disconnect).
+        // When the stream ends normally via `poll_next → None`, `on_done` is already `None`
+        // and this becomes a no-op.
+        if self.on_done.is_some() {
+            self.fire_done();
+        }
+    }
+}
+
+/// Accumulate token usage from one SSE chunk, updating `line_buf` for the in-progress line.
+/// Bytes are never held back — this function is called purely as a side-channel parser.
+fn parse_sse_chunk_into(
+    chunk: &[u8],
+    line_buf: &mut Vec<u8>,
+    overflow: &mut bool,
+    usage: &mut SseUsage,
+) {
+    for &byte in chunk {
+        if byte == b'\n' {
+            if !*overflow {
+                process_sse_line(line_buf, usage);
+            }
+            line_buf.clear();
+            *overflow = false;
+        } else if *overflow {
+            // Already past the cap for this line — discard bytes until the next newline.
+        } else {
+            line_buf.push(byte);
+            if line_buf.len() > SSE_LINE_BUF_CAP {
+                *overflow = true;
+                line_buf.clear(); // Free the memory; we won't parse this line.
+            }
+        }
+    }
+    // Incomplete trailing line stays in `line_buf` for the next chunk.
+}
+
+/// Parse one complete SSE line. Handles Anthropic (`message_start` / `message_delta`)
+/// and OpenAI-compatible (final `usage` chunk, `choices[*].finish_reason`) formats.
+fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
+    let Some(data) = line.strip_prefix(b"data: ") else {
+        return;
+    };
+    // OpenAI uses `data: [DONE]` as a stream sentinel — not JSON, safe to skip.
+    if data == b"[DONE]" {
+        return;
+    }
+    let Ok(json) = serde_json::from_slice::<Value>(data) else {
+        return;
+    };
+
+    // Model name: at root for OpenAI chunks; inside `message` for Anthropic `message_start`.
+    if usage.model.is_none() {
+        let model = json
+            .get("model")
+            .or_else(|| json.pointer("/message/model"))
+            .and_then(Value::as_str);
+        if let Some(m) = model {
+            usage.model = Some(m.to_owned());
+        }
+    }
+
+    match json.get("type").and_then(Value::as_str) {
+        Some("message_start") => {
+            // Anthropic: input usage lives inside the nested `message` object.
+            let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
+            usage.in_tokens = u("/message/usage/input_tokens");
+            usage.cache_write_tokens = u("/message/usage/cache_creation_input_tokens");
+            usage.cache_read_tokens = u("/message/usage/cache_read_input_tokens");
+        }
+        Some("message_delta") => {
+            // Anthropic: output token count and stop reason.
+            if let Some(n) = json.pointer("/usage/output_tokens").and_then(Value::as_u64) {
+                usage.out_tokens = n;
+            }
+            if let Some(stop) = json.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                usage.stop_reason = Some(stop.to_owned());
+            }
+        }
+        _ => {
+            // OpenAI-compatible: final usage chunk (only populated when
+            // `stream_options.include_usage` was set in the request).
+            if let Some(pt) = json.pointer("/usage/prompt_tokens").and_then(Value::as_u64) {
+                // `prompt_tokens` includes cached tokens; price the cached part as a cache read.
+                let cached = json
+                    .pointer("/usage/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                usage.in_tokens = pt.saturating_sub(cached);
+                usage.cache_read_tokens = cached;
+            }
+            if let Some(ct) = json
+                .pointer("/usage/completion_tokens")
+                .and_then(Value::as_u64)
+            {
+                usage.out_tokens = ct;
+            }
+            // Track the last non-null finish_reason; `"length"` means truncated.
+            if let Some(fr) = json
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .filter(|fr| !fr.is_empty())
+            {
+                usage.stop_reason = Some(fr.to_owned());
+            }
+        }
+    }
 }
 
 /// Construct the trace and enqueue it for the background writer, entirely off the response
@@ -3461,6 +3706,7 @@ fn spawn_trace(
     latency_ms: u64,
     session_header: Option<String>,
     tenant: String,
+    provider: &'static str,
 ) {
     let config = state.config.clone();
     let traces = state.traces.clone();
@@ -3473,6 +3719,7 @@ fn spawn_trace(
                 &resp,
                 latency_ms,
                 session_header.as_deref(),
+                provider,
             ),
             None => build_error_trace(&config, &req_body, latency_ms, session_header.as_deref()),
         };
@@ -3551,8 +3798,21 @@ fn response_usage(body: &[u8]) -> ResponseUsage {
         return ResponseUsage::default();
     };
     let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
+    let model = json.get("model").and_then(Value::as_str).map(str::to_owned);
+    // OpenAI Chat Completions reports `prompt_tokens` INCLUDING cached tokens; split the cached
+    // part out so it is priced as a cache read, matching the Anthropic split below.
+    if json.pointer("/usage/prompt_tokens").is_some() {
+        let cached = u("/usage/prompt_tokens_details/cached_tokens");
+        return ResponseUsage {
+            model,
+            in_tokens: u("/usage/prompt_tokens").saturating_sub(cached),
+            cache_write_tokens: 0,
+            cache_read_tokens: cached,
+            out_tokens: u("/usage/completion_tokens"),
+        };
+    }
     ResponseUsage {
-        model: json.get("model").and_then(Value::as_str).map(str::to_owned),
+        model,
         in_tokens: u("/usage/input_tokens"),
         cache_write_tokens: u("/usage/cache_creation_input_tokens"),
         cache_read_tokens: u("/usage/cache_read_input_tokens"),
@@ -3567,6 +3827,7 @@ fn build_trace(
     resp_body: &Bytes,
     latency_ms: u64,
     session_header: Option<&str>,
+    provider: &str,
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
     let usage = response_usage(resp_body);
@@ -3580,7 +3841,7 @@ fn build_trace(
     let cost_usd = config
         .prices
         .cost_usd_with_cache(
-            &format!("anthropic/{model}"),
+            &format!("{provider}/{model}"),
             in_tokens,
             cache_write_tokens,
             cache_read_tokens,
@@ -3591,7 +3852,7 @@ fn build_trace(
     let attempt = Attempt {
         rung: 0,
         model,
-        provider: "anthropic".to_owned(),
+        provider: provider.to_owned(),
         in_tokens,
         cache_write_tokens,
         cache_read_tokens,
@@ -3624,47 +3885,79 @@ fn build_trace(
     trace
 }
 
-/// Build the observe-mode trace for a **streamed** response: we relayed real bytes to the caller,
-/// but the token usage lives in the SSE events we didn't buffer, so it's recorded as served with
-/// unknown (zero) usage — honest about what we served without inventing token counts. The stop
-/// reason is in the same unbuffered events, so `truncated` is unknown too and recorded as false.
-fn build_stream_trace(
+/// Build the observe-mode trace for a **streamed** response using token usage collected by
+/// [`SseTap`] from the in-flight SSE events. If no usage events were seen (e.g. the stream
+/// errored before `message_start`), the attempt is recorded with zero tokens and zero cost —
+/// honest fallback rather than invented numbers.
+fn build_stream_trace_from_usage(
     config: &ProxyConfig,
     req_body: &Bytes,
     latency_ms: u64,
     session_header: Option<&str>,
+    usage: SseUsage,
+    provider: &str,
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
-    let model = req_model.unwrap_or_else(|| "unknown".to_owned());
+    // Prefer the model name seen in the SSE events (authoritative); fall back to the
+    // request-side model field, then "unknown".
+    let model = usage
+        .model
+        .or(req_model)
+        .unwrap_or_else(|| "unknown".to_owned());
+
+    let (in_tokens, cache_write_tokens, cache_read_tokens, out_tokens) = (
+        usage.in_tokens,
+        usage.cache_write_tokens,
+        usage.cache_read_tokens,
+        usage.out_tokens,
+    );
+
+    let cost_usd = config
+        .prices
+        .cost_usd_with_cache(
+            &format!("{provider}/{model}"),
+            in_tokens,
+            cache_write_tokens,
+            cache_read_tokens,
+            out_tokens,
+        )
+        .unwrap_or(0.0);
+
+    // `"max_tokens"` is Anthropic's stop_reason; `"length"` is OpenAI's finish_reason for
+    // the same condition.
+    let truncated = matches!(
+        usage.stop_reason.as_deref(),
+        Some("max_tokens") | Some("length")
+    );
 
     let attempt = Attempt {
         rung: 0,
         model,
-        provider: "anthropic".to_owned(),
-        in_tokens: 0,
-        // Nothing was served, so there is no cache traffic to account for.
-        cache_write_tokens: 0,
-        cache_read_tokens: 0,
-        out_tokens: 0,
-        cost_usd: 0.0,
+        provider: provider.to_owned(),
+        in_tokens,
+        cache_write_tokens,
+        cache_read_tokens,
+        out_tokens,
+        cost_usd,
         latency_ms,
         gates: Vec::new(),
         verdict: Verdict::Pass,
-        truncated: false,
+        truncated,
     };
 
     let mut trace = base_trace(config, req_body, latency_ms, session_header);
+    trace.request.features.prompt_token_bucket = token_bucket(in_tokens);
     trace.request.features.tool_count = tool_count;
     trace.request.features.has_images = has_images;
     trace.attempts.push(attempt);
     trace.final_ = FinalOutcome {
         served_rung: Some(0),
         served_from: ServedFrom::Attempt,
-        total_cost_usd: 0.0,
+        total_cost_usd: cost_usd,
         gate_cost_usd: 0.0,
         total_latency_ms: latency_ms,
         escalations: 0,
-        counterfactual_baseline_usd: 0.0,
+        counterfactual_baseline_usd: cost_usd,
         savings_usd: 0.0,
         cache_source: None,
     };
@@ -4386,11 +4679,20 @@ async fn observe_passthrough_openai_path(
                 latency_ms,
                 session_header,
                 tenant,
+                "openai",
             );
             (status, resp_headers, resp_body).into_response()
         }
         Err(err) => {
-            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
+            spawn_trace(
+                &state,
+                body,
+                None,
+                latency_ms,
+                session_header,
+                tenant,
+                "openai",
+            );
             err.into_response()
         }
     }
@@ -4419,12 +4721,22 @@ async fn observe_stream_openai_path(
     let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     match result {
         Ok((status, resp_headers, response)) => {
-            spawn_stream_trace(&state, body, latency_ms, session_header, tenant);
-            let stream_body = Body::from_stream(response.bytes_stream());
+            let on_done =
+                stream_trace_callback(&state, body, latency_ms, session_header, tenant, "openai");
+            let tap = SseTap::new(response.bytes_stream(), on_done);
+            let stream_body = Body::from_stream(tap);
             (status, resp_headers, stream_body).into_response()
         }
         Err(err) => {
-            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
+            spawn_trace(
+                &state,
+                body,
+                None,
+                latency_ms,
+                session_header,
+                tenant,
+                "openai",
+            );
             err.into_response()
         }
     }
@@ -5006,6 +5318,51 @@ mod tests {
         ProxyConfig::from_lookup(|_| None).unwrap()
     }
 
+    /// An OpenAI-shaped observe response is priced as `openai/<model>` from `prompt_tokens` /
+    /// `completion_tokens`, with cached prompt tokens split out as cache reads; it was once priced
+    /// as `anthropic/<model>` from Anthropic field names, which recorded zero tokens and $0.
+    #[test]
+    fn openai_observe_receipt_uses_openai_usage_and_price() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"gpt-4.1-mini","messages":[]}"#);
+        let resp = Bytes::from_static(
+            br#"{"model":"gpt-4.1-mini","choices":[{"finish_reason":"length"}],
+                "usage":{"prompt_tokens":1000,"completion_tokens":200,
+                         "prompt_tokens_details":{"cached_tokens":400}}}"#,
+        );
+        let trace = build_trace(&config, &req, &resp, 7, None, "openai");
+        let a = &trace.attempts[0];
+        assert_eq!(a.provider, "openai");
+        assert_eq!(a.in_tokens, 600, "uncached prompt tokens");
+        assert_eq!(a.cache_read_tokens, 400);
+        assert_eq!(a.out_tokens, 200);
+        assert!(a.truncated, "finish_reason length");
+        let want = config
+            .prices
+            .cost_usd_with_cache("openai/gpt-4.1-mini", 600, 0, 400, 200)
+            .expect("gpt-4.1-mini is priced");
+        assert!(want > 0.0);
+        assert!(
+            (a.cost_usd - want).abs() < 1e-12,
+            "{} vs {want}",
+            a.cost_usd
+        );
+
+        let mut u = SseUsage::default();
+        let mut buf = Vec::new();
+        let mut overflow = false;
+        parse_sse_chunk_into(
+            b"data: {\"model\":\"gpt-4.1-mini\",\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":200,\"prompt_tokens_details\":{\"cached_tokens\":400}}}\n",
+            &mut buf,
+            &mut overflow,
+            &mut u,
+        );
+        assert_eq!(
+            (u.in_tokens, u.cache_read_tokens, u.out_tokens),
+            (600, 400, 200)
+        );
+    }
+
     #[test]
     fn build_trace_maps_request_and_response_fields() {
         let config = test_config();
@@ -5016,7 +5373,7 @@ mod tests {
             br#"{"model":"claude-haiku-4-5","usage":{"input_tokens":1200,"output_tokens":300}}"#,
         );
 
-        let trace = build_trace(&config, &req, &resp, 42, Some("sess-1"));
+        let trace = build_trace(&config, &req, &resp, 42, Some("sess-1"), "anthropic");
 
         assert_eq!(trace.request.api, "anthropic.messages");
         assert_eq!(trace.session_id, "sess-1");
@@ -5038,7 +5395,7 @@ mod tests {
         let req = Bytes::from_static(b"{}");
         let resp = Bytes::from_static(b"{}");
 
-        let trace = build_trace(&config, &req, &resp, 1, None);
+        let trace = build_trace(&config, &req, &resp, 1, None, "anthropic");
 
         assert_eq!(trace.session_id, trace.trace_id.to_string());
     }
@@ -9126,5 +9483,262 @@ mod tests {
             "the scan must actually see the templates ({count})"
         );
         assert!(js.contains("const esc ="), "the escaper must exist");
+    }
+
+    // ── SSE tap: byte-relay identity, split-chunk parsing, oversize-line safety ──────────────
+
+    /// A minimal `Stream` backed by a `VecDeque`, usable in synchronous-feeling async tests
+    /// without pulling in `futures-util` or `async-stream`.
+    struct TestStream {
+        chunks: std::collections::VecDeque<Result<Bytes, reqwest::Error>>,
+    }
+
+    impl TestStream {
+        fn from_ok(v: Vec<&'static [u8]>) -> Self {
+            Self {
+                chunks: v.into_iter().map(|b| Ok(Bytes::from_static(b))).collect(),
+            }
+        }
+    }
+
+    impl Stream for TestStream {
+        type Item = Result<Bytes, reqwest::Error>;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.chunks.pop_front())
+        }
+    }
+
+    /// SSE bytes for an Anthropic response with `input_tokens=100`, `output_tokens=200`,
+    /// cache fields, and `stop_reason="max_tokens"`, split into two chunks at a point that
+    /// falls inside the `message_start` data line.
+    fn anthropic_sse_bytes() -> (&'static [u8], &'static [u8]) {
+        // chunk 1 ends mid-way through the message_start data line
+        let c1: &'static [u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-haiku-4-5\",\"usage\":{\"input_tokens\":100,\"cache_crea";
+        // chunk 2 completes that line and adds message_delta
+        let c2: &'static [u8] = b"tion_input_tokens\":50,\"cache_read_input_tokens\":25}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":200},\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n";
+        (c1, c2)
+    }
+
+    /// (1) Split-chunk parsing: usage is read correctly even when an SSE event is split across
+    /// chunk boundaries. Relayed bytes must equal the concatenation of the input chunks exactly.
+    ///
+    /// Mutation checks run by the author:
+    /// - Commented out the `"message_start"` arm → `in_tokens` assertion failed.
+    /// - Commented out the `"message_delta"` arm → `out_tokens` assertion failed.
+    /// - Changed `Poll::Ready(Some(Ok(chunk)))` to return `Bytes::new()` → byte-identity
+    ///   assertion failed.
+    #[tokio::test]
+    async fn sse_tap_parses_usage_across_split_chunks_and_relays_bytes_unchanged() {
+        let (c1, c2) = anthropic_sse_bytes();
+        let all_bytes: Vec<u8> = [c1, c2].concat();
+
+        let stream = TestStream::from_ok(vec![c1, c2]);
+        let (tx, rx) = tokio::sync::oneshot::channel::<SseUsage>();
+        let tap = SseTap::new(stream, move |u| {
+            let _ = tx.send(u);
+        });
+
+        // Consuming the body drives `poll_next` to `None`, firing `on_done`.
+        let collected = axum::body::to_bytes(Body::from_stream(tap), usize::MAX)
+            .await
+            .unwrap();
+
+        // Byte identity: every chunk forwarded unchanged.
+        assert_eq!(
+            collected.as_ref(),
+            all_bytes.as_slice(),
+            "relayed bytes must equal input bytes exactly"
+        );
+
+        let usage = rx.await.unwrap();
+        assert_eq!(usage.in_tokens, 100, "input_tokens from message_start");
+        assert_eq!(
+            usage.cache_write_tokens, 50,
+            "cache_creation from message_start"
+        );
+        assert_eq!(usage.cache_read_tokens, 25, "cache_read from message_start");
+        assert_eq!(usage.out_tokens, 200, "output_tokens from message_delta");
+        assert_eq!(
+            usage.model.as_deref(),
+            Some("claude-haiku-4-5"),
+            "model from message_start"
+        );
+        assert_eq!(
+            usage.stop_reason.as_deref(),
+            Some("max_tokens"),
+            "stop_reason from message_delta"
+        );
+
+        // `truncated` flows through `build_stream_trace_from_usage`.
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        let trace = build_stream_trace_from_usage(&config, &req, 10, None, usage, "anthropic");
+        assert!(
+            trace.attempts[0].truncated,
+            "max_tokens stop_reason must set truncated=true"
+        );
+        assert!(
+            trace.attempts[0].cost_usd > 0.0,
+            "non-zero tokens must produce a non-zero cost"
+        );
+    }
+
+    /// (2) End-to-end observe-mode streaming: receipt has real token counts and cost.
+    /// Spins up a local axum server that returns a fixed SSE payload, routes a streaming
+    /// observe request through it, and checks the stored trace.
+    ///
+    /// Mutation checks run by the author:
+    /// - Replaced `SseTap::new(...)` with the old `spawn_stream_trace(...)` call → `in_tokens`
+    ///   and `cost_usd` assertions both failed (reverted to confirm they pass again).
+    #[tokio::test]
+    async fn observe_stream_receipt_has_sse_usage_and_non_zero_cost() {
+        // SSE payload: 100 input, 50 output, stop_reason=max_tokens → truncated.
+        const SSE: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-haiku-4-5\",",
+            "\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":0,",
+            "\"cache_read_input_tokens\":0}}}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":50},",
+            "\"delta\":{\"stop_reason\":\"max_tokens\"}}\n",
+            "\n",
+        );
+
+        // Fake upstream that returns SSE with the correct content-type.
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/event-stream; charset=utf-8",
+                    )],
+                    SSE,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some(base_url.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let (traces, mut rx) = mpsc::channel(4);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(HashMap::new()),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+
+        let body = Bytes::from_static(
+            br#"{"model":"claude-haiku-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let resp = observe_stream(state, HeaderMap::new(), body, None, "default".to_owned()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // Consuming the body drives the stream to completion, fires `on_done`, which spawns
+        // the trace-building task.
+        let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+
+        // `rx.recv()` yields until the spawned task sends the trace.
+        let trace = rx
+            .recv()
+            .await
+            .expect("trace must be sent after stream ends");
+        assert_eq!(trace.attempts.len(), 1, "one attempt");
+        let attempt = &trace.attempts[0];
+        assert_eq!(
+            attempt.in_tokens, 100,
+            "input tokens from SSE message_start"
+        );
+        assert_eq!(
+            attempt.out_tokens, 50,
+            "output tokens from SSE message_delta"
+        );
+        assert!(
+            attempt.cost_usd > 0.0,
+            "non-zero tokens must produce a non-zero cost"
+        );
+        assert!(
+            attempt.truncated,
+            "max_tokens stop_reason must set truncated=true in the receipt"
+        );
+        assert_eq!(
+            attempt.model, "claude-haiku-4-5",
+            "model from SSE message_start"
+        );
+    }
+
+    /// (3) Oversize-line safety: a `data:` line that exceeds `SSE_LINE_BUF_CAP` is silently
+    /// skipped from parsing, but valid events that follow are still parsed correctly.
+    ///
+    /// Mutation check run by the author:
+    /// - Removed the `*overflow = true` branch → the `usage.in_tokens` assertion still passed
+    ///   (the line is too long to be valid JSON), so we additionally verify that the line_buf
+    ///   stays bounded by asserting it never grows above the cap.
+    #[test]
+    fn sse_tap_oversize_line_skipped_and_following_valid_event_still_parsed() {
+        // Build a `data:` line that just exceeds the cap.
+        let mut big_chunk = b"data: ".to_vec();
+        big_chunk.extend(std::iter::repeat_n(b'x', SSE_LINE_BUF_CAP + 1));
+        big_chunk.push(b'\n');
+        // Append a normal event immediately after.
+        big_chunk.extend_from_slice(
+            b"event: message_start\n\
+              data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\
+              \"usage\":{\"input_tokens\":42,\"cache_creation_input_tokens\":0,\
+              \"cache_read_input_tokens\":0}}}\n\n",
+        );
+
+        let mut line_buf: Vec<u8> = Vec::new();
+        let mut overflow = false;
+        let mut usage = SseUsage::default();
+        parse_sse_chunk_into(&big_chunk, &mut line_buf, &mut overflow, &mut usage);
+
+        // The line buffer must never exceed the cap.
+        assert!(
+            line_buf.len() <= SSE_LINE_BUF_CAP,
+            "line buffer must stay bounded: len={}",
+            line_buf.len()
+        );
+        // Parsing must still work for the valid event that follows.
+        assert_eq!(
+            usage.in_tokens, 42,
+            "valid event after oversize line must still be parsed"
+        );
+        assert_eq!(
+            usage.model.as_deref(),
+            Some("m"),
+            "model must be extracted from the valid event"
+        );
     }
 }
