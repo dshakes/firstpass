@@ -42,7 +42,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use firstpass_core::{
-    Arm, Config, Experiment, ExperimentReport, ExperimentStatus, Trace, Verdict, select,
+    select, Arm, Config, Experiment, ExperimentReport, ExperimentStatus, Trace, Verdict,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -1337,7 +1337,7 @@ pub fn render(views: &[ExperimentView]) -> String {
 mod tests {
     use firstpass_core::trace::ExperimentRecord;
     use firstpass_core::{
-        Features, FinalOutcome, GENESIS_HASH, Mode, PolicyRef, RequestInfo, ServedFrom, TaskKind,
+        Features, FinalOutcome, Mode, PolicyRef, RequestInfo, ServedFrom, TaskKind, GENESIS_HASH,
     };
 
     use super::*;
@@ -1406,6 +1406,7 @@ mod tests {
                 bucket: 0,
                 fingerprint: fp(),
             }),
+            upstream_provider: String::new(),
         }
     }
 

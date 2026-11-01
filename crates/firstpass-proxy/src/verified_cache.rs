@@ -591,6 +591,7 @@ mod tests {
             shadow: None,
             route_ix: None,
             experiment: None,
+            upstream_provider: String::new(),
         }
     }
 

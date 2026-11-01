@@ -240,6 +240,12 @@ pub struct Trace {
     /// a `[route.challenger]` — byte-identical to earlier traces and hash-chain compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experiment: Option<ExperimentRecord>,
+    /// The upstream provider that was contacted when the request ended in an error and there
+    /// are no attempts to read the provider from. Absent (empty) on successful traces — the
+    /// provider is then authoritative on the attempt. `skip_serializing_if` keeps old hashes
+    /// intact: an absent field serializes as absent, not as `""`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub upstream_provider: String,
 }
 
 /// Which controller supplied the serve threshold. Precedence is e-process > ACI > fixed
@@ -582,6 +588,7 @@ mod tests {
             elastic: None,
             risk: None,
             experiment: None,
+            upstream_provider: String::new(),
         };
         t.recompute_savings();
         t

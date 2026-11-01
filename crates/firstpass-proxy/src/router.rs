@@ -254,6 +254,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
         elastic,
         risk: None,
         experiment: None,
+        upstream_provider: String::new(),
     };
     trace.recompute_savings();
     (outcome, trace)
