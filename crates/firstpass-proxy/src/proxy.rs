@@ -9447,6 +9447,11 @@ mod tests {
             pairs[0].x_ch, 0.0,
             "challenger failed json-valid on every rung"
         );
+        assert_eq!(
+            pairs[0].in_log,
+            crate::store::InLogStatus::NotInLog,
+            "no shared log is configured, so the pair cannot be in one"
+        );
         let _ = std::fs::remove_file(&db);
     }
 
