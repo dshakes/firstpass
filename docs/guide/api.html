@@ -79,7 +79,7 @@
     <tr><td><code>POST /v1/chat/completions</code></td><td>OpenAI-dialect inbound. Same cascade, OpenAI wire format.</td></tr>
     <tr><td><code>POST /v1/feedback</code></td><td>Report a deferred outcome for a past request — drives adaptive calibration.</td></tr>
     <tr><td><code>GET /v1/capabilities</code></td><td>What this instance supports — providers, gates, modes.</td></tr>
-    <tr><td><code>GET /v1/receipts?limit=N</code></td><td>The tenant's newest receipts (1 to 200) plus all-time <code>summary</code> totals, including <code>truncated</code>: attempts whose answer stopped at the output-token limit. Feeds the panel; behind auth.</td></tr>
+    <tr><td><code>GET /v1/receipts?limit=N</code></td><td>The tenant's newest receipts (1 to 200) plus all-time <code>summary</code> totals, including <code>truncated</code>: attempts whose answer stopped at the output-token limit (unknown, so not counted, for observe-mode streamed responses, which are relayed unbuffered). Feeds the panel; behind auth.</td></tr>
     <tr><td><code>GET /v1/experiments</code></td><td>The tenant's certified-selection experiments (<a href="#experiments">below</a>). Behind auth.</td></tr>
     <tr><td><code>GET /panel</code></td><td>The operator dashboard: one self-contained page that fetches the two endpoints above. Serves no data itself, and is sent with a Content-Security-Policy that lets only its own script run and only talk to this origin.</td></tr>
     <tr><td><code>GET /healthz</code></td><td>Liveness / readiness.</td></tr>

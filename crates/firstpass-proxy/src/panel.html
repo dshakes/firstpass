@@ -267,6 +267,10 @@
   function tile(k, v, s, tone) {
     return `<div class="tile"><div class="k">${esc(k)}</div><div class="v ${esc(tone || '')}">${esc(v)}</div><div class="s">${esc(s || '')}</div></div>`;
   }
+  // A fail on an answer that stopped at max_tokens may describe the cap rather than the model.
+  const h_cut = n => (Number(n) > 0
+    ? `<div class="lede" style="margin:8px 0 0">${esc(num(n))} answers stopped at the output-token limit (max_tokens). A gate fail on a cut-off answer may describe the cap, not the model.</div>` : '');
+
   function h_overview() {
     const s = state.summary;
     if (!s || !s.requests) {
@@ -296,10 +300,6 @@
         <span class="fail">fail ${esc(num(g.fail))} (${esc(pct(g.fail, total))})</span>
         <span class="abstain">abstain ${esc(num(g.abstain))} (${esc(pct(g.abstain, total))})</span></div>${h_cut(s.truncated)}`;
   }
-
-  // A fail on an answer that stopped at max_tokens may describe the cap rather than the model.
-  const h_cut = n => (Number(n) > 0
-    ? `<div class="lede" style="margin:8px 0 0">${esc(num(n))} answers stopped at the output-token limit (max_tokens). A gate fail on a cut-off answer may describe the cap, not the model.</div>` : '');
 
   // ---- experiments ----------------------------------------------------------------------------
   const EXPLAIN = {

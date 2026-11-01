@@ -1660,10 +1660,12 @@ fn spawn_paired_challenger(
         // still serves its best attempt. And an error is a failure, not a skipped pair: errors
         // cluster on hard requests, so skipping them would flatter the challenger toward a
         // certification it has not earned.
-        let x_ch = if ch_trace.final_.served_from == firstpass_core::ServedFrom::Attempt {
-            1.0
-        } else {
-            0.0
+        let x_ch = match ch_trace.final_.served_from {
+            firstpass_core::ServedFrom::Attempt => 1.0,
+            firstpass_core::ServedFrom::BestAttempt | firstpass_core::ServedFrom::Error => 0.0,
+            // Not produced by `route_enforce` today; a replayed answer had no fresh gate run, so it
+            // is not comparable rather than a failure.
+            firstpass_core::ServedFrom::Cache => return,
         };
 
         // Persist the pair to the store for startup rebuild and CLI replay.
@@ -3624,7 +3626,8 @@ fn build_trace(
 
 /// Build the observe-mode trace for a **streamed** response: we relayed real bytes to the caller,
 /// but the token usage lives in the SSE events we didn't buffer, so it's recorded as served with
-/// unknown (zero) usage — honest about what we served without inventing token counts.
+/// unknown (zero) usage — honest about what we served without inventing token counts. The stop
+/// reason is in the same unbuffered events, so `truncated` is unknown too and recorded as false.
 fn build_stream_trace(
     config: &ProxyConfig,
     req_body: &Bytes,
