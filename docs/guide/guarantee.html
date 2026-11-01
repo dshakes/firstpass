@@ -89,7 +89,7 @@
 <div class="recap">Firstpass certifies a distribution-free upper bound on served-failure rate — you supply the target and confidence, calibration supplies the threshold.</div>
 
 <h2 id="chart">The live result<a class="anchor" href="#chart" aria-label="Link to this section">#</a></h2>
-<div class="tldr">On <a href="benchmarks.html">974 real MBPP coding tasks</a>, gated by real unit tests, with pre-registered <code>α=0.10, δ=0.05</code>: realized served-failure was <b>7.7%</b> (under the 10% target at 95% confidence), calibrated risk was <b>5.5%</b>, and <b>82% of requests were served from the cheap tier</b> with no escalation.</div>
+<div class="tldr">On <a href="benchmarks.html">974 real MBPP coding tasks</a>, gated by real unit tests, with pre-registered <code>α=0.10, δ=0.05</code>: realized served-failure was <b>7.7%</b> (under the 10% target at 95% confidence), calibrated risk was <b>5.5%</b>, and <b>82% of requests were served from the cheap tier</b> with no escalation. This is one run on one dataset: the realized rate sits above the calibrated risk and below the target, which is the bound doing its job, not a promise for your workload.</div>
 <p class="subh">Reading the numbers</p>
 <p>The committed result — from <code>docs/benchmarks/mbpp-live-base.txt</code> — is 974 real MBPP coding tasks, gated by real unit tests, live against an Anthropic solver, with pre-registered <code>α=0.10, δ=0.05</code>:</p>
 <div class="chips">
