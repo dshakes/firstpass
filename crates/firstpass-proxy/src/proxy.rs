@@ -9650,6 +9650,85 @@ mod tests {
     /// Mutation checks run by the author:
     /// - Replaced `SseTap::new(...)` with the old `spawn_stream_trace(...)` call → `in_tokens`
     ///   and `cost_usd` assertions both failed (reverted to confirm they pass again).
+    /// An upstream 429 is relayed to the caller byte-for-byte and recorded as an error, never as a
+    /// served pass, on both the buffered and the streaming observe paths.
+    #[tokio::test]
+    async fn observe_records_an_upstream_429_as_an_error_on_both_paths() {
+        const ERR: &str =
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    ERR,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some(base_url.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let (traces, mut rx) = mpsc::channel(4);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(HashMap::new()),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+        for body in [
+            &br#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}"#[..],
+            &br#"{"model":"claude-haiku-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}"#[..],
+        ] {
+            let resp = observe_passthrough(
+                state.clone(),
+                HeaderMap::new(),
+                Bytes::from_static(body),
+                None,
+                "default".to_owned(),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+            let relayed = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(relayed.as_ref(), ERR.as_bytes(), "relayed byte-for-byte");
+            let trace = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("trace within 5s")
+                .expect("a trace");
+            assert_eq!(
+                trace.final_.served_from,
+                ServedFrom::Error,
+                "stream={}",
+                String::from_utf8_lossy(body).contains("stream")
+            );
+            assert!(trace.attempts.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn observe_stream_receipt_has_sse_usage_and_non_zero_cost() {
         // SSE payload: 100 input, 50 output, stop_reason=max_tokens → truncated.
