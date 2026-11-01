@@ -142,7 +142,7 @@ max_usd_per_day = 5.0    # required: the challenger makes real calls</code></pre
   </tbody>
 </table></div>
 <p>A tighter <code>margin = 0.03</code> certified only 63% of the good challengers within 20,000 sessions, which is why the default is 0.05. The cost is information, not the method: two arms at about 76% success need thousands of sessions to separate a 4-point gap. A lower <code>percent</code> slows the experiment but limits how much traffic the challenger sees.</p>
-<p><b>Live, paired mode</b> (real sonnet-5 vs haiku-4-5, tests run in a sandbox, <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/live-certified-selection.md">full write-up</a>): on all 974 MBPP tasks haiku passed 84.6% against sonnet's 95.4% and was <b>halted at pair 137</b>, robust to the order of the pairs. On 150 APPS contest problems the gap was 6.7 points, close to the margin, and the experiment correctly stayed <b>undecided</b>.</p>
+<p><b>Live, paired mode</b> (real sonnet-5 vs haiku-4-5, tests run in a sandbox, <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/live-certified-selection.md">full write-up</a>): on all 974 MBPP tasks haiku passed 84.6% against sonnet's 95.4% and was <b>halted at pair 137</b>, robust to the order of the pairs. On 290 APPS contest problems the gap was 4.5 points (65.2% vs 60.7%), and the experiment correctly stayed <b>undecided</b>: inside the margin, but not yet provably so.</p>
 
 <h2 id="limits">Limits<a class="anchor" href="#limits" aria-label="Link to this section">#</a></h2>
 <ul>
