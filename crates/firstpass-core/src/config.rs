@@ -2722,12 +2722,14 @@ discount = 0.98
             assert!(Config::parse(toml).is_err(), "accepted: {why}");
         }
 
-        // A declared provider + price makes a custom rung acceptable.
+        // A declared provider + price makes a custom rung acceptable. The id must not be a built-in,
+        // or this would pass without the `[[provider]]` lookup at all.
+        assert!(!BUILTIN_OPENAI_COMPATIBLE.iter().any(|(id, ..)| *id == "myhost"));
         assert!(
             Config::parse(&format!(
-                "{route}[route.challenger]\nladder = [\"groq/llama\"]\npercent = 10.0\n\
-                 [[provider]]\nid = \"groq\"\ndialect = \"openai\"\nbase_url = \"https://api.groq.com/openai\"\n\
-                 [[price]]\nmodel = \"groq/llama\"\ninput_per_mtok = 0.1\noutput_per_mtok = 0.1\n"
+                "{route}[route.challenger]\nladder = [\"myhost/llama\"]\npercent = 10.0\n\
+                 [[provider]]\nid = \"myhost\"\ndialect = \"openai\"\nbase_url = \"http://127.0.0.1:11434\"\n\
+                 [[price]]\nmodel = \"myhost/llama\"\ninput_per_mtok = 0.0\noutput_per_mtok = 0.0\n"
             ))
             .is_ok()
         );
