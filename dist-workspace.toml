@@ -19,3 +19,8 @@ install-updater = true
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
+
+# GitHub retires the macOS 14 runner image on 2026-11-02 (actions/runner-images#13518); dist 0.32
+# still defaults aarch64-apple-darwin to it, and a brownout cancelled the v0.9.1 build.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
