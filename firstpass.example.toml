@@ -13,9 +13,10 @@
 # Routes are matched top-to-bottom; the first match wins. Each route binds a slice
 # of traffic to a mode, a model ladder (cheapest first), and the gates that must pass.
 
-# Providers a ladder can route to. `anthropic` and `openai` are built in; declare a `[[provider]]`
-# for anything else. Any OpenAI-compatible endpoint — Groq, Together, Fireworks, DeepSeek, Mistral,
-# xAI, OpenRouter, Azure, or a local Ollama / vLLM server — is one entry, no rebuild. A ladder rung
+# Providers a ladder can route to. `anthropic` and `openai` are built in, and so are the common
+# OpenAI-compatible hosts (groq, deepseek, together, fireworks, mistral, openrouter, …), each reading
+# its usual key env var. Declare a `[[provider]]` for anything else (Azure, a local Ollama / vLLM
+# server) or to override a built-in's URL — one entry, no rebuild. A ladder rung
 # then reads `<id>/<model>`, so you can start a rung on a cheap open-source model and escalate to a
 # frontier model only when the gate fails. `dialect` is `openai`, `anthropic`, or `gemini`;
 # `api_key_env` names the env var holding that provider's key (omit for a keyless local endpoint).

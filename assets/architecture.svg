@@ -45,7 +45,7 @@
   <line x1="644" y1="136" x2="662" y2="136" stroke="#19E3B1" stroke-width="1.6" marker-end="url(#a-arp)"/>
   <!-- gate pass shortcut -->
   <path d="M444 166 L444 190 L713 190 L713 168" fill="none" stroke="#19E3B1" stroke-width="1.4" marker-end="url(#a-arp)"/>
-  <text x="578" y="205" text-anchor="middle" fill="#19E3B1" font-size="10" font-weight="600">gate passes → serve, no escalation (82% of traffic)</text>
+  <text x="578" y="205" text-anchor="middle" fill="#19E3B1" font-size="10" font-weight="600">gate passes → serve, no escalation</text>
   <!-- escalate re-gate loop -->
   <path d="M584 166 L584 230 L444 230 L444 168" fill="none" stroke="#FF5C5C" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#a-arf)"/>
   <text x="514" y="248" text-anchor="middle" fill="#FF5C5C" font-size="10" font-weight="600">re-gate the next rung</text>

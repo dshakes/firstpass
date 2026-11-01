@@ -8,11 +8,9 @@ as stale and the artifact as the bug to file.
 | Artifact | Claim it backs | Command | Cost |
 |---|---|---|---|
 | [`mbpp-live-base.txt`](mbpp-live-base.txt) ✅ | MBPP served-failure bound, base (test) gate | `FIRSTPASS_CODING_DATASET=./mbpp.jsonl cargo run --release -p firstpass-bench -- --coding-live` | your key + Docker, ~$5 |
-| `mbpp-live-judged.txt` | MBPP bound with an LLM judge on the gate | same, plus `FIRSTPASS_CODING_JUDGE=<model>` | your key + Docker, ~$10 |
 | [`mbpp-policy-974.txt`](mbpp-policy-974.txt) ✅ | Routing policy vs always-cheap / always-top, haiku→sonnet ladder | `FIRSTPASS_CODING_DATASET=./mbpp-974.jsonl cargo run --release -p firstpass-bench -- --coding-policy` | your key + Docker, ~$3 |
 | [`mbpp-policy-974-opus.txt`](mbpp-policy-974-opus.txt) ✅ | Same comparison on a ~15× ladder, haiku→opus | same, plus `FIRSTPASS_CODING_LADDER="anthropic/claude-haiku-4-5,anthropic/claude-opus-4-8"` | your key + Docker, ~$9 |
 | [`elastic-validation.txt`](elastic-validation.txt) ✅ | Elastic-verification Phase 3: cost saved + held-out served-failure bound | `cargo run --release -p firstpass-bench -- --elastic` | free (offline) |
-| `live-200.txt` | 200-task live cost/success table | `cargo run -p firstpass-bench -- --live` | your key, ~a few $ |
 | [`prior-blend-replay.md`](prior-blend-replay.md) ✅ | Study A: prior+learned blend is BLEND-NEUTRAL (+ the hindsight-leak correction) | `cargo run --release -p firstpass-bench -- --replay-blend <mbpp.jsonl> <matrix1> <priors1> ...` | free (offline replay of committed matrices + priors) |
 | [`decision-gate-study.md`](decision-gate-study.md) ✅ | Study B: `decision` gate error rates on real MBPP, NOT-RECOMMENDED (OpenJev) | `cargo run --release -p firstpass-bench -- --decision-study <candidates.jsonl> <mbpp.jsonl> <base_url> <labels.jsonl> <scores.jsonl>` | local OpenJev + fail-closed sandbox |
 

@@ -17,7 +17,7 @@
       <stop offset="1" stop-color="#5EEACB" stop-opacity="0"/>
     </linearGradient>
     <clipPath id="savedClip">
-      <text x="90" y="452" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" font-weight="700">SAVED $0.0502 — 80% cheaper at proven quality</text>
+      <text x="90" y="452" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" font-weight="700">EXAMPLE: saved $0.0502 (illustrative)</text>
     </clipPath>
   </defs>
 
@@ -81,7 +81,7 @@
 
   <line x1="90" y1="400" x2="630" y2="400" stroke="#263449" stroke-width="1"/>
 
-  <text x="90" y="452" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" font-weight="700" fill="#19E3B1">SAVED $0.0502 &#8212; 80% cheaper at proven quality</text>
+  <text x="90" y="452" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" font-weight="700" fill="#19E3B1">EXAMPLE: saved $0.0502 (illustrative)</text>
   <g clip-path="url(#savedClip)">
     <rect x="-140" y="425" width="140" height="36" fill="url(#shimmerGrad)">
       <animate attributeName="x" values="-140;700" dur="4s" repeatCount="indefinite"/>

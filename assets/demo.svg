@@ -24,7 +24,7 @@
   <text x="30" y="200" font-size="13.5" fill="#E6EDF3">rung 1  <tspan fill="#5EEACB">claude-sonnet-5</tspan>  <tspan fill="#8A97A6">$0.0121</tspan></text>
   <text x="30" y="232" font-size="13.5" fill="#8A97A6">        gate <tspan fill="#E6EDF3">cargo-test</tspan> → <tspan fill="#19E3B1" font-weight="700">✓ pass</tspan>  (all green — proven, not guessed)</text>
 
-  <text x="30" y="272" font-size="14.5" font-weight="700" fill="#19E3B1" filter="url(#tglow)">✓ served rung 1 · saved $0.0502 vs always-top · receipt 0192f3a1 sealed ⛓<animate attributeName="opacity" values="1;0.75;1" dur="2.6s" repeatCount="indefinite"/></text>
+  <text x="30" y="272" font-size="14.5" font-weight="700" fill="#19E3B1" filter="url(#tglow)">✓ served rung 1 · example: saved $0.0502 vs always-top · receipt 0192f3a1 sealed ⛓<animate attributeName="opacity" values="1;0.75;1" dur="2.6s" repeatCount="indefinite"/></text>
 
   <!-- blinking cursor (pure decoration) -->
   <rect x="30" y="288" width="9" height="15" fill="#19E3B1">
