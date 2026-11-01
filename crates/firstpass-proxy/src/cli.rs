@@ -1168,6 +1168,7 @@ mod tests {
             elastic: None,
             risk: None,
             experiment: None,
+            upstream_provider: String::new(),
         };
         let t0 = mk(GENESIS_HASH, "s0");
         let t1 = mk(&t0.hash().unwrap(), "s1");
@@ -1284,6 +1285,7 @@ mod tests {
             shadow: None,
             route_ix: None,
             experiment: None,
+            upstream_provider: String::new(),
         }
     }
 
@@ -1406,6 +1408,7 @@ mod tests {
             shadow: None,
             route_ix: None,
             experiment: None,
+            upstream_provider: String::new(),
         };
 
         let rows = export_training_jsonl(&[mk(Some(0.25), true), mk(None, false)]);
@@ -1503,6 +1506,7 @@ mod tests {
             elastic: None,
             risk: None,
             experiment: None,
+            upstream_provider: String::new(),
         };
         let ex = explain_trace(&t);
         assert_eq!(

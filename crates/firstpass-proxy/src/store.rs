@@ -1055,6 +1055,7 @@ mod tests {
             elastic: None,
             risk: None,
             experiment: None,
+            upstream_provider: String::new(),
         };
         trace.recompute_savings();
         trace
