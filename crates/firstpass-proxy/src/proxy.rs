@@ -1566,10 +1566,11 @@ fn spawn_paired_challenger(
         return;
     };
 
-    // Pre-spawn fast path: without a shared log, local state is authoritative and we can avoid
-    // cloning if the challenger is already known to be halted. With a shared log this check may
-    // use cold-start empty state; `ensure_synced` inside the task corrects that.
-    if !state.experiments.has_log() && state.experiments.challenger_blocked(&tenant, route_ix) {
+    // Pre-spawn fast path: check local halt state before cloning. If local state is empty (cold
+    // start with a shared log) this may incorrectly allow a spawn; `ensure_synced` inside the
+    // task is the authoritative cluster-wide check. The unconditional guard here catches the
+    // common steady-state case cheaply.
+    if state.experiments.challenger_blocked(&tenant, route_ix) {
         return;
     }
 
@@ -1591,15 +1592,21 @@ fn spawn_paired_challenger(
     let api = api.to_owned();
 
     tokio::spawn(async move {
-        // Issue 2 fix: pull cluster state for (tenant, route_ix) the first time this process
-        // sees it. Without this a fresh replica starts with an empty map, so `challenger_blocked`
-        // and `may_spend` below would check against nothing, silently bypassing a halt or cap
-        // that another replica already established.
-        if state.experiments.has_log() {
-            state
-                .experiments
-                .ensure_synced(&tenant, route_ix, &fingerprint)
-                .await;
+        // Pull cluster state for (tenant, route_ix) the first time this process sees it. Without
+        // this a fresh replica starts with an empty map and would bypass a halt or cap that
+        // another replica already established. `ensure_synced` is a no-op (returns true) when no
+        // shared log is configured. Returns false on a log read error → fail closed: skip eval.
+        if !state
+            .experiments
+            .ensure_synced(&tenant, route_ix, &fingerprint)
+            .await
+        {
+            tracing::debug!(
+                tenant,
+                route = route_ix,
+                "paired challenger: ensure_synced failed (log error), skipping evaluation"
+            );
+            return;
         }
 
         // Re-check halt status after ensure_synced: a halt from another replica is now visible.
@@ -1696,22 +1703,21 @@ fn spawn_paired_challenger(
         let ch_errored = ch_trace.final_.served_from == firstpass_core::ServedFrom::Error;
         let ch_trunc = crate::experiment::truncated_attempts(&ch_trace);
 
-        // Health and ledger are only tallied directly when no shared log is attached. When a log
-        // IS attached, `apply_log_record` handles both from the `LogRecord::Pair` fields, so the
-        // originating replica does not double-count (health once from live + once from log replay).
-        if !state.experiments.has_log() {
-            state
-                .paired_ledger
-                .debit(&tenant, route_ix, challenger_cost, pair_ts);
-            state.experiments.observe_health(
-                &tenant,
-                route_ix,
-                &fingerprint,
-                firstpass_core::Arm::Challenger,
-                ch_errored,
-                ch_trunc,
-            );
-        }
+        // Health and ledger are ALWAYS tallied locally here, regardless of whether a shared log
+        // is attached. `apply_log_record` skips health and ledger for records bearing this
+        // replica's own `replica_id`, preventing double-count. Remote replicas see these values
+        // through the log and tally them in `apply_log_record`.
+        state
+            .paired_ledger
+            .debit(&tenant, route_ix, challenger_cost, pair_ts);
+        state.experiments.observe_health(
+            &tenant,
+            route_ix,
+            &fingerprint,
+            firstpass_core::Arm::Challenger,
+            ch_errored,
+            ch_trunc,
+        );
 
         // Only a gate pass is success. `Served` is not: a ladder whose every rung failed its gates
         // still serves its best attempt. And an error is a failure, not a skipped pair: errors
@@ -2396,21 +2402,28 @@ async fn enforce_pipeline_inner(
     // In **paired** mode the challenger never serves any session: arm is always Incumbent, and the
     // challenger is evaluated off-path by `spawn_paired_challenger` after the response is returned.
 
-    // Issue 2 fix (live path): before checking `challenger_blocked`, ensure this (tenant, route_ix)
-    // has been synced at least once so a fresh replica cannot serve a challenger that another
-    // replica already halted. Only the first request per (tenant, route) per process pays the
-    // LRANGE cost; subsequent requests see `synced_once=true` and skip it.
-    if let Some(fp) = route
+    // Live-mode only: before checking `challenger_blocked`, ensure this (tenant, route_ix) has
+    // been synced at least once so a fresh replica cannot serve a challenger that another replica
+    // already halted. Only the first request per (tenant, route) per process pays the LRANGE
+    // cost; subsequent requests see `synced_once=true` and skip it immediately.
+    //
+    // Paired challengers are excluded: they evaluate off-path in `spawn_paired_challenger`, which
+    // calls `ensure_synced` itself. Calling it here too would block the user response on Redis.
+    //
+    // On sync failure (log error): fail closed — treat as halted (serve incumbent only).
+    let live_sync_ok = if let Some(fp) = route
         .challenger
         .as_ref()
-        .filter(|_| allow_challenger)
+        .filter(|ch| allow_challenger && !ch.is_paired())
         .map(|ch| ch.fingerprint(&route.ladder))
     {
         state
             .experiments
             .ensure_synced(&tenant, route_ix, &fp)
-            .await;
-    }
+            .await
+    } else {
+        true
+    };
 
     let experiment = route
         .challenger
@@ -2420,6 +2433,7 @@ async fn enforce_pipeline_inner(
             let bucket = firstpass_core::Challenger::bucket(&state.config.prompt_salt, &session_id);
             let assigned = ch.arm_of(bucket);
             let arm = if ch.is_paired()
+                || (!live_sync_ok && !ch.is_paired())
                 || (assigned == firstpass_core::Arm::Challenger
                     && state.experiments.challenger_blocked(&tenant, route_ix))
             {
@@ -8527,7 +8541,7 @@ mod tests {
         );
 
         // One sync makes B read the shared log and reach the same Halted decision.
-        state_b
+        let _ = state_b
             .experiments
             .sync_from_backend("default", 0, &fp)
             .await;

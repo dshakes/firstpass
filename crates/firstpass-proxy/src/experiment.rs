@@ -55,6 +55,18 @@ const MAX_TRACKED_SESSIONS: usize = 1_000_000;
 
 // ── Shared log (optional Redis / in-memory backend) ───────────────────────────────────────────
 
+/// An error returned by [`ExperimentLogBackend`] operations.
+///
+/// Backend failures are not fatal for the request path: evidence is withheld from other replicas
+/// (delaying a decision), but the local replica keeps serving. Callers use this to decide whether
+/// to serve the challenger arm (fail closed when the backend is unreachable).
+#[derive(Debug, thiserror::Error)]
+pub enum LogError {
+    /// The backend (e.g. Redis) returned an error.
+    #[error("experiment log backend error: {0}")]
+    Backend(String),
+}
+
 /// A record appended to the shared experiment log.
 ///
 /// Live mode uses `Outcome`; paired mode uses `Pair`. The list for a given
@@ -92,6 +104,12 @@ pub enum LogRecord {
         /// was added (treated as "long ago" by `ShadowLedger::seed`, i.e., not debited today).
         #[serde(default)]
         ts_unix: i64,
+        /// The per-process UUID of the replica that wrote this record. Used to skip double-tallying
+        /// health and spend on the originating replica (which already tallied them locally when the
+        /// challenger call completed). Records from older replicas (missing this field) deserialize
+        /// to `Uuid::nil()`, which never matches any live replica's UUID and so are treated as remote.
+        #[serde(default)]
+        replica_id: Uuid,
     },
 }
 
@@ -107,23 +125,27 @@ pub enum LogRecord {
 /// evidence, never retract it.
 #[async_trait::async_trait]
 pub trait ExperimentLogBackend: Send + Sync + fmt::Debug {
-    /// Append `record` to the list. Returns the new list length (1-based).
+    /// Append `record` to the list. Returns the new list length (1-based), or an error if the
+    /// backend is unreachable. A failure means the pair/outcome will not reach other replicas,
+    /// but local accounting (health, ledger) was already performed by the caller.
     async fn append(
         &self,
         tenant: &str,
         route_ix: usize,
         fingerprint: &str,
         record: LogRecord,
-    ) -> u64;
+    ) -> Result<u64, LogError>;
 
     /// Return records starting at `offset` (0-based). Empty if the list has ≤ `offset` entries.
+    /// Returns an error if the backend is unreachable; callers use this to distinguish "truly
+    /// empty" from "unreachable" and fail closed (do not serve the challenger) accordingly.
     async fn load_since(
         &self,
         tenant: &str,
         route_ix: usize,
         fingerprint: &str,
         offset: u64,
-    ) -> Vec<LogRecord>;
+    ) -> Result<Vec<LogRecord>, LogError>;
 
     /// Atomically claim a session for this experiment (live mode session dedup across replicas).
     ///
@@ -166,12 +188,12 @@ impl ExperimentLogBackend for InMemoryExperimentLog {
         route_ix: usize,
         fingerprint: &str,
         record: LogRecord,
-    ) -> u64 {
+    ) -> Result<u64, LogError> {
         let key = (tenant.to_owned(), route_ix, fingerprint.to_owned());
         let mut lists = self.lists.lock().unwrap_or_else(PoisonError::into_inner);
         let list = lists.entry(key).or_default();
         list.push(record);
-        list.len() as u64
+        Ok(list.len() as u64)
     }
 
     async fn load_since(
@@ -180,17 +202,17 @@ impl ExperimentLogBackend for InMemoryExperimentLog {
         route_ix: usize,
         fingerprint: &str,
         offset: u64,
-    ) -> Vec<LogRecord> {
+    ) -> Result<Vec<LogRecord>, LogError> {
         let key = (tenant.to_owned(), route_ix, fingerprint.to_owned());
         let lists = self.lists.lock().unwrap_or_else(PoisonError::into_inner);
         match lists.get(&key) {
-            None => vec![],
+            None => Ok(vec![]),
             Some(list) => {
                 let start = offset as usize;
                 if start >= list.len() {
-                    vec![]
+                    Ok(vec![])
                 } else {
-                    list[start..].to_vec()
+                    Ok(list[start..].to_vec())
                 }
             }
         }
@@ -296,20 +318,15 @@ mod redis_log {
             route_ix: usize,
             fingerprint: &str,
             record: LogRecord,
-        ) -> u64 {
+        ) -> Result<u64, super::LogError> {
             let key = Self::list_key(tenant, route_ix, fingerprint);
-            let Ok(json) = serde_json::to_string(&record) else {
-                return 0;
-            };
+            let json = serde_json::to_string(&record)
+                .map_err(|e| super::LogError::Backend(format!("serialize: {e}")))?;
             let mut conn = self.conn.lock().await;
             use redis::AsyncCommands as _;
-            match conn.rpush::<_, _, u64>(&key, json).await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!(key, %e, "experiment log: redis RPUSH failed");
-                    0
-                }
-            }
+            conn.rpush::<_, _, u64>(&key, json)
+                .await
+                .map_err(|e| super::LogError::Backend(format!("RPUSH {key}: {e}")))
         }
 
         async fn load_since(
@@ -318,18 +335,16 @@ mod redis_log {
             route_ix: usize,
             fingerprint: &str,
             offset: u64,
-        ) -> Vec<LogRecord> {
+        ) -> Result<Vec<super::LogRecord>, super::LogError> {
             let key = Self::list_key(tenant, route_ix, fingerprint);
             let mut conn = self.conn.lock().await;
             use redis::AsyncCommands as _;
-            let raw: Vec<String> = match conn.lrange(&key, offset as isize, -1).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(key, %e, "experiment log: redis LRANGE failed");
-                    return vec![];
-                }
-            };
-            raw.iter()
+            let raw: Vec<String> = conn
+                .lrange(&key, offset as isize, -1)
+                .await
+                .map_err(|e| super::LogError::Backend(format!("LRANGE {key}: {e}")))?;
+            Ok(raw
+                .iter()
                 .filter_map(|s| match serde_json::from_str(s) {
                     Ok(r) => Some(r),
                     Err(e) => {
@@ -337,7 +352,7 @@ mod redis_log {
                         None
                     }
                 })
-                .collect()
+                .collect())
         }
 
         async fn claim_session(
@@ -388,6 +403,9 @@ struct Entry {
     /// per `(tenant, route_ix)` per process triggers one synchronous sync. Subsequent requests see
     /// `synced_once = true` and skip the extra round-trip.
     synced_once: bool,
+    /// Whether a `tracing::warn!` has already been emitted for a failed cold-start sync on this
+    /// entry. Guards against per-request log spam when the backend is persistently unreachable.
+    sync_warn_logged: bool,
 }
 
 fn session_hash(session_id: &str) -> u64 {
@@ -415,8 +433,11 @@ struct Params {
     fingerprint: String,
 }
 
+/// Type alias to keep the `sync_gates` field type below clippy's complexity threshold.
+type SyncGates = Mutex<HashMap<(String, usize), Arc<tokio::sync::Mutex<()>>>>;
+
 /// Per-`(tenant, route)` certified-selection state. Cheap to share behind an `Arc`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ExperimentMonitor {
     /// `(margin, alpha)` per route index that has a challenger.
     params: HashMap<usize, Params>,
@@ -430,6 +451,35 @@ pub struct ExperimentMonitor {
     /// Optional paired-challenger spend ledger. When present, `apply_log_record` seeds cluster
     /// spend into it so the daily cap is cluster-wide rather than per-process.
     paired_ledger: Option<Arc<crate::shadow::ShadowLedger>>,
+    /// Random UUID for this process instance. Stamped on every `LogRecord::Pair` this replica
+    /// writes so that `apply_log_record` can skip double-tallying health and ledger for own
+    /// records (which were already tallied locally when the challenger call completed).
+    replica_id: Uuid,
+    /// Per-`(tenant, route_ix)` gate for coalescing concurrent cold-start syncs.
+    ///
+    /// All concurrent first-request callers for a fresh entry block on the same
+    /// `tokio::sync::Mutex`. Only one calls the backend (LRANGE); subsequent waiters re-check
+    /// `synced_once` and return immediately once the winner sets it. The outer `Mutex` protects
+    /// the map; the inner async `Mutex` serialises the cold-start burst without holding the outer
+    /// lock across an await.
+    sync_gates: SyncGates,
+}
+
+impl Default for ExperimentMonitor {
+    /// An inert monitor with no experiments configured: every lookup returns `false`/unknown, no
+    /// log is attached, and no ledger is attached.  Used in demo/test paths that construct an
+    /// `AppState` without a real `Config` (e.g. `Arc::default()`).
+    fn default() -> Self {
+        Self {
+            params: HashMap::new(),
+            unavailable: false,
+            entries: Mutex::new(HashMap::new()),
+            log: None,
+            paired_ledger: None,
+            replica_id: Uuid::now_v7(),
+            sync_gates: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl ExperimentMonitor {
@@ -460,6 +510,8 @@ impl ExperimentMonitor {
             entries: Mutex::default(),
             log: None,
             paired_ledger: None,
+            replica_id: Uuid::now_v7(),
+            sync_gates: Mutex::default(),
         }
     }
 
@@ -497,7 +549,9 @@ impl ExperimentMonitor {
     }
 
     /// Perform one `sync_from_backend` the first time a `(tenant, route)` entry is used in this
-    /// process. No-op when no log is configured or the entry has already been synced once.
+    /// process. Returns `true` when the entry is synced (either it already was, or the sync just
+    /// succeeded). Returns `false` when the log backend is unreachable; callers should fail closed
+    /// for this request (serve incumbent / skip evaluation).
     ///
     /// **Why this is needed.** `build_paired_ledger` starts empty when `shared_log=true`, and
     /// `start_sync_task` only syncs entries already in the map. A brand-new replica (or a
@@ -505,28 +559,82 @@ impl ExperimentMonitor {
     /// `may_spend` against nothing, silently bypassing a cluster-level halt decision or the daily
     /// spend cap. One synchronous sync before the first check closes that window.
     ///
-    /// **Concurrent-call safety.** `synced_once` is set only *after* the sync completes, so every
-    /// request in a first-request burst waits for synced state rather than checking the halt and
-    /// the cap against nothing. Concurrent first syncs may each issue one LRANGE; that is safe
-    /// because `sync_from_backend` applies each record once and only advances the offset. The flag
-    /// is set even if the sync failed (e.g. the log is unreachable), so an outage does not turn
-    /// every request into a backend call; the periodic sync task retries known entries.
+    /// **Burst coalescing.** A per-entry `tokio::sync::Mutex` gate serialises concurrent
+    /// first-request callers so exactly one LRANGE is issued per burst. Subsequent waiters
+    /// re-check `synced_once` after acquiring the gate and return immediately. `synced_once` is
+    /// set only on success; on failure it stays false (so the next burst retries), but a warning
+    /// is logged only once per entry to avoid spam during a persistent outage.
     ///
     /// Only the first request per `(tenant, route_ix)` per process pays one backend LRANGE.
-    pub async fn ensure_synced(&self, tenant: &str, route_ix: usize, fingerprint: &str) {
+    pub async fn ensure_synced(&self, tenant: &str, route_ix: usize, fingerprint: &str) -> bool {
         if self.log.is_none() {
-            return;
+            return true; // no log = always "synced" (local is authoritative)
         }
-        let needs_sync = {
+
+        // Quick check: already synced? Avoids allocating a gate key on the fast path.
+        {
             let mut map = self.lock();
-            self.entry(&mut map, tenant, route_ix)
-                .is_some_and(|e| !e.synced_once)
+            match self.entry(&mut map, tenant, route_ix) {
+                Some(e) if e.synced_once => return true,
+                None => return true, // no challenger on this route
+                Some(_) => {}        // needs sync — fall through
+            }
+        }
+
+        // Get or create the per-entry coalescing gate. We clone the Arc while holding the
+        // outer (sync) lock, then drop the lock before awaiting the async gate.
+        let gate = {
+            let mut gates = self
+                .sync_gates
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            gates
+                .entry((tenant.to_owned(), route_ix))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
         };
-        if needs_sync {
-            self.sync_from_backend(tenant, route_ix, fingerprint).await;
-            let mut map = self.lock();
-            if let Some(e) = self.entry(&mut map, tenant, route_ix) {
-                e.synced_once = true;
+
+        // All concurrent first-request callers block here on the same gate.
+        // Only one issues the LRANGE; the others wait and then re-check synced_once.
+        let _guard = gate.lock().await;
+
+        // Re-check: a concurrent caller may have completed the sync while we waited.
+        {
+            let map = self.lock();
+            if map
+                .get(tenant)
+                .and_then(|r| r.get(&route_ix))
+                .is_some_and(|e| e.synced_once)
+            {
+                return true;
+            }
+        }
+
+        // Perform the cold-start sync. Set synced_once only on success.
+        match self.sync_from_backend(tenant, route_ix, fingerprint).await {
+            Ok(()) => {
+                let mut map = self.lock();
+                if let Some(e) = self.entry(&mut map, tenant, route_ix) {
+                    e.synced_once = true;
+                }
+                true
+            }
+            Err(e) => {
+                // Log once per entry; do not spam on every request during a persistent outage.
+                let mut map = self.lock();
+                if let Some(entry) = self.entry(&mut map, tenant, route_ix)
+                    && !entry.sync_warn_logged
+                {
+                    entry.sync_warn_logged = true;
+                    tracing::warn!(
+                        tenant,
+                        route = route_ix,
+                        error = %e,
+                        "shared log unreachable on cold start; halt guard and spend cap \
+                         may use stale (empty) state — serving incumbent only for this request"
+                    );
+                }
+                false
             }
         }
     }
@@ -579,6 +687,7 @@ impl ExperimentMonitor {
                         saturated_logged: false,
                         remote_log_offset: 0,
                         synced_once: false,
+                        sync_warn_logged: false,
                     });
                 }
                 Err(e) => {
@@ -803,15 +912,18 @@ impl ExperimentMonitor {
             LogRecord::Pair {
                 x_inc,
                 x_ch,
+                incumbent_cost_usd: _,
                 challenger_cost_usd,
                 ch_error,
                 ch_truncated,
                 ts_unix,
-                ..
+                replica_id: record_replica_id,
             } => {
                 let Some(e) = self.entry(map, tenant, route_ix) else {
                     return false;
                 };
+                // Evidence (e-process wealth) is applied for ALL records — own and remote —
+                // because the evidence itself arrives only through the log in shared-log mode.
                 let before = e.experiment.status();
                 if e.experiment.observe_pair(*x_inc, *x_ch) {
                     // The incumbent's cost is already counted on the serving path; only the
@@ -819,22 +931,22 @@ impl ExperimentMonitor {
                     e.experiment
                         .observe_cost(Arm::Challenger, *challenger_cost_usd);
                 }
-                // Tally challenger health. The live path skips `observe_health` when a log is
-                // attached, so this is the single place health is counted per replica view.
-                if *ch_error || *ch_truncated > 0 {
-                    e.health.challenger.errors += u64::from(*ch_error);
-                    e.health.challenger.truncated += *ch_truncated;
-                }
-                // Seed the paired-challenger spend ledger for cluster-wide cap enforcement.
-                // `seed` uses the pair's original timestamp and only debits today's spend,
-                // so records from previous UTC days never affect today's cap.
-                // The live path skips `paired_ledger.debit` when a log is attached, so this
-                // is the single debit point per replica view (no double-counting).
-                if let Some(ledger) = &self.paired_ledger {
-                    let now = jiff::Timestamp::now();
-                    let pair_ts = jiff::Timestamp::from_second(*ts_unix)
-                        .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
-                    ledger.seed(tenant, route_ix, *challenger_cost_usd, pair_ts, now);
+                // Health and spend are tallied on the originating replica in
+                // `spawn_paired_challenger` (always, regardless of log state). For remote
+                // records (different replica_id, or nil for old replicas), tally them here.
+                // Skipping own records prevents double-counting.
+                let is_own = *record_replica_id == self.replica_id;
+                if !is_own {
+                    if *ch_error || *ch_truncated > 0 {
+                        e.health.challenger.errors += u64::from(*ch_error);
+                        e.health.challenger.truncated += *ch_truncated;
+                    }
+                    if let Some(ledger) = &self.paired_ledger {
+                        let now = jiff::Timestamp::now();
+                        let pair_ts = jiff::Timestamp::from_second(*ts_unix)
+                            .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+                        ledger.seed(tenant, route_ix, *challenger_cost_usd, pair_ts, now);
+                    }
                 }
                 before != e.experiment.status()
             }
@@ -857,10 +969,17 @@ impl ExperimentMonitor {
     /// 2. Only ever advance `remote_log_offset` — never rewind it — so a slower
     ///    concurrent call that loaded a shorter slice cannot wind the cursor back.
     ///
-    /// No-op when no log backend is configured.
-    pub async fn sync_from_backend(&self, tenant: &str, route_ix: usize, fingerprint: &str) {
+    /// No-op (returns `Ok`) when no log backend is configured.
+    /// Returns `Err` if the backend is unreachable; callers should treat a failure as
+    /// "state unknown" and fail closed (do not serve the challenger for this request).
+    pub async fn sync_from_backend(
+        &self,
+        tenant: &str,
+        route_ix: usize,
+        fingerprint: &str,
+    ) -> Result<(), LogError> {
         let Some(log) = &self.log else {
-            return;
+            return Ok(());
         };
         // Snapshot offset before dropping the lock to await I/O.
         let offset = {
@@ -869,9 +988,11 @@ impl ExperimentMonitor {
                 .map_or(0, |e| e.remote_log_offset)
         };
         // Lock is dropped here. Another sync may advance `remote_log_offset` while we await.
-        let records = log.load_since(tenant, route_ix, fingerprint, offset).await;
+        let records = log
+            .load_since(tenant, route_ix, fingerprint, offset)
+            .await?;
         if records.is_empty() {
-            return;
+            return Ok(());
         }
         let mut map = self.lock();
         for (i, rec) in records.iter().enumerate() {
@@ -912,6 +1033,7 @@ impl ExperimentMonitor {
                 Self::publish(&map, route_ix);
             }
         }
+        Ok(())
     }
 
     /// Record an outcome to the shared log (if configured), then sync from the log.
@@ -948,21 +1070,33 @@ impl ExperimentMonitor {
         {
             return false;
         }
-        log.append(
-            tenant,
-            route_ix,
-            fingerprint,
-            LogRecord::Outcome {
-                arm,
-                outcome,
-                session_hash: session_hash(session_id),
-                cost_usd,
-            },
-        )
-        .await;
+        if let Err(e) = log
+            .append(
+                tenant,
+                route_ix,
+                fingerprint,
+                LogRecord::Outcome {
+                    arm,
+                    outcome,
+                    session_hash: session_hash(session_id),
+                    cost_usd,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                tenant,
+                route = route_ix,
+                error = %e,
+                "outcome log append failed; evidence will not reach other replicas"
+            );
+            // Fall back to local state so at least this replica counts the outcome.
+            return self.observe_outcome(tenant, route_ix, fingerprint, arm, session_id, verdict);
+        }
         // Pull in any records other replicas appended since last sync, plus the one we
         // just appended (so local state is always up-to-date after an append).
-        self.sync_from_backend(tenant, route_ix, fingerprint).await;
+        // A sync failure is non-fatal: we'll catch up on the next background sync.
+        let _ = self.sync_from_backend(tenant, route_ix, fingerprint).await;
         true
     }
 
@@ -1032,7 +1166,12 @@ impl ExperimentMonitor {
         {
             return false;
         }
-        let appended = log
+        // Health and ledger were already tallied locally in `spawn_paired_challenger` (always,
+        // regardless of log state). The caller's local debit is the single source of truth;
+        // `apply_log_record` will skip re-tallying for own records (matched by replica_id).
+        // An append failure means the evidence will not reach other replicas, which only delays
+        // a decision — it does not affect local accounting.
+        if let Err(e) = log
             .append(
                 tenant,
                 route_ix,
@@ -1045,33 +1184,23 @@ impl ExperimentMonitor {
                     ch_error,
                     ch_truncated,
                     ts_unix,
+                    replica_id: self.replica_id,
                 },
             )
-            .await;
-        if appended == 0 {
-            // The shared log did not take the record (e.g. Redis RPUSH failed). Its evidence is
-            // withheld, which only delays a decision. Its spend and health must still count here:
-            // the live path skipped them because the log was meant to deliver them, and leaving
-            // them out would switch the daily cap off exactly while the log is unreachable.
-            if let Some(ledger) = &self.paired_ledger {
-                ledger.debit(
-                    tenant,
-                    route_ix,
-                    challenger_cost_usd,
-                    jiff::Timestamp::now(),
-                );
-            }
-            self.observe_health(
+            .await
+        {
+            tracing::warn!(
                 tenant,
-                route_ix,
-                fingerprint,
-                Arm::Challenger,
-                ch_error,
-                ch_truncated,
+                route = route_ix,
+                error = %e,
+                "paired log append failed; evidence will not reach other replicas \
+                 (local spend and health were already tallied)"
             );
             return false;
         }
-        self.sync_from_backend(tenant, route_ix, fingerprint).await;
+        // Sync to apply own record immediately (so this replica sees its own evidence) and
+        // to pick up any remote records. A sync failure is non-fatal.
+        let _ = self.sync_from_backend(tenant, route_ix, fingerprint).await;
         true
     }
 
@@ -1103,7 +1232,7 @@ impl ExperimentMonitor {
                     v
                 };
                 for (tenant, route_ix, fingerprint) in keys {
-                    monitor
+                    let _ = monitor
                         .sync_from_backend(&tenant, route_ix, &fingerprint)
                         .await;
                 }
@@ -1944,7 +2073,7 @@ mod tests {
             a.record_pair("t", 0, &fp_str, 1.0, 1.0, 0.10, 0.01, false, 0, 0)
                 .await;
         }
-        b.sync_from_backend("t", 0, &fp_str).await;
+        let _ = b.sync_from_backend("t", 0, &fp_str).await;
         close(challenger(&a));
         close(challenger(&b));
 
@@ -1977,7 +2106,7 @@ mod tests {
         // must count once, not twice (pairs carry no session to dedup on).
         let restarted = build_monitor_with(&db.to_string_lossy(), &cfg, true)
             .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
-        restarted.sync_from_backend("t", 0, &fp_str).await;
+        let _ = restarted.sync_from_backend("t", 0, &fp_str).await;
         close(challenger(&restarted));
         let _ = std::fs::remove_file(&db);
     }
@@ -2034,7 +2163,7 @@ mod tests {
         );
 
         // After one sync pass, replica B reads the shared log and reaches the same decision.
-        replica_b.sync_from_backend("t", 0, &fp_str).await;
+        let _ = replica_b.sync_from_backend("t", 0, &fp_str).await;
         assert_eq!(
             replica_b.status("t", 0),
             ExperimentStatus::Halted,
@@ -2118,7 +2247,7 @@ mod tests {
         );
 
         // After sync, B learns of the halt and blocks.
-        replica_b.sync_from_backend("t", 0, &fp_str).await;
+        let _ = replica_b.sync_from_backend("t", 0, &fp_str).await;
         assert!(
             replica_b.challenger_blocked("t", 0),
             "replica_b must block after syncing the halt from the shared log"
@@ -2166,8 +2295,8 @@ mod tests {
             .await;
 
         // Sync both so they agree on the log.
-        replica_a.sync_from_backend("t", 0, &fp_str).await;
-        replica_b.sync_from_backend("t", 0, &fp_str).await;
+        let _ = replica_a.sync_from_backend("t", 0, &fp_str).await;
+        let _ = replica_b.sync_from_backend("t", 0, &fp_str).await;
 
         // Only one outcome should have been counted (not two).
         let reps_a = replica_a.reports();
@@ -2344,7 +2473,7 @@ mod tests {
         );
 
         // One sync makes B read the full log and reach the same decision.
-        replica_b
+        let _ = replica_b
             .sync_from_backend(&unique_tenant, 0, &fp_str)
             .await;
         assert_eq!(
@@ -2425,10 +2554,10 @@ mod tests {
             .await;
 
         // Sync both.
-        replica_a
+        let _ = replica_a
             .sync_from_backend(&unique_tenant, 0, &fp_str)
             .await;
-        replica_b
+        let _ = replica_b
             .sync_from_backend(&unique_tenant, 0, &fp_str)
             .await;
 
@@ -2522,7 +2651,7 @@ mod tests {
         );
 
         // After one sync, B learns the halt and blocks.
-        replica_b
+        let _ = replica_b
             .sync_from_backend(&unique_tenant, 0, &fp_str)
             .await;
         assert!(
@@ -2582,7 +2711,10 @@ mod tests {
         }
 
         // Prove storage-level isolation: load_since for tenant_b returns nothing.
-        let records = log.load_since(&tenant_b, 0, &fp_str, 0).await;
+        let records = log
+            .load_since(&tenant_b, 0, &fp_str, 0)
+            .await
+            .expect("load_since must not fail on a reachable Redis");
         assert!(
             records.is_empty(),
             "backend must return no records for tenant_b"
@@ -2624,6 +2756,7 @@ mod tests {
                 ts_unix,
                 x_inc,
                 x_ch,
+                replica_id,
                 ..
             } => {
                 assert!(!ch_error, "ch_error defaults to false");
@@ -2631,6 +2764,13 @@ mod tests {
                 assert_eq!(ts_unix, 0, "ts_unix defaults to 0");
                 assert!((x_inc - 1.0).abs() < f64::EPSILON);
                 assert!((x_ch - 0.5).abs() < f64::EPSILON);
+                // Old records have no replica_id field → default nil UUID, treated as "remote"
+                // by apply_log_record (health+ledger tallied for them, not skipped).
+                assert_eq!(
+                    replica_id,
+                    uuid::Uuid::nil(),
+                    "missing replica_id defaults to nil"
+                );
             }
             _ => panic!("expected Pair variant"),
         }
@@ -2689,27 +2829,70 @@ mod tests {
     /// (c) If live `observe_health` were also called (double-count) → A's errors == 2 → fails.
     /// (d) If B's sync does not read the ledger → B's spent_today == 0.0 → fails.
     /// (e) If cluster cap not enforced → `may_spend` returns true when over cap → fails.
-    /// A shared log that is down: every append fails (returns 0, as the Redis backend does on a
-    /// failed RPUSH) and nothing can be read back.
+    /// A log that is fully down: every append and load_since returns an error.
     #[derive(Debug)]
     struct DownLog;
 
     #[async_trait::async_trait]
     impl ExperimentLogBackend for DownLog {
-        async fn append(&self, _: &str, _: usize, _: &str, _: LogRecord) -> u64 {
-            0
+        async fn append(&self, _: &str, _: usize, _: &str, _: LogRecord) -> Result<u64, LogError> {
+            Err(LogError::Backend("simulated outage".to_owned()))
         }
-        async fn load_since(&self, _: &str, _: usize, _: &str, _: u64) -> Vec<LogRecord> {
-            vec![]
+        async fn load_since(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: u64,
+        ) -> Result<Vec<LogRecord>, LogError> {
+            Err(LogError::Backend("simulated outage".to_owned()))
         }
         async fn claim_session(&self, _: &str, _: usize, _: &str, _: &str) -> bool {
             false
         }
     }
 
-    /// With the shared log unreachable, a paired challenger's spend still counts against the cap
-    /// and its health is still tallied: the live path defers both to the log, so a failed append
-    /// must not silently drop them.
+    /// A log where append succeeds but load_since always fails (simulates a write-ok/read-fail
+    /// scenario, e.g. Redis replica lag or a partial outage).
+    #[derive(Debug)]
+    struct AppendOnlyLog(InMemoryExperimentLog);
+
+    #[async_trait::async_trait]
+    impl ExperimentLogBackend for AppendOnlyLog {
+        async fn append(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            record: LogRecord,
+        ) -> Result<u64, LogError> {
+            self.0.append(tenant, route_ix, fingerprint, record).await
+        }
+        async fn load_since(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: u64,
+        ) -> Result<Vec<LogRecord>, LogError> {
+            Err(LogError::Backend("simulated read failure".to_owned()))
+        }
+        async fn claim_session(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            session_id: &str,
+        ) -> bool {
+            self.0
+                .claim_session(tenant, route_ix, fingerprint, session_id)
+                .await
+        }
+    }
+
+    /// With the shared log fully down, a paired challenger's spend is still counted against the cap
+    /// and health is still tallied because `spawn_paired_challenger` debits/tallies locally before
+    /// calling `record_pair`. The test simulates that local accounting path directly.
     #[tokio::test]
     async fn paired_spend_counts_against_the_cap_when_the_shared_log_is_down() {
         let ledger = Arc::new(crate::shadow::ShadowLedger::new());
@@ -2717,6 +2900,13 @@ mod tests {
             .with_log(Arc::new(DownLog) as Arc<dyn ExperimentLogBackend>)
             .with_paired_ledger(Arc::clone(&ledger));
         let now = jiff::Timestamp::now();
+
+        // Simulate what spawn_paired_challenger does: ALWAYS debit and tally health locally,
+        // then call record_pair. The debit/health happen before record_pair regardless of
+        // whether the log append succeeds.
+        ledger.debit("t", 0, 0.7, now);
+        m.observe_health("t", 0, &fp(), Arm::Challenger, true, 2);
+
         let accepted = m
             .record_pair("t", 0, &fp(), 1.0, 0.0, 0.1, 0.7, true, 2, now.as_second())
             .await;
@@ -2733,6 +2923,58 @@ mod tests {
         assert_eq!((h.errors, h.truncated), (1, 2), "{h:?}");
     }
 
+    /// When append succeeds but load_since fails, local spend (debited by spawn_paired_challenger)
+    /// still enforces the cap. The pair record is in the backend (other replicas can read it on
+    /// their next sync), but this replica cannot read it back immediately.
+    #[tokio::test]
+    async fn paired_spend_enforced_when_append_succeeds_but_read_fails() {
+        let ledger = Arc::new(crate::shadow::ShadowLedger::new());
+        let m = ExperimentMonitor::from_config(&config())
+            .with_log(Arc::new(AppendOnlyLog(InMemoryExperimentLog::new()))
+                as Arc<dyn ExperimentLogBackend>)
+            .with_paired_ledger(Arc::clone(&ledger));
+        let now = jiff::Timestamp::now();
+
+        // Simulate spawn_paired_challenger: local debit + health first.
+        ledger.debit("t", 0, 0.6, now);
+        m.observe_health("t", 0, &fp(), Arm::Challenger, false, 1);
+
+        // record_pair: append succeeds, but sync (load_since) fails.
+        let accepted = m
+            .record_pair("t", 0, &fp(), 1.0, 1.0, 0.1, 0.6, false, 1, now.as_second())
+            .await;
+        // The pair was appended to the log (returns false only on append failure).
+        // With AppendOnlyLog, append succeeds but sync returns Err, so record_pair still
+        // returns false (sync failure propagates the same as before... actually no).
+        // record_pair returns true when append succeeds, regardless of sync outcome.
+        // Actually: record_pair ignores the sync error (let _ = sync...) and returns true.
+        assert!(accepted, "pair was appended to log");
+
+        // Local spend (from the explicit debit above) enforces the cap.
+        assert!(
+            (ledger.spent_today("t", 0, now) - 0.6).abs() < 1e-9,
+            "local spend = 0.6"
+        );
+        assert!(
+            !ledger.may_spend("t", 0, 0.5, now),
+            "cap enforced by local debit even when read-back fails"
+        );
+        let h = m.reports()[0].health.challenger;
+        assert_eq!((h.errors, h.truncated), (0, 1), "{h:?}");
+    }
+
+    /// Two replicas sharing a log count each pair's health and spend exactly once.
+    ///
+    /// `spawn_paired_challenger` ALWAYS debits the local ledger and tallies health, then calls
+    /// `record_pair`. `apply_log_record` skips health and ledger for records bearing the replica's
+    /// own `replica_id` (preventing double-count on the originating node) but applies them for
+    /// remote records (different `replica_id`).
+    ///
+    /// This test simulates that contract directly:
+    ///   - A does explicit `debit` + `observe_health` (what `spawn_paired_challenger` does), then
+    ///     calls `record_pair`.  A's counts stay at the values set by those local calls.
+    ///   - B calls `sync_from_backend`.  B's counts come from `apply_log_record` (remote record),
+    ///     matching A's locally-set values exactly.
     #[tokio::test]
     async fn two_replicas_health_and_spend_count_once() {
         let shared = Arc::new(InMemoryExperimentLog::new());
@@ -2756,15 +2998,19 @@ mod tests {
             "log must be attached for this test to be meaningful"
         );
 
-        // Replica A records a pair: ch_error=true, ch_truncated=1, cost=0.8.
-        // The live path (spawn_paired_challenger) would skip observe_health and debit when
-        // has_log() is true; here we test record_pair directly (same code path via apply_log_record).
+        // Simulate what spawn_paired_challenger does: ALWAYS debit and tally health locally,
+        // regardless of whether the shared log is up.  record_pair only propagates evidence to
+        // other replicas — it does not re-tally on the originating replica.
+        ledger_a.debit("t", 0, 0.8, now_ts);
+        replica_a.observe_health("t", 0, &fp_str, Arm::Challenger, true, 1);
+
         let accepted = replica_a
             .record_pair("t", 0, &fp_str, 1.0, 0.5, 0.1, 0.8, true, 1, now_secs)
             .await;
         assert!(accepted, "pair must be accepted");
 
-        // (a) & (c): A's health comes from apply_log_record, counted exactly once.
+        // A's health comes from the explicit observe_health above, counted exactly once.
+        // apply_log_record skips own records (same replica_id), so no double-count.
         let reps_a = replica_a.reports();
         assert_eq!(
             reps_a[0].health.challenger.errors, 1,
@@ -2775,7 +3021,7 @@ mod tests {
             "A: challenger truncated counted once"
         );
 
-        // (b): A's ledger is seeded by apply_log_record (not live debit, which is skipped).
+        // A's ledger comes from the explicit debit above.
         let a_spent = ledger_a.spent_today("t", 0, now_ts);
         assert!(
             (a_spent - 0.8).abs() < 1e-12,
@@ -2789,27 +3035,28 @@ mod tests {
             "B: no spend before sync"
         );
 
-        // Sync B from the shared log.
-        replica_b.sync_from_backend("t", 0, &fp_str).await;
+        // Sync B from the shared log: B sees A's record as "remote" (different replica_id),
+        // so apply_log_record tallies health and seeds the ledger for B.
+        let _ = replica_b.sync_from_backend("t", 0, &fp_str).await;
 
-        // B's health matches A's.
         let reps_b = replica_b.reports();
         assert_eq!(
             reps_b[0].health.challenger.errors, 1,
             "B: challenger error visible after sync"
         );
-
-        // (d): B's ledger includes A's spend.
         let b_spent = ledger_b.spent_today("t", 0, now_ts);
         assert!(
             (b_spent - 0.8).abs() < 1e-12,
             "B: ledger reflects A's spend after sync; got {b_spent}"
         );
 
-        // (e): Add another pair to push cluster total over 1.0 cap.
+        // Add a second pair (via A's local path then record_pair) to push cluster total over cap.
+        ledger_a.debit("t", 0, 0.3, now_ts);
+        replica_a.observe_health("t", 0, &fp_str, Arm::Challenger, false, 0);
         replica_a
             .record_pair("t", 0, &fp_str, 1.0, 0.5, 0.1, 0.3, false, 0, now_secs)
             .await;
+
         let a_total = ledger_a.spent_today("t", 0, now_ts);
         assert!(
             (a_total - 1.1).abs() < 1e-12,
@@ -2821,7 +3068,7 @@ mod tests {
         );
 
         // B syncs and also sees the cap exhausted.
-        replica_b.sync_from_backend("t", 0, &fp_str).await;
+        let _ = replica_b.sync_from_backend("t", 0, &fp_str).await;
         assert!(
             !ledger_b.may_spend("t", 0, 1.0, now_ts),
             "B: cap exhausted from cluster spend"
@@ -2844,7 +3091,7 @@ mod tests {
             route_ix: usize,
             fingerprint: &str,
             record: LogRecord,
-        ) -> u64 {
+        ) -> Result<u64, LogError> {
             self.0.append(tenant, route_ix, fingerprint, record).await
         }
 
@@ -2854,14 +3101,14 @@ mod tests {
             route_ix: usize,
             fingerprint: &str,
             offset: u64,
-        ) -> Vec<LogRecord> {
+        ) -> Result<Vec<LogRecord>, LogError> {
             let records = self
                 .0
                 .load_since(tenant, route_ix, fingerprint, offset)
-                .await;
+                .await?;
             // Yield control so a concurrently-polled task can enter between load and re-lock.
             tokio::task::yield_now().await;
-            records
+            Ok(records)
         }
 
         async fn claim_session(
@@ -2896,7 +3143,7 @@ mod tests {
 
         // Append 3 pairs directly (bypassing the monitor, so offset stays at 0 on the monitor).
         for _ in 0..3 {
-            shared
+            let _ = shared
                 .append(
                     "t",
                     0,
@@ -2909,6 +3156,9 @@ mod tests {
                         ch_error: true,
                         ch_truncated: 1,
                         ts_unix: 0,
+                        // nil UUID: simulates records from an older replica; treated as remote
+                        // by apply_log_record (health+ledger are tallied here, not locally).
+                        replica_id: uuid::Uuid::nil(),
                     },
                 )
                 .await;
@@ -2926,8 +3176,12 @@ mod tests {
         let fp1 = fp_str.clone();
         let fp2 = fp_str.clone();
         tokio::join!(
-            async move { m1.sync_from_backend("t", 0, &fp1).await },
-            async move { m2.sync_from_backend("t", 0, &fp2).await },
+            async move {
+                let _ = m1.sync_from_backend("t", 0, &fp1).await;
+            },
+            async move {
+                let _ = m2.sync_from_backend("t", 0, &fp2).await;
+            },
         );
 
         let snaps = monitor.reports();
@@ -2968,9 +3222,11 @@ mod tests {
 
         let ledger_a = Arc::new(crate::shadow::ShadowLedger::new());
         // Replica A already spent the full cap.
+        // Simulate spawn_paired_challenger: debit locally first, then record to the shared log.
         let replica_a = ExperimentMonitor::from_config(&cfg)
             .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>)
             .with_paired_ledger(Arc::clone(&ledger_a));
+        ledger_a.debit("t", 0, cap, now_ts);
         replica_a
             .record_pair(
                 "t",
@@ -3003,7 +3259,12 @@ mod tests {
         );
 
         // After ensure_synced: B syncs from the log and seeds its ledger from A's pair.
-        replica_b.ensure_synced("t", 0, &fp_str).await;
+        // ensure_synced returns true on success; the caller (proxy.rs) uses this to fail-closed.
+        let synced = replica_b.ensure_synced("t", 0, &fp_str).await;
+        assert!(
+            synced,
+            "ensure_synced must return true when the log is healthy"
+        );
         let may_spend_after_sync = ledger_b.may_spend("t", 0, cap, now_ts);
         assert!(
             !may_spend_after_sync,
@@ -3124,7 +3385,8 @@ mod tests {
         );
 
         // After ensure_synced: B reads the log and sees the Halted status.
-        replica_b.ensure_synced("t", 0, &fp_str).await;
+        let synced = replica_b.ensure_synced("t", 0, &fp_str).await;
+        assert!(synced, "ensure_synced must succeed with healthy log");
         assert!(
             replica_b.challenger_blocked("t", 0),
             "B: after ensure_synced, halt must block the challenger"
