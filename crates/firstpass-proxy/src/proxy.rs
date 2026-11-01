@@ -9787,15 +9787,13 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// When the SQLite write for a NotInLog pair fails, no evidence is applied locally.
-    /// Durability ordering: evidence must not exist in memory without a durable backing record.
-    ///
-    /// Mutation check: if `apply_pair_locally` is called unconditionally (without checking the
-    /// SQLite write result), the experiment accumulates evidence and this assertion fires.
+    /// When the durable write for a local-only pair fails, the in-memory monitor gets no evidence:
+    /// evidence without a durable record would vanish on restart and could let a halted
+    /// challenger run again. Driven end to end through the router, with an unwritable store.
     #[tokio::test]
     async fn sqlite_write_failure_withholds_local_evidence() {
-        // Use an invalid DB path so append_experiment_pair always fails.
-        let bad_db = "/nonexistent/firstpass-sqlite-fail.db";
+        use tower::ServiceExt;
+        let bad_db = "/nonexistent-firstpass-dir/firstpass-sqlite-fail.db";
         let (mut state, _rx) = challenger_state(50.0, bad_db);
         let toml = format!(
             "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
@@ -9805,70 +9803,52 @@ mod tests {
         );
         let mut cfg = (*state.config).clone();
         cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
-        // No shared log: NotInLog path, SQLite is the only durable record.
         state.experiments = Arc::new(crate::experiment::ExperimentMonitor::from_config(
             cfg.routing.as_ref().unwrap(),
         ));
         state.config = Arc::new(cfg);
-        let fingerprint = state.experiments.fingerprint(0).unwrap().to_owned();
-
-        // Simulate the production flow in spawn_paired_challenger:
-        // 1. record_pair (no log → returns false, no evidence)
-        // 2. SQLite write fails (bad path)
-        // 3. apply_pair_locally must NOT be called when SQLite fails.
-        //    We verify this indirectly: pairs must stay at 0.
-        let appended = state
-            .experiments
-            .record_pair(
-                "default",
-                0,
-                &fingerprint,
-                1.0,
-                0.0,
-                0.001,
-                0.001,
-                false,
-                0,
-                0,
-                uuid::Uuid::nil(),
-            )
-            .await;
-        assert!(!appended, "no log → not appended");
-
-        let row = crate::store::ExperimentPairRow {
-            tenant: "default".to_owned(),
-            route_ix: 0,
-            fingerprint: fingerprint.clone(),
-            trace_id: uuid::Uuid::nil(),
-            x_inc: 1.0,
-            x_ch: 0.0,
-            challenger_cost_usd: 0.001,
-            ch_error: false,
-            ch_truncated: 0,
-            ts: jiff::Timestamp::now(),
-            in_log: crate::store::InLogStatus::NotInLog,
-        };
-        // SQLite write fails (bad_db path does not exist).
-        let write_result = crate::store::append_experiment_pair(bad_db, &row);
-        assert!(write_result.is_err(), "SQLite write must fail on bad path");
-
-        // Production code: only apply evidence when write succeeds.
-        if write_result.is_ok() {
-            state.experiments.apply_pair_locally(
-                "default",
-                0,
-                &fingerprint,
-                1.0,
-                0.0,
-                0.001,
-                uuid::Uuid::nil(),
-            );
-        }
-        // No evidence was applied.
+        let mut outs = HashMap::new();
+        outs.insert(
+            INCUMBENT.to_owned(),
+            Ok(model_resp(INCUMBENT, "{\"ok\": 1}")),
+        );
+        outs.insert(
+            CHALLENGER.to_owned(),
+            Ok(model_resp(CHALLENGER, "{\"ok\": 1}")),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        state.providers = ProviderRegistry::from_map(map);
+        let (ledger, monitor) = (state.paired_ledger.clone(), state.experiments.clone());
+        let router = app(state).expect("router");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(user_body()))
+            .unwrap();
         assert_eq!(
-            state.experiments.reports().len(),
-            0,
-            "SQLite write failed → no entry created, no evidence applied"
+            router.oneshot(req).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+        // The challenger ran once its spend is debited; the write attempt follows immediately.
+        for _ in 0..200 {
+            if ledger.spent_today("default", 0, jiff::Timestamp::now()) > 0.0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            ledger.spent_today("default", 0, jiff::Timestamp::now()) > 0.0,
+            "challenger ran"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let pairs: u64 = monitor.reports().iter().map(|r| r.report.pairs).sum();
+        assert_eq!(
+            pairs, 0,
+            "the durable write failed, so no evidence was applied"
         );
     }
 

@@ -4400,6 +4400,147 @@ mod tests {
         );
     }
 
+    /// After a restart, a pair replayed from the local store (its append had timed out after
+    /// Redis applied it) and then seen again in the log under the old replica id counts health
+    /// and spend once: the restarted process has a new replica id, so only the trace_id dedup
+    /// stops the log copy from being tallied a second time.
+    #[tokio::test]
+    async fn restart_counts_a_timed_out_pair_once_across_store_and_log() {
+        let db =
+            std::env::temp_dir().join(format!("firstpass-restart-dedup-{}.db", Uuid::now_v7()));
+        crate::store::ensure_migrated(&db).unwrap();
+        let log = Arc::new(InMemoryExperimentLog::new());
+        let cfg = config();
+        let fp_str = fp();
+        let tid = Uuid::now_v7();
+        let now = jiff::Timestamp::now();
+        // The record IS in the log, written by the previous process (a different replica id).
+        let before_restart = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+        log.append(
+            "t",
+            0,
+            &fp_str,
+            LogRecord::Pair {
+                x_inc: 1.0,
+                x_ch: 1.0,
+                incumbent_cost_usd: 0.1,
+                challenger_cost_usd: 0.05,
+                ch_error: false,
+                ch_truncated: 1,
+                ts_unix: now.as_second(),
+                replica_id: before_restart.replica_id,
+                trace_id: tid,
+            },
+        )
+        .await
+        .unwrap();
+        // ...and in the local store as NotInLog, because the append reported a timeout.
+        crate::store::append_experiment_pair(
+            &db,
+            &crate::store::ExperimentPairRow {
+                tenant: "t".to_owned(),
+                route_ix: 0,
+                fingerprint: fp_str.clone(),
+                trace_id: tid,
+                x_inc: 1.0,
+                x_ch: 1.0,
+                challenger_cost_usd: 0.05,
+                ch_error: false,
+                ch_truncated: 1,
+                ts: now,
+                in_log: crate::store::InLogStatus::NotInLog,
+            },
+        )
+        .unwrap();
+
+        // Restart: rebuild from the store with a shared log, as run.rs does.
+        let ledger = Arc::new(crate::shadow::ShadowLedger::new());
+        ledger.debit("t", 0, 0.05, now); // what build_paired_ledger seeds from the NotInLog row
+        let restarted = build_monitor_with(&db.to_string_lossy(), &cfg, true)
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>)
+            .with_paired_ledger(Arc::clone(&ledger));
+        assert_ne!(restarted.replica_id, before_restart.replica_id);
+        restarted.sync_from_backend("t", 0, &fp_str).await.unwrap();
+
+        let r = &restarted.reports()[0];
+        assert_eq!(r.report.pairs, 1, "evidence once");
+        assert_eq!(r.health.challenger.truncated, 1, "health once");
+        assert!(
+            (ledger.spent_today("t", 0, now) - 0.05).abs() < 1e-9,
+            "spend once: {}",
+            ledger.spent_today("t", 0, now)
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A log that can be switched to failing mid-test, counting reads.
+    #[derive(Debug, Default)]
+    struct SwitchableLog {
+        inner: InMemoryExperimentLog,
+        failing: std::sync::atomic::AtomicBool,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ExperimentLogBackend for SwitchableLog {
+        async fn append(
+            &self,
+            t: &str,
+            r: usize,
+            f: &str,
+            rec: LogRecord,
+        ) -> Result<u64, LogError> {
+            self.inner.append(t, r, f, rec).await
+        }
+        async fn load_since(
+            &self,
+            t: &str,
+            r: usize,
+            f: &str,
+            o: u64,
+        ) -> Result<Vec<Option<LogRecord>>, LogError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(LogError::Backend("down".to_owned()));
+            }
+            self.inner.load_since(t, r, f, o).await
+        }
+        async fn claim_session(&self, t: &str, r: usize, f: &str, s: &str) -> bool {
+            self.inner.claim_session(t, r, f, s).await
+        }
+    }
+
+    /// On ONE monitor: synced state stays trusted only within the staleness bound. Once the log
+    /// goes down, a recent sync still counts (no read), but past the bound the stale state is
+    /// not trusted and `ensure_synced` fails closed.
+    #[tokio::test]
+    async fn synced_state_expires_after_the_staleness_bound_when_the_log_is_down() {
+        tokio::time::pause();
+        let log = Arc::new(SwitchableLog::default());
+        let m = ExperimentMonitor::from_config(&config())
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+        let fp_str = fp();
+        assert!(
+            m.ensure_synced("t", 0, &fp_str).await,
+            "first sync succeeds"
+        );
+        log.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let reads = log.reads.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::advance(SYNC_STALENESS_BOUND / 2).await;
+        assert!(m.ensure_synced("t", 0, &fp_str).await, "fresh: trusted");
+        assert_eq!(
+            log.reads.load(std::sync::atomic::Ordering::SeqCst),
+            reads,
+            "fresh state needs no read"
+        );
+        tokio::time::advance(SYNC_STALENESS_BOUND).await;
+        assert!(
+            !m.ensure_synced("t", 0, &fp_str).await,
+            "stale and the log is down: fail closed"
+        );
+    }
+
     // ── Issue 4: sync timeout ────────────────────────────────────────────────────────────────
 
     /// A `load_since` that never completes (pending forever) must not stall `ensure_synced`.
