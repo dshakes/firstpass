@@ -3537,7 +3537,17 @@ fn stream_trace_callback(
                     )
                 }
                 SseEndReason::Eof => {
-                    // Normal stream completion.
+                    // The upstream closed cleanly. If events were seen but never the terminal one,
+                    // it closed early: a partial, not a pass. If nothing was parsed at all (e.g. a
+                    // JSON body on a streaming request) there is no evidence either way, so it is
+                    // recorded as served, as before.
+                    let saw_events =
+                        usage.model.is_some() || usage.in_tokens > 0 || usage.out_tokens > 0;
+                    let outcome = if usage.completed || !saw_events {
+                        StreamOutcome::Served
+                    } else {
+                        StreamOutcome::Partial
+                    };
                     build_stream_trace_from_usage(
                         &config,
                         &req_body,
@@ -3545,7 +3555,7 @@ fn stream_trace_callback(
                         session_header.as_deref(),
                         usage,
                         provider,
-                        StreamOutcome::Served,
+                        outcome,
                     )
                 }
             }
@@ -3708,6 +3718,8 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
     let Some(data) = line.strip_prefix(b"data: ") else {
         return;
     };
+    // Tolerate CRLF line endings: the line splitter only strips `\n`.
+    let data = data.strip_suffix(b"\r").unwrap_or(data);
     // OpenAI uses `data: [DONE]` as a stream sentinel — not JSON, safe to skip.
     if data == b"[DONE]" {
         usage.completed = true;
@@ -10409,6 +10421,54 @@ mod tests {
         let resp = Bytes::from_static(br#"{"usage":{"prompt_tokens":100,"completion_tokens":10}}"#);
         let trace = build_trace(&config, &req, &resp, 1, None, "openai");
         assert!(trace.attempts[0].cost_usd > 0.0, "{:?}", trace.attempts[0]);
+    }
+
+    /// A clean upstream close after events but before the terminal one is a partial, not a pass;
+    /// a close with the terminal event seen is a served pass.
+    #[tokio::test]
+    async fn stream_callback_eof_before_completion_is_a_partial() {
+        let (state, mut rx) = test_state_with_channel();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        for (completed, want) in [(false, Verdict::Abstain), (true, Verdict::Pass)] {
+            let cb = stream_trace_callback(
+                &state,
+                req.clone(),
+                5,
+                None,
+                "default".to_owned(),
+                "anthropic",
+                true,
+            );
+            cb(
+                SseUsage {
+                    model: Some("claude-haiku-4-5".to_owned()),
+                    in_tokens: 50,
+                    completed,
+                    ..Default::default()
+                },
+                SseEndReason::Eof,
+            );
+            let trace = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("trace within 5s")
+                .expect("a trace");
+            assert_eq!(trace.attempts[0].verdict, want, "completed={completed}");
+        }
+    }
+
+    /// `[DONE]` and JSON events are recognised on CRLF-terminated streams too.
+    #[test]
+    fn sse_parser_tolerates_crlf() {
+        let mut u = SseUsage::default();
+        let (mut buf, mut over) = (Vec::new(), false);
+        parse_sse_chunk_into(
+            b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":7}}}\r\ndata: [DONE]\r\n",
+            &mut buf,
+            &mut over,
+            &mut u,
+        );
+        assert_eq!(u.in_tokens, 7);
+        assert!(u.completed);
     }
 
     /// The SSE parser marks completion only on a terminal event, for both providers.

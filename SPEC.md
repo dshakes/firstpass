@@ -531,11 +531,10 @@ a wrong promotion costs money, never correctness — and the probe bounds even t
     "total_cost_usd": 0.0192, "gate_cost_usd": 0.008,
     "total_latency_ms": 6400, "escalations": 1,
     "counterfactual_baseline_usd": 0.0410   // what always-top-rung would have cost → savings math
-  },
-  // `upstream_provider`: present only on an observe-mode error receipt with no attempt (e.g. an
-  // upstream 429), naming the provider that failed. Omitted when empty, so older receipts hash
-  // identically.
-  "upstream_provider": "anthropic"
+  }
+  // An observe-mode error receipt with no attempt (e.g. an upstream 429) also carries
+  // "upstream_provider": "anthropic" | "openai", naming the provider that failed. It is omitted
+  // when empty, so older receipts hash identically.
 }
 ```
 
