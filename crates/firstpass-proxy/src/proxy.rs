@@ -1565,9 +1565,11 @@ fn spawn_paired_challenger(
     let Some(x_inc) = pair_outcome(served_from) else {
         return;
     };
-    // A halted challenger has been proven worse; live mode stops serving it, and paired mode must
-    // stop paying for it. The halt is final, so further pairs could only spend.
-    if state.experiments.challenger_blocked(&tenant, route_ix) {
+
+    // Pre-spawn fast path: without a shared log, local state is authoritative and we can avoid
+    // cloning if the challenger is already known to be halted. With a shared log this check may
+    // use cold-start empty state; `ensure_synced` inside the task corrects that.
+    if !state.experiments.has_log() && state.experiments.challenger_blocked(&tenant, route_ix) {
         return;
     }
 
@@ -1589,6 +1591,29 @@ fn spawn_paired_challenger(
     let api = api.to_owned();
 
     tokio::spawn(async move {
+        // Issue 2 fix: pull cluster state for (tenant, route_ix) the first time this process
+        // sees it. Without this a fresh replica starts with an empty map, so `challenger_blocked`
+        // and `may_spend` below would check against nothing, silently bypassing a halt or cap
+        // that another replica already established.
+        if state.experiments.has_log() {
+            state
+                .experiments
+                .ensure_synced(&tenant, route_ix, &fingerprint)
+                .await;
+        }
+
+        // Re-check halt status after ensure_synced: a halt from another replica is now visible.
+        if state.experiments.challenger_blocked(&tenant, route_ix) {
+            return;
+        }
+
+        // Issue 4 (in-flight staleness): with a shared log the originating replica only learns
+        // its own spend after append + read-back (`apply_log_record` seeds the ledger). Between
+        // `may_spend` here and the read-back a concurrent pair on this replica could also pass
+        // the cap check. We accept this soft-cap overshoot (bounded by concurrent in-flight
+        // paired calls × cost/call) rather than adding optimistic debit + per-record origin
+        // tagging to avoid double-seeding. `ensure_synced` above ensures the cluster state is
+        // fresh at the start of the first evaluation per process lifetime.
         let now = jiff::Timestamp::now();
         if !state
             .paired_ledger
@@ -1659,6 +1684,14 @@ fn spawn_paired_challenger(
         };
 
         let (_, ch_trace) = route_enforce(ctx).await;
+
+        // Issue 3 fix: sample the pair timestamp AFTER route_enforce completes. Using `now`
+        // (captured before route_enforce) would misattribute pairs that finish just after UTC
+        // midnight: `ShadowLedger::seed` would treat them as yesterday and silently skip the
+        // debit, bypassing the daily cap. Sampling here ensures `ts_unix` and `pair_row.ts`
+        // always carry the actual completion date.
+        let pair_ts = jiff::Timestamp::now();
+
         let challenger_cost = ch_trace.final_.total_cost_usd;
         let ch_errored = ch_trace.final_.served_from == firstpass_core::ServedFrom::Error;
         let ch_trunc = crate::experiment::truncated_attempts(&ch_trace);
@@ -1669,7 +1702,7 @@ fn spawn_paired_challenger(
         if !state.experiments.has_log() {
             state
                 .paired_ledger
-                .debit(&tenant, route_ix, challenger_cost, now);
+                .debit(&tenant, route_ix, challenger_cost, pair_ts);
             state.experiments.observe_health(
                 &tenant,
                 route_ix,
@@ -1703,7 +1736,7 @@ fn spawn_paired_challenger(
             challenger_cost_usd: challenger_cost,
             ch_error: ch_errored,
             ch_truncated: ch_trunc,
-            ts: now,
+            ts: pair_ts,
         };
         if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
             tracing::warn!(%e, "paired challenger: failed to persist pair to store");
@@ -1723,7 +1756,7 @@ fn spawn_paired_challenger(
                 challenger_cost,
                 ch_errored,
                 ch_trunc,
-                now.as_second(),
+                pair_ts.as_second(),
             )
             .await;
 
@@ -2362,6 +2395,23 @@ async fn enforce_pipeline_inner(
     //
     // In **paired** mode the challenger never serves any session: arm is always Incumbent, and the
     // challenger is evaluated off-path by `spawn_paired_challenger` after the response is returned.
+
+    // Issue 2 fix (live path): before checking `challenger_blocked`, ensure this (tenant, route_ix)
+    // has been synced at least once so a fresh replica cannot serve a challenger that another
+    // replica already halted. Only the first request per (tenant, route) per process pays the
+    // LRANGE cost; subsequent requests see `synced_once=true` and skip it.
+    if let Some(fp) = route
+        .challenger
+        .as_ref()
+        .filter(|_| allow_challenger)
+        .map(|ch| ch.fingerprint(&route.ladder))
+    {
+        state
+            .experiments
+            .ensure_synced(&tenant, route_ix, &fp)
+            .await;
+    }
+
     let experiment = route
         .challenger
         .as_ref()

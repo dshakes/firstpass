@@ -382,6 +382,12 @@ struct Entry {
     saturated_logged: bool,
     /// How many records have been consumed from the shared log so far (incremental LRANGE).
     remote_log_offset: u64,
+    /// Whether this entry has completed at least one full `sync_from_backend` pass since the
+    /// process started. Used by `ensure_synced` to gate the cold-start pull: a fresh replica must
+    /// see cluster state (halt decisions, spend) before it checks caps, so the very first request
+    /// per `(tenant, route_ix)` per process triggers one synchronous sync. Subsequent requests see
+    /// `synced_once = true` and skip the extra round-trip.
+    synced_once: bool,
 }
 
 fn session_hash(session_id: &str) -> u64 {
@@ -490,6 +496,47 @@ impl ExperimentMonitor {
         self.log.is_some()
     }
 
+    /// Perform one `sync_from_backend` the first time a `(tenant, route)` entry is used in this
+    /// process. No-op when no log is configured or the entry has already been synced once.
+    ///
+    /// **Why this is needed.** `build_paired_ledger` starts empty when `shared_log=true`, and
+    /// `start_sync_task` only syncs entries already in the map. A brand-new replica (or a
+    /// `(tenant, route)` pair not yet seen on this instance) would check `challenger_blocked` and
+    /// `may_spend` against nothing, silently bypassing a cluster-level halt decision or the daily
+    /// spend cap. One synchronous sync before the first check closes that window.
+    ///
+    /// **Concurrent-call safety.** The `synced_once` flag is set to `true` inside the lock
+    /// *before* the sync, so a concurrent second call from the same first-request burst sees it
+    /// set and skips the extra round-trip. The second caller proceeds with potentially unseen
+    /// state for the ~sync-duration window; this is the same staleness that already exists for
+    /// subsequent requests, so it is acceptable.
+    ///
+    /// Only the first request per `(tenant, route_ix)` per process pays one backend LRANGE.
+    pub async fn ensure_synced(&self, tenant: &str, route_ix: usize, fingerprint: &str) {
+        if self.log.is_none() {
+            return;
+        }
+        let needs_sync = {
+            let mut map = self.lock();
+            match self.entry(&mut map, tenant, route_ix) {
+                Some(e) => {
+                    if e.synced_once {
+                        false
+                    } else {
+                        // Set the flag before releasing the lock: concurrent callers see it set
+                        // and skip the extra sync rather than racing to issue duplicate LRANGEs.
+                        e.synced_once = true;
+                        true
+                    }
+                }
+                None => false,
+            }
+        };
+        if needs_sync {
+            self.sync_from_backend(tenant, route_ix, fingerprint).await;
+        }
+    }
+
     /// The fingerprint receipts for `route_ix` must carry to count, if it has a challenger.
     #[must_use]
     pub fn fingerprint(&self, route_ix: usize) -> Option<&str> {
@@ -537,6 +584,7 @@ impl ExperimentMonitor {
                         sessions: HashSet::new(),
                         saturated_logged: false,
                         remote_log_offset: 0,
+                        synced_once: false,
                     });
                 }
                 Err(e) => {
@@ -805,27 +853,49 @@ impl ExperimentMonitor {
     /// Call this after every feedback event (within the feedback handler, not on the hot
     /// serve path) and from a background timer so all replicas stay ≤ 5 s stale.
     ///
+    /// **Concurrent-call safety.** `record_pair` and `start_sync_task` both call this
+    /// concurrently on the same `(tenant, route_ix)`. Both may snapshot the same
+    /// `remote_log_offset` before either updates it, load the same slice from the backend,
+    /// and then race to apply it. The fix is two-part:
+    /// 1. After re-acquiring the lock, skip any record whose absolute index
+    ///    `offset + i` is already covered by the current `remote_log_offset` (a concurrent
+    ///    call advanced it while we were awaiting `load_since`).
+    /// 2. Only ever advance `remote_log_offset` — never rewind it — so a slower
+    ///    concurrent call that loaded a shorter slice cannot wind the cursor back.
+    ///
     /// No-op when no log backend is configured.
     pub async fn sync_from_backend(&self, tenant: &str, route_ix: usize, fingerprint: &str) {
         let Some(log) = &self.log else {
             return;
         };
+        // Snapshot offset before dropping the lock to await I/O.
         let offset = {
             let mut map = self.lock();
             self.entry(&mut map, tenant, route_ix)
                 .map_or(0, |e| e.remote_log_offset)
         };
+        // Lock is dropped here. Another sync may advance `remote_log_offset` while we await.
         let records = log.load_since(tenant, route_ix, fingerprint, offset).await;
         if records.is_empty() {
             return;
         }
         let mut map = self.lock();
         for (i, rec) in records.iter().enumerate() {
+            let abs_ix = offset + i as u64;
+            // Skip records already applied by a concurrent sync that ran ahead of us.
+            let current_offset = map
+                .get(tenant)
+                .and_then(|r| r.get(&route_ix))
+                .map_or(0, |e| e.remote_log_offset);
+            if abs_ix < current_offset {
+                continue;
+            }
             let changed = self.apply_log_record(&mut map, tenant, route_ix, fingerprint, rec);
-            // Update offset regardless of whether the record was applied (stale records
-            // still advance the cursor; we must not re-read them on the next sync).
+            // Monotonic advance: never rewind the offset even if a concurrent call loaded
+            // a shorter prefix.  Update regardless of whether the record was applied (a
+            // stale-fingerprint record still must not be re-read on the next sync).
             if let Some(e) = map.get_mut(tenant).and_then(|r| r.get_mut(&route_ix)) {
-                e.remote_log_offset = offset + i as u64 + 1;
+                e.remote_log_offset = e.remote_log_offset.max(abs_ix + 1);
             }
             if changed {
                 let after = map
@@ -2761,6 +2831,253 @@ mod tests {
         assert!(
             !ledger_b.may_spend("t", 0, 1.0, now_ts),
             "B: cap exhausted from cluster spend"
+        );
+    }
+
+    // ── Concurrent sync idempotency (Issue 1 fix) ────────────────────────────────────────────
+
+    /// A log backend that yields after returning records from `load_since`, allowing the tokio
+    /// scheduler to run other tasks between the data-load and the re-acquire of the monitor lock.
+    /// This deterministically surfaces the "two concurrent syncs, same slice" race.
+    #[derive(Debug)]
+    struct YieldingLog(InMemoryExperimentLog);
+
+    #[async_trait::async_trait]
+    impl ExperimentLogBackend for YieldingLog {
+        async fn append(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            record: LogRecord,
+        ) -> u64 {
+            self.0.append(tenant, route_ix, fingerprint, record).await
+        }
+
+        async fn load_since(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            offset: u64,
+        ) -> Vec<LogRecord> {
+            let records = self
+                .0
+                .load_since(tenant, route_ix, fingerprint, offset)
+                .await;
+            // Yield control so a concurrently-polled task can enter between load and re-lock.
+            tokio::task::yield_now().await;
+            records
+        }
+
+        async fn claim_session(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            session_id: &str,
+        ) -> bool {
+            self.0
+                .claim_session(tenant, route_ix, fingerprint, session_id)
+                .await
+        }
+    }
+
+    /// Two concurrent `sync_from_backend` calls on the same monitor, both loading the same 3
+    /// records from offset=0, must result in exactly 3 pairs / 3 errors / 3 truncated — never 6.
+    ///
+    /// The `YieldingLog` above forces actual task interleaving: both syncs snapshot `offset=0`,
+    /// call `load_since` (which yields), and then race to apply the same slice. Without the
+    /// `abs_ix < current_offset` guard and the monotonic-advance, the second sync would re-apply
+    /// all 3 records and produce 6 pairs (doubling the e-process wealth — a correctness violation).
+    ///
+    /// Mutation test: removing the `if abs_ix < current_offset { continue; }` guard makes the
+    /// second sync apply records 0–2 again. With `ch_error=true` per record, errors go from 3 to
+    /// 6 and the `assert_eq!(3)` below fails.
+    #[tokio::test]
+    async fn concurrent_sync_does_not_double_count_pairs() {
+        let shared = Arc::new(YieldingLog(InMemoryExperimentLog::new()));
+        let cfg = config();
+        let fp_str = fp();
+
+        // Append 3 pairs directly (bypassing the monitor, so offset stays at 0 on the monitor).
+        for _ in 0..3 {
+            shared
+                .append(
+                    "t",
+                    0,
+                    &fp_str,
+                    LogRecord::Pair {
+                        x_inc: 1.0,
+                        x_ch: 1.0,
+                        incumbent_cost_usd: 0.10,
+                        challenger_cost_usd: 0.05,
+                        ch_error: true,
+                        ch_truncated: 1,
+                        ts_unix: 0,
+                    },
+                )
+                .await;
+        }
+
+        let monitor = Arc::new(
+            ExperimentMonitor::from_config(&cfg)
+                .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>),
+        );
+
+        // Both tasks snapshot `offset=0`, call load_since (which yields to let the other task
+        // also snapshot offset=0 and call load_since), then race to apply the same 3 records.
+        let m1 = Arc::clone(&monitor);
+        let m2 = Arc::clone(&monitor);
+        let fp1 = fp_str.clone();
+        let fp2 = fp_str.clone();
+        tokio::join!(
+            async move { m1.sync_from_backend("t", 0, &fp1).await },
+            async move { m2.sync_from_backend("t", 0, &fp2).await },
+        );
+
+        let snaps = monitor.reports();
+        assert_eq!(snaps.len(), 1);
+        let snap = &snaps[0];
+        assert_eq!(
+            snap.report.pairs, 3,
+            "pairs must be 3, not double-counted: got {}",
+            snap.report.pairs
+        );
+        assert_eq!(
+            snap.health.challenger.errors, 3,
+            "errors must be 3, not double-counted: got {}",
+            snap.health.challenger.errors
+        );
+        assert_eq!(
+            snap.health.challenger.truncated, 3,
+            "truncated must be 3, not double-counted: got {}",
+            snap.health.challenger.truncated
+        );
+    }
+
+    // ── ensure_synced cold-start guard (Issue 2 fix) ─────────────────────────────────────────
+
+    /// A replica whose map is empty (cold start) but whose shared log already shows today's spend
+    /// at the cap must refuse a new evaluation after `ensure_synced`.
+    ///
+    /// Mutation test: removing `ensure_synced` or making it a no-op means B starts with an empty
+    /// ledger, `may_spend` returns true even though the cap is already exhausted, and the
+    /// `assert!(!may_spend_after_sync)` assertion fails.
+    #[tokio::test]
+    async fn ensure_synced_cold_start_respects_cluster_cap() {
+        let shared = Arc::new(InMemoryExperimentLog::new());
+        let cfg = config();
+        let fp_str = fp();
+        let now_ts = jiff::Timestamp::now();
+        let cap = 0.5_f64;
+
+        let ledger_a = Arc::new(crate::shadow::ShadowLedger::new());
+        // Replica A already spent the full cap.
+        let replica_a = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>)
+            .with_paired_ledger(Arc::clone(&ledger_a));
+        replica_a
+            .record_pair(
+                "t",
+                0,
+                &fp_str,
+                1.0,
+                1.0,
+                0.10,
+                cap,
+                false,
+                0,
+                now_ts.as_second(),
+            )
+            .await;
+        assert!(
+            !ledger_a.may_spend("t", 0, cap, now_ts),
+            "A: cap exhausted after recording one pair"
+        );
+
+        // Replica B starts with an empty map — it has never seen this (tenant, route).
+        let ledger_b = Arc::new(crate::shadow::ShadowLedger::new());
+        let replica_b = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>)
+            .with_paired_ledger(Arc::clone(&ledger_b));
+
+        // Before ensure_synced: B's ledger is empty → `may_spend` would incorrectly allow spend.
+        assert!(
+            ledger_b.may_spend("t", 0, cap, now_ts),
+            "B: before ensure_synced, empty ledger allows spend (expected)"
+        );
+
+        // After ensure_synced: B syncs from the log and seeds its ledger from A's pair.
+        replica_b.ensure_synced("t", 0, &fp_str).await;
+        let may_spend_after_sync = ledger_b.may_spend("t", 0, cap, now_ts);
+        assert!(
+            !may_spend_after_sync,
+            "B: after ensure_synced, cluster spend at cap — must refuse"
+        );
+    }
+
+    /// A replica whose log already shows a halted experiment must block the challenger after
+    /// `ensure_synced`, even though it has never seen the experiment locally.
+    ///
+    /// Mutation test: removing `ensure_synced` leaves B with `Undecided` (empty map) after the
+    /// check. `challenger_blocked` returns `false` and the second `assert!` fails.
+    #[tokio::test]
+    async fn ensure_synced_cold_start_respects_cluster_halt() {
+        let shared = Arc::new(InMemoryExperimentLog::new());
+        let cfg = config();
+        let fp_str = fp();
+
+        let replica_a = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+
+        // Drive experiment to Halted on replica A.
+        let mut halted = false;
+        for i in 0..500 {
+            replica_a
+                .record_outcome(
+                    "t",
+                    0,
+                    &fp_str,
+                    Arm::Incumbent,
+                    &format!("i{i}"),
+                    Verdict::Pass,
+                    0.10,
+                )
+                .await;
+            replica_a
+                .record_outcome(
+                    "t",
+                    0,
+                    &fp_str,
+                    Arm::Challenger,
+                    &format!("c{i}"),
+                    Verdict::Fail,
+                    0.02,
+                )
+                .await;
+            if replica_a.status("t", 0) == ExperimentStatus::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "experiment never halted on replica A");
+
+        // Replica B: cold start — empty map.
+        let replica_b = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+
+        // Before ensure_synced: B does not know about the halt.
+        assert!(
+            !replica_b.challenger_blocked("t", 0),
+            "B: before ensure_synced, halt unknown (expected)"
+        );
+
+        // After ensure_synced: B reads the log and sees the Halted status.
+        replica_b.ensure_synced("t", 0, &fp_str).await;
+        assert!(
+            replica_b.challenger_blocked("t", 0),
+            "B: after ensure_synced, halt must block the challenger"
         );
     }
 }
