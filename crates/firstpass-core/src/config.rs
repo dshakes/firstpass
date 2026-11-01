@@ -2724,7 +2724,11 @@ discount = 0.98
 
         // A declared provider + price makes a custom rung acceptable. The id must not be a built-in,
         // or this would pass without the `[[provider]]` lookup at all.
-        assert!(!BUILTIN_OPENAI_COMPATIBLE.iter().any(|(id, ..)| *id == "myhost"));
+        assert!(
+            !BUILTIN_OPENAI_COMPATIBLE
+                .iter()
+                .any(|(id, ..)| *id == "myhost")
+        );
         assert!(
             Config::parse(&format!(
                 "{route}[route.challenger]\nladder = [\"myhost/llama\"]\npercent = 10.0\n\
