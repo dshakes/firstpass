@@ -301,8 +301,10 @@
     </div>
     <div class="qs">
       <h3>2 · Route your agent through it</h3>
-      <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy quickstart"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>firstpass-proxy                                   <span class="tk-c"># observe mode: changes nothing</span>
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8080   <span class="tk-c"># your agent now goes through it</span>
+      <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy quickstart"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># terminal 1: observe mode changes nothing</span>
+firstpass-proxy
+<span class="tk-c"># terminal 2: your agent now goes through it</span>
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 <span class="tk-c"># use your agent; read receipts at http://127.0.0.1:8080/panel</span></code></pre></div>
       <div class="off">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/></svg>
