@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-01
+
+The first live paid run of certified model selection (sonnet-5 vs haiku-4-5, paired mode, real
+Anthropic, sandboxed test gates) found defects no replay had. All are fixed here, and the
+results are in `docs/benchmarks/live-certified-selection.md`.
+
+### Fixed
+- **Paired challenger graded on "served", not on a gate pass (#244).** A best attempt served after
+  every rung failed counted as a pass, so a never-passing challenger could be certified. Shadow
+  scoring had the same bug in `would_pass`.
+- **A challenger error is a failed pair, not a skipped one (#248).** Errors cluster on hard
+  requests; skipping them flattered the challenger toward certification.
+- **A halted paired challenger kept running (#245)** and spending on every sampled request.
+- **Enforce-path upstream timeout raised from 120 s to 600 s (#246).** Long generations returned
+  502s, and in paired mode the dropped pairs biased the comparison.
+- Paired challenger cost was never recorded, so paired mode could never recommend *adopt*. The
+  paired daily cap reset on restart. With `redis_url`, a restart double-counted pairs (#243).
+
+### Added
+- Per-arm `health` on every experiment: errors and answers cut off at `max_tokens`, shown on
+  `GET /v1/experiments`, `firstpass experiment` and the panel (#248).
+- `truncated` on receipt attempts when the model stopped at the output-token limit (omitted when
+  false, so existing receipts hash identically), plus a `truncated` count in the `/v1/receipts`
+  summary (#248).
+- Panel: Content-Security-Policy pinning its one inline script, paired-mode display (mode, sample
+  rate, today's spend against the cap), and hash-routed views. `/v1/receipts` totals are now an
+  incremental SQL aggregate: about 39 ms instead of about 4.3 s per poll at 164k receipts (#243).
+- `scripts/live-paired/`: a reproducible live-run harness (spend-capped driver, sandboxed MBPP and
+  APPS gates, seeded APPS fetcher) (#247).
+
+## Earlier changes (shipped through v0.9.0, not yet split by release)
+
 ### Added: verified predictive routing prior + decision-model gate (both experimental, default-off)
 
 `[escalation.prior]` — an optional pre-generation decision-model prior (TypeSafe's Jev) that answers
