@@ -3384,11 +3384,20 @@ async fn observe_passthrough(
                 latency_ms,
                 session_header,
                 tenant,
+                "anthropic",
             );
             (status, resp_headers, resp_body).into_response()
         }
         Err(err) => {
-            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
+            spawn_trace(
+                &state,
+                body,
+                None,
+                latency_ms,
+                session_header,
+                tenant,
+                "anthropic",
+            );
             err.into_response()
         }
     }
@@ -3418,13 +3427,28 @@ async fn observe_stream(
 
     match result {
         Ok((status, resp_headers, response)) => {
-            let on_done = stream_trace_callback(&state, body, latency_ms, session_header, tenant);
+            let on_done = stream_trace_callback(
+                &state,
+                body,
+                latency_ms,
+                session_header,
+                tenant,
+                "anthropic",
+            );
             let tap = SseTap::new(response.bytes_stream(), on_done);
             let stream_body = Body::from_stream(tap);
             (status, resp_headers, stream_body).into_response()
         }
         Err(err) => {
-            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
+            spawn_trace(
+                &state,
+                body,
+                None,
+                latency_ms,
+                session_header,
+                tenant,
+                "anthropic",
+            );
             err.into_response()
         }
     }
@@ -3439,24 +3463,27 @@ fn stream_trace_callback(
     latency_ms: u64,
     session_header: Option<String>,
     tenant: String,
+    provider: &'static str,
 ) -> impl FnOnce(SseUsage) + Send + 'static {
     let config = state.config.clone();
     let traces = state.traces.clone();
     let spill = state.spill.clone();
+    // Runs inline, not in a spawned task: it may fire from `SseTap::drop`, which can run outside
+    // a Tokio runtime (e.g. during shutdown), where `tokio::spawn` would panic. The work is cheap
+    // and non-blocking: build the trace, then `offer_trace`'s non-blocking `try_send`.
     move |usage: SseUsage| {
-        tokio::spawn(async move {
-            let mut trace = build_stream_trace_from_usage(
-                &config,
-                &req_body,
-                latency_ms,
-                session_header.as_deref(),
-                usage,
-            );
-            // Stamp the resolved tenant identity — never the config default nor anything
-            // request-borne.
-            trace.tenant_id = tenant;
-            offer_trace(&traces, spill.as_ref(), trace);
-        });
+        let mut trace = build_stream_trace_from_usage(
+            &config,
+            &req_body,
+            latency_ms,
+            session_header.as_deref(),
+            usage,
+            provider,
+        );
+        // Stamp the resolved tenant identity — never the config default nor anything
+        // request-borne.
+        trace.tenant_id = tenant;
+        offer_trace(&traces, spill.as_ref(), trace);
     }
 }
 
@@ -3642,7 +3669,13 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
             // OpenAI-compatible: final usage chunk (only populated when
             // `stream_options.include_usage` was set in the request).
             if let Some(pt) = json.pointer("/usage/prompt_tokens").and_then(Value::as_u64) {
-                usage.in_tokens = pt;
+                // `prompt_tokens` includes cached tokens; price the cached part as a cache read.
+                let cached = json
+                    .pointer("/usage/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                usage.in_tokens = pt.saturating_sub(cached);
+                usage.cache_read_tokens = cached;
             }
             if let Some(ct) = json
                 .pointer("/usage/completion_tokens")
@@ -3673,6 +3706,7 @@ fn spawn_trace(
     latency_ms: u64,
     session_header: Option<String>,
     tenant: String,
+    provider: &'static str,
 ) {
     let config = state.config.clone();
     let traces = state.traces.clone();
@@ -3685,6 +3719,7 @@ fn spawn_trace(
                 &resp,
                 latency_ms,
                 session_header.as_deref(),
+                provider,
             ),
             None => build_error_trace(&config, &req_body, latency_ms, session_header.as_deref()),
         };
@@ -3763,8 +3798,21 @@ fn response_usage(body: &[u8]) -> ResponseUsage {
         return ResponseUsage::default();
     };
     let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
+    let model = json.get("model").and_then(Value::as_str).map(str::to_owned);
+    // OpenAI Chat Completions reports `prompt_tokens` INCLUDING cached tokens; split the cached
+    // part out so it is priced as a cache read, matching the Anthropic split below.
+    if json.pointer("/usage/prompt_tokens").is_some() {
+        let cached = u("/usage/prompt_tokens_details/cached_tokens");
+        return ResponseUsage {
+            model,
+            in_tokens: u("/usage/prompt_tokens").saturating_sub(cached),
+            cache_write_tokens: 0,
+            cache_read_tokens: cached,
+            out_tokens: u("/usage/completion_tokens"),
+        };
+    }
     ResponseUsage {
-        model: json.get("model").and_then(Value::as_str).map(str::to_owned),
+        model,
         in_tokens: u("/usage/input_tokens"),
         cache_write_tokens: u("/usage/cache_creation_input_tokens"),
         cache_read_tokens: u("/usage/cache_read_input_tokens"),
@@ -3779,6 +3827,7 @@ fn build_trace(
     resp_body: &Bytes,
     latency_ms: u64,
     session_header: Option<&str>,
+    provider: &str,
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
     let usage = response_usage(resp_body);
@@ -3792,7 +3841,7 @@ fn build_trace(
     let cost_usd = config
         .prices
         .cost_usd_with_cache(
-            &format!("anthropic/{model}"),
+            &format!("{provider}/{model}"),
             in_tokens,
             cache_write_tokens,
             cache_read_tokens,
@@ -3803,7 +3852,7 @@ fn build_trace(
     let attempt = Attempt {
         rung: 0,
         model,
-        provider: "anthropic".to_owned(),
+        provider: provider.to_owned(),
         in_tokens,
         cache_write_tokens,
         cache_read_tokens,
@@ -3846,6 +3895,7 @@ fn build_stream_trace_from_usage(
     latency_ms: u64,
     session_header: Option<&str>,
     usage: SseUsage,
+    provider: &str,
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
     // Prefer the model name seen in the SSE events (authoritative); fall back to the
@@ -3865,7 +3915,7 @@ fn build_stream_trace_from_usage(
     let cost_usd = config
         .prices
         .cost_usd_with_cache(
-            &format!("anthropic/{model}"),
+            &format!("{provider}/{model}"),
             in_tokens,
             cache_write_tokens,
             cache_read_tokens,
@@ -3883,7 +3933,7 @@ fn build_stream_trace_from_usage(
     let attempt = Attempt {
         rung: 0,
         model,
-        provider: "anthropic".to_owned(),
+        provider: provider.to_owned(),
         in_tokens,
         cache_write_tokens,
         cache_read_tokens,
@@ -4629,11 +4679,20 @@ async fn observe_passthrough_openai_path(
                 latency_ms,
                 session_header,
                 tenant,
+                "openai",
             );
             (status, resp_headers, resp_body).into_response()
         }
         Err(err) => {
-            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
+            spawn_trace(
+                &state,
+                body,
+                None,
+                latency_ms,
+                session_header,
+                tenant,
+                "openai",
+            );
             err.into_response()
         }
     }
@@ -4662,13 +4721,22 @@ async fn observe_stream_openai_path(
     let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     match result {
         Ok((status, resp_headers, response)) => {
-            let on_done = stream_trace_callback(&state, body, latency_ms, session_header, tenant);
+            let on_done =
+                stream_trace_callback(&state, body, latency_ms, session_header, tenant, "openai");
             let tap = SseTap::new(response.bytes_stream(), on_done);
             let stream_body = Body::from_stream(tap);
             (status, resp_headers, stream_body).into_response()
         }
         Err(err) => {
-            spawn_trace(&state, body, None, latency_ms, session_header, tenant);
+            spawn_trace(
+                &state,
+                body,
+                None,
+                latency_ms,
+                session_header,
+                tenant,
+                "openai",
+            );
             err.into_response()
         }
     }
@@ -5250,6 +5318,51 @@ mod tests {
         ProxyConfig::from_lookup(|_| None).unwrap()
     }
 
+    /// An OpenAI-shaped observe response is priced as `openai/<model>` from `prompt_tokens` /
+    /// `completion_tokens`, with cached prompt tokens split out as cache reads; it was once priced
+    /// as `anthropic/<model>` from Anthropic field names, which recorded zero tokens and $0.
+    #[test]
+    fn openai_observe_receipt_uses_openai_usage_and_price() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"gpt-4.1-mini","messages":[]}"#);
+        let resp = Bytes::from_static(
+            br#"{"model":"gpt-4.1-mini","choices":[{"finish_reason":"length"}],
+                "usage":{"prompt_tokens":1000,"completion_tokens":200,
+                         "prompt_tokens_details":{"cached_tokens":400}}}"#,
+        );
+        let trace = build_trace(&config, &req, &resp, 7, None, "openai");
+        let a = &trace.attempts[0];
+        assert_eq!(a.provider, "openai");
+        assert_eq!(a.in_tokens, 600, "uncached prompt tokens");
+        assert_eq!(a.cache_read_tokens, 400);
+        assert_eq!(a.out_tokens, 200);
+        assert!(a.truncated, "finish_reason length");
+        let want = config
+            .prices
+            .cost_usd_with_cache("openai/gpt-4.1-mini", 600, 0, 400, 200)
+            .expect("gpt-4.1-mini is priced");
+        assert!(want > 0.0);
+        assert!(
+            (a.cost_usd - want).abs() < 1e-12,
+            "{} vs {want}",
+            a.cost_usd
+        );
+
+        let mut u = SseUsage::default();
+        let mut buf = Vec::new();
+        let mut overflow = false;
+        parse_sse_chunk_into(
+            b"data: {\"model\":\"gpt-4.1-mini\",\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":200,\"prompt_tokens_details\":{\"cached_tokens\":400}}}\n",
+            &mut buf,
+            &mut overflow,
+            &mut u,
+        );
+        assert_eq!(
+            (u.in_tokens, u.cache_read_tokens, u.out_tokens),
+            (600, 400, 200)
+        );
+    }
+
     #[test]
     fn build_trace_maps_request_and_response_fields() {
         let config = test_config();
@@ -5260,7 +5373,7 @@ mod tests {
             br#"{"model":"claude-haiku-4-5","usage":{"input_tokens":1200,"output_tokens":300}}"#,
         );
 
-        let trace = build_trace(&config, &req, &resp, 42, Some("sess-1"));
+        let trace = build_trace(&config, &req, &resp, 42, Some("sess-1"), "anthropic");
 
         assert_eq!(trace.request.api, "anthropic.messages");
         assert_eq!(trace.session_id, "sess-1");
@@ -5282,7 +5395,7 @@ mod tests {
         let req = Bytes::from_static(b"{}");
         let resp = Bytes::from_static(b"{}");
 
-        let trace = build_trace(&config, &req, &resp, 1, None);
+        let trace = build_trace(&config, &req, &resp, 1, None, "anthropic");
 
         assert_eq!(trace.session_id, trace.trace_id.to_string());
     }
@@ -9462,7 +9575,7 @@ mod tests {
         // `truncated` flows through `build_stream_trace_from_usage`.
         let config = test_config();
         let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
-        let trace = build_stream_trace_from_usage(&config, &req, 10, None, usage);
+        let trace = build_stream_trace_from_usage(&config, &req, 10, None, usage, "anthropic");
         assert!(
             trace.attempts[0].truncated,
             "max_tokens stop_reason must set truncated=true"
