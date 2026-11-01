@@ -68,8 +68,10 @@ A change is not "done" until `cargo test` and `cargo clippy` pass. Report the ac
 
 Config surface (the parser is `deny_unknown_fields`, so a wrong key is a hard failure, not a warning):
 
-- **Only `anthropic` and `openai` are built-in providers.** A `google`/`groq`/local ladder needs its own
-  `[[provider]]` block or the rung never resolves.
+- **Built-in providers are `anthropic`, `openai`, and the OpenAI-compatible hosts in
+  `firstpass_core::config::BUILTIN_OPENAI_COMPATIBLE`** (groq, deepseek, together, fireworks, mistral,
+  openrouter, xai, cerebras). A `google`/Gemini or local (Ollama, vLLM) ladder needs its own
+  `[[provider]]` block or the rung never resolves. Every rung still needs a price.
 - **Only `non-empty` and `json-valid` are built-in gates.** `schema`, tests, judge, and consistency each need a `[[gate]]`.
 - **Every ladder rung must resolve to a price** — built-in or a `[[price]]` block. There is no silent fallback:
   an unpriced rung would record `cost_usd: 0.0` in a tamper-evident receipt and leave `[budget]` caps un-trippable,

@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use axum::http::HeaderMap;
+use firstpass_core::config::BUILTIN_OPENAI_COMPATIBLE;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1287,42 +1288,6 @@ impl std::fmt::Debug for ProviderRegistry {
             .finish()
     }
 }
-
-/// OpenAI-compatible providers registered out of the box: `(id, base_url, api_key_env)`.
-///
-/// Every one of these speaks the OpenAI Chat Completions wire format, so a ladder can name
-/// `groq/…` or `deepseek/…` without a `[[provider]]` block. A user block with the same id still
-/// wins — this is a default, not a lock.
-///
-/// **Endpoints only, deliberately no prices.** A base URL is a stable fact; a price is not. Model
-/// pricing on these platforms changes without notice, and a stale built-in price would write a
-/// wrong `cost_usd` into a tamper-evident receipt and quietly mis-feed `[budget]` caps — the exact
-/// defect class 0.4.0 shipped a breaking change to eliminate. So a rung on one of these providers
-/// still requires an explicit `[[price]]`, and `Config::parse` refuses to start without it, naming
-/// the model and printing the block to paste. Declaring the number you are actually billed is a
-/// second of work; discovering months later that every receipt was wrong is not.
-///
-/// A self-hosted runtime (Ollama, vLLM, LM Studio) has no key and no fixed host, so it stays a
-/// `[[provider]]` block: guessing `localhost:11434` for someone would be a default that silently
-/// points at the wrong machine.
-const BUILTIN_OPENAI_COMPATIBLE: &[(&str, &str, &str)] = &[
-    ("groq", "https://api.groq.com/openai", "GROQ_API_KEY"),
-    ("deepseek", "https://api.deepseek.com", "DEEPSEEK_API_KEY"),
-    ("together", "https://api.together.xyz", "TOGETHER_API_KEY"),
-    (
-        "fireworks",
-        "https://api.fireworks.ai/inference",
-        "FIREWORKS_API_KEY",
-    ),
-    ("mistral", "https://api.mistral.ai", "MISTRAL_API_KEY"),
-    (
-        "openrouter",
-        "https://openrouter.ai/api",
-        "OPENROUTER_API_KEY",
-    ),
-    ("xai", "https://api.x.ai", "XAI_API_KEY"),
-    ("cerebras", "https://api.cerebras.ai", "CEREBRAS_API_KEY"),
-];
 
 /// The env var a built-in OpenAI-compatible provider reads its key from, if `id` is one.
 ///

@@ -229,6 +229,42 @@ pub enum AuthScheme {
     GcpOauth,
 }
 
+/// OpenAI-compatible providers registered out of the box: `(id, base_url, api_key_env)`.
+///
+/// Every one of these speaks the OpenAI Chat Completions wire format, so a ladder can name
+/// `groq/…` or `deepseek/…` without a `[[provider]]` block. A user block with the same id still
+/// wins — this is a default, not a lock.
+///
+/// **Endpoints only, deliberately no prices.** A base URL is a stable fact; a price is not. Model
+/// pricing on these platforms changes without notice, and a stale built-in price would write a
+/// wrong `cost_usd` into a tamper-evident receipt and quietly mis-feed `[budget]` caps — the exact
+/// defect class 0.4.0 shipped a breaking change to eliminate. So a rung on one of these providers
+/// still requires an explicit `[[price]]`, and `Config::parse` refuses to start without it, naming
+/// the model and printing the block to paste. Declaring the number you are actually billed is a
+/// second of work; discovering months later that every receipt was wrong is not.
+///
+/// A self-hosted runtime (Ollama, vLLM, LM Studio) has no key and no fixed host, so it stays a
+/// `[[provider]]` block: guessing `localhost:11434` for someone would be a default that silently
+/// points at the wrong machine.
+pub const BUILTIN_OPENAI_COMPATIBLE: &[(&str, &str, &str)] = &[
+    ("groq", "https://api.groq.com/openai", "GROQ_API_KEY"),
+    ("deepseek", "https://api.deepseek.com", "DEEPSEEK_API_KEY"),
+    ("together", "https://api.together.xyz", "TOGETHER_API_KEY"),
+    (
+        "fireworks",
+        "https://api.fireworks.ai/inference",
+        "FIREWORKS_API_KEY",
+    ),
+    ("mistral", "https://api.mistral.ai", "MISTRAL_API_KEY"),
+    (
+        "openrouter",
+        "https://openrouter.ai/api",
+        "OPENROUTER_API_KEY",
+    ),
+    ("xai", "https://api.x.ai", "XAI_API_KEY"),
+    ("cerebras", "https://api.cerebras.ai", "CEREBRAS_API_KEY"),
+];
+
 /// A model provider a ladder can route to. Declared as `[[provider]]` in TOML; referenced from a
 /// ladder as `<id>/<model>` (e.g. `groq/llama-3.3-70b-versatile`).
 #[derive(Debug, Clone, Deserialize)]
@@ -1512,11 +1548,14 @@ impl Config {
                         "route[{i}] challenger rung {rung:?} is not a `provider/model` string"
                     ))
                 })?;
-                let builtin = matches!(m.provider.as_str(), "anthropic" | "openai");
+                let builtin = matches!(m.provider.as_str(), "anthropic" | "openai")
+                    || BUILTIN_OPENAI_COMPATIBLE
+                        .iter()
+                        .any(|(id, _, _)| *id == m.provider);
                 if !builtin && !self.providers.iter().any(|p| p.id == m.provider) {
                     return Err(Error::InvalidConfig(format!(
-                        "route[{i}] challenger rung {rung:?}: provider {:?} is not built in \
-                         (only `anthropic` and `openai` are) and has no `[[provider]]` block",
+                        "route[{i}] challenger rung {rung:?}: provider {:?} is not built in and \
+                         has no `[[provider]]` block",
                         m.provider
                     )));
                 }
@@ -2620,6 +2659,14 @@ discount = 0.98
         assert!((c.margin - crate::select::DEFAULT_MARGIN).abs() < f64::EPSILON);
         assert!((c.alpha - crate::select::DEFAULT_ALPHA).abs() < f64::EPSILON);
 
+        // A built-in OpenAI-compatible provider resolves without a `[[provider]]` block, exactly as
+        // it does on the serving path; it still needs its price declared.
+        let groq = Config::parse(&format!(
+            "{route}[route.challenger]\nladder = [\"groq/llama\"]\npercent = 10.0\n\
+             [[price]]\nmodel = \"groq/llama\"\ninput_per_mtok = 0.1\noutput_per_mtok = 0.1\n"
+        ));
+        assert!(groq.is_ok(), "built-in groq challenger: {groq:?}");
+
         let bad: &[(&str, String)] = &[
             ("empty ladder", ch("ladder = []\npercent = 10.0")),
             (
@@ -2659,8 +2706,8 @@ discount = 0.98
             (
                 "unresolvable provider",
                 format!(
-                    "{route}[route.challenger]\nladder = [\"groq/llama\"]\npercent = 10.0\n\
-                     [[price]]\nmodel = \"groq/llama\"\ninput_per_mtok = 0.1\noutput_per_mtok = 0.1\n"
+                    "{route}[route.challenger]\nladder = [\"nope/llama\"]\npercent = 10.0\n\
+                     [[price]]\nmodel = \"nope/llama\"\ninput_per_mtok = 0.1\noutput_per_mtok = 0.1\n"
                 ),
             ),
             ("malformed rung", ch("ladder = [\"haiku\"]\npercent = 10.0")),
@@ -2675,12 +2722,18 @@ discount = 0.98
             assert!(Config::parse(toml).is_err(), "accepted: {why}");
         }
 
-        // A declared provider + price makes a custom rung acceptable.
+        // A declared provider + price makes a custom rung acceptable. The id must not be a built-in,
+        // or this would pass without the `[[provider]]` lookup at all.
+        assert!(
+            !BUILTIN_OPENAI_COMPATIBLE
+                .iter()
+                .any(|(id, ..)| *id == "myhost")
+        );
         assert!(
             Config::parse(&format!(
-                "{route}[route.challenger]\nladder = [\"groq/llama\"]\npercent = 10.0\n\
-                 [[provider]]\nid = \"groq\"\ndialect = \"openai\"\nbase_url = \"https://api.groq.com/openai\"\n\
-                 [[price]]\nmodel = \"groq/llama\"\ninput_per_mtok = 0.1\noutput_per_mtok = 0.1\n"
+                "{route}[route.challenger]\nladder = [\"myhost/llama\"]\npercent = 10.0\n\
+                 [[provider]]\nid = \"myhost\"\ndialect = \"openai\"\nbase_url = \"http://127.0.0.1:11434\"\n\
+                 [[price]]\nmodel = \"myhost/llama\"\ninput_per_mtok = 0.0\noutput_per_mtok = 0.0\n"
             ))
             .is_ok()
         );
