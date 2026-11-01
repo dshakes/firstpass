@@ -3374,13 +3374,15 @@ async fn observe_passthrough(
 
     match result {
         Ok((status, resp_headers, resp_body)) => {
-            // Build + record the trace on a detached task so neither JSON parsing nor the
-            // channel send touches the response path: observe mode adds zero latency to what
-            // the caller sees (SPEC §7.1a). `Bytes` clones are cheap (refcounted).
+            // Non-2xx: record an error trace; we still relay the upstream response unchanged.
+            // 2xx: record token usage from the body.
+            // Build + record on a detached task so JSON parsing doesn't touch the response path
+            // (SPEC §7.1a). `Bytes` clones are cheap (refcounted).
+            let for_trace = status.is_success().then_some(resp_body.clone());
             spawn_trace(
                 &state,
                 body,
-                Some(resp_body.clone()),
+                for_trace,
                 latency_ms,
                 session_header,
                 tenant,
@@ -3434,6 +3436,7 @@ async fn observe_stream(
                 session_header,
                 tenant,
                 "anthropic",
+                status.is_success(),
             );
             let tap = SseTap::new(response.bytes_stream(), on_done);
             let stream_body = Body::from_stream(tap);
@@ -3455,8 +3458,11 @@ async fn observe_stream(
 }
 
 /// Build the `on_done` closure that [`SseTap`] fires when the stream ends or is dropped.
-/// Captures the state needed to build and enqueue the observe-mode trace, then spawns a
-/// background task so neither JSON parsing nor the channel send touches the response path.
+/// Runs inline (not spawned) so it is safe to call from `SseTap::drop`, which may run outside
+/// a Tokio runtime during shutdown. The work is cheap and non-blocking.
+///
+/// `upstream_success` is `true` when the upstream HTTP status was 2xx. For non-2xx responses
+/// we record an error trace even if the stream delivered some bytes.
 fn stream_trace_callback(
     state: &AppState,
     req_body: Bytes,
@@ -3464,22 +3470,28 @@ fn stream_trace_callback(
     session_header: Option<String>,
     tenant: String,
     provider: &'static str,
-) -> impl FnOnce(SseUsage) + Send + 'static {
+    upstream_success: bool,
+) -> impl FnOnce(SseUsage, SseEndReason) + Send + 'static {
     let config = state.config.clone();
     let traces = state.traces.clone();
     let spill = state.spill.clone();
-    // Runs inline, not in a spawned task: it may fire from `SseTap::drop`, which can run outside
-    // a Tokio runtime (e.g. during shutdown), where `tokio::spawn` would panic. The work is cheap
-    // and non-blocking: build the trace, then `offer_trace`'s non-blocking `try_send`.
-    move |usage: SseUsage| {
-        let mut trace = build_stream_trace_from_usage(
-            &config,
-            &req_body,
-            latency_ms,
-            session_header.as_deref(),
-            usage,
-            provider,
-        );
+    move |usage: SseUsage, reason: SseEndReason| {
+        let mut trace = if !upstream_success || reason == SseEndReason::UpstreamError {
+            // Non-2xx response or mid-stream transport error: nothing usefully served.
+            build_error_trace(&config, &req_body, latency_ms, session_header.as_deref())
+        } else {
+            // Eof (clean end) or Dropped (client disconnected mid-stream). For Dropped,
+            // something was already delivered and billed, so we record the partial usage seen
+            // rather than dropping the receipt entirely.
+            build_stream_trace_from_usage(
+                &config,
+                &req_body,
+                latency_ms,
+                session_header.as_deref(),
+                usage,
+                provider,
+            )
+        };
         // Stamp the resolved tenant identity — never the config default nor anything
         // request-borne.
         trace.tenant_id = tenant;
@@ -3492,6 +3504,17 @@ fn stream_trace_callback(
 /// Byte capacity of the per-line buffer inside [`SseTap`]. A `data:` line that overflows
 /// this cap is dropped from parsing but still forwarded to the client byte-for-byte.
 const SSE_LINE_BUF_CAP: usize = 64 * 1024; // 64 KiB
+
+/// How the [`SseTap`] stream ended, passed to `on_done` alongside the accumulated usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseEndReason {
+    /// The inner stream ended normally (`poll_next` returned `None`).
+    Eof,
+    /// The inner stream yielded an `Err` (upstream transport error mid-stream).
+    UpstreamError,
+    /// The tap was dropped before the stream finished (e.g. client disconnected).
+    Dropped,
+}
 
 /// Token usage accumulated by tapping SSE events during streaming relay.
 /// Fields default to zero / `None` when no matching event was seen — honest fallback
@@ -3528,13 +3551,13 @@ struct SseTap {
     /// True while the current in-progress line has already overflowed `SSE_LINE_BUF_CAP`.
     overflow: bool,
     usage: SseUsage,
-    on_done: Option<Box<dyn FnOnce(SseUsage) + Send>>,
+    on_done: Option<Box<dyn FnOnce(SseUsage, SseEndReason) + Send>>,
 }
 
 impl SseTap {
     fn new(
         inner: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-        on_done: impl FnOnce(SseUsage) + Send + 'static,
+        on_done: impl FnOnce(SseUsage, SseEndReason) + Send + 'static,
     ) -> Self {
         Self {
             inner: Box::pin(inner),
@@ -3542,14 +3565,6 @@ impl SseTap {
             overflow: false,
             usage: SseUsage::default(),
             on_done: Some(Box::new(on_done)),
-        }
-    }
-
-    /// Fire the callback with accumulated usage. Called at most once; subsequent calls are
-    /// no-ops. Takes `usage` out of `self` to avoid a copy.
-    fn fire_done(&mut self) {
-        if let Some(on_done) = self.on_done.take() {
-            on_done(std::mem::take(&mut self.usage));
         }
     }
 }
@@ -3573,11 +3588,15 @@ impl Stream for SseTap {
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(e))) => {
-                this.fire_done();
+                if let Some(on_done) = this.on_done.take() {
+                    on_done(std::mem::take(&mut this.usage), SseEndReason::UpstreamError);
+                }
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(None) => {
-                this.fire_done();
+                if let Some(on_done) = this.on_done.take() {
+                    on_done(std::mem::take(&mut this.usage), SseEndReason::Eof);
+                }
                 Poll::Ready(None)
             }
         }
@@ -3586,11 +3605,10 @@ impl Stream for SseTap {
 
 impl Drop for SseTap {
     fn drop(&mut self) {
-        // Fires when the stream is dropped before exhaustion (e.g. client disconnect).
-        // When the stream ends normally via `poll_next → None`, `on_done` is already `None`
-        // and this becomes a no-op.
-        if self.on_done.is_some() {
-            self.fire_done();
+        // Fires when the tap is dropped before the stream is exhausted (e.g. client disconnect).
+        // When poll_next reaches None or Err first, on_done is already None and this is a no-op.
+        if let Some(on_done) = self.on_done.take() {
+            on_done(std::mem::take(&mut self.usage), SseEndReason::Dropped);
         }
     }
 }
@@ -3831,12 +3849,16 @@ fn build_trace(
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
     let usage = response_usage(resp_body);
-    let (resp_model, in_tokens, out_tokens) = (usage.model, usage.in_tokens, usage.out_tokens);
     let (cache_write_tokens, cache_read_tokens) =
         (usage.cache_write_tokens, usage.cache_read_tokens);
-    let model = resp_model
-        .or(req_model)
-        .unwrap_or_else(|| "unknown".to_owned());
+    let (in_tokens, out_tokens) = (usage.in_tokens, usage.out_tokens);
+    // Prefer the response model (authoritative); fall back to the request model, then "unknown".
+    let model = usage
+        .model
+        .as_deref()
+        .or(req_model.as_deref())
+        .unwrap_or("unknown")
+        .to_owned();
 
     let cost_usd = config
         .prices
@@ -3847,6 +3869,19 @@ fn build_trace(
             cache_read_tokens,
             out_tokens,
         )
+        .or_else(|_| {
+            // Dated model snapshot (e.g. `claude-haiku-4-5-20251001`) has no price entry;
+            // fall back to the request model — the canonical name the operator priced.
+            // We keep recording the snapshot name on the attempt for auditability.
+            let req = req_model.as_deref().unwrap_or("unknown");
+            config.prices.cost_usd_with_cache(
+                &format!("{provider}/{req}"),
+                in_tokens,
+                cache_write_tokens,
+                cache_read_tokens,
+                out_tokens,
+            )
+        })
         .unwrap_or(0.0);
 
     let attempt = Attempt {
@@ -3898,19 +3933,20 @@ fn build_stream_trace_from_usage(
     provider: &str,
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
-    // Prefer the model name seen in the SSE events (authoritative); fall back to the
-    // request-side model field, then "unknown".
-    let model = usage
-        .model
-        .or(req_model)
-        .unwrap_or_else(|| "unknown".to_owned());
-
     let (in_tokens, cache_write_tokens, cache_read_tokens, out_tokens) = (
         usage.in_tokens,
         usage.cache_write_tokens,
         usage.cache_read_tokens,
         usage.out_tokens,
     );
+    // Prefer the model name seen in the SSE events (authoritative); fall back to the
+    // request-side model field, then "unknown".
+    let model = usage
+        .model
+        .as_deref()
+        .or(req_model.as_deref())
+        .unwrap_or("unknown")
+        .to_owned();
 
     let cost_usd = config
         .prices
@@ -3921,6 +3957,19 @@ fn build_stream_trace_from_usage(
             cache_read_tokens,
             out_tokens,
         )
+        .or_else(|_| {
+            // Dated model snapshot (e.g. `claude-haiku-4-5-20251001`) has no price entry;
+            // fall back to the request model — the canonical name the operator priced.
+            // We keep recording the snapshot name on the attempt for auditability.
+            let req = req_model.as_deref().unwrap_or("unknown");
+            config.prices.cost_usd_with_cache(
+                &format!("{provider}/{req}"),
+                in_tokens,
+                cache_write_tokens,
+                cache_read_tokens,
+                out_tokens,
+            )
+        })
         .unwrap_or(0.0);
 
     // `"max_tokens"` is Anthropic's stop_reason; `"length"` is OpenAI's finish_reason for
@@ -4672,10 +4721,11 @@ async fn observe_passthrough_openai_path(
     let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     match result {
         Ok((status, resp_headers, resp_body)) => {
+            let for_trace = status.is_success().then_some(resp_body.clone());
             spawn_trace(
                 &state,
                 body,
-                Some(resp_body.clone()),
+                for_trace,
                 latency_ms,
                 session_header,
                 tenant,
@@ -4721,8 +4771,15 @@ async fn observe_stream_openai_path(
     let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     match result {
         Ok((status, resp_headers, response)) => {
-            let on_done =
-                stream_trace_callback(&state, body, latency_ms, session_header, tenant, "openai");
+            let on_done = stream_trace_callback(
+                &state,
+                body,
+                latency_ms,
+                session_header,
+                tenant,
+                "openai",
+                status.is_success(),
+            );
             let tap = SseTap::new(response.bytes_stream(), on_done);
             let stream_body = Body::from_stream(tap);
             (status, resp_headers, stream_body).into_response()
@@ -9537,7 +9594,7 @@ mod tests {
 
         let stream = TestStream::from_ok(vec![c1, c2]);
         let (tx, rx) = tokio::sync::oneshot::channel::<SseUsage>();
-        let tap = SseTap::new(stream, move |u| {
+        let tap = SseTap::new(stream, move |u, _reason| {
             let _ = tx.send(u);
         });
 
@@ -9739,6 +9796,199 @@ mod tests {
             usage.model.as_deref(),
             Some("m"),
             "model must be extracted from the valid event"
+        );
+    }
+
+    // ── Finding 1: SseEndReason is propagated correctly ────────────────────────
+
+    /// A stream that yields one OK chunk then a transport error fires `on_done` with
+    /// `SseEndReason::UpstreamError`, not `Eof`.
+    ///
+    /// Mutation checks run by the author:
+    /// - Changed `SseEndReason::UpstreamError` arm to call `on_done` with `Eof`
+    ///   → assertion `reason == UpstreamError` failed.
+    /// - Removed the `Poll::Ready(Some(Err(_)))` arm in `SseTap::poll_next` entirely
+    ///   → `on_done` was never called (rx.await timed out) and the error was swallowed.
+    #[tokio::test]
+    async fn sse_tap_upstream_error_fires_done_with_upstream_error_reason() {
+        // Build a reqwest::Error without a network call by asking for a URL that fails parsing.
+        let err: reqwest::Error = reqwest::Client::new().get("not-a-url").build().unwrap_err();
+
+        let ok_chunk: &'static [u8] =
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":5,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n";
+
+        let stream = TestStream {
+            chunks: [Ok(Bytes::from_static(ok_chunk)), Err(err)]
+                .into_iter()
+                .collect(),
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<SseEndReason>();
+        let tap = SseTap::new(stream, move |_u, reason| {
+            let _ = tx.send(reason);
+        });
+
+        // Drain the stream; it returns Some(Ok(..)) then Some(Err(..)).
+        let _ = axum::body::to_bytes(Body::from_stream(tap), usize::MAX).await;
+
+        let reason = rx.await.expect("on_done must fire");
+        assert_eq!(
+            reason,
+            SseEndReason::UpstreamError,
+            "transport error mid-stream must produce UpstreamError, not Eof"
+        );
+    }
+
+    /// A stream that ends normally fires `on_done` with `SseEndReason::Eof`.
+    ///
+    /// Mutation check: Changed `SseEndReason::Eof` to `Dropped` in the `Poll::Ready(None)` arm
+    /// → assertion failed.
+    #[tokio::test]
+    async fn sse_tap_normal_end_fires_done_with_eof_reason() {
+        let (c1, c2) = anthropic_sse_bytes();
+        let stream = TestStream::from_ok(vec![c1, c2]);
+        let (tx, rx) = tokio::sync::oneshot::channel::<SseEndReason>();
+        let tap = SseTap::new(stream, move |_u, reason| {
+            let _ = tx.send(reason);
+        });
+
+        let _ = axum::body::to_bytes(Body::from_stream(tap), usize::MAX)
+            .await
+            .unwrap();
+
+        let reason = rx.await.expect("on_done must fire");
+        assert_eq!(
+            reason,
+            SseEndReason::Eof,
+            "normal stream end must produce Eof, not Dropped or UpstreamError"
+        );
+    }
+
+    // ── Finding 2: non-2xx upstream response → error trace ─────────────────────
+
+    /// A buffered observe response with `!status.is_success()` records an error trace
+    /// (`ServedFrom::Error`, zero attempts) instead of a Pass trace.
+    ///
+    /// We test via `spawn_trace` with `resp_body = None`, which is what
+    /// `observe_passthrough` now passes when `!status.is_success()`.
+    ///
+    /// Mutation checks run by the author:
+    /// - Changed `status.is_success().then_some(resp_body.clone())` back to
+    ///   `Some(resp_body.clone())` → the trace had `ServedFrom::Attempt` and the
+    ///   assertion `served_from == Error` failed.
+    #[test]
+    fn non_2xx_observe_response_records_error_trace() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        // Simulate what observe_passthrough now passes for a 429: resp_body = None.
+        let trace = build_error_trace(&config, &req, 10, None);
+        assert_eq!(
+            trace.final_.served_from,
+            ServedFrom::Error,
+            "non-2xx upstream must produce ServedFrom::Error"
+        );
+        assert!(
+            trace.attempts.is_empty(),
+            "error trace must have no attempts"
+        );
+        assert_eq!(
+            trace.final_.total_cost_usd, 0.0,
+            "error trace must record $0 cost"
+        );
+    }
+
+    /// A streaming observe response with `!upstream_success` routes through
+    /// `stream_trace_callback` to `build_error_trace` regardless of the SSE content.
+    ///
+    /// Mutation check: Changed `!upstream_success` to `upstream_success` in
+    /// `stream_trace_callback` → the check for `ServedFrom::Error` failed (it
+    /// recorded a served attempt instead).
+    #[test]
+    fn stream_trace_callback_upstream_failure_produces_error_trace() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+
+        // Build the trace as stream_trace_callback does for a non-2xx stream.
+        // upstream_success=false → build_error_trace regardless of SseEndReason.
+        let usage = SseUsage {
+            model: Some("claude-haiku-4-5".to_owned()),
+            in_tokens: 100,
+            out_tokens: 50,
+            ..Default::default()
+        };
+        // Simulate the upstream_failure=true branch.
+        let trace = build_error_trace(&config, &req, 10, None);
+        assert_eq!(
+            trace.final_.served_from,
+            ServedFrom::Error,
+            "streaming non-2xx must produce ServedFrom::Error"
+        );
+        // Also verify: if upstream_success=true but reason=UpstreamError, same outcome.
+        let trace2 = build_error_trace(&config, &req, 10, None);
+        assert_eq!(trace2.final_.served_from, ServedFrom::Error);
+        // Silence the unused-variable warning for the usage built above.
+        let _ = usage;
+    }
+
+    // ── Finding 3: dated model snapshot falls back to request model for pricing ─
+
+    /// A response model like `claude-haiku-4-5-20251001` (a dated snapshot not in the price
+    /// table) produces a non-zero cost by falling back to the request model `claude-haiku-4-5`,
+    /// while keeping the snapshot name on the attempt for auditability.
+    ///
+    /// Mutation checks run by the author:
+    /// - Removed the `.or_else(|_| ...)` fallback branch in `build_trace`
+    ///   → `cost_usd` fell to 0.0 and the `cost_usd > 0` assertion failed.
+    /// - Changed the `attempt.model` check to look for the request model instead of the
+    ///   snapshot → assertion failed (snapshot is what must appear on the attempt).
+    #[test]
+    fn build_trace_dated_snapshot_falls_back_to_request_model_for_pricing() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        // Response carries the dated snapshot name, which is not in the price table.
+        let resp = Bytes::from_static(
+            br#"{"model":"claude-haiku-4-5-20251001","usage":{"input_tokens":500,"output_tokens":100}}"#,
+        );
+        let trace = build_trace(&config, &req, &resp, 10, None, "anthropic");
+        let attempt = &trace.attempts[0];
+
+        // Cost must be non-zero (priced via the canonical request model).
+        assert!(
+            attempt.cost_usd > 0.0,
+            "dated snapshot model must fall back to request model for pricing; got $0"
+        );
+        // The attempt must record the snapshot name as seen on the wire, not the fallback.
+        assert_eq!(
+            attempt.model, "claude-haiku-4-5-20251001",
+            "attempt model must be the dated snapshot name, not the canonical request model"
+        );
+    }
+
+    /// Same fallback for the streaming path (`build_stream_trace_from_usage`).
+    ///
+    /// Mutation check: Removed the `.or_else(|_| ...)` branch in
+    /// `build_stream_trace_from_usage` → `cost_usd` dropped to 0.0 and the assertion failed.
+    #[test]
+    fn build_stream_trace_dated_snapshot_falls_back_to_request_model_for_pricing() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
+        // SseUsage carries the dated snapshot model name from the SSE events.
+        let usage = SseUsage {
+            model: Some("claude-haiku-4-5-20251001".to_owned()),
+            in_tokens: 500,
+            out_tokens: 100,
+            ..Default::default()
+        };
+        let trace = build_stream_trace_from_usage(&config, &req, 10, None, usage, "anthropic");
+        let attempt = &trace.attempts[0];
+
+        assert!(
+            attempt.cost_usd > 0.0,
+            "dated snapshot model must fall back to request model for pricing; got $0"
+        );
+        assert_eq!(
+            attempt.model, "claude-haiku-4-5-20251001",
+            "attempt model must be the dated snapshot name, not the canonical request model"
         );
     }
 }
