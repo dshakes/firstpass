@@ -505,11 +505,12 @@ impl ExperimentMonitor {
     /// `may_spend` against nothing, silently bypassing a cluster-level halt decision or the daily
     /// spend cap. One synchronous sync before the first check closes that window.
     ///
-    /// **Concurrent-call safety.** The `synced_once` flag is set to `true` inside the lock
-    /// *before* the sync, so a concurrent second call from the same first-request burst sees it
-    /// set and skips the extra round-trip. The second caller proceeds with potentially unseen
-    /// state for the ~sync-duration window; this is the same staleness that already exists for
-    /// subsequent requests, so it is acceptable.
+    /// **Concurrent-call safety.** `synced_once` is set only *after* the sync completes, so every
+    /// request in a first-request burst waits for synced state rather than checking the halt and
+    /// the cap against nothing. Concurrent first syncs may each issue one LRANGE; that is safe
+    /// because `sync_from_backend` applies each record once and only advances the offset. The flag
+    /// is set even if the sync failed (e.g. the log is unreachable), so an outage does not turn
+    /// every request into a backend call; the periodic sync task retries known entries.
     ///
     /// Only the first request per `(tenant, route_ix)` per process pays one backend LRANGE.
     pub async fn ensure_synced(&self, tenant: &str, route_ix: usize, fingerprint: &str) {
@@ -518,22 +519,15 @@ impl ExperimentMonitor {
         }
         let needs_sync = {
             let mut map = self.lock();
-            match self.entry(&mut map, tenant, route_ix) {
-                Some(e) => {
-                    if e.synced_once {
-                        false
-                    } else {
-                        // Set the flag before releasing the lock: concurrent callers see it set
-                        // and skip the extra sync rather than racing to issue duplicate LRANGEs.
-                        e.synced_once = true;
-                        true
-                    }
-                }
-                None => false,
-            }
+            self.entry(&mut map, tenant, route_ix)
+                .is_some_and(|e| !e.synced_once)
         };
         if needs_sync {
             self.sync_from_backend(tenant, route_ix, fingerprint).await;
+            let mut map = self.lock();
+            if let Some(e) = self.entry(&mut map, tenant, route_ix) {
+                e.synced_once = true;
+            }
         }
     }
 
@@ -3022,6 +3016,62 @@ mod tests {
     ///
     /// Mutation test: removing `ensure_synced` leaves B with `Undecided` (empty map) after the
     /// check. `challenger_blocked` returns `false` and the second `assert!` fails.
+    /// Two requests arriving together on a cold replica both see the cluster halt by the time
+    /// `ensure_synced` returns: the second must not slip through while the first is still syncing.
+    #[tokio::test]
+    async fn ensure_synced_burst_waits_for_synced_state() {
+        let shared = Arc::new(YieldingLog(InMemoryExperimentLog::new()));
+        let cfg = config();
+        let fp_str = fp();
+        let replica_a = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+        for i in 0..500 {
+            replica_a
+                .record_outcome(
+                    "t",
+                    0,
+                    &fp_str,
+                    Arm::Incumbent,
+                    &format!("i{i}"),
+                    Verdict::Pass,
+                    0.10,
+                )
+                .await;
+            replica_a
+                .record_outcome(
+                    "t",
+                    0,
+                    &fp_str,
+                    Arm::Challenger,
+                    &format!("c{i}"),
+                    Verdict::Fail,
+                    0.02,
+                )
+                .await;
+            if replica_a.status("t", 0) == ExperimentStatus::Halted {
+                break;
+            }
+        }
+        assert_eq!(replica_a.status("t", 0), ExperimentStatus::Halted);
+
+        let replica_b = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+        let (first, second) = tokio::join!(
+            async {
+                replica_b.ensure_synced("t", 0, &fp_str).await;
+                replica_b.challenger_blocked("t", 0)
+            },
+            async {
+                replica_b.ensure_synced("t", 0, &fp_str).await;
+                replica_b.challenger_blocked("t", 0)
+            },
+        );
+        assert!(
+            first && second,
+            "both burst requests see the halt: {first} {second}"
+        );
+    }
+
     #[tokio::test]
     async fn ensure_synced_cold_start_respects_cluster_halt() {
         let shared = Arc::new(InMemoryExperimentLog::new());
