@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-01
+
+Completes the 0.9.1 release on every channel. The 0.9.1 GitHub Release, Homebrew formula and npm
+package never built, because GitHub's macOS 14 runner image is being retired (2026-11-02) and a
+brownout cancelled the aarch64-apple-darwin job. 0.9.1 is on crates.io, PyPI and Docker only.
+
+### Fixed
+- Release builds aarch64-apple-darwin on `macos-15` (#251).
+
+### Docs
+- Live APPS result extended to 290 problems (65.2% vs 60.7%, undecided), and the APPS cost ratio
+  corrected from 0.21 to 0.09 (#250).
+
 ## [0.9.1] - 2026-11-01
 
 The first live paid run of certified model selection (sonnet-5 vs haiku-4-5, paired mode, real
