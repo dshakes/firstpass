@@ -707,9 +707,12 @@ fn cmd_experiment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     };
+    // Ensure the schema is up to date before reading; callers may have an older DB
+    // that predates the `in_log` column.  Errors here are surfaced, not swallowed.
+    store::ensure_migrated(db)?;
     let traces = store::load_tenant_traces(db, &tenant).unwrap_or_default();
     let deferred = store::load_all_deferred(db).unwrap_or_default();
-    let pairs = store::load_all_experiment_pairs(db).unwrap_or_default();
+    let pairs = store::load_all_experiment_pairs(db)?;
     let reports = experiment::experiments_from_traces(&traces, &deferred, &pairs, routing);
     let views = experiment::views(reports, routing);
     if json {

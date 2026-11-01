@@ -304,11 +304,15 @@ pub fn build_paired_ledger(config: &ProxyConfig, shared_log: bool) -> crate::sha
     match crate::store::load_all_experiment_pairs(&config.db_path) {
         Ok(rows) => {
             let now = jiff::Timestamp::now();
-            // With a shared log, pairs that reached Redis (in_log=true) will be seeded by
-            // `apply_log_record` during the first sync; only seed from offline pairs
-            // (in_log=false) that were never pushed and need local replay.
+            // With a shared log, pairs that reached Redis (in_log=InLog) will be seeded by
+            // `apply_log_record` during the first sync; seed from NotInLog and Unknown rows
+            // that were never confirmed as pushed.  Unknown rows are treated conservatively:
+            // they count against the spend cap (safe to over-count) but not evidence.
             // Without a shared log, seed from all pairs (original behaviour).
-            for row in rows.iter().filter(|r| !shared_log || !r.in_log) {
+            for row in rows
+                .iter()
+                .filter(|r| !shared_log || r.in_log != crate::store::InLogStatus::InLog)
+            {
                 ledger.seed(
                     &row.tenant,
                     row.route_ix,
@@ -1760,10 +1764,20 @@ fn spawn_paired_challenger(
                 ch_errored,
                 ch_trunc,
                 pair_ts.as_second(),
+                ch_trace.trace_id,
             )
             .await;
 
         // Persist to SQLite for startup rebuild and CLI replay.
+        // `in_log` is set explicitly (never relying on the schema DEFAULT):
+        //   - has_log() && appended → InLog (evidence is in Redis)
+        //   - has_log() && !appended → NotInLog (append failed; replay locally on restart)
+        //   - !has_log() → NotInLog (single-replica; no shared log exists)
+        let in_log = if state.experiments.has_log() && appended {
+            crate::store::InLogStatus::InLog
+        } else {
+            crate::store::InLogStatus::NotInLog
+        };
         let pair_row = crate::store::ExperimentPairRow {
             tenant: tenant.clone(),
             route_ix,
@@ -1775,7 +1789,7 @@ fn spawn_paired_challenger(
             ch_error: ch_errored,
             ch_truncated: ch_trunc,
             ts: pair_ts,
-            in_log: appended,
+            in_log,
         };
         if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
             tracing::warn!(%e, "paired challenger: failed to persist pair to store");
@@ -9168,7 +9182,7 @@ mod tests {
             ch_error: false,
             ch_truncated: 0,
             ts,
-            in_log: true,
+            in_log: crate::store::InLogStatus::InLog,
         };
         let two_days_ago = now - jiff::SignedDuration::from_hours(48);
         for r in [
@@ -9239,10 +9253,10 @@ mod tests {
             ch_error: false,
             ch_truncated: 0,
             ts: now,
-            in_log: false,
+            in_log: crate::store::InLogStatus::NotInLog,
         };
         let log_row = crate::store::ExperimentPairRow {
-            in_log: true,
+            in_log: crate::store::InLogStatus::InLog,
             challenger_cost_usd: 0.4,
             trace_id: Uuid::now_v7(),
             ..offline_row.clone()
@@ -9264,6 +9278,63 @@ mod tests {
         assert!(
             (spent2 - 1.1).abs() < 1e-9,
             "both rows seeded with shared_log=false; got {spent2}"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// `in_log=Unknown` rows (legacy / migrated) are seeded into the ledger when shared_log=true,
+    /// so they count against the spend cap (conservative: safer to over-count than under-count).
+    #[tokio::test]
+    async fn build_paired_ledger_unknown_rows_count_toward_spend_with_shared_log() {
+        let db =
+            std::env::temp_dir().join(format!("firstpass-unknown-ledger-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let now = jiff::Timestamp::now();
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 2.0\n"
+        );
+        let db_s = db.to_string_lossy().into_owned();
+        let cfg = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.clone()),
+            "FIRSTPASS_DB" => Some(db_s.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+        let unknown_row = crate::store::ExperimentPairRow {
+            tenant: "default".to_owned(),
+            route_ix: 0,
+            fingerprint: "fp".to_owned(),
+            trace_id: Uuid::now_v7(),
+            x_inc: 1.0,
+            x_ch: 0.0,
+            challenger_cost_usd: 0.6,
+            ch_error: false,
+            ch_truncated: 0,
+            ts: now,
+            in_log: crate::store::InLogStatus::Unknown,
+        };
+        let log_row = crate::store::ExperimentPairRow {
+            in_log: crate::store::InLogStatus::InLog,
+            challenger_cost_usd: 0.3,
+            trace_id: Uuid::now_v7(),
+            ..unknown_row.clone()
+        };
+        crate::store::append_experiment_pair(&db, &unknown_row).unwrap();
+        crate::store::append_experiment_pair(&db, &log_row).unwrap();
+
+        // shared_log=true: Unknown counts toward spend; InLog is skipped.
+        let ledger = build_paired_ledger(&cfg, true);
+        let spent = ledger.spent_today("default", 0, now);
+        assert!(
+            (spent - 0.6).abs() < 1e-9,
+            "Unknown row seeded (conservative); InLog row skipped; got {spent}"
         );
 
         let _ = std::fs::remove_file(&db);
@@ -9479,7 +9550,8 @@ mod tests {
             route_ix: usize,
             fingerprint: &str,
             offset: u64,
-        ) -> Result<Vec<crate::experiment::LogRecord>, crate::experiment::LogError> {
+        ) -> Result<Vec<Option<crate::experiment::LogRecord>>, crate::experiment::LogError>
+        {
             let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.always_fail || n > 0 {
                 return Err(crate::experiment::LogError::Backend("down".into()));
@@ -9589,7 +9661,8 @@ mod tests {
             _: usize,
             _: &str,
             _: u64,
-        ) -> Result<Vec<crate::experiment::LogRecord>, crate::experiment::LogError> {
+        ) -> Result<Vec<Option<crate::experiment::LogRecord>>, crate::experiment::LogError>
+        {
             Ok(vec![])
         }
         async fn claim_session(&self, _: &str, _: usize, _: &str, _: &str) -> bool {
@@ -9655,8 +9728,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(pairs.len(), 1);
-        assert!(
-            !pairs[0].in_log,
+        assert_eq!(
+            pairs[0].in_log,
+            crate::store::InLogStatus::NotInLog,
             "the append failed, so the row must be marked offline"
         );
         let _ = std::fs::remove_file(&db);
@@ -9720,6 +9794,7 @@ mod tests {
                     false,
                     0,
                     0,
+                    uuid::Uuid::nil(),
                 )
                 .await;
         }

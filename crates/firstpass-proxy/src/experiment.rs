@@ -117,6 +117,12 @@ pub enum LogRecord {
         /// to `Uuid::nil()`, which never matches any live replica's UUID and so are treated as remote.
         #[serde(default)]
         replica_id: Uuid,
+        /// The challenger trace-id, used for cross-source dedup: prevents a pair from being
+        /// counted twice when an append times out after Redis applied it (append returns Err but
+        /// the record is in the log). `#[serde(default)]` so records written by older replicas
+        /// deserialize to `Uuid::nil()`, which is never deduplicated.
+        #[serde(default)]
+        trace_id: Uuid,
     },
 }
 
@@ -143,16 +149,18 @@ pub trait ExperimentLogBackend: Send + Sync + fmt::Debug {
         record: LogRecord,
     ) -> Result<u64, LogError>;
 
-    /// Return records starting at `offset` (0-based). Empty if the list has ≤ `offset` entries.
-    /// Returns an error if the backend is unreachable; callers use this to distinguish "truly
-    /// empty" from "unreachable" and fail closed (do not serve the challenger) accordingly.
+    /// Return records starting at `offset` (0-based). Each element is `Some(record)` for a valid
+    /// entry or `None` for a malformed one (failed to deserialize). The list length equals the
+    /// number of positions consumed: a `None` at index `i` still advances `offset` by 1. Empty
+    /// if the list has ≤ `offset` entries. Returns an error if the backend is unreachable; callers
+    /// use this to distinguish "truly empty" from "unreachable" and fail closed.
     async fn load_since(
         &self,
         tenant: &str,
         route_ix: usize,
         fingerprint: &str,
         offset: u64,
-    ) -> Result<Vec<LogRecord>, LogError>;
+    ) -> Result<Vec<Option<LogRecord>>, LogError>;
 
     /// Atomically claim a session for this experiment (live mode session dedup across replicas).
     ///
@@ -209,7 +217,7 @@ impl ExperimentLogBackend for InMemoryExperimentLog {
         route_ix: usize,
         fingerprint: &str,
         offset: u64,
-    ) -> Result<Vec<LogRecord>, LogError> {
+    ) -> Result<Vec<Option<LogRecord>>, LogError> {
         let key = (tenant.to_owned(), route_ix, fingerprint.to_owned());
         let lists = self.lists.lock().unwrap_or_else(PoisonError::into_inner);
         match lists.get(&key) {
@@ -219,7 +227,8 @@ impl ExperimentLogBackend for InMemoryExperimentLog {
                 if start >= list.len() {
                     Ok(vec![])
                 } else {
-                    Ok(list[start..].to_vec())
+                    // In-memory records are always valid (never malformed).
+                    Ok(list[start..].iter().map(|r| Some(r.clone())).collect())
                 }
             }
         }
@@ -342,7 +351,7 @@ mod redis_log {
             route_ix: usize,
             fingerprint: &str,
             offset: u64,
-        ) -> Result<Vec<super::LogRecord>, super::LogError> {
+        ) -> Result<Vec<Option<super::LogRecord>>, super::LogError> {
             let key = Self::list_key(tenant, route_ix, fingerprint);
             let mut conn = self.conn.lock().await;
             use redis::AsyncCommands as _;
@@ -350,12 +359,17 @@ mod redis_log {
                 .lrange(&key, offset as isize, -1)
                 .await
                 .map_err(|e| super::LogError::Backend(format!("LRANGE {key}: {e}")))?;
+            // Preserve positions: None for malformed entries so sync_from_backend advances
+            // remote_log_offset over them and does not re-read them on the next sync.
             Ok(raw
                 .iter()
-                .filter_map(|s| match serde_json::from_str(s) {
+                .map(|s| match serde_json::from_str(s) {
                     Ok(r) => Some(r),
                     Err(e) => {
-                        tracing::warn!(%e, "experiment log: skipping malformed log record");
+                        tracing::warn!(
+                            %e,
+                            "experiment log: malformed record; position consumed, evidence skipped"
+                        );
                         None
                     }
                 })
@@ -402,6 +416,22 @@ struct Entry {
     /// legitimate outcome, which costs power and never validity.
     sessions: HashSet<u64>,
     saturated_logged: bool,
+    /// Challenger trace-ids whose evidence (e-process pair) has already been applied.
+    ///
+    /// Prevents a pair from being counted twice when an append times out after Redis applied
+    /// the record (the append returns `Err` but the record is in the log). The apply-once
+    /// rule covers three paths:
+    /// - Local append-failure in `record_pair` (evidence applied there + id inserted here).
+    /// - SQLite replay at startup (`monitor_from_traces` inserts ids for `NotInLog` rows).
+    /// - Log sync in `apply_log_record` (skips evidence if id already present).
+    ///
+    /// A nil UUID (`Uuid::nil()`) is never inserted and never checked (old records without
+    /// a trace_id are always applied; their dedup depends on the e-process being ordered and
+    /// idempotent by offset, not by id).
+    ///
+    /// Capped at `MAX_TRACKED_SESSIONS` with the same saturation policy: once full, new
+    /// pairs are skipped rather than evicting old ids (evicting would let a pair count twice).
+    applied_pair_ids: HashSet<Uuid>,
     /// How many records have been consumed from the shared log so far (incremental LRANGE).
     remote_log_offset: u64,
     /// Whether this entry has completed at least one full `sync_from_backend` pass since the
@@ -708,6 +738,7 @@ impl ExperimentMonitor {
                         health: Health::default(),
                         sessions: HashSet::new(),
                         saturated_logged: false,
+                        applied_pair_ids: HashSet::new(),
                         remote_log_offset: 0,
                         synced_once: false,
                         sync_warn_logged: false,
@@ -942,18 +973,44 @@ impl ExperimentMonitor {
                 ch_truncated,
                 ts_unix,
                 replica_id: record_replica_id,
+                trace_id: record_trace_id,
             } => {
                 let Some(e) = self.entry(map, tenant, route_ix) else {
                     return false;
                 };
-                // Evidence (e-process wealth) is applied for ALL records — own and remote —
-                // because the evidence itself arrives only through the log in shared-log mode.
+                // Dedup by trace_id: a pair whose append timed out after Redis applied it
+                // may have already been counted locally (in record_pair's failure path or
+                // replayed from SQLite at startup). Skip evidence if the id is already known.
+                // Nil UUID (old records without trace_id) bypasses dedup — always applied.
+                let already_applied =
+                    !record_trace_id.is_nil() && e.applied_pair_ids.contains(record_trace_id);
                 let before = e.experiment.status();
-                if e.experiment.observe_pair(*x_inc, *x_ch) {
-                    // The incumbent's cost is already counted on the serving path; only the
-                    // off-path challenger call is new spend.
-                    e.experiment
-                        .observe_cost(Arm::Challenger, *challenger_cost_usd);
+                if !already_applied {
+                    if e.applied_pair_ids.len() >= MAX_TRACKED_SESSIONS {
+                        // Saturated: skip evidence rather than evicting (evicting lets a pair
+                        // count twice, breaking the pairing argument).
+                        if !e.saturated_logged {
+                            e.saturated_logged = true;
+                            tracing::warn!(
+                                tenant,
+                                route = route_ix,
+                                "experiment pair-id set is full; new pairs' evidence is skipped"
+                            );
+                        }
+                    } else {
+                        // Evidence (e-process wealth) is applied for ALL non-deduped records —
+                        // own and remote — because in shared-log mode the log is the canonical
+                        // source of evidence for all replicas.
+                        if e.experiment.observe_pair(*x_inc, *x_ch) {
+                            // The incumbent's cost is already counted on the serving path; only
+                            // the off-path challenger call is new spend.
+                            e.experiment
+                                .observe_cost(Arm::Challenger, *challenger_cost_usd);
+                        }
+                        if !record_trace_id.is_nil() {
+                            e.applied_pair_ids.insert(*record_trace_id);
+                        }
+                    }
                 }
                 // Health and spend are tallied on the originating replica in
                 // `spawn_paired_challenger` (always, regardless of log state). For remote
@@ -1025,7 +1082,7 @@ impl ExperimentMonitor {
             return Ok(());
         }
         let mut map = self.lock();
-        for (i, rec) in records.iter().enumerate() {
+        for (i, opt_rec) in records.iter().enumerate() {
             let abs_ix = offset + i as u64;
             // Skip records already applied by a concurrent sync that ran ahead of us.
             let current_offset = map
@@ -1035,7 +1092,12 @@ impl ExperimentMonitor {
             if abs_ix < current_offset {
                 continue;
             }
-            let changed = self.apply_log_record(&mut map, tenant, route_ix, fingerprint, rec);
+            // Malformed entries (None): advance the offset but apply nothing.
+            let changed = if let Some(rec) = opt_rec {
+                self.apply_log_record(&mut map, tenant, route_ix, fingerprint, rec)
+            } else {
+                false
+            };
             // Monotonic advance: never rewind the offset even if a concurrent call loaded
             // a shorter prefix.  Update regardless of whether the record was applied (a
             // stale-fingerprint record still must not be re-read on the next sync).
@@ -1144,6 +1206,11 @@ impl ExperimentMonitor {
     /// `ch_error`, `ch_truncated`, and `ts_unix` are forwarded into [`LogRecord::Pair`] so other
     /// replicas can rebuild challenger health and seed the paired-spend ledger. In the no-log path
     /// they are ignored (the caller handles health and ledger directly).
+    ///
+    /// `trace_id` is the challenger's trace UUID and is used for cross-source dedup: if Redis
+    /// applied the record but the append returned `Err` (timeout), the next sync sees the same
+    /// trace_id and skips evidence it already counted locally. Pass `Uuid::nil()` in tests
+    /// that are not exercising dedup — nil is never inserted into the dedup set.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_pair(
         &self,
@@ -1157,6 +1224,7 @@ impl ExperimentMonitor {
         ch_error: bool,
         ch_truncated: u64,
         ts_unix: i64,
+        trace_id: Uuid,
     ) -> bool {
         if self.fingerprint(route_ix) != Some(fingerprint) {
             return false;
@@ -1220,6 +1288,7 @@ impl ExperimentMonitor {
                     ch_truncated,
                     ts_unix,
                     replica_id: self.replica_id,
+                    trace_id,
                 },
             )
             .await
@@ -1233,32 +1302,40 @@ impl ExperimentMonitor {
             );
             // Apply evidence locally so the experiment can still make progress (halt/certify)
             // during a Redis outage. This pair is written to SQLite with in_log=false and will
-            // be replayed on restart; there is no shared-log entry to double-count against.
+            // be replayed on restart. Register the trace_id so that if Redis actually applied
+            // the record (append timed out after the write), the next sync does not double-count.
             let mut map = self.lock();
             if let Some(entry) = self.entry(&mut map, tenant, route_ix) {
-                let before = entry.experiment.status();
-                if entry.experiment.observe_pair(x_inc, x_ch) {
-                    entry
-                        .experiment
-                        .observe_cost(Arm::Challenger, challenger_cost_usd);
-                }
-                if before != entry.experiment.status() {
-                    match entry.experiment.status() {
-                        ExperimentStatus::Halted => tracing::error!(
-                            tenant,
-                            route = route_ix,
-                            "EXPERIMENT HALTED: paired challenger worse than incumbent \
-                             (local evidence only — log append failed)"
-                        ),
-                        ExperimentStatus::Certified => tracing::info!(
-                            tenant,
-                            route = route_ix,
-                            "experiment certified (paired, local evidence): \
-                             challenger within margin"
-                        ),
-                        ExperimentStatus::Undecided => {}
+                let already_applied =
+                    !trace_id.is_nil() && entry.applied_pair_ids.contains(&trace_id);
+                if !already_applied {
+                    let before = entry.experiment.status();
+                    if entry.experiment.observe_pair(x_inc, x_ch) {
+                        entry
+                            .experiment
+                            .observe_cost(Arm::Challenger, challenger_cost_usd);
                     }
-                    Self::publish(&map, route_ix);
+                    if !trace_id.is_nil() {
+                        entry.applied_pair_ids.insert(trace_id);
+                    }
+                    if before != entry.experiment.status() {
+                        match entry.experiment.status() {
+                            ExperimentStatus::Halted => tracing::error!(
+                                tenant,
+                                route = route_ix,
+                                "EXPERIMENT HALTED: paired challenger worse than incumbent \
+                                 (local evidence only — log append failed)"
+                            ),
+                            ExperimentStatus::Certified => tracing::info!(
+                                tenant,
+                                route = route_ix,
+                                "experiment certified (paired, local evidence): \
+                                 challenger within margin"
+                            ),
+                            ExperimentStatus::Undecided => {}
+                        }
+                        Self::publish(&map, route_ix);
+                    }
                 }
             }
             return false; // false = record is NOT in the shared log
@@ -1422,6 +1499,10 @@ pub fn monitor_from_traces(
     // Replay paired-mode evidence in insertion order. Each pair bypasses FIFO queuing
     // (both outcomes arrived simultaneously in the off-path task), which is why they land
     // in `experiment_pairs` rather than the deferred-verdict table.
+    //
+    // After applying evidence, register the trace_id in applied_pair_ids so that when the
+    // same pair later arrives from the shared log (e.g. an append that timed out but Redis
+    // applied it) sync_from_backend skips it and does not double-count.
     for row in pairs {
         let mut map = monitor.lock();
         if let Some(e) = monitor.entry(&mut map, &row.tenant, row.route_ix) {
@@ -1429,6 +1510,11 @@ pub fn monitor_from_traces(
                 if e.experiment.observe_pair(row.x_inc, row.x_ch) {
                     e.experiment
                         .observe_cost(Arm::Challenger, row.challenger_cost_usd);
+                }
+                // Register trace_id for cross-source dedup (prevents double-counting if the
+                // same pair arrives from the shared log on the first sync_from_backend).
+                if !row.trace_id.is_nil() {
+                    e.applied_pair_ids.insert(row.trace_id);
                 }
                 // Rebuild challenger health from the persisted fields.
                 if row.ch_error || row.ch_truncated > 0 {
@@ -1472,14 +1558,19 @@ pub fn build_monitor_with(db_path: &str, config: &Config, shared_log: bool) -> E
         .and_then(|(t, d)| crate::store::load_all_experiment_pairs(db_path).map(|p| (t, d, p)));
     match loaded {
         Ok((traces, deferred, pairs)) => {
-            // With a shared log, pairs with `in_log=true` will arrive from the log on the
-            // first sync_from_backend; replaying them here too would double-count evidence.
-            // Pairs with `in_log=false` were never pushed to the log (Redis was down when
-            // they were written) so they must be replayed locally on restart.
-            // Without a shared log, all pairs are replayed (original behaviour).
+            // With a shared log, the restart rules for evidence are (see InLogStatus docs):
+            //   NotInLog → replay evidence locally (written during an outage; not in Redis).
+            //   InLog    → do NOT replay evidence; the log delivers it on the first sync.
+            //   Unknown  → do NOT replay evidence; we cannot know if it's in the log,
+            //              so we conservatively withhold it (delays a decision — safe).
+            // Without a shared log: all pairs replay normally (original behaviour).
             let offline_pairs: Vec<crate::store::ExperimentPairRow>;
             let replayed: &[crate::store::ExperimentPairRow] = if shared_log {
-                offline_pairs = pairs.iter().filter(|r| !r.in_log).cloned().collect();
+                offline_pairs = pairs
+                    .iter()
+                    .filter(|r| r.in_log == crate::store::InLogStatus::NotInLog)
+                    .cloned()
+                    .collect();
                 &offline_pairs
             } else {
                 &pairs
@@ -2134,7 +2225,19 @@ mod tests {
         for _ in 0..3 {
             assert!(
                 direct
-                    .record_pair("t", 0, &fp_str, 1.0, 1.0, 0.10, 0.01, false, 0, 0)
+                    .record_pair(
+                        "t",
+                        0,
+                        &fp_str,
+                        1.0,
+                        1.0,
+                        0.10,
+                        0.01,
+                        false,
+                        0,
+                        0,
+                        Uuid::nil()
+                    )
                     .await
             );
         }
@@ -2146,8 +2249,20 @@ mod tests {
         let b = ExperimentMonitor::from_config(&cfg)
             .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
         for _ in 0..3 {
-            a.record_pair("t", 0, &fp_str, 1.0, 1.0, 0.10, 0.01, false, 0, 0)
-                .await;
+            a.record_pair(
+                "t",
+                0,
+                &fp_str,
+                1.0,
+                1.0,
+                0.10,
+                0.01,
+                false,
+                0,
+                0,
+                Uuid::nil(),
+            )
+            .await;
         }
         let _ = b.sync_from_backend("t", 0, &fp_str).await;
         close(challenger(&a));
@@ -2172,7 +2287,7 @@ mod tests {
                     ch_error: false,
                     ch_truncated: 0,
                     ts: jiff::Timestamp::now(),
-                    in_log: true, // mark as already in the log
+                    in_log: crate::store::InLogStatus::InLog,
                 },
             )
             .unwrap();
@@ -2881,7 +2996,7 @@ mod tests {
                 ch_error: true,
                 ch_truncated: 2,
                 ts: jiff::Timestamp::now(),
-                in_log: true,
+                in_log: crate::store::InLogStatus::InLog,
             },
         )
         .unwrap();
@@ -2922,7 +3037,7 @@ mod tests {
             _: usize,
             _: &str,
             _: u64,
-        ) -> Result<Vec<LogRecord>, LogError> {
+        ) -> Result<Vec<Option<LogRecord>>, LogError> {
             Err(LogError::Backend("simulated outage".to_owned()))
         }
         async fn claim_session(&self, _: &str, _: usize, _: &str, _: &str) -> bool {
@@ -2952,7 +3067,7 @@ mod tests {
             _: usize,
             _: &str,
             _: u64,
-        ) -> Result<Vec<LogRecord>, LogError> {
+        ) -> Result<Vec<Option<LogRecord>>, LogError> {
             Err(LogError::Backend("simulated read failure".to_owned()))
         }
         async fn claim_session(
@@ -2986,7 +3101,19 @@ mod tests {
         m.observe_health("t", 0, &fp(), Arm::Challenger, true, 2);
 
         let accepted = m
-            .record_pair("t", 0, &fp(), 1.0, 0.0, 0.1, 0.7, true, 2, now.as_second())
+            .record_pair(
+                "t",
+                0,
+                &fp(),
+                1.0,
+                0.0,
+                0.1,
+                0.7,
+                true,
+                2,
+                now.as_second(),
+                Uuid::nil(),
+            )
             .await;
         assert!(!accepted, "nothing reached the log");
         assert!(
@@ -3019,7 +3146,19 @@ mod tests {
 
         // record_pair: append succeeds, but sync (load_since) fails.
         let accepted = m
-            .record_pair("t", 0, &fp(), 1.0, 1.0, 0.1, 0.6, false, 1, now.as_second())
+            .record_pair(
+                "t",
+                0,
+                &fp(),
+                1.0,
+                1.0,
+                0.1,
+                0.6,
+                false,
+                1,
+                now.as_second(),
+                Uuid::nil(),
+            )
             .await;
         // The pair was appended to the log (returns false only on append failure).
         // With AppendOnlyLog, append succeeds but sync returns Err, so record_pair still
@@ -3083,7 +3222,19 @@ mod tests {
         replica_a.observe_health("t", 0, &fp_str, Arm::Challenger, true, 1);
 
         let accepted = replica_a
-            .record_pair("t", 0, &fp_str, 1.0, 0.5, 0.1, 0.8, true, 1, now_secs)
+            .record_pair(
+                "t",
+                0,
+                &fp_str,
+                1.0,
+                0.5,
+                0.1,
+                0.8,
+                true,
+                1,
+                now_secs,
+                Uuid::nil(),
+            )
             .await;
         assert!(accepted, "pair must be accepted");
 
@@ -3132,7 +3283,19 @@ mod tests {
         ledger_a.debit("t", 0, 0.3, now_ts);
         replica_a.observe_health("t", 0, &fp_str, Arm::Challenger, false, 0);
         replica_a
-            .record_pair("t", 0, &fp_str, 1.0, 0.5, 0.1, 0.3, false, 0, now_secs)
+            .record_pair(
+                "t",
+                0,
+                &fp_str,
+                1.0,
+                0.5,
+                0.1,
+                0.3,
+                false,
+                0,
+                now_secs,
+                Uuid::nil(),
+            )
             .await;
 
         let a_total = ledger_a.spent_today("t", 0, now_ts);
@@ -3179,7 +3342,7 @@ mod tests {
             route_ix: usize,
             fingerprint: &str,
             offset: u64,
-        ) -> Result<Vec<LogRecord>, LogError> {
+        ) -> Result<Vec<Option<LogRecord>>, LogError> {
             let records = self
                 .0
                 .load_since(tenant, route_ix, fingerprint, offset)
@@ -3237,6 +3400,8 @@ mod tests {
                         // nil UUID: simulates records from an older replica; treated as remote
                         // by apply_log_record (health+ledger are tallied here, not locally).
                         replica_id: uuid::Uuid::nil(),
+                        // nil: no per-pair dedup for this test.
+                        trace_id: uuid::Uuid::nil(),
                     },
                 )
                 .await;
@@ -3317,6 +3482,7 @@ mod tests {
                 false,
                 0,
                 now_ts.as_second(),
+                Uuid::nil(),
             )
             .await;
         assert!(
@@ -3488,7 +3654,7 @@ mod tests {
         let fp_str = fp();
         let now_ts = jiff::Timestamp::now();
 
-        // `in_log=false`: written during a Redis outage; must be replayed on restart.
+        // NotInLog: written during a Redis outage; must be replayed on restart.
         crate::store::append_experiment_pair(
             &db,
             &crate::store::ExperimentPairRow {
@@ -3502,12 +3668,12 @@ mod tests {
                 ch_error: false,
                 ch_truncated: 0,
                 ts: now_ts,
-                in_log: false,
+                in_log: crate::store::InLogStatus::NotInLog,
             },
         )
         .unwrap();
 
-        // `in_log=true`: already in Redis; must NOT be replayed locally (comes from sync).
+        // InLog: already in Redis; must NOT be replayed locally (comes from sync).
         crate::store::append_experiment_pair(
             &db,
             &crate::store::ExperimentPairRow {
@@ -3521,7 +3687,7 @@ mod tests {
                 ch_error: false,
                 ch_truncated: 0,
                 ts: now_ts,
-                in_log: true,
+                in_log: crate::store::InLogStatus::InLog,
             },
         )
         .unwrap();
@@ -3566,7 +3732,7 @@ mod tests {
             _: usize,
             _: &str,
             _: u64,
-        ) -> Result<Vec<LogRecord>, LogError> {
+        ) -> Result<Vec<Option<LogRecord>>, LogError> {
             self.load_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(LogError::Backend("down".to_owned()))
@@ -3677,8 +3843,21 @@ mod tests {
                 break;
             }
             // Losing pair: x_inc=1.0 (pass), x_ch=0.0 (fail).
+            // Nil trace_id: not testing dedup, just local-evidence accumulation.
             let accepted = m
-                .record_pair("t", 0, &fp_str, 1.0, 0.0, 0.1, 0.01, false, 0, 0)
+                .record_pair(
+                    "t",
+                    0,
+                    &fp_str,
+                    1.0,
+                    0.0,
+                    0.1,
+                    0.01,
+                    false,
+                    0,
+                    0,
+                    Uuid::nil(),
+                )
                 .await;
             assert!(!accepted, "append failing log returns false");
             pairs_applied += 1;
@@ -3692,6 +3871,264 @@ mod tests {
         assert!(
             m.reports()[0].report.pairs > 0,
             "pairs counted locally despite failed appends"
+        );
+    }
+
+    // ── Issue 1b: Unknown tri-state for legacy rows ───────────────────────────────────────────
+
+    /// Rows migrated from a schema without `in_log` get `InLogStatus::Unknown` (DEFAULT 2).
+    /// With shared_log=true, Unknown rows contribute spend (cap is stricter — safe) but NOT
+    /// evidence (withholding only delays a decision — safe).
+    #[tokio::test]
+    async fn unknown_rows_contribute_spend_but_not_evidence_with_shared_log() {
+        use crate::store::InLogStatus;
+        let db =
+            std::env::temp_dir().join(format!("firstpass-unknown-{}.db", uuid::Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let cfg = config();
+        let fp_str = fp();
+        let now_ts = jiff::Timestamp::now();
+
+        // One Unknown row (legacy) and one NotInLog row (outage).
+        for (in_log, x_ch) in [
+            (InLogStatus::Unknown, 0.8_f64),
+            (InLogStatus::NotInLog, 0.6),
+        ] {
+            crate::store::append_experiment_pair(
+                &db,
+                &crate::store::ExperimentPairRow {
+                    tenant: "t".to_owned(),
+                    route_ix: 0,
+                    fingerprint: fp_str.clone(),
+                    trace_id: uuid::Uuid::now_v7(),
+                    x_inc: 1.0,
+                    x_ch,
+                    challenger_cost_usd: 0.1,
+                    ch_error: false,
+                    ch_truncated: 0,
+                    ts: now_ts,
+                    in_log,
+                },
+            )
+            .unwrap();
+        }
+
+        // shared_log=true: only NotInLog row contributes evidence (1 pair); Unknown withheld.
+        let m = build_monitor_with(&db.to_string_lossy(), &cfg, true);
+        let reps = m.reports();
+        assert_eq!(
+            reps[0].report.pairs, 1,
+            "shared_log=true: only NotInLog evidence replayed; got {}",
+            reps[0].report.pairs
+        );
+
+        // shared_log=false: both rows contribute evidence (2 pairs).
+        let m2 = build_monitor_with(&db.to_string_lossy(), &cfg, false);
+        let reps2 = m2.reports();
+        assert_eq!(
+            reps2[0].report.pairs, 2,
+            "shared_log=false: all rows replayed; got {}",
+            reps2[0].report.pairs
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── Issue 2: load_since preserves positions of malformed entries ─────────────────────────
+
+    /// A log backend that injects a None (malformed) entry between two valid ones.
+    /// Position-preserving: the returned vec has length 3 (valid, None, valid).
+    #[derive(Debug)]
+    struct MalformedMiddleLog {
+        inner: InMemoryExperimentLog,
+    }
+
+    #[async_trait::async_trait]
+    impl ExperimentLogBackend for MalformedMiddleLog {
+        async fn append(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            record: LogRecord,
+        ) -> Result<u64, LogError> {
+            self.inner
+                .append(tenant, route_ix, fingerprint, record)
+                .await
+        }
+
+        async fn load_since(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            offset: u64,
+        ) -> Result<Vec<Option<LogRecord>>, LogError> {
+            // Call inner (which returns Vec<Option<LogRecord>> with all Some).
+            let mut records = self
+                .inner
+                .load_since(tenant, route_ix, fingerprint, offset)
+                .await?;
+            // Inject None at index 1 (if the list has at least 2 elements) to simulate a
+            // malformed entry. This preserves list length so offset arithmetic stays correct.
+            if records.len() >= 2 {
+                records[1] = None;
+            }
+            Ok(records)
+        }
+
+        async fn claim_session(&self, _: &str, _: usize, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// A log with a malformed entry at position 1 must:
+    /// 1. Apply position 0 and position 2 exactly once each (None at position 1 is skipped).
+    /// 2. After two consecutive syncs, `remote_log_offset` == 3 (all positions consumed).
+    /// 3. A third sync reads nothing new (offset already at 3).
+    #[tokio::test]
+    async fn malformed_log_entry_advances_offset_and_valid_entries_applied_once() {
+        let log = Arc::new(MalformedMiddleLog {
+            inner: InMemoryExperimentLog::new(),
+        });
+        let cfg = config();
+        let fp_str = fp();
+
+        // Append 3 pairs directly to the inner log (records 0, 1, 2).
+        for _ in 0..3 {
+            let _ = log
+                .inner
+                .append(
+                    "t",
+                    0,
+                    &fp_str,
+                    LogRecord::Pair {
+                        x_inc: 1.0,
+                        x_ch: 1.0,
+                        incumbent_cost_usd: 0.1,
+                        challenger_cost_usd: 0.05,
+                        ch_error: false,
+                        ch_truncated: 0,
+                        ts_unix: 0,
+                        replica_id: uuid::Uuid::nil(),
+                        trace_id: uuid::Uuid::nil(),
+                    },
+                )
+                .await;
+        }
+        // The MalformedMiddleLog replaces position 1 with None.
+
+        let m = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+
+        // First sync: applies positions 0 and 2 (valid), skips position 1 (None).
+        let _ = m.sync_from_backend("t", 0, &fp_str).await;
+        let pairs_after_first = m.reports()[0].report.pairs;
+        // 2 valid entries applied (positions 0 and 2); position 1 consumed but not counted.
+        assert_eq!(
+            pairs_after_first, 2,
+            "first sync: 2 valid entries applied, got {pairs_after_first}"
+        );
+
+        // Second sync: offset is already at 3, nothing new.
+        let _ = m.sync_from_backend("t", 0, &fp_str).await;
+        let pairs_after_second = m.reports()[0].report.pairs;
+        assert_eq!(
+            pairs_after_second, 2,
+            "second sync: no re-application, pairs still 2, got {pairs_after_second}"
+        );
+
+        // Verify offset equals list length: offset must be 3 (all 3 positions consumed).
+        let offset = {
+            let map = m.lock();
+            map.get("t")
+                .and_then(|r| r.get(&0))
+                .map_or(0, |e| e.remote_log_offset)
+        };
+        assert_eq!(
+            offset, 3,
+            "offset must equal list length after consuming all positions"
+        );
+    }
+
+    // ── Issue 3: trace_id dedup prevents double-counting on append-timeout ───────────────────
+
+    /// A backend that appends successfully (the record IS in the log) but always returns Err
+    /// from `append` (simulates an append that timed out after Redis applied it).
+    #[derive(Debug)]
+    struct PushThenErrorLog {
+        inner: InMemoryExperimentLog,
+    }
+
+    #[async_trait::async_trait]
+    impl ExperimentLogBackend for PushThenErrorLog {
+        async fn append(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            record: LogRecord,
+        ) -> Result<u64, LogError> {
+            // Write the record to the inner log (it IS there).
+            let _ = self
+                .inner
+                .append(tenant, route_ix, fingerprint, record)
+                .await;
+            // But report failure to the caller (timeout simulation).
+            Err(LogError::Backend("timeout after write".to_owned()))
+        }
+
+        async fn load_since(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            offset: u64,
+        ) -> Result<Vec<Option<LogRecord>>, LogError> {
+            self.inner
+                .load_since(tenant, route_ix, fingerprint, offset)
+                .await
+        }
+
+        async fn claim_session(&self, _: &str, _: usize, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// When `append` times out after Redis applied it, the evidence must count exactly once:
+    /// - `record_pair` applies locally (append returned Err) and inserts the trace_id.
+    /// - `sync_from_backend` sees the same trace_id in the log and skips it.
+    /// A restart with the same SQLite NotInLog row + the same record in the log also counts once.
+    #[tokio::test]
+    async fn trace_id_dedup_prevents_double_count_on_append_timeout() {
+        let log = Arc::new(PushThenErrorLog {
+            inner: InMemoryExperimentLog::new(),
+        });
+        let cfg = config();
+        let fp_str = fp();
+        let tid = Uuid::now_v7();
+
+        let m = ExperimentMonitor::from_config(&cfg)
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+
+        // record_pair: append fails (returns Err) but the record IS in the log.
+        let appended = m
+            .record_pair("t", 0, &fp_str, 1.0, 1.0, 0.1, 0.05, false, 0, 0, tid)
+            .await;
+        assert!(!appended, "append returned Err → record_pair returns false");
+
+        // Local evidence was applied: 1 pair.
+        assert_eq!(m.reports()[0].report.pairs, 1, "evidence applied locally");
+
+        // Sync: the record is in the log (PushThenErrorLog wrote it). Without dedup,
+        // apply_log_record would count it again (pairs → 2). With dedup, it skips.
+        let _ = m.sync_from_backend("t", 0, &fp_str).await;
+        assert_eq!(
+            m.reports()[0].report.pairs,
+            1,
+            "after sync: pairs still 1 (trace_id dedup prevented double-count)"
         );
     }
 }
