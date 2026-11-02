@@ -14,9 +14,10 @@ All traffic is localhost only; no real API keys required.
 
 ## count\_tokens endpoint (this PR)
 
-Claude Code calls `POST /v1/messages/count_tokens` for context-window
-management.  This endpoint was not previously registered; the proxy would 404,
-breaking context accounting.
+Anthropic clients use `POST /v1/messages/count_tokens` to size context before a
+call.  This endpoint was not previously registered; the proxy would 404.  It is
+exercised here by a direct fixture request: the single-shot Claude Code run below
+does not call it, so this run does not show Claude Code itself using it.
 
 | Test | HTTP | Upstream path reached | Response |
 |------|------|----------------------|----------|
@@ -43,7 +44,7 @@ logic applies: token counting is not a routable request.
 | Endpoint | Proxy handler | Status | Notes |
 |----------|--------------|--------|-------|
 | `POST /v1/messages` | `messages` | PASS | Anthropic Messages; observe + enforce |
-| `POST /v1/messages/count_tokens` | `count_tokens_passthrough` | **PASS (added this PR)** | No receipt; see above |
+| `POST /v1/messages/count_tokens` | `count_tokens_passthrough` | **PASS** | No receipt; see above |
 | `POST /v1/chat/completions` | `chat_completions` | PASS | OpenAI Chat; aider, cline, cursor |
 | `POST /v1/responses` | `responses` | PASS | OpenAI Responses API (Codex) |
 | `GET /v1/models` | `models` | PASS | Served from ladder config |

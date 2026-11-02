@@ -16,6 +16,7 @@ Usage (invoked by run_compat.sh):
 
 import http.server
 import json
+import os
 import sys
 import threading
 
@@ -73,7 +74,7 @@ ANTHROPIC_TOOL_SSE = (
     '"content_block":{"type":"tool_use","id":"toolu_01","name":"bash","input":{}}}\n\n'
     "event: content_block_delta\n"
     'data: {"type":"content_block_delta","index":0,'
-    '"delta":{"type":"input_json_delta","partial_json":"{}\\""}}\n\n'
+    '"delta":{"type":"input_json_delta","partial_json":"{}"}}\n\n'
     "event: content_block_stop\n"
     'data: {"type":"content_block_stop","index":0}\n\n'
     "event: message_delta\n"
@@ -190,8 +191,11 @@ def record(entry):
         # Flush after every request so the shell harness can read mid-run.
         if _log_path[0]:
             try:
-                with open(_log_path[0], "w") as f:
+                # Write-then-rename so a concurrent reader never sees a truncated file.
+                tmp = _log_path[0] + ".tmp"
+                with open(tmp, "w") as f:
                     f.write(json.dumps(recorded, indent=2))
+                os.replace(tmp, _log_path[0])
             except OSError:
                 pass
 
@@ -348,6 +352,9 @@ if __name__ == "__main__":
 
     server = http.server.HTTPServer(("127.0.0.1", port), FakeUpstreamHandler)
     actual_port = server.server_address[1]
+    # The log file is the readiness signal: it exists only once *this* process holds the port.
+    if log_path:
+        dump_log(log_path)
 
     # Print the port first so the caller can read it before blocking.
     print(actual_port, flush=True)

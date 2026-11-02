@@ -45,8 +45,8 @@ PROXY_BIN="$REPO_ROOT/target/release/firstpass"
 # ---------------------------------------------------------------------------
 # Fixed ports in a quiet range (19300–19400) — not Redis/Valkey/other services
 # ---------------------------------------------------------------------------
-UPSTREAM_PORT=19350
-PROXY_PORT=19351
+UPSTREAM_PORT="${FP_COMPAT_UPSTREAM_PORT:-19350}"
+PROXY_PORT="${FP_COMPAT_PROXY_PORT:-19351}"
 # A private, per-run work directory: portable across macOS and Linux, no predictable shared
 # temp names, and parallel runs cannot collide. Removed on exit.
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fp-compat.XXXXXX")" || { echo "ERROR: mktemp failed"; exit 1; }
@@ -61,6 +61,8 @@ _cleanup() {
   [ -n "$WORK_DIR" ] && rm -rf "$WORK_DIR"
 }
 trap _cleanup EXIT
+# An interrupt must still run the EXIT trap so neither daemon outlives the run.
+trap 'exit 130' INT TERM
 
 # ---------------------------------------------------------------------------
 # Start fake upstream
@@ -68,17 +70,17 @@ trap _cleanup EXIT
 echo "==> starting fake upstream on $UPSTREAM_PORT..."
 python3 "$SCRIPT_DIR/fake_upstream.py" "$UPSTREAM_PORT" "$REQUEST_LOG" &
 UP_PID=$!
-# Wait for it to accept connections
-python3 - <<PYEOF
-import socket, time
-for _ in range(30):
-    try:
-        s = socket.create_connection(('127.0.0.1', $UPSTREAM_PORT), timeout=0.3)
-        s.close()
-        break
-    except:
-        time.sleep(0.2)
-PYEOF
+# Wait for the request log it creates right after binding. It lives in our private WORK_DIR, so
+# a foreign process already holding the port cannot fake readiness the way a socket probe can.
+for _i in $(seq 1 50); do
+  [ -f "$REQUEST_LOG" ] && break
+  kill -0 "$UP_PID" 2>/dev/null || break
+  sleep 0.1
+done
+if [ ! -f "$REQUEST_LOG" ] || ! kill -0 "$UP_PID" 2>/dev/null; then
+  echo "ERROR: fake upstream did not start on port $UPSTREAM_PORT (port taken? set FP_COMPAT_UPSTREAM_PORT)" >&2
+  exit 1
+fi
 echo "    upstream ready (pid=$UP_PID)"
 
 # ---------------------------------------------------------------------------
@@ -215,6 +217,7 @@ run_with_timeout() {
   return 124
 }
 
+HARNESS_FAILED=0
 # ── count_tokens ─────────────────────────────────────────────────────────────
 echo ""
 echo "==> POST /v1/messages/count_tokens"
@@ -226,6 +229,11 @@ CT_CODE=$(echo "$CT_RAW" | cut -d' ' -f1)
 CT_BODY=$(echo "$CT_RAW" | cut -d' ' -f2-)
 CT_EP=$(endpoints_since "$CT_BEF")
 echo "    HTTP $CT_CODE | upstream: $CT_EP | body: $CT_BODY"
+if [ "$CT_CODE" = "200" ] && [ "$CT_EP" = "/v1/messages/count_tokens" ]; then
+  CT_STATUS="**PASS**"
+else
+  CT_STATUS="**FAIL**"; HARNESS_FAILED=1
+fi
 
 # ── Codex fixture (Responses API) ────────────────────────────────────────────
 echo "==> POST /v1/responses (Codex fixture)"
@@ -261,8 +269,8 @@ run_claude() {
   fi
   echo "==> claude (30 s timeout)..."
   local bef; bef=$(count_log)
-  local tmpdir; tmpdir="$(mktemp -d)"
-  local outfile; outfile="$(mktemp)"
+  local tmpdir; tmpdir="$(mktemp -d "$WORK_DIR/claude.XXXXXX")"
+  local outfile; outfile="$(mktemp "$WORK_DIR/claude-out.XXXXXX")"
   local rc=0
 
   ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT" \
@@ -304,13 +312,15 @@ run_aider() {
   fi
   echo "==> aider (60 s timeout)..."
   local bef; bef=$(count_log)
-  local tmpdir; tmpdir="$(mktemp -d)"
-  local outfile; outfile="$(mktemp)"
+  local tmpdir; tmpdir="$(mktemp -d "$WORK_DIR/aider.XXXXXX")"
+  local outfile; outfile="$(mktemp "$WORK_DIR/aider-out.XXXXXX")"
   local rc=0
 
+  # `exec` replaces the subshell with aider, so the pid we time out and kill is aider itself,
+  # not a wrapper that would leave it orphaned.
   (
     cd "$tmpdir" && \
-    OPENAI_API_KEY=dummy \
+    OPENAI_API_KEY=dummy exec \
       "$cli" \
         --no-git --yes \
         "--openai-api-key=dummy" \
@@ -376,6 +386,8 @@ except Exception as e:
 PYEOF
 )
 
+# Receipts are written by a background SQLite writer; give it a moment to drain.
+sleep 1
 RC=$(python3 - <<PYEOF
 import sqlite3
 try:
@@ -427,9 +439,10 @@ All traffic is localhost only; no real API keys required.
 
 ## count\_tokens endpoint (this PR)
 
-Claude Code calls \`POST /v1/messages/count_tokens\` for context-window
-management.  This endpoint was not previously registered; the proxy would 404,
-breaking context accounting.
+Anthropic clients use \`POST /v1/messages/count_tokens\` to size context before a
+call.  This endpoint was not previously registered; the proxy would 404.  It is
+exercised here by a direct fixture request: the single-shot Claude Code run below
+does not call it, so this run does not show Claude Code itself using it.
 
 | Test | HTTP | Upstream path reached | Response |
 |------|------|----------------------|----------|
@@ -456,7 +469,7 @@ logic applies: token counting is not a routable request.
 | Endpoint | Proxy handler | Status | Notes |
 |----------|--------------|--------|-------|
 | \`POST /v1/messages\` | \`messages\` | PASS | Anthropic Messages; observe + enforce |
-| \`POST /v1/messages/count_tokens\` | \`count_tokens_passthrough\` | **PASS (added this PR)** | No receipt; see above |
+| \`POST /v1/messages/count_tokens\` | \`count_tokens_passthrough\` | $CT_STATUS | No receipt; see above |
 | \`POST /v1/chat/completions\` | \`chat_completions\` | PASS | OpenAI Chat; aider, cline, cursor |
 | \`POST /v1/responses\` | \`responses\` | PASS | OpenAI Responses API (Codex) |
 | \`GET /v1/models\` | \`models\` | PASS | Served from ladder config |
@@ -509,3 +522,7 @@ curl -X POST http://127.0.0.1:PORT/v1/responses \\
 MDEOF
 echo ""
 echo "==> Matrix written to: $MATRIX_OUT"
+if [ "$HARNESS_FAILED" -ne 0 ]; then
+  echo "ERROR: count_tokens passthrough failed (HTTP $CT_CODE, upstream saw: $CT_EP)" >&2
+  exit 1
+fi
