@@ -727,24 +727,25 @@ fn cmd_experiment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     store::ensure_migrated(db)?;
     let traces = store::load_tenant_traces(db, &tenant).unwrap_or_default();
     let deferred = store::load_all_deferred(db).unwrap_or_default();
-    let pairs = store::load_all_experiment_pairs(db)?;
-    let reports = experiment::experiments_from_traces(&traces, &deferred, &pairs, routing);
-    let views = experiment::views(reports, routing);
-
-    // Issue 5b: when the config has a shared log (redis_url on a challenger), this report
-    // is from the local store only.  The log-replicated state lives in Redis; a restarted or
-    // fresh replica may not have synced all of it yet.  Print a clear caveat so an operator
-    // reading the CLI output knows to consult the cluster-authoritative source.
+    let mut pairs = store::load_all_experiment_pairs(db)?;
+    // With a shared log the cluster's evidence lives in the log, not in this store. Apply the
+    // same rule the server uses at startup: only rows the log never received (`NotInLog`) are
+    // evidence here; `InLog` rows belong to the log and legacy `Unknown` rows are withheld.
     let has_shared_log = routing
         .routes
         .iter()
         .any(|r| r.challenger.as_ref().is_some_and(|c| c.redis_url.is_some()));
+    if has_shared_log {
+        pairs.retain(|r| r.in_log == store::InLogStatus::NotInLog);
+    }
+    let reports = experiment::experiments_from_traces(&traces, &deferred, &pairs, routing);
+    let views = experiment::views(reports, routing);
     if has_shared_log && !json {
         eprintln!(
-            "Note: this report is from the local receipt store only.\n\
-             Cluster-authoritative state (shared Redis log) is visible at\n\
-             GET /v1/experiments or in the panel.  The numbers below may be\n\
-             incomplete if this replica has not yet synced all log records.\n"
+            "Note: a shared experiment log is configured, so this report covers only the pairs\n\
+             this store holds locally (those the log never received). The cluster's evidence\n\
+             lives in the log; a replica's /v1/experiments and panel reflect it once that\n\
+             replica has served traffic on the route.\n"
         );
     }
 

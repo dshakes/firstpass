@@ -1430,8 +1430,24 @@ impl ExperimentMonitor {
             return false;
         }
         // Sync to apply own record immediately (so this replica sees its own evidence) and
-        // to pick up any remote records. A sync failure is non-fatal.
-        let _ = self.sync_from_backend(tenant, route_ix, fingerprint).await;
+        // to pick up any remote records. If the read-back fails, apply this pair locally now:
+        // the record IS in the log, so the later successful sync will see the same trace_id and
+        // skip it (no double count), while a decisive halt is not delayed in the meantime.
+        if self
+            .sync_from_backend(tenant, route_ix, fingerprint)
+            .await
+            .is_err()
+        {
+            self.apply_pair_locally(
+                tenant,
+                route_ix,
+                fingerprint,
+                x_inc,
+                x_ch,
+                challenger_cost_usd,
+                trace_id,
+            );
+        }
         true
     }
 
@@ -4504,6 +4520,36 @@ mod tests {
         async fn claim_session(&self, t: &str, r: usize, f: &str, s: &str) -> bool {
             self.inner.claim_session(t, r, f, s).await
         }
+    }
+
+    /// The append lands but the read-back fails: the pair's evidence is applied locally right
+    /// away (a halt is not delayed), and when the log recovers the same record is not counted
+    /// again.
+    #[tokio::test]
+    async fn read_back_failure_applies_the_pair_locally_and_recovery_does_not_double_count() {
+        let log = Arc::new(SwitchableLog::default());
+        let m = ExperimentMonitor::from_config(&config())
+            .with_log(Arc::clone(&log) as Arc<dyn ExperimentLogBackend>);
+        let fp_str = fp();
+        log.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let tid = Uuid::now_v7();
+        let appended = m
+            .record_pair("t", 0, &fp_str, 1.0, 0.0, 0.1, 0.05, false, 0, 0, tid)
+            .await;
+        assert!(appended, "the append itself succeeded");
+        assert_eq!(
+            m.reports()[0].report.pairs,
+            1,
+            "applied locally despite the failed read"
+        );
+        log.failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        m.sync_from_backend("t", 0, &fp_str).await.unwrap();
+        assert_eq!(
+            m.reports()[0].report.pairs,
+            1,
+            "recovery sync deduplicated by trace_id"
+        );
     }
 
     /// On ONE monitor: synced state stays trusted only within the staleness bound. Once the log
