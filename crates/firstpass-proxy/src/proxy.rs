@@ -1938,7 +1938,7 @@ async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let session_header = header_str(&headers, SESSION_HEADER);
+    let session_header = caller_session(&headers, &body, &state.config.prompt_salt);
 
     // Only parse the request for routing when a routing config is loaded — an observe-only
     // deployment does zero on-path parsing and keeps its zero-added-latency guarantee.
@@ -2193,6 +2193,86 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
+}
+
+/// Headers coding agents set per conversation, checked after the explicit Firstpass header.
+const AGENT_SESSION_HEADERS: [&str; 3] =
+    ["x-claude-code-session-id", "session_id", "conversation_id"];
+
+/// Longest session id taken verbatim from a caller header or body field (bounds storage).
+const SESSION_MAX_BYTES: usize = 256;
+
+fn cap_session(s: &str) -> &str {
+    let mut end = s.len().min(SESSION_MAX_BYTES);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// The caller's session id, so multi-turn coding-agent conversations group without cooperation.
+/// Priority: explicit `x-firstpass-session`; agent session header (`agent:`); Anthropic
+/// `metadata.user_id` only when it embeds `session_` (`meta:`); `prompt_cache_key` (`pck:`);
+/// finally, for agent-shaped requests (multi-message or tool-bearing), a salted hash of the
+/// append-only conversation prefix (`conv:`). Plain single-turn traffic yields `None`.
+/// Never errors; raw prompt text is only ever seen through the salted hash.
+fn caller_session(headers: &HeaderMap, body: &[u8], salt: &str) -> Option<String> {
+    if let Some(v) = header_str(headers, SESSION_HEADER) {
+        return Some(v);
+    }
+    for name in AGENT_SESSION_HEADERS {
+        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(format!("agent:{}", cap_session(v)));
+            }
+        }
+    }
+    let json: Value = serde_json::from_slice(body).ok()?;
+    if let Some(u) = json.pointer("/metadata/user_id").and_then(Value::as_str)
+        && u.contains("session_")
+    {
+        return Some(format!("meta:{}", cap_session(u)));
+    }
+    if let Some(k) = json.get("prompt_cache_key").and_then(Value::as_str) {
+        let k = k.trim();
+        if !k.is_empty() {
+            return Some(format!("pck:{}", cap_session(k)));
+        }
+    }
+    let msgs = json.get("messages").and_then(Value::as_array);
+    let input = json.get("input");
+    let n_items = msgs
+        .map(Vec::len)
+        .or_else(|| input.and_then(Value::as_array).map(Vec::len))
+        .unwrap_or(0);
+    let has_tools = json
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|t| !t.is_empty());
+    if n_items <= 1 && !has_tools {
+        return None;
+    }
+    // Stable prefix: system/instructions, then up to and including the first user message
+    // (Anthropic `messages[0]`, chat through first `user`, Responses first `input` item).
+    let mut prefix = vec![
+        json.get("system").cloned().unwrap_or(Value::Null),
+        json.get("instructions").cloned().unwrap_or(Value::Null),
+    ];
+    if let Some(msgs) = msgs {
+        for m in msgs {
+            prefix.push(m.clone());
+            if m.get("role").and_then(Value::as_str) == Some("user") {
+                break;
+            }
+        }
+    } else if let Some(first) = input.and_then(|i| i.as_array().and_then(|a| a.first()).or(Some(i)))
+    {
+        prefix.push(first.clone());
+    }
+    let bytes = serde_json::to_vec(&prefix).ok()?;
+    let h = prompt_hash(salt, &bytes);
+    Some(format!("conv:{}", h.get(..16)?))
 }
 
 /// Build the routing/telemetry feature vector from request headers + body (best-effort;
@@ -5192,7 +5272,7 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let session_header = header_str(&headers, SESSION_HEADER);
+    let session_header = caller_session(&headers, &body, &state.config.prompt_salt);
 
     if let Some(routing) = state.config.routing.as_ref() {
         let features = extract_openai_features(&headers, &body);
@@ -5257,7 +5337,7 @@ async fn responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let session_header = header_str(&headers, SESSION_HEADER);
+    let session_header = caller_session(&headers, &body, &state.config.prompt_salt);
 
     // Streaming cannot be gated, so it never enters the enforce path. Passing the ORIGINAL body
     // through matters: the upstream speaks Responses too, and handing it a translated body would
@@ -5359,6 +5439,116 @@ async fn responses(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use serde_json::json;
+
+    fn sess(h: &[(&str, &str)], body: serde_json::Value) -> Option<String> {
+        let mut headers = HeaderMap::new();
+        for (k, v) in h {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        caller_session(&headers, body.to_string().as_bytes(), "salt")
+    }
+
+    #[test]
+    fn caller_session_priority_order() {
+        let body = json!({
+            "metadata": {"user_id": "u_session_abc"}, "prompt_cache_key": "k",
+            "tools": [{"name": "t"}], "messages": [{"role": "user", "content": "hi"}],
+        });
+        let all = [("x-firstpass-session", "explicit"), ("session_id", "ag")];
+        assert_eq!(sess(&all, body.clone()).as_deref(), Some("explicit"));
+        assert_eq!(sess(&all[1..], body.clone()).as_deref(), Some("agent:ag"));
+        assert_eq!(
+            sess(&[], body.clone()).as_deref(),
+            Some("meta:u_session_abc")
+        );
+        let mut b = body.clone();
+        b["metadata"] = json!({"user_id": "plain-user"});
+        assert_eq!(sess(&[], b.clone()).as_deref(), Some("pck:k"));
+        b.as_object_mut().unwrap().remove("prompt_cache_key");
+        assert!(sess(&[], b).unwrap().starts_with("conv:"));
+    }
+
+    #[test]
+    fn caller_session_caps_and_trims_header_values() {
+        let long = "a".repeat(300);
+        let id = sess(&[("conversation_id", &long)], json!({})).unwrap();
+        assert_eq!(id.len(), "agent:".len() + 256);
+        assert_eq!(cap_session(&"é".repeat(300)).len(), 256); // char boundary safe
+        assert_eq!(sess(&[("session_id", "  ")], json!({})), None);
+    }
+
+    #[test]
+    fn caller_session_anthropic_conversation_is_stable_across_turns() {
+        let u1 = json!({"role": "user", "content": "fix the bug"});
+        let t1 = json!({"system": "sys", "tools": [{"name": "t"}], "messages": [u1]});
+        let t2 = json!({"system": "sys", "tools": [{"name": "t"}], "messages": [
+            u1, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "more"}]});
+        let other = json!({"system": "sys", "tools": [{"name": "t"}],
+            "messages": [{"role": "user", "content": "different task"}]});
+        let a = sess(&[], t1).unwrap();
+        assert!(a.starts_with("conv:") && a.len() == 5 + 16);
+        assert_eq!(Some(a.clone()), sess(&[], t2));
+        assert_ne!(Some(a), sess(&[], other));
+        // single turn, no tools -> None; plain metadata.user_id never used
+        let plain =
+            json!({"metadata": {"user_id": "bob"}, "messages": [{"role": "user", "content": "x"}]});
+        assert_eq!(sess(&[], plain), None);
+        assert_eq!(sess(&[], json!("not an object")), None);
+    }
+
+    #[test]
+    fn caller_session_openai_chat_and_responses_shapes() {
+        let chat = |tail: &str| {
+            json!({"messages": [
+                {"role": "system", "content": "s"}, {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a"}, {"role": "user", "content": tail}]})
+        };
+        let c = sess(&[], chat("one")).unwrap();
+        assert_eq!(Some(c.clone()), sess(&[], chat("two")));
+        let diff = json!({"messages": [
+            {"role": "system", "content": "s"}, {"role": "user", "content": "other"},
+            {"role": "assistant", "content": "a"}]});
+        assert_ne!(Some(c), sess(&[], diff));
+        assert_eq!(
+            sess(&[], json!({"messages": [{"role": "user", "content": "q"}]})),
+            None
+        );
+
+        let resp = |items: serde_json::Value| json!({"instructions": "i", "input": items});
+        let first = json!({"role": "user", "content": "q"});
+        let r1 = sess(
+            &[],
+            resp(json!([first, {"role": "user", "content": "more"}])),
+        )
+        .unwrap();
+        assert!(r1.starts_with("conv:"));
+        assert_eq!(
+            Some(r1.clone()),
+            sess(
+                &[],
+                resp(
+                    json!([first, {"role": "assistant", "content": "x"}, {"role": "user", "content": "y"}])
+                )
+            )
+        );
+        assert_ne!(
+            Some(r1),
+            sess(&[], resp(json!([{"role": "user", "content": "z"}, first])))
+        );
+        // string input, no tools -> single turn
+        assert_eq!(sess(&[], resp(json!("hello"))), None);
+        assert!(
+            sess(
+                &[],
+                json!({"input": "hello", "tools": [{"type": "function"}]})
+            )
+            .is_some()
+        );
+    }
 
     /// ADR 0011 precedence, and the evidence fields travel only with the controller that has
     /// them: a certified e-process wins over ACI and config; ACI over config; nothing ⇒ `None`.

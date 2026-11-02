@@ -478,6 +478,64 @@ async fn session_promotion_skips_the_rung_that_already_failed() {
     );
 }
 
+/// A coding agent sends no `x-firstpass-session`; its turns must still group (derived from the
+/// stable conversation prefix) so promotion carries turn 1's failure into turn 2.
+#[tokio::test]
+async fn agent_turns_without_a_session_header_share_a_promotion() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy_with(
+        &upstream,
+        &[
+            "anthropic/claude-haiku-4-5",
+            "anthropic/claude-sonnet-5",
+            "anthropic/claude-opus-4-8",
+        ],
+        "",
+        "[escalation.session_promotion]\nafter_failures = 1\nwindow = \"30m\"\n",
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let tools =
+        json!([{ "name": "bash", "description": "run", "input_schema": { "type": "object" } }]);
+    let send = |messages: serde_json::Value| {
+        let client = client.clone();
+        let url = format!("{proxy}/v1/messages");
+        let tools = tools.clone();
+        async move {
+            client
+                .post(url)
+                .header("x-api-key", "byok-test")
+                .json(&json!({
+                    "model": "claude-haiku-4-5", "max_tokens": 256,
+                    "tools": tools, "messages": messages,
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let first_user = json!({ "role": "user", "content": "write a hello world" });
+
+    assert_eq!(send(json!([first_user])).await.status(), 200);
+    let first = wait_for_traces(&db, 1).await;
+    assert_eq!(first[0].attempts.len(), 2, "turn 1 must climb 0 -> 1");
+
+    // Turn 2 appends assistant + user; no session header anywhere.
+    let turn2 = json!([
+        first_user,
+        { "role": "assistant", "content": "ok" },
+        { "role": "user", "content": "now add a test" },
+    ]);
+    assert_eq!(send(turn2).await.status(), 200);
+    let both = wait_for_traces(&db, 2).await;
+    let second = both
+        .iter()
+        .find(|t| t.trace_id != first[0].trace_id)
+        .expect("second trace");
+    assert_eq!(second.attempts.len(), 1, "turn 2 must skip the failed rung");
+    assert_eq!(second.attempts[0].rung, 1, "started on the promoted rung");
+}
+
 /// The Responses API served through the real gated ladder over real HTTP.
 ///
 /// The point is not the translation — that is unit-tested. It is that a Responses client gets the
