@@ -60,7 +60,7 @@
 <h1>Coding agents</h1>
 <p class="page-sub">Claude Code, Codex and aider are multi-turn, tool-calling clients. This page covers how Firstpass groups their turns into sessions, how it gates tool calls, what the routing-granularity eval found, and what has and has not been tested.</p>
 
-<div class="tldr">Point the agent at the proxy. In <b>observe</b> mode nothing changes and every call gets a receipt. In <b>enforce</b> mode, tool-call turns are judged by <b><code>non-empty</code></b>, <b><code>json-valid</code></b> and <b><code>tool-args-valid</code></b>, turns are grouped into <b>sessions with no header</b>, and the evidence says to <b>keep a session on one model</b>.</div>
+<div class="tldr">Point the agent at the proxy. In <b>observe</b> mode nothing changes and every model call gets a receipt (<code>count_tokens</code> metadata calls do not). In <b>enforce</b> mode, tool-call turns are judged by <b><code>non-empty</code></b>, <b><code>json-valid</code></b> and <b><code>tool-args-valid</code></b>, turns are grouped into <b>sessions with no header</b>, and the evidence says to <b>keep a session on one model</b>.</div>
 
 <h2 id="setup">1. Point the agent at the proxy<a class="anchor" href="#setup" aria-label="Link to this section">#</a></h2>
 <div class="tblwrap"><table>
