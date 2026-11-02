@@ -800,10 +800,9 @@ def _self_check() -> None:
     expected_cwc = 1.0 * (5 / 10) + 5.0
     assert overhead > 0  # the handoff re-read is still computed, for the cost-only illustration
     assert abs(cwc2 - expected_cwc) < 1e-9, f"got {cwc2}, expected {expected_cwc}"
-    # switch overhead is present in cwc2 but absent from cnc2 (no-cache has no cache-miss penalty)
-    # cnc2 scales up the observed costs by the no-cache multiplier but does NOT add switch overhead
-    no_switch_wc = 1.0 * (5 / 10) + 5.0  # partial_cheap + top, no overhead
-    assert cwc2 > no_switch_wc, "switch overhead increases with-cache cost"
+    # Restart: the with-cache cost is exactly partial cheap spend + the top model's recorded run.
+    no_switch_wc = 1.0 * (5 / 10) + 5.0
+    assert abs(cwc2 - no_switch_wc) < 1e-9, "restart is not charged a separate switch overhead"
     # no-cache costs MORE than with-cache (caching saves money even with the switch overhead)
     assert cnc2 > cwc2, (
         "no-cache total > with-cache total (caching always saves, even with switch overhead)"
