@@ -161,6 +161,56 @@ async fn two_requests_form_a_valid_two_link_chain() {
     let _ = std::fs::remove_file(&db_path);
 }
 
+/// `POST /v1/messages/count_tokens` must be routed through to the upstream and its response
+/// relayed byte-for-byte.  Mutation: remove the route registration and the assert below 404s.
+#[tokio::test]
+async fn count_tokens_is_proxied_to_upstream_and_relayed() {
+    // Mock upstream that also answers count_tokens.
+    let router = axum::Router::new()
+        .route(
+            "/v1/messages",
+            post(|| async {
+                let body: Value = serde_json::from_str(CANNED_RESPONSE).unwrap();
+                axum::Json(body)
+            }),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(|| async { axum::Json(json!({"input_tokens": 77})) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let upstream = format!("http://{addr}");
+    let (proxy, db_path) = spawn_proxy(&upstream).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{proxy}/v1/messages/count_tokens"))
+        .header("x-api-key", "test")
+        .json(&json!({"model": "claude-3-haiku-20240307", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200, "count_tokens must not 404");
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["input_tokens"], 77, "upstream token count relayed");
+
+    // No receipt for a metadata call — the trace store must stay empty.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let traces = load_all_traces(&db_path).unwrap_or_default();
+    assert!(
+        traces.is_empty(),
+        "count_tokens must not write a receipt; got {} trace(s)",
+        traces.len()
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
 /// A minimal Anthropic-shaped SSE body (message_start … message_stop).
 const SSE_RESPONSE: &str = concat!(
     "event: message_start\n",
