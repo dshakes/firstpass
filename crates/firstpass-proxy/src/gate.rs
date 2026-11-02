@@ -340,6 +340,16 @@ fn validate_tool_args_against_tools(
         {
             return schema_violation(args, schema, "args");
         }
+        // OpenAI Responses format: {"type":"function","name":"...","parameters":{...}}.
+        // `tool_name_is_known` already accepts this shape by its top-level `name`, so without this
+        // branch a known tool would skip schema validation entirely — fail-open.
+        if let (Some(n), Some(schema)) = (
+            tool.get("name").and_then(serde_json::Value::as_str),
+            tool.get("parameters"),
+        ) && n == name
+        {
+            return schema_violation(args, schema, "args");
+        }
         // OpenAI format: {"type":"function","function":{"name":"...","parameters":{...}}}
         if let Some(func) = tool.get("function")
             && let (Some(n), Some(schema)) = (
@@ -1507,6 +1517,63 @@ mod tests {
         assert!(
             r.reason.as_deref().is_some_and(|s| s.contains("search")),
             "reason must name the failing tool"
+        );
+    }
+
+    /// A `/v1/responses` request, routed exactly as the handler routes it (Responses → Chat body →
+    /// `parse_openai_request`), has its `function_call` arguments checked against the Responses
+    /// tool's `parameters`: bad args Fail, good args Pass.
+    #[tokio::test]
+    async fn tool_args_valid_checks_responses_function_call_args() {
+        let responses_req = serde_json::json!({
+            "model": "gpt-5.5", "input": "weather?", "stream": true,
+            "tools": [{ "type": "function", "name": "get_weather", "parameters": {
+                "type": "object", "required": ["city"],
+                "properties": { "city": { "type": "string" } } } }],
+        });
+        let chat = crate::responses::request_to_chat(&responses_req).to_string();
+        let req = crate::proxy::parse_openai_request(chat.as_bytes(), true).unwrap();
+        let resp = |args: &str| ModelResponse {
+            raw: serde_json::json!({ "choices": [{ "message": { "role": "assistant",
+                "content": null, "tool_calls": [{ "id": "call_1", "type": "function",
+                "function": { "name": "get_weather", "arguments": args } }] } }] }),
+            ..tool_use_resp()
+        };
+        let bad = ToolArgsValidGate
+            .evaluate(&req, &resp(r#"{"town":"Paris"}"#))
+            .await;
+        assert_eq!(bad.verdict, Verdict::Fail, "{:?}", bad.reason);
+        let good = ToolArgsValidGate
+            .evaluate(&req, &resp(r#"{"city":"Paris"}"#))
+            .await;
+        assert_eq!(good.verdict, Verdict::Pass, "{:?}", good.reason);
+    }
+
+    /// A tool declared in the flat Responses shape (`{type, name, parameters}`) is schema-checked,
+    /// not waved through: `tool_name_is_known` accepts it by name, so skipping the schema would be
+    /// fail-open.
+    #[tokio::test]
+    async fn tool_args_valid_checks_flat_responses_tool_schema() {
+        let req = ModelRequest {
+            tools: serde_json::json!([{ "type": "function", "name": "search", "parameters": {
+                "type": "object", "required": ["q"], "properties": { "q": { "type": "string" } } } }]),
+            ..tool_req_with_schema()
+        };
+        let bad = ModelResponse {
+            raw: serde_json::json!({ "content": [{ "type": "tool_use", "id": "t1",
+                "name": "search", "input": {} }] }),
+            ..tool_use_resp()
+        };
+        assert_eq!(
+            ToolArgsValidGate.evaluate(&req, &bad).await.verdict,
+            Verdict::Fail
+        );
+        assert_eq!(
+            ToolArgsValidGate
+                .evaluate(&req, &tool_use_resp())
+                .await
+                .verdict,
+            Verdict::Pass
         );
     }
 

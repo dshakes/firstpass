@@ -2602,7 +2602,7 @@ async fn handle_enforce(
             .await;
             let _ = tx.send(out);
         });
-        return sse_keepalive_response(rx, Box::new(anthropic_sse_from_message));
+        return sse_keepalive_response(rx, Box::new(anthropic_sse_from_message), sse_error_event);
     }
     match enforce_pipeline(
         state,
@@ -3461,10 +3461,12 @@ const SSE_KEEPALIVE_EVERY: Duration = Duration::from_secs(5);
 ///
 /// `format_message` converts the gated result `Value` to the dialect-appropriate SSE frame
 /// string: pass [`anthropic_sse_from_message`] for Anthropic clients,
-/// [`openai_sse_from_message`] for OpenAI clients.
+/// [`openai_sse_from_message`] for OpenAI clients. `format_error` renders a pipeline failure in
+/// the same dialect — a Responses client waits for `response.failed`, not an Anthropic `error`.
 fn sse_keepalive_response(
     rx: tokio::sync::oneshot::Receiver<Result<Value, ProxyError>>,
     format_message: Box<dyn Fn(&Value) -> String + Send>,
+    format_error: fn(&ProxyError) -> String,
 ) -> Response {
     let mut ticks = tokio::time::interval(SSE_KEEPALIVE_EVERY);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3473,6 +3475,7 @@ fn sse_keepalive_response(
         rx: Some(rx),
         ticks,
         format_message,
+        format_error,
     };
     (
         axum::http::StatusCode::OK,
@@ -3493,6 +3496,8 @@ struct KeepaliveStream {
     ticks: tokio::time::Interval,
     /// Converts the served result `Value` to the caller's dialect SSE frames.
     format_message: Box<dyn Fn(&Value) -> String + Send>,
+    /// Converts a pipeline failure to the caller's dialect SSE frames.
+    format_error: fn(&ProxyError) -> String,
 }
 
 impl futures_core::Stream for KeepaliveStream {
@@ -3509,8 +3514,8 @@ impl futures_core::Stream for KeepaliveStream {
         if let Poll::Ready(out) = std::pin::Pin::new(rx).poll(cx) {
             let frame = match out {
                 Ok(Ok(message)) => (self.format_message)(&message),
-                Ok(Err(e)) => sse_error_event(&e),
-                Err(_) => sse_error_event(&ProxyError::Internal(
+                Ok(Err(e)) => (self.format_error)(&e),
+                Err(_) => (self.format_error)(&ProxyError::Internal(
                     "enforce pipeline task dropped".to_owned(),
                 )),
             };
@@ -5423,6 +5428,7 @@ async fn handle_enforce_openai(
         return sse_keepalive_response(
             rx,
             Box::new(move |v| openai_sse_from_message(v, include_usage)),
+            sse_error_event,
         );
     }
     match enforce_pipeline_openai(
@@ -5642,10 +5648,14 @@ async fn chat_completions(
 /// Completions path so the gate, ladder, budget, and receipt are the *same* ones, not a parallel
 /// implementation that could drift.
 ///
-/// Falls back to the OpenAI observe passthrough for anything it cannot gate faithfully — a
-/// streaming request (enforce is inherently buffered: the gate must see the whole candidate), or
-/// no matching enforce route. That is the same fallback `/v1/chat/completions` already uses, so a
-/// request that cannot be verified is still served rather than refused.
+/// A `stream: true` request on an enforce route is buffered like `/v1/chat/completions` streaming:
+/// the ladder runs to a gated answer behind SSE keepalives, then the served answer is re-emitted as
+/// a Responses event stream ([`crate::responses::sse_from_response`]). Not token-by-token — the
+/// gate has to see the whole candidate before anything reaches the client.
+///
+/// Falls back to the OpenAI observe passthrough for anything it cannot gate faithfully — content
+/// the translation cannot represent, or no matching enforce route. Passthrough relays the ORIGINAL
+/// body to the upstream's Responses path, so a streaming client still gets Responses events.
 async fn responses(
     State(state): State<AppState>,
     Extension(TenantId(tenant)): Extension<TenantId>,
@@ -5653,21 +5663,6 @@ async fn responses(
     body: Bytes,
 ) -> Response {
     let mut session_header = header_session(&headers, &state.config.prompt_salt);
-
-    // Streaming cannot be gated, so it never enters the enforce path. Passing the ORIGINAL body
-    // through matters: the upstream speaks Responses too, and handing it a translated body would
-    // return Chat-shaped events to a client waiting for Responses ones.
-    if is_stream_request(&body) {
-        return observe_passthrough_openai_path(
-            state,
-            headers,
-            body,
-            session_header,
-            tenant,
-            crate::upstream::OPENAI_RESPONSES_PATH,
-        )
-        .await;
-    }
 
     let Ok(parsed) = serde_json::from_slice::<Value>(&body) else {
         return observe_passthrough_openai_path(
@@ -5723,6 +5718,35 @@ async fn responses(
                     Dialect::Openai,
                 )
             {
+                if is_stream_request(&body) {
+                    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
+                    tokio::spawn(async move {
+                        let out = enforce_pipeline_openai_as(
+                            &state,
+                            &headers,
+                            &chat_body,
+                            &body,
+                            "openai.responses",
+                            features,
+                            &route,
+                            route_ix,
+                            session_header,
+                            tenant,
+                            routing_mode,
+                        )
+                        .await;
+                        let _ = tx.send(out);
+                    });
+                    return sse_keepalive_response(
+                        rx,
+                        Box::new(|chat| {
+                            crate::responses::sse_from_response(
+                                &crate::responses::response_from_chat(chat),
+                            )
+                        }),
+                        responses_sse_error,
+                    );
+                }
                 return match enforce_pipeline_openai_as(
                     &state,
                     &headers,
@@ -5753,6 +5777,12 @@ async fn responses(
         crate::upstream::OPENAI_RESPONSES_PATH,
     )
     .await
+}
+
+/// A ladder failure on a streaming Responses request, as the `response.failed` event a Responses
+/// client (OpenAI SDK, Codex) treats as terminal. Client-safe message only, as [`sse_error_event`].
+fn responses_sse_error(e: &ProxyError) -> String {
+    crate::responses::sse_failed(&format!("resp_{}", Uuid::now_v7()), &e.client_message())
 }
 
 #[cfg(test)]
@@ -8298,6 +8328,7 @@ mod tests {
             rx: Some(rx),
             ticks,
             format_message: Box::new(anthropic_sse_from_message),
+            format_error: sse_error_event,
         };
         /// One poll of the stream: `Some(item)` if ready, `None` if pending right now.
         async fn next(

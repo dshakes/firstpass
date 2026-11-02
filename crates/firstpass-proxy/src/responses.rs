@@ -13,14 +13,18 @@
 //! pipeline unchanged, and converts the reply back. One translation layer instead of a parallel
 //! implementation that could drift on the parts that matter.
 //!
+//! ## Streaming
+//!
+//! `enforce` is inherently buffered — the gate has to see the whole candidate before it can judge
+//! it — so a `stream: true` request runs the ladder to a gated answer and [`sse_from_response`]
+//! then re-emits that answer as a Responses event stream: one delta per text part / argument
+//! string, not token-by-token.
+//!
 //! ## What it does not do yet
 //!
-//! Streaming. `enforce` is inherently buffered — the gate has to see the whole candidate before it
-//! can judge it — so a streaming Responses request is served through the observe passthrough, the
-//! same fallback the Chat Completions path uses for a request it cannot gate faithfully. Reasoning
-//! items, tool-call round trips, and stateful `previous_response_id` threading are also out of
-//! scope here; they are passed through where harmless and otherwise left alone rather than
-//! half-translated.
+//! Reasoning items and stateful `previous_response_id` threading. A request carrying either takes
+//! the passthrough (see [`has_untranslatable_content`]); the enforce path runs over Chat
+//! Completions, which has no reasoning items, so a served answer never contains one.
 
 use serde_json::{Map, Value};
 
@@ -353,6 +357,11 @@ pub fn response_from_chat(chat: &Value) -> Value {
     let mut resp = Map::new();
     resp.insert("id".to_owned(), Value::String(id.to_owned()));
     resp.insert("object".to_owned(), Value::String("response".to_owned()));
+    // Required by the SDK's `Response` type; Chat's `created` is the same unix-seconds instant.
+    resp.insert(
+        "created_at".to_owned(),
+        chat.get("created").cloned().unwrap_or(Value::from(0)),
+    );
     resp.insert("model".to_owned(), Value::String(model.to_owned()));
 
     // A reply may carry text, tool calls, or both. Dropping the tool calls here would hand an
@@ -432,9 +441,366 @@ pub fn response_from_chat(chat: &Value) -> Value {
     Value::Object(resp)
 }
 
+/// Append one `event: <type>` SSE frame: `data` (a JSON object) stamped with `type` and the next
+/// `sequence_number`.
+fn push_event(out: &mut String, seq: &mut u64, kind: &str, data: Value) {
+    let mut data = match data {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    };
+    data.insert("type".to_owned(), Value::String(kind.to_owned()));
+    data.insert("sequence_number".to_owned(), Value::from(*seq));
+    *seq += 1;
+    out.push_str("event: ");
+    out.push_str(kind);
+    out.push_str("\ndata: ");
+    out.push_str(&Value::Object(data).to_string());
+    out.push_str("\n\n");
+}
+
+/// The `response` carried by `response.created` / `response.in_progress`: the final object's
+/// identity (`id`, `model`, `created_at`) with nothing generated yet. The SDK's stream accumulator
+/// raises if a lifecycle event's `response.id` differs from the one `response.created` announced.
+fn in_progress_snapshot(resp: &Value) -> Value {
+    let mut snap = resp.clone();
+    if let Some(m) = snap.as_object_mut() {
+        m.insert("status".to_owned(), "in_progress".into());
+        m.insert("output".to_owned(), Value::Array(Vec::new()));
+        m.insert("output_text".to_owned(), "".into());
+        m.insert("usage".to_owned(), Value::Null);
+        m.remove("incomplete_details");
+    }
+    snap
+}
+
+/// Re-emit a complete Responses object (from [`response_from_chat`]) as the Responses SSE event
+/// sequence the OpenAI SDK's stream accumulator and Codex's `process_responses_event` parse.
+///
+/// `response.created` → `response.in_progress` → per output item: `response.output_item.added`;
+/// for a `message`, per content part `response.content_part.added` → `response.output_text.delta`
+/// → `response.output_text.done` → `response.content_part.done`; for a `function_call`,
+/// `response.function_call_arguments.delta` → `.done`; then `response.output_item.done` → finally
+/// `response.completed` (`response.incomplete` for a truncated answer) carrying the full object
+/// with `usage`. Event item ids are the final object's ids: the SDK raises if an item's identity
+/// changes between `added`, `done`, and `completed`.
+///
+/// Any other item type (none today — the Chat path has no reasoning items) passes through as an
+/// `output_item.added` / `.done` pair rather than being dropped.
+#[must_use]
+pub fn sse_from_response(resp: &Value) -> String {
+    use serde_json::json;
+    let mut out = String::new();
+    let mut seq = 0_u64;
+    let snapshot = in_progress_snapshot(resp);
+    for kind in ["response.created", "response.in_progress"] {
+        push_event(&mut out, &mut seq, kind, json!({ "response": snapshot }));
+    }
+    let items = resp
+        .get("output")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    for (output_index, item) in items.iter().enumerate() {
+        let item_id = item.get("id").cloned().unwrap_or(Value::Null);
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        // The `added` item is the in-progress shell; its content arrives in the events after it.
+        let mut shell = item.clone();
+        if let Some(m) = shell.as_object_mut() {
+            match kind {
+                "message" => {
+                    m.insert("content".to_owned(), json!([]));
+                }
+                "function_call" => {
+                    m.insert("arguments".to_owned(), "".into());
+                }
+                _ => {}
+            }
+            if m.contains_key("status") {
+                m.insert("status".to_owned(), "in_progress".into());
+            }
+        }
+        push_event(
+            &mut out,
+            &mut seq,
+            "response.output_item.added",
+            json!({ "output_index": output_index, "item": shell }),
+        );
+        match kind {
+            "message" => {
+                let parts = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map_or(&[][..], Vec::as_slice);
+                for (content_index, part) in parts.iter().enumerate() {
+                    let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
+                    let mut empty = part.clone();
+                    if let Some(m) = empty.as_object_mut() {
+                        m.insert("text".to_owned(), "".into());
+                    }
+                    let at = |mut extra: Value| {
+                        if let Some(m) = extra.as_object_mut() {
+                            m.insert("item_id".to_owned(), item_id.clone());
+                            m.insert("output_index".to_owned(), output_index.into());
+                            m.insert("content_index".to_owned(), content_index.into());
+                        }
+                        extra
+                    };
+                    let kinds_and_data = [
+                        ("response.content_part.added", json!({ "part": empty })),
+                        (
+                            "response.output_text.delta",
+                            json!({ "delta": text, "logprobs": [] }),
+                        ),
+                        (
+                            "response.output_text.done",
+                            json!({ "text": text, "logprobs": [] }),
+                        ),
+                        ("response.content_part.done", json!({ "part": part })),
+                    ];
+                    for (k, data) in kinds_and_data {
+                        // An empty part has no delta to send; `done` still carries its (empty) text.
+                        if k == "response.output_text.delta" && text.is_empty() {
+                            continue;
+                        }
+                        push_event(&mut out, &mut seq, k, at(data));
+                    }
+                }
+            }
+            "function_call" => {
+                let args = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                for (k, data) in [
+                    (
+                        "response.function_call_arguments.delta",
+                        json!({ "delta": args }),
+                    ),
+                    (
+                        "response.function_call_arguments.done",
+                        json!({ "arguments": args }),
+                    ),
+                ] {
+                    let mut data = data;
+                    if let Some(m) = data.as_object_mut() {
+                        m.insert("item_id".to_owned(), item_id.clone());
+                        m.insert("output_index".to_owned(), output_index.into());
+                    }
+                    push_event(&mut out, &mut seq, k, data);
+                }
+            }
+            _ => {}
+        }
+        push_event(
+            &mut out,
+            &mut seq,
+            "response.output_item.done",
+            json!({ "output_index": output_index, "item": item }),
+        );
+    }
+    let terminal = if resp.get("status").and_then(Value::as_str) == Some("incomplete") {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
+    push_event(&mut out, &mut seq, terminal, json!({ "response": resp }));
+    out
+}
+
+/// A Responses stream that failed before any answer could be served (the ladder exhausted, a
+/// budget tripped): `response.created` then `response.failed`, both under `id`. The SDK requires
+/// `response.created` first; Codex reads `response.error.message` from `response.failed`.
+#[must_use]
+pub fn sse_failed(id: &str, message: &str) -> String {
+    let mut out = String::new();
+    let mut seq = 0_u64;
+    let base = serde_json::json!({
+        "id": id, "object": "response", "created_at": 0, "model": "", "output": [],
+        "usage": null, "error": null,
+    });
+    let snapshot = in_progress_snapshot(&base);
+    push_event(
+        &mut out,
+        &mut seq,
+        "response.created",
+        serde_json::json!({ "response": snapshot }),
+    );
+    let mut failed = base;
+    failed["status"] = "failed".into();
+    failed["error"] = serde_json::json!({ "code": "server_error", "message": message });
+    push_event(
+        &mut out,
+        &mut seq,
+        "response.failed",
+        serde_json::json!({ "response": failed }),
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Split an SSE body into its `data` objects, asserting each frame's `event:` line names the
+    /// same type as its payload and that `sequence_number` counts 0, 1, 2, … with no gap.
+    fn frames(sse: &str) -> Vec<Value> {
+        let out: Vec<Value> = sse
+            .split("\n\n")
+            .filter(|f| !f.is_empty())
+            .map(|f| {
+                let (ev, data) = f.split_once('\n').unwrap();
+                let v: Value = serde_json::from_str(data.strip_prefix("data: ").unwrap()).unwrap();
+                assert_eq!(ev.strip_prefix("event: "), v["type"].as_str());
+                v
+            })
+            .collect();
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(v["sequence_number"], i, "{v}");
+        }
+        out
+    }
+
+    fn types(events: &[Value]) -> Vec<&str> {
+        events.iter().map(|e| e["type"].as_str().unwrap()).collect()
+    }
+
+    fn chat(content: Value, tool_calls: Option<Value>) -> Value {
+        let mut msg = serde_json::json!({ "role": "assistant", "content": content });
+        if let Some(tc) = tool_calls {
+            msg["tool_calls"] = tc;
+        }
+        serde_json::json!({
+            "id": "chatcmpl-1", "created": 1_700_000_000, "model": "openai/gpt-5.5",
+            "choices": [{ "index": 0, "message": msg, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18 },
+        })
+    }
+
+    fn call() -> Value {
+        serde_json::json!([{ "id": "call_1", "type": "function",
+            "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" } }])
+    }
+
+    const TEXT_EVENTS: [&str; 6] = [
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+    ];
+    const CALL_EVENTS: [&str; 4] = [
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+    ];
+
+    fn expected(items: &[&[&str]]) -> Vec<String> {
+        let mut v = vec!["response.created", "response.in_progress"];
+        for i in items {
+            v.extend_from_slice(i);
+        }
+        v.push("response.completed");
+        v.into_iter().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn text_response_streams_the_exact_event_sequence() {
+        let resp = response_from_chat(&chat(Value::from("hello world"), None));
+        let ev = frames(&sse_from_response(&resp));
+        assert_eq!(types(&ev), expected(&[&TEXT_EVENTS]));
+        // Lifecycle events share the final response id; created/in_progress carry no output yet.
+        for e in [&ev[0], &ev[1]] {
+            assert_eq!(e["response"]["id"], "chatcmpl-1");
+            assert_eq!(e["response"]["status"], "in_progress");
+            assert_eq!(e["response"]["output"], serde_json::json!([]));
+        }
+        let item_id = ev[2]["item"]["id"].clone();
+        assert_eq!(item_id, "msg_chatcmpl-1");
+        assert_eq!(ev[2]["item"]["content"], serde_json::json!([]));
+        for e in &ev[3..7] {
+            assert_eq!(e["item_id"], item_id);
+            assert_eq!(e["output_index"], 0);
+            assert_eq!(e["content_index"], 0);
+        }
+        assert_eq!(ev[4]["delta"], "hello world");
+        assert_eq!(ev[5]["text"], "hello world");
+        assert_eq!(ev[6]["part"]["text"], "hello world");
+        assert_eq!(ev[7]["item"], resp["output"][0]);
+        let done = &ev[8]["response"];
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["created_at"], 1_700_000_000);
+        assert_eq!(
+            done["usage"],
+            serde_json::json!({ "input_tokens": 11, "output_tokens": 7, "total_tokens": 18 })
+        );
+        assert_eq!(done["output"][0]["content"][0]["text"], "hello world");
+    }
+
+    #[test]
+    fn function_call_response_streams_its_arguments() {
+        let resp = response_from_chat(&chat(Value::Null, Some(call())));
+        let ev = frames(&sse_from_response(&resp));
+        assert_eq!(types(&ev), expected(&[&CALL_EVENTS]));
+        let added = &ev[2]["item"];
+        assert_eq!(added["type"], "function_call");
+        assert_eq!(added["call_id"], "call_1");
+        assert_eq!(added["name"], "get_weather");
+        assert_eq!(added["arguments"], "");
+        for e in &ev[3..5] {
+            assert_eq!(e["item_id"], added["id"]);
+            assert_eq!(e["output_index"], 0);
+        }
+        assert_eq!(ev[3]["delta"], r#"{"city":"Paris"}"#);
+        assert_eq!(ev[4]["arguments"], r#"{"city":"Paris"}"#);
+        assert_eq!(ev[5]["item"]["arguments"], r#"{"city":"Paris"}"#);
+        assert_eq!(ev[6]["response"]["usage"]["total_tokens"], 18);
+    }
+
+    #[test]
+    fn text_then_function_call_use_consecutive_output_indexes() {
+        let resp = response_from_chat(&chat(Value::from("checking"), Some(call())));
+        let ev = frames(&sse_from_response(&resp));
+        assert_eq!(types(&ev), expected(&[&TEXT_EVENTS, &CALL_EVENTS]));
+        assert_eq!(ev[2]["output_index"], 0);
+        assert_eq!(ev[8]["output_index"], 1);
+        assert_eq!(ev[8]["item"]["type"], "function_call");
+        let done = &ev[12]["response"];
+        assert_eq!(done["output"].as_array().unwrap().len(), 2);
+        assert_eq!(done["usage"]["input_tokens"], 11);
+        assert_eq!(done["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn truncated_response_ends_with_incomplete_not_completed() {
+        let mut c = chat(Value::from("cut"), None);
+        c["choices"][0]["finish_reason"] = "length".into();
+        let ev = frames(&sse_from_response(&response_from_chat(&c)));
+        assert_eq!(ev.last().unwrap()["type"], "response.incomplete");
+    }
+
+    #[test]
+    fn non_message_items_pass_through_as_added_and_done() {
+        let resp = serde_json::json!({ "id": "r", "status": "completed", "output": [
+            { "type": "reasoning", "id": "rs_1", "summary": [] } ] });
+        let ev = frames(&sse_from_response(&resp));
+        assert_eq!(
+            types(&ev),
+            expected(&[&["response.output_item.added", "response.output_item.done"]])
+        );
+        assert_eq!(ev[3]["item"]["id"], "rs_1");
+    }
+
+    #[test]
+    fn failure_is_created_then_failed_under_one_id() {
+        let ev = frames(&sse_failed("resp_x", "all rungs failed"));
+        assert_eq!(types(&ev), ["response.created", "response.failed"]);
+        assert_eq!(ev[0]["response"]["id"], "resp_x");
+        assert_eq!(ev[1]["response"]["id"], "resp_x");
+        assert_eq!(ev[1]["response"]["status"], "failed");
+        assert_eq!(ev[1]["response"]["error"]["code"], "server_error");
+        assert_eq!(ev[1]["response"]["error"]["message"], "all rungs failed");
+    }
 
     #[test]
     fn the_single_turn_string_shorthand_becomes_a_user_message() {
