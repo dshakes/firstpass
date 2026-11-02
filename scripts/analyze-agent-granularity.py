@@ -442,7 +442,7 @@ def escalate_pin(
     price_top_in: float,
 ) -> tuple[bool, float, float]:
     """(resolved, cost_with_cache, cost_no_cache).
-    cost_with_cache includes switch overhead; cost_no_cache does not.
+    Restart semantics: cost_with_cache = cheap spend up to tau + the top model's recorded run.
     """
     cheap_res, cheap_cost, cheap_steps = row["runs"][0]
     top_res, top_cost, top_steps = row["runs"][-1]
@@ -807,15 +807,12 @@ def _self_check() -> None:
     assert cnc2 > cwc2, (
         "no-cache total > with-cache total (caching always saves, even with switch overhead)"
     )
-    # switch overhead is the entire delta between cwc2 and no-switch cost
-    assert abs((cwc2 - no_switch_wc) - overhead) < 1e-9, (
-        "overhead is exactly the cache-miss cost"
-    )
-    # tau=-1 boundary: treated as tau=0, so overhead = I0 × price_top (no cheap steps accumulated)
+    # (The handoff re-read `overhead` is a cost-only illustration and is not part of cwc2.)
+    # tau=-1 boundary: escalate before any cheap step, so the policy is always-top exactly.
     _, cwc_neg1, _ = escalate_pin(row, tau=-1.0, I0=1000, delta=300, price_top_in=15.0)
     overhead_at_0 = switch_overhead_usd(0, 15.0, 1000, 300)  # I0 × price_top
     assert overhead_at_0 == 1000 * 15.0 / 1e6, "tau=0 overhead = I0 × price_top"
-    expected_tau_neg1 = 0.0 + overhead_at_0 + 5.0  # 0 partial cheap + overhead + top
+    expected_tau_neg1 = 0.0 + 5.0  # restart at once: no cheap spend + the top model's own run
     assert abs(cwc_neg1 - expected_tau_neg1) < 1e-9, (
         f"tau=-1: {cwc_neg1} vs {expected_tau_neg1}"
     )
