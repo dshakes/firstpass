@@ -103,6 +103,20 @@ pub fn verify_chain<T: Serialize + Chained>(records: &[T], genesis: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An auditor re-derives each hash from the STORED json text. serde_json's default float
+    /// parser can land one ulp off the writer's f64 (real receipts carry costs like
+    /// 0.00023999999999999998), so the re-derived hash differed and `firstpass verify` flagged an
+    /// untouched chain. The `float_roundtrip` feature on the workspace dependency fixes it.
+    #[test]
+    fn float_text_round_trip_is_exact() {
+        for n in 1..20_000_u32 {
+            let x = f64::from(n) * 20.0 / 1e6 * 3.0 + f64::from(n) / 1e6 * 5.0;
+            let text = serde_json::to_string(&x).unwrap();
+            let back: f64 = serde_json::from_str(&text).unwrap();
+            assert_eq!(x.to_bits(), back.to_bits(), "{text}");
+        }
+    }
     use serde::Serialize;
     use serde_json::json;
 

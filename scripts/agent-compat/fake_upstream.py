@@ -212,6 +212,223 @@ def dump_log(path=None):
 
 
 # ---------------------------------------------------------------------------
+# Enforce-mode script (FAKE_SCRIPT=enforce). Deterministic, per-model behaviour so a real CLI
+# drives a real escalation through the proxy's gates:
+#   * cheap model (haiku / *-mini): its FIRST reply is bad -- a tool_use with args that violate
+#     the declared schema when the request declares tools (Claude Code), else an empty reply
+#     (aider). Every later cheap reply is valid.
+#   * top model: always valid, unless FAKE_TOP_FAILS=1 (negative control for the harness).
+#   * a request whose last message is a tool_result gets plain text from any model.
+# The chosen behaviour is stamped on the request log entry as "scripted".
+# ---------------------------------------------------------------------------
+
+SCRIPT_ON = os.environ.get("FAKE_SCRIPT") == "enforce"
+TOP_FAILS = os.environ.get("FAKE_TOP_FAILS") == "1"
+_cheap_seen = {"anthropic": 0, "openai": 0}
+
+
+def is_cheap(model):
+    return "haiku" in model or "mini" in model
+
+
+def declared_tools(parsed):
+    """[(name, schema)] from an Anthropic (input_schema) or OpenAI (function.parameters) body."""
+    out = []
+    for t in parsed.get("tools") or []:
+        if "function" in t:
+            out.append(
+                (t["function"].get("name"), t["function"].get("parameters") or {})
+            )
+        else:
+            out.append((t.get("name"), t.get("input_schema") or {}))
+    return out
+
+
+def valid_args(schema):
+    return {k: "echo fp-enforce-ok" for k in schema.get("required", [])}
+
+
+def pick_tool(tools):
+    for name, schema in tools:
+        if name == "Bash" and schema.get("required"):
+            return name, schema
+    for name, schema in tools:
+        if schema.get("required"):
+            return name, schema
+    return None, {}
+
+
+def last_is_tool_result(parsed):
+    msgs = parsed.get("messages") or []
+    if not msgs:
+        return False
+    last = msgs[-1]
+    if last.get("role") == "tool":
+        return True
+    c = last.get("content")
+    return isinstance(c, list) and any(b.get("type") == "tool_result" for b in c)
+
+
+def decide(api, parsed):
+    """Return (scripted-label, kind, tool_name, tool_args). kind: text|empty|tool."""
+    model = parsed.get("model", "")
+    if last_is_tool_result(parsed):
+        return "text-after-tool-result", "text", None, None
+    name, schema = pick_tool(declared_tools(parsed))
+    bad = False
+    if is_cheap(model):
+        _cheap_seen[api] += 1
+        bad = _cheap_seen[api] == 1
+    elif TOP_FAILS:
+        bad = True
+    tag = "cheap" if is_cheap(model) else "top"
+    if name:
+        if bad:
+            return f"{tag}-bad-tool-args", "tool", name, {}
+        return f"{tag}-valid-tool", "tool", name, valid_args(schema)
+    if bad:
+        return f"{tag}-empty", "empty", None, None
+    return f"{tag}-text", "text", None, None
+
+
+def scripted_anthropic(parsed, kind, name, args, stream):
+    model = parsed.get("model", "claude")
+    if kind == "tool":
+        blocks = [{"type": "tool_use", "id": "toolu_fp1", "name": name, "input": args}]
+        stop = "tool_use"
+    elif kind == "empty":
+        blocks, stop = [{"type": "text", "text": ""}], "end_turn"
+    else:
+        blocks, stop = (
+            [{"type": "text", "text": "Scripted reply from " + model}],
+            "end_turn",
+        )
+    msg = {
+        "id": "msg_script",
+        "type": "message",
+        "role": "assistant",
+        "content": blocks,
+        "model": model,
+        "stop_reason": stop,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 20, "output_tokens": 8},
+    }
+    if not stream:
+        return json.dumps(msg)
+
+    def ev(t, d):
+        return f"event: {t}\ndata: {json.dumps(d)}\n\n"
+
+    out = ev(
+        "message_start",
+        {"type": "message_start", "message": dict(msg, content=[], stop_reason=None)},
+    )
+    for i, b in enumerate(blocks):
+        if b["type"] == "tool_use":
+            out += ev(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": i,
+                    "content_block": dict(b, input={}),
+                },
+            )
+            out += ev(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": i,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(b["input"]),
+                    },
+                },
+            )
+        else:
+            out += ev(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": i,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+            if b["text"]:
+                out += ev(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": i,
+                        "delta": {"type": "text_delta", "text": b["text"]},
+                    },
+                )
+        out += ev("content_block_stop", {"type": "content_block_stop", "index": i})
+    out += ev(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": None},
+            "usage": {"output_tokens": 8},
+        },
+    )
+    return out + ev("message_stop", {"type": "message_stop"})
+
+
+def scripted_openai(parsed, kind, name, args, stream):
+    model = parsed.get("model", "gpt")
+    message = {"role": "assistant", "content": None}
+    finish = "stop"
+    if kind == "tool":
+        message["tool_calls"] = [
+            {
+                "id": "call_fp1",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)},
+            }
+        ]
+        finish = "tool_calls"
+    elif kind == "empty":
+        message["content"] = ""
+    else:
+        message["content"] = "Scripted reply from " + model
+    if not stream:
+        return json.dumps(
+            {
+                "id": "chatcmpl-script",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": model,
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 8,
+                    "total_tokens": 28,
+                },
+            }
+        )
+    delta = dict(message)
+    if "tool_calls" in delta:
+        delta["tool_calls"] = [dict(tc, index=0) for tc in delta["tool_calls"]]
+
+    def chunk(d, f):
+        return (
+            "data: "
+            + json.dumps(
+                {
+                    "id": "chatcmpl-script",
+                    "object": "chat.completion.chunk",
+                    "created": 1700000000,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": d, "finish_reason": f}],
+                }
+            )
+            + "\n\n"
+        )
+
+    return chunk(delta, None) + chunk({}, finish) + "data: [DONE]\n\n"
+
+
+# ---------------------------------------------------------------------------
 # Request handler
 # ---------------------------------------------------------------------------
 
@@ -310,9 +527,26 @@ class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
             "headers": redact_headers(dict(self.headers)),
             "body_shape": body_shape(raw),
         }
+        path = self.path.split("?")[0]
+        scripted = None
+        if SCRIPT_ON and path in ("/v1/messages", "/v1/chat/completions"):
+            try:
+                parsed = json.loads(raw)
+                api = "anthropic" if path == "/v1/messages" else "openai"
+                with _lock:  # decide() mutates the cheap-reply counter
+                    label, kind, tname, targs = decide(api, parsed)
+                entry["scripted"] = label
+                scripted = (api, parsed, kind, tname, targs)
+            except (ValueError, AttributeError):
+                pass
         record(entry)
 
-        path = self.path.split("?")[0]
+        if scripted:
+            api, parsed, kind, tname, targs = scripted
+            build = scripted_anthropic if api == "anthropic" else scripted_openai
+            body = build(parsed, kind, tname, targs, is_stream)
+            (self.send_sse if is_stream else self.send_json)(200, body)
+            return
 
         if path == "/v1/messages":
             if is_stream:
