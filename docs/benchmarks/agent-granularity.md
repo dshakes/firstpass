@@ -140,7 +140,8 @@ P3-pool: fitted eps per fold = [0.2, 0.05]; repo_router picks cheapest within ep
 pre-registered rule tests **non-inferiority at 1pp**: lb=−0.050 < −0.01, so non-inferiority is
 not shown. Both are reported; they answer different questions.
 
-**P3-pool vs P2** (pool-controlled comparison, pre-registered P2-vs-P3):
+**P3-pool vs P2** (pool-controlled comparison — **exploratory**: the P2-vs-P3 rule is
+pre-registered but the P3-pool arm is not; it was added after the first results, deviation #5):
 Δresolved CI lb = −0.004 ≥ −0.01 AND Δ$/inst CI ub = −$0.077 < −$0.01.
 Per the pre-registered "adds value" rule: **P3-pool adds value over P2** — it resolves more at
 lower cost. This is the result after fixing `repo_router` to pick the cheapest eligible model
@@ -197,7 +198,10 @@ All changes made after e848709 (pre-registration commit), before publication.
 
 ## What this means
 
-1. **P3-pool beats P2** at the pre-registered threshold: per-session selection using the repo
+1. **P3-pool beats P2** at the pre-registered threshold — an **exploratory** result (the arm was
+   added after the first results; its fitted eps differs by fold, [0.2, 0.05]; and every repo is
+   seen in both folds, so a new repo gets no evidence). It is a hypothesis for a fresh,
+   pre-registered run, not a shipped claim: per-session selection using the repo
    feature, when applied to the same 11-model pool and corrected to pick the cheapest eligible
    model, resolves more at lower cost than workload selection. The key driver is the repo
    feature identifying repos where cheap models are sufficient: the corrected router sends those
