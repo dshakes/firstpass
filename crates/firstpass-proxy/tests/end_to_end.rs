@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -42,6 +43,53 @@ async fn spawn_upstream() -> String {
         axum::serve(listener, router).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+/// One recorded Gemini upstream request: `(path_and_query, x_goog_api_key_header)`.
+type GeminiLogEntry = (String, Option<String>);
+
+/// A recording Gemini upstream: logs every request's path+query and `x-goog-api-key` header so
+/// tests can assert that the proxy forwarded the query correctly and scrubbed `?key=`.
+#[derive(Clone, Default)]
+struct GeminiRequestLog(Arc<std::sync::Mutex<Vec<GeminiLogEntry>>>);
+
+async fn recording_gemini_handler(
+    State(log): State<GeminiRequestLog>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    _body: Bytes,
+) -> Response {
+    let pq = uri
+        .path_and_query()
+        .map(|pq| pq.to_string())
+        .unwrap_or_default();
+    let key = headers
+        .get("x-goog-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    log.0.lock().unwrap().push((pq, key));
+    Json(json!({
+        "candidates": [{ "content": { "role": "model", "parts": [{ "text": "recorded" }] } }],
+        "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 3 },
+    }))
+    .into_response()
+}
+
+async fn spawn_recording_gemini_upstream() -> (String, GeminiRequestLog) {
+    let log = GeminiRequestLog::default();
+    let log_clone = log.clone();
+    let router = Router::new()
+        .route(
+            "/v1beta/models/{model_action}",
+            post(recording_gemini_handler),
+        )
+        .with_state(log_clone);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (format!("http://{addr}"), log)
 }
 
 fn requested_model(body: &Bytes) -> String {
@@ -1360,4 +1408,185 @@ async fn gemini_enforce_streaming_returns_gemini_sse() {
     verify_chain(&traces, GENESIS_HASH).unwrap();
 
     let _ = std::fs::remove_file(&db);
+}
+
+/// `?alt=sse` (and any other query params) must reach the upstream verbatim.
+/// Without this, `streamGenerateContent` returns a JSON array instead of SSE, breaking
+/// Gemini CLI streaming in observe mode.
+///
+/// Mutation check: comment out the `?{scrubbed_query}` append in `observe_passthrough_gemini`
+/// → upstream receives no query, the recorded path has no `alt=sse`, assertion fails.
+#[tokio::test]
+async fn gemini_query_alt_sse_forwarded() {
+    let (upstream, log) = spawn_recording_gemini_upstream().await;
+    let db_path = std::env::temp_dir().join(format!("firstpass-e2e-{}.db", uuid::Uuid::now_v7()));
+    let db_str = db_path.to_string_lossy().into_owned();
+    let upstream_c = upstream.clone();
+    let config = ProxyConfig::from_lookup(move |key| match key {
+        "FIRSTPASS_UPSTREAM_GEMINI" => Some(upstream_c.clone()),
+        "FIRSTPASS_DB" => Some(db_str.clone()),
+        _ => None,
+    })
+    .unwrap();
+    let (traces_store, _writer) = store::open(&db_path).unwrap();
+    let promoter = firstpass_proxy::proxy::build_promoter_async(&config)
+        .await
+        .unwrap();
+    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config)
+        .await
+        .unwrap();
+    let state = AppState {
+        config: Arc::new(config),
+        http: reqwest::Client::new(),
+        providers: ProviderRegistry::from_config(&[], &upstream, &upstream),
+        gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
+        shadow_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        paired_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        experiments: std::sync::Arc::default(),
+        guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
+        traces: traces_store,
+        adaptive: None,
+        eprocess: None,
+        bandit: None,
+        promoter,
+        verified_cache,
+        predictor: None,
+        prior: None,
+        tenant_rate_limiter: None,
+        spill: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state).unwrap()).await.unwrap();
+    });
+    let proxy = format!("http://{addr}");
+
+    // Send with ?alt=sse as real Gemini CLI does for streamGenerateContent.
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{proxy}/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
+        ))
+        .header("x-goog-api-key", "AIza-test")
+        .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Give the upstream a moment to record the request.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let recorded = log.0.lock().unwrap().clone();
+    assert!(
+        !recorded.is_empty(),
+        "upstream must have received a request"
+    );
+    let (path_and_query, _key) = &recorded[0];
+    assert!(
+        path_and_query.contains("alt=sse"),
+        "upstream must have received ?alt=sse; got path_and_query={path_and_query}"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// `?key=` is an alternate way Gemini clients pass the API key. The proxy must:
+/// 1. Forward the key value to the upstream as `x-goog-api-key` header (not in the URL).
+/// 2. NOT include the key value in the upstream URL (which could appear in server-side logs).
+/// 3. NOT store the key value in the receipt / trace.
+///
+/// Mutation check: comment out the `key_from_query` injection in `gemini_generate_content`
+/// → upstream receives no `x-goog-api-key` header (assertion 1 fails), or if `key=` is left
+/// in the scrubbed query the URL would carry it and assertion 2 fails.
+#[tokio::test]
+async fn gemini_query_key_not_in_receipt() {
+    let (upstream, log) = spawn_recording_gemini_upstream().await;
+    let db_path = std::env::temp_dir().join(format!("firstpass-e2e-{}.db", uuid::Uuid::now_v7()));
+    let db_str = db_path.to_string_lossy().into_owned();
+    let upstream_c = upstream.clone();
+    let config = ProxyConfig::from_lookup(move |key| match key {
+        "FIRSTPASS_UPSTREAM_GEMINI" => Some(upstream_c.clone()),
+        "FIRSTPASS_DB" => Some(db_str.clone()),
+        _ => None,
+    })
+    .unwrap();
+    let (traces_store, _writer) = store::open(&db_path).unwrap();
+    let promoter = firstpass_proxy::proxy::build_promoter_async(&config)
+        .await
+        .unwrap();
+    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config)
+        .await
+        .unwrap();
+    let state = AppState {
+        config: Arc::new(config),
+        http: reqwest::Client::new(),
+        providers: ProviderRegistry::from_config(&[], &upstream, &upstream),
+        gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
+        shadow_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        paired_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        experiments: std::sync::Arc::default(),
+        guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
+        traces: traces_store,
+        adaptive: None,
+        eprocess: None,
+        bandit: None,
+        promoter,
+        verified_cache,
+        predictor: None,
+        prior: None,
+        tenant_rate_limiter: None,
+        spill: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state).unwrap()).await.unwrap();
+    });
+    let proxy = format!("http://{addr}");
+
+    // Send with ?key= (no x-goog-api-key header), using a recognisable sentinel value.
+    let sentinel = "dummy-secret-q";
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{proxy}/v1beta/models/gemini-2.0-flash:generateContent?key={sentinel}"
+        ))
+        .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Give the upstream a moment to record the request.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let recorded = log.0.lock().unwrap().clone();
+    assert!(
+        !recorded.is_empty(),
+        "upstream must have received a request"
+    );
+    let (path_and_query, api_key_header) = &recorded[0];
+
+    // 1. Key must have been forwarded as x-goog-api-key header.
+    assert_eq!(
+        api_key_header.as_deref(),
+        Some(sentinel),
+        "upstream must receive the key as x-goog-api-key header"
+    );
+
+    // 2. Upstream URL must NOT contain the key value.
+    assert!(
+        !path_and_query.contains(sentinel),
+        "upstream URL must not contain the key; got path_and_query={path_and_query}"
+    );
+
+    // 3. Stored receipt must NOT contain the key value.
+    let traces = wait_for_traces(&db_path, 1).await;
+    assert!(!traces.is_empty(), "trace must be written");
+    let trace_json = serde_json::to_string(&traces[0]).unwrap();
+    assert!(
+        !trace_json.contains(sentinel),
+        "receipt must not contain the key value; trace_json snippet: {}",
+        &trace_json[..trace_json.len().min(400)]
+    );
+
+    let _ = std::fs::remove_file(&db_path);
 }

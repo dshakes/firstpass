@@ -5802,22 +5802,69 @@ fn responses_sse_error(e: &ProxyError) -> String {
 /// `model_action` and is ignored by the gate (we always buffer the full candidate).
 ///
 /// **Observe mode** — transparent relay to `FIRSTPASS_UPSTREAM_GEMINI`, streaming or buffered.
-/// The `x-goog-api-key` header is forwarded verbatim; never sent to Anthropic/OpenAI upstreams.
-/// If the client sent the key as a `?key=` query parameter it is stripped from receipts/traces
-/// before storage.
+/// Split `?key=…` out of a Gemini request query string so the API key never appears in a
+/// URL forwarded upstream (which could surface in server-side error logs via reqwest errors).
+///
+/// Returns `(key_value, scrubbed_query)`:
+/// - `key_value` — the raw `key=` value if present
+/// - `scrubbed_query` — the query string with `key=…` removed; safe to include in upstream
+///   URLs and path strings used for logging because it never contains the API key
+fn parse_gemini_query(raw: Option<&str>) -> (Option<String>, String) {
+    let Some(q) = raw.filter(|s| !s.is_empty()) else {
+        return (None, String::new());
+    };
+    let mut key_val: Option<String> = None;
+    let scrubbed: Vec<&str> = q
+        .split('&')
+        .filter(|pair| {
+            if let Some(v) = pair.strip_prefix("key=") {
+                if !v.is_empty() {
+                    key_val = Some(v.to_owned());
+                }
+                false // exclude from scrubbed query
+            } else {
+                !pair.is_empty()
+            }
+        })
+        .collect();
+    (key_val, scrubbed.join("&"))
+}
+
+/// The `x-goog-api-key` header (or `?key=` query parameter) is forwarded to the Gemini upstream
+/// only; never sent to Anthropic/OpenAI upstreams. A `?key=` value is moved to the
+/// `x-goog-api-key` header before the upstream URL is built so the key never appears in a URL
+/// that could surface in server-side logs. The key is NOT stored in receipts or traces.
 ///
 /// **Enforce mode** — translate Gemini → Chat, run the ladder/gate/escalation, translate back.
-/// Anything not representable in Chat (binary data, executableCode, …) falls through to
-/// observe passthrough.
+/// Anything not representable in Chat (binary data, executableCode, thoughtSignature on tool
+/// calls, …) falls through to observe passthrough.
 ///
 /// `countTokens` is always observe-passthrough (no gate, just relay).
 async fn gemini_generate_content(
     State(state): State<AppState>,
     Extension(TenantId(tenant)): Extension<TenantId>,
     axum::extract::Path(model_action): axum::extract::Path<String>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Strip ?key= from the forwarded URL and inject it as x-goog-api-key header so
+    // the key never appears in an upstream URL that could surface in server-side error logs.
+    let (key_from_query, scrubbed_query) = parse_gemini_query(raw_query.as_deref());
+    let headers: HeaderMap =
+        if let (Some(k), None) = (&key_from_query, headers.get("x-goog-api-key")) {
+            match axum::http::HeaderValue::from_str(k) {
+                Ok(v) => {
+                    let mut h = headers;
+                    h.insert("x-goog-api-key", v);
+                    h
+                }
+                Err(_) => headers,
+            }
+        } else {
+            headers
+        };
+
     // Split "gemini-2.0-flash:generateContent" → ("gemini-2.0-flash", "generateContent")
     let (model, action) = model_action
         .split_once(':')
@@ -5825,7 +5872,11 @@ async fn gemini_generate_content(
 
     // countTokens: metadata endpoint, always observe
     if action.starts_with("countTokens") {
-        let path = format!("/v1beta/models/{model_action}");
+        let path = if scrubbed_query.is_empty() {
+            format!("/v1beta/models/{model_action}")
+        } else {
+            format!("/v1beta/models/{model_action}?{scrubbed_query}")
+        };
         let start = Instant::now();
         let result = crate::upstream::forward_gemini_path(
             &state.http,
@@ -5879,15 +5930,14 @@ async fn gemini_generate_content(
             tenant,
             model_action,
             is_streaming,
+            scrubbed_query,
         )
         .await;
     };
 
-    session_header = session_header
-        .take()
-        .or_else(|| body_session(&parsed, &state.config.prompt_salt));
-
     // Content the translation cannot faithfully represent → observe passthrough (allow-list).
+    // body_session is NOT called here — consistent with the `responses` handler which only
+    // computes body_session on enforce routes where the body is already being parsed.
     if crate::gemini::has_untranslatable_content(&parsed) {
         return observe_passthrough_gemini(
             state,
@@ -5897,6 +5947,7 @@ async fn gemini_generate_content(
             tenant,
             model_action,
             is_streaming,
+            scrubbed_query,
         )
         .await;
     }
@@ -5910,6 +5961,10 @@ async fn gemini_generate_content(
             .route_for(&features)
             .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
         {
+            // body_session only on enforce routes — consistent with `responses` handler.
+            session_header = session_header
+                .take()
+                .or_else(|| body_session(&parsed, &state.config.prompt_salt));
             let route_ix = routing
                 .routes
                 .iter()
@@ -5986,13 +6041,16 @@ async fn gemini_generate_content(
         tenant,
         model_action,
         is_streaming,
+        scrubbed_query,
     )
     .await
 }
 
 /// Observe passthrough for Gemini `generateContent` / `streamGenerateContent`.
 /// Preserves the exact upstream path (`:generateContent` or `:streamGenerateContent`) so the
-/// upstream receives the right verb.
+/// upstream receives the right verb. The `scrubbed_query` is the request query string with any
+/// `key=` parameter removed; it is safe to forward and will never contain the API key.
+#[allow(clippy::too_many_arguments)]
 async fn observe_passthrough_gemini(
     state: AppState,
     headers: HeaderMap,
@@ -6001,8 +6059,13 @@ async fn observe_passthrough_gemini(
     tenant: String,
     model_action: String,
     is_streaming: bool,
+    scrubbed_query: String,
 ) -> Response {
-    let path = format!("/v1beta/models/{model_action}");
+    let path = if scrubbed_query.is_empty() {
+        format!("/v1beta/models/{model_action}")
+    } else {
+        format!("/v1beta/models/{model_action}?{scrubbed_query}")
+    };
     if is_streaming {
         let start = Instant::now();
         let result = crate::upstream::forward_gemini_streaming_path(

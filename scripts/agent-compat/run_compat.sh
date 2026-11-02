@@ -571,7 +571,7 @@ Forwarded verbatim on all proxy paths:
 
 | Gap | Status | Upgrade path |
 |-----|--------|-------------|
-| Gemini CLI real run | fixture only | Real \`gemini\` CLI requires GOOGLE_API_KEY; inbound protocol now supported, untranslatable parts (inlineData, executableCode) fall through as observe passthrough. |
+| Gemini CLI real run | fixture only | Real \`gemini\` CLI requires GOOGLE_API_KEY; inbound protocol supported; untranslatable parts (inlineData, executableCode) fall through. On Gemini 2.5+/3 with tool use, turns carrying \`thoughtSignature\` are observe passthrough — gemini-cli replays it in history, so most agentic turns after the first tool call on those models are not gated. |
 | cline headless auth | Env workaround needed | cline needs \`CLINE_BASE_URL\`/\`CLINE_API_KEY\` env vars; currently requires interactive setup. |
 | cursor-agent | Cursor-cloud bound | No workaround without real Cursor OAuth. |
 | codex standalone binary | Missing | Shell alias only; covered by Responses API fixture tests. |

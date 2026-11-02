@@ -217,7 +217,13 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
                 || obj.contains_key("functionCall")
                 || obj.contains_key("functionResponse");
             if translatable {
-                return false;
+                // `thoughtSignature` on a functionCall part is an opaque signed token
+                // required for Gemini 2.5+/3 extended-thinking replay. Chat Completions
+                // has no equivalent field, so the translation would silently drop it.
+                // gemini-cli replays thoughtSignature in every subsequent history turn
+                // after the first tool call — for those models, most agentic turns that
+                // involve tool use will take the observe-passthrough path.
+                return obj.contains_key("thoughtSignature");
             }
             // Known-bad: binary/code/video/server-state
             true
@@ -530,6 +536,26 @@ mod tests {
             ],
         })));
         // mutant: if we flag functionCall as untranslatable, this fails
+    }
+
+    #[test]
+    fn function_call_with_thought_signature_is_untranslatable() {
+        // Gemini 2.5+/3 returns `thoughtSignature` on functionCall parts. gemini-cli
+        // replays it in every subsequent history turn, so after the first tool call
+        // on those models most agentic turns will have untranslatable content and fall
+        // through to observe passthrough.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "contents": [{
+                "role": "model",
+                "parts": [{
+                    "functionCall": { "name": "f", "args": {} },
+                    "thoughtSignature": "Aef8xyz=="
+                }],
+            }],
+        })));
+        // mutant: if we remove `obj.contains_key("thoughtSignature")` from the guard,
+        // has_untranslatable_content returns false (the functionCall makes it "translatable")
+        // and this assertion fails — the thoughtSignature would be silently dropped.
     }
 
     #[test]
