@@ -2005,7 +2005,7 @@ async fn messages(
                     let shadow_ctx = route.shadow.map(|_| {
                         (
                             body.clone(),
-                            Auth::from_headers(&headers),
+                            Auth::from_headers(&headers, firstpass_core::Dialect::Anthropic),
                             features.clone(),
                             tenant.clone(),
                             session_header
@@ -2602,7 +2602,7 @@ async fn handle_enforce(
             .await;
             let _ = tx.send(out);
         });
-        return sse_keepalive_response(rx, anthropic_sse_from_message);
+        return sse_keepalive_response(rx, Box::new(anthropic_sse_from_message));
     }
     match enforce_pipeline(
         state,
@@ -3336,7 +3336,7 @@ async fn enforce_pipeline(
             "request body is not a valid Anthropic Messages request".to_owned(),
         ));
     };
-    let auth = Auth::from_headers(headers);
+    let auth = Auth::from_headers(headers, firstpass_core::Dialect::Anthropic);
     let resp = enforce_pipeline_inner(
         state,
         body,
@@ -3432,7 +3432,7 @@ async fn enforce_pipeline_openai_as(
             "request body is not a valid OpenAI Chat Completions request".to_owned(),
         ));
     };
-    let auth = Auth::from_headers(headers);
+    let auth = Auth::from_headers(headers, firstpass_core::Dialect::Openai);
     let resp = enforce_pipeline_inner(
         state,
         receipt_body,
@@ -3464,7 +3464,7 @@ const SSE_KEEPALIVE_EVERY: Duration = Duration::from_secs(5);
 /// [`openai_sse_from_message`] for OpenAI clients.
 fn sse_keepalive_response(
     rx: tokio::sync::oneshot::Receiver<Result<Value, ProxyError>>,
-    format_message: fn(&Value) -> String,
+    format_message: Box<dyn Fn(&Value) -> String + Send>,
 ) -> Response {
     let mut ticks = tokio::time::interval(SSE_KEEPALIVE_EVERY);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3492,7 +3492,7 @@ struct KeepaliveStream {
     rx: Option<tokio::sync::oneshot::Receiver<Result<Value, ProxyError>>>,
     ticks: tokio::time::Interval,
     /// Converts the served result `Value` to the caller's dialect SSE frames.
-    format_message: fn(&Value) -> String,
+    format_message: Box<dyn Fn(&Value) -> String + Send>,
 }
 
 impl futures_core::Stream for KeepaliveStream {
@@ -3507,9 +3507,8 @@ impl futures_core::Stream for KeepaliveStream {
             return Poll::Ready(None); // final frame already emitted
         };
         if let Poll::Ready(out) = std::pin::Pin::new(rx).poll(cx) {
-            let fmt = self.format_message;
             let frame = match out {
-                Ok(Ok(message)) => fmt(&message),
+                Ok(Ok(message)) => (self.format_message)(&message),
                 Ok(Err(e)) => sse_error_event(&e),
                 Err(_) => sse_error_event(&ProxyError::Internal(
                     "enforce pipeline task dropped".to_owned(),
@@ -3591,29 +3590,168 @@ fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
     })
 }
 
+/// Map an OpenAI `finish_reason` to the nearest Anthropic `stop_reason`.
+/// Used when an Anthropic-dialect client is served by an OpenAI-compatible rung.
+///
+/// Mapping:
+/// - `"tool_calls"` → `"tool_use"` (model invoked a tool)
+/// - `"length"` → `"max_tokens"` (output-token limit reached)
+/// - `"stop"` → `"end_turn"` (normal completion)
+/// - `"content_filter"` → `"end_turn"` (conservative: treated as end-of-turn)
+/// - anything else → passed through (forward-compatible with future values)
+fn openai_finish_reason_to_anthropic(finish_reason: &str) -> &str {
+    match finish_reason {
+        "tool_calls" => "tool_use",
+        "length" => "max_tokens",
+        "stop" => "end_turn",
+        "content_filter" => "end_turn",
+        other => other,
+    }
+}
+
+/// Convert an OpenAI `message` object (`choices[0].message`) to an Anthropic `content` array.
+///
+/// Appends a `text` block for non-empty `content`, then one `tool_use` block per valid entry
+/// in `tool_calls`. Returns at least one block (an empty text block when nothing else is present).
+fn openai_message_to_anthropic_content(msg: &Value) -> Value {
+    let mut blocks: Vec<Value> = Vec::new();
+
+    if let Some(text) = msg
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        blocks.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+
+    if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+        for tc in tool_calls {
+            // Anthropic clients match tool_result to tool_use by id, so an empty id is invalid.
+            let id = tc
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map_or_else(
+                    || format!("toolu_{}", Uuid::now_v7().simple()),
+                    str::to_owned,
+                );
+            let name = tc
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let input = tc
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !name.is_empty() {
+                blocks.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": input,
+                }));
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        serde_json::json!([{ "type": "text", "text": "" }])
+    } else {
+        Value::Array(blocks)
+    }
+}
+
+/// Map a Gemini `finishReason` string to an Anthropic `stop_reason`.
+fn gemini_finish_reason_to_anthropic(reason: &str) -> &str {
+    match reason {
+        "MAX_TOKENS" => "max_tokens",
+        "STOP" => "end_turn",
+        other => other,
+    }
+}
+
 /// Render a served [`ModelResponse`] back into an Anthropic Messages response envelope, so the
 /// caller sees the same wire shape regardless of which provider actually answered.
 ///
-/// The `content` blocks come **verbatim** from the upstream response (`resp.raw`) when it is an
-/// Anthropic message — so `tool_use` / `thinking` / multiple text blocks reach the caller intact
-/// (ADR 0005 I2). Only when `raw` has no Anthropic `content` array (a synthetic response, or the
-/// OpenAI adapter, which has `choices` instead) do we fall back to a single reconstructed text
-/// block. The envelope (`id`, `model`, `usage`) is always normalized so the served model id is the
-/// prefixed ladder id, not the bare wire id.
+/// Content translation:
+///   - Anthropic-shaped raw (`content` array): used verbatim — `tool_use`, `thinking`, etc. intact.
+///   - OpenAI-shaped raw (`choices[0].message`): `tool_calls` → `tool_use` blocks; `content` text.
+///   - Gemini or synthetic: falls back to a single text block from `resp.text`.
+///
+/// Stop-reason mapping covers Anthropic, OpenAI (`finish_reason`), and Gemini (`finishReason`).
+/// `stop_reason = "tool_use"` is only emitted when the content array actually contains a
+/// `tool_use` block — a clean tool-call check that guards against OpenAI malformed responses.
 fn anthropic_response_json(resp: &ModelResponse) -> Value {
-    let content = resp
+    // Build content, detecting raw shape by key presence.
+    let content = if let Some(c) = resp.raw.get("content").filter(|c| c.is_array()) {
+        c.clone()
+    } else if let Some(msg) = resp.raw.pointer("/choices/0/message") {
+        openai_message_to_anthropic_content(msg)
+    } else {
+        // Gemini or synthesized response — use normalized text.
+        serde_json::json!([{ "type": "text", "text": resp.text }])
+    };
+
+    let has_tool_use = content.as_array().is_some_and(|a| {
+        a.iter()
+            .any(|b| b.get("type") == Some(&Value::String("tool_use".to_owned())))
+    });
+
+    // Carry the real stop_reason from the upstream; map cross-provider vocabularies.
+    // Guard: if stop_reason would be "tool_use" but the content has no tool_use blocks
+    // (e.g. malformed OpenAI response), fall back to "end_turn".
+    let stop_reason_str = resp
         .raw
-        .get("content")
-        .filter(|c| c.is_array())
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            resp.raw
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .map(openai_finish_reason_to_anthropic)
+        })
+        .or_else(|| {
+            resp.raw
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str)
+                .map(gemini_finish_reason_to_anthropic)
+        })
+        .unwrap_or("end_turn");
+    let stop_reason_str = if stop_reason_str == "tool_use" && !has_tool_use {
+        "end_turn"
+    } else {
+        stop_reason_str
+    };
+    let stop_reason = Value::String(stop_reason_str.to_owned());
+    let stop_sequence = resp
+        .raw
+        .get("stop_sequence")
         .cloned()
-        .unwrap_or_else(|| serde_json::json!([{ "type": "text", "text": resp.text }]));
+        .unwrap_or(Value::Null);
+
+    // Build usage with cache counters when the provider reported them.
+    let mut usage = serde_json::json!({
+        "input_tokens": resp.in_tokens,
+        "output_tokens": resp.out_tokens,
+    });
+    if resp.cache_write_tokens > 0 {
+        usage["cache_creation_input_tokens"] = Value::from(resp.cache_write_tokens);
+    }
+    if resp.cache_read_tokens > 0 {
+        usage["cache_read_input_tokens"] = Value::from(resp.cache_read_tokens);
+    }
+
     serde_json::json!({
         "id": format!("msg_{}", Uuid::now_v7()),
         "type": "message",
         "role": "assistant",
         "model": resp.model,
         "content": content,
-        "usage": { "input_tokens": resp.in_tokens, "output_tokens": resp.out_tokens },
+        "stop_reason": stop_reason,
+        "stop_sequence": stop_sequence,
+        "usage": usage,
     })
 }
 
@@ -3635,9 +3773,17 @@ fn sse_event(out: &mut String, event: &str, data: &Value) {
 fn anthropic_sse_from_message(message: &Value) -> String {
     let mut out = String::new();
 
-    // message_start carries the envelope with content emptied — the blocks stream next.
+    // message_start carries the envelope with content emptied.
+    // Per the Anthropic SSE spec:
+    //   - stop_reason / stop_sequence must be null here; real values arrive in message_delta.
+    //   - usage.output_tokens must be 0 here; the real count arrives in message_delta.usage.
+    //     Clients that sum deltas would double-count if the non-zero value from the final message
+    //     were forwarded in message_start.
     let mut start_msg = message.clone();
     start_msg["content"] = Value::Array(Vec::new());
+    start_msg["stop_reason"] = Value::Null;
+    start_msg["stop_sequence"] = Value::Null;
+    start_msg["usage"]["output_tokens"] = Value::from(0u64);
     sse_event(
         &mut out,
         "message_start",
@@ -3670,6 +3816,43 @@ fn anthropic_sse_from_message(message: &Value) -> String {
                         "delta": { "type": "input_json_delta", "partial_json": input_json } }),
                 );
             }
+            Some("thinking") => {
+                // Extended thinking block: start empty, emit thinking_delta then signature_delta.
+                let thinking = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+                let signature = block.get("signature").and_then(Value::as_str).unwrap_or("");
+                sse_event(
+                    &mut out,
+                    "content_block_start",
+                    &serde_json::json!({ "type": "content_block_start", "index": i,
+                        "content_block": { "type": "thinking", "thinking": "" } }),
+                );
+                sse_event(
+                    &mut out,
+                    "content_block_delta",
+                    &serde_json::json!({ "type": "content_block_delta", "index": i,
+                        "delta": { "type": "thinking_delta", "thinking": thinking } }),
+                );
+                if !signature.is_empty() {
+                    sse_event(
+                        &mut out,
+                        "content_block_delta",
+                        &serde_json::json!({ "type": "content_block_delta", "index": i,
+                            "delta": { "type": "signature_delta", "signature": signature } }),
+                    );
+                }
+            }
+            Some("redacted_thinking") => {
+                // Redacted thinking block: the Anthropic SSE spec does NOT define a
+                // `redacted_thinking_delta` event type. Emit the full block in
+                // `content_block_start` and then `content_block_stop` with no delta.
+                sse_event(
+                    &mut out,
+                    "content_block_start",
+                    &serde_json::json!({ "type": "content_block_start", "index": i,
+                        "content_block": block }),
+                );
+                // No delta events — fall through to content_block_stop below.
+            }
             _ => {
                 // text (and any other text-bearing block): start empty, stream the text as one delta.
                 let text = block.get("text").and_then(Value::as_str).unwrap_or("");
@@ -3698,10 +3881,21 @@ fn anthropic_sse_from_message(message: &Value) -> String {
         .pointer("/usage/output_tokens")
         .cloned()
         .unwrap_or_else(|| Value::from(0));
+    // Use the real stop_reason carried through from the upstream response (never hardcode "end_turn").
+    let stop_reason = message
+        .get("stop_reason")
+        .cloned()
+        .unwrap_or_else(|| Value::String("end_turn".to_owned()));
+    let mut message_delta_delta =
+        serde_json::json!({ "stop_reason": stop_reason, "stop_sequence": Value::Null });
+    // Include stop_sequence in the delta only when it was actually set.
+    if let Some(seq) = message.get("stop_sequence").filter(|v| !v.is_null()) {
+        message_delta_delta["stop_sequence"] = seq.clone();
+    }
     sse_event(
         &mut out,
         "message_delta",
-        &serde_json::json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" },
+        &serde_json::json!({ "type": "message_delta", "delta": message_delta_delta,
             "usage": { "output_tokens": out_tokens } }),
     );
     sse_event(
@@ -5037,7 +5231,9 @@ fn extract_openai_content_and_tools(raw: &Value, text: &str) -> (Value, Option<V
 /// so an OpenAI-client caller sees the standard wire shape regardless of which rung answered.
 fn openai_response_json(resp: &ModelResponse) -> Value {
     let (content_text, tool_calls) = extract_openai_content_and_tools(&resp.raw, &resp.text);
-    let finish_reason = if tool_calls.is_some() {
+    let finish_reason = if resp.truncated() {
+        "length"
+    } else if tool_calls.is_some() {
         "tool_calls"
     } else {
         "stop"
@@ -5070,7 +5266,16 @@ fn openai_response_json(resp: &ModelResponse) -> Value {
 /// Re-emit a served OpenAI `chat.completion` envelope as an SSE stream body
 /// (`data: chat.completion.chunk` frames ending with `data: [DONE]`), so a `stream: true`
 /// OpenAI client is served even though enforce buffered the full response to gate it.
-fn openai_sse_from_message(message: &Value) -> String {
+/// Whether `stream_options.include_usage` was set to `true` in the request body.
+fn stream_options_include_usage(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.pointer("/stream_options/include_usage").cloned())
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn openai_sse_from_message(message: &Value, include_usage: bool) -> String {
     let id = message
         .get("id")
         .and_then(Value::as_str)
@@ -5124,9 +5329,22 @@ fn openai_sse_from_message(message: &Value) -> String {
         out.push_str("\n\n");
     }
 
-    // Tool calls delta (if any)
+    // Tool calls delta (if any) — each call carries its `index` field per the OpenAI SSE spec.
     if let Some(tc) = tool_calls {
-        let tc_chunk = chunk(serde_json::json!({ "tool_calls": tc }));
+        let tc_with_index: Vec<Value> = tc
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .enumerate()
+                    .map(|(idx, call)| {
+                        let mut c = call.clone();
+                        c["index"] = Value::from(idx);
+                        c
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tc_chunk = chunk(serde_json::json!({ "tool_calls": tc_with_index }));
         out.push_str("data: ");
         out.push_str(&tc_chunk.to_string());
         out.push_str("\n\n");
@@ -5143,6 +5361,22 @@ fn openai_sse_from_message(message: &Value) -> String {
     out.push_str("data: ");
     out.push_str(&finish_chunk.to_string());
     out.push_str("\n\n");
+
+    // Usage chunk — only emitted when the request set `stream_options.include_usage: true`.
+    // OpenAI spec: a chunk with `choices: []` immediately before [DONE].
+    if include_usage && let Some(usage) = message.get("usage") {
+        let usage_chunk = serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": usage
+        });
+        out.push_str("data: ");
+        out.push_str(&usage_chunk.to_string());
+        out.push_str("\n\n");
+    }
 
     out.push_str("data: [DONE]\n\n");
     out
@@ -5167,6 +5401,7 @@ async fn handle_enforce_openai(
     routing_mode: RoutingMode,
 ) -> Response {
     if is_stream_request(body) {
+        let include_usage = stream_options_include_usage(body);
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
         let (state_c, headers_c, body_c, route_c) =
             (state.clone(), headers.clone(), body.clone(), route.clone());
@@ -5185,7 +5420,10 @@ async fn handle_enforce_openai(
             .await;
             let _ = tx.send(out);
         });
-        return sse_keepalive_response(rx, openai_sse_from_message);
+        return sse_keepalive_response(
+            rx,
+            Box::new(move |v| openai_sse_from_message(v, include_usage)),
+        );
     }
     match enforce_pipeline_openai(
         state,
@@ -6487,6 +6725,60 @@ mod tests {
             trace.policy.mode_profile.is_none(),
             "mode_profile must be absent when Balanced (byte-identical invariant)"
         );
+    }
+
+    /// An agent's tool step (a reply that is only a tool call) is served from the cheap rung on a
+    /// `non-empty` route; it used to read as empty, fail the gate and escalate every tool step.
+    /// The reply keeps its real `stop_reason: tool_use` so the agent loop continues.
+    #[tokio::test]
+    async fn enforce_serves_a_tool_only_turn_from_the_cheap_rung() {
+        let haiku = "anthropic/claude-haiku-4-5";
+        let mut tool_turn = model_resp(haiku, "");
+        tool_turn.raw = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "bash",
+                         "input": {"command": "ls"}}],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let (state, mut rx) = enforce_state(
+            &[haiku, "anthropic/claude-sonnet-5"],
+            &["non-empty"],
+            vec![
+                (haiku, Ok(tool_turn)),
+                (
+                    "anthropic/claude-sonnet-5",
+                    Ok(model_resp(
+                        "anthropic/claude-sonnet-5",
+                        "should not be called",
+                    )),
+                ),
+            ],
+        );
+        // Request must declare tools — NonEmptyGate only bypasses the empty-text check when the
+        // request actually declared tools (a tool-call response on a no-tools request is a bug).
+        let body_with_tools = Bytes::from_static(br#"{
+            "model": "ignored",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "run ls"}],
+            "tools": [{"name": "bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}]
+        }"#);
+        let resp = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            body_with_tools,
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["stop_reason"], "tool_use", "{json}");
+        let trace = rx.try_recv().expect("trace enqueued");
+        assert_eq!(trace.attempts.len(), 1, "no escalation on a tool step");
+        assert_eq!(trace.final_.served_rung, Some(0));
     }
 
     #[tokio::test]
@@ -8005,7 +8297,7 @@ mod tests {
         let mut stream = KeepaliveStream {
             rx: Some(rx),
             ticks,
-            format_message: anthropic_sse_from_message,
+            format_message: Box::new(anthropic_sse_from_message),
         };
         /// One poll of the stream: `Some(item)` if ready, `None` if pending right now.
         async fn next(
@@ -8312,7 +8604,7 @@ mod tests {
                 "content": [{ "type": "text", "text": "Hi there!" }]
             }),
         };
-        let sse = openai_sse_from_message(&openai_response_json(&resp));
+        let sse = openai_sse_from_message(&openai_response_json(&resp), false);
         // Every line is either blank or starts with "data: "
         for line in sse.lines() {
             assert!(
@@ -10484,7 +10776,7 @@ mod tests {
             shadow,
             0,
             &user_body(),
-            Auth::from_headers(&HeaderMap::new()),
+            Auth::from_headers(&HeaderMap::new(), firstpass_core::Dialect::Anthropic),
             &Features::new(TaskKind::Other),
             "t".to_owned(),
             "s".to_owned(),
@@ -11723,6 +12015,628 @@ mod tests {
                 String::from_utf8_lossy(body).contains("stream")
             );
             assert!(trace.attempts.is_empty(), "no attempts on 429");
+        }
+    }
+
+    // ── Defect 2: Anthropic buffered + SSE reply fidelity ────────────────────
+
+    fn thinking_tool_resp() -> ModelResponse {
+        ModelResponse {
+            model: "anthropic/claude-3-7-sonnet-20250219".to_owned(),
+            text: String::new(),
+            in_tokens: 20,
+            cache_write_tokens: 100,
+            cache_read_tokens: 50,
+            out_tokens: 30,
+            raw: serde_json::json!({
+                "stop_reason": "tool_use",
+                "stop_sequence": null,
+                "content": [
+                    { "type": "thinking", "thinking": "I need to call the tool.", "signature": "sig_abc123" },
+                    { "type": "tool_use", "id": "tu_1", "name": "search", "input": { "q": "test" } }
+                ]
+            }),
+        }
+    }
+
+    #[test]
+    fn anthropic_response_json_carries_stop_reason_and_cache_tokens() {
+        let resp = thinking_tool_resp();
+        let json = anthropic_response_json(&resp);
+
+        assert_eq!(
+            json["stop_reason"], "tool_use",
+            "stop_reason must be forwarded"
+        );
+        assert_eq!(json["stop_sequence"], Value::Null);
+
+        // Cache counters must appear in usage.
+        assert_eq!(json["usage"]["cache_creation_input_tokens"], 100);
+        assert_eq!(json["usage"]["cache_read_input_tokens"], 50);
+        assert_eq!(json["usage"]["input_tokens"], 20);
+        assert_eq!(json["usage"]["output_tokens"], 30);
+
+        // Content preserved verbatim from raw.
+        let content = json["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn anthropic_response_json_omits_cache_tokens_when_zero() {
+        let resp = ModelResponse {
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            ..thinking_tool_resp()
+        };
+        let json = anthropic_response_json(&resp);
+        assert!(
+            json["usage"]["cache_creation_input_tokens"].is_null(),
+            "zero cache_write omitted"
+        );
+        assert!(
+            json["usage"]["cache_read_input_tokens"].is_null(),
+            "zero cache_read omitted"
+        );
+    }
+
+    #[test]
+    fn anthropic_response_json_maps_openai_finish_reason_to_anthropic_stop_reason() {
+        // When an Anthropic-dialect client is served by an OpenAI rung, `raw` has
+        // `choices[0].finish_reason` instead of `stop_reason`. Verify the non-tool mappings.
+        let cases = [
+            ("length", "max_tokens"),
+            ("stop", "end_turn"),
+            ("content_filter", "end_turn"),
+        ];
+        for (finish_reason, expected_stop_reason) in cases {
+            let resp = ModelResponse {
+                model: "gpt-4o".to_owned(),
+                text: String::new(),
+                in_tokens: 5,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+                out_tokens: 3,
+                raw: serde_json::json!({
+                    "choices": [{ "finish_reason": finish_reason, "message": { "content": null } }]
+                }),
+            };
+            let json = anthropic_response_json(&resp);
+            assert_eq!(
+                json["stop_reason"].as_str(),
+                Some(expected_stop_reason),
+                "finish_reason={finish_reason} → stop_reason={expected_stop_reason}"
+            );
+        }
+        // "tool_calls" → "tool_use" only when there are actual tool_use blocks in the content.
+        // (Tested fully in anthropic_response_json_translates_openai_tool_calls_to_tool_use_blocks)
+        let resp_with_calls = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: String::new(),
+            in_tokens: 5,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 3,
+            raw: serde_json::json!({
+                "choices": [{ "finish_reason": "tool_calls", "message": {
+                    "content": null,
+                    "tool_calls": [{"id":"c1","type":"function",
+                        "function":{"name":"f","arguments":"{}"}}]
+                }}]
+            }),
+        };
+        assert_eq!(
+            anthropic_response_json(&resp_with_calls)["stop_reason"].as_str(),
+            Some("tool_use"),
+            "finish_reason=tool_calls with tool_call in message → stop_reason=tool_use"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_from_message_uses_real_stop_reason_and_thinking() {
+        let resp = thinking_tool_resp();
+        let message = anthropic_response_json(&resp);
+        let sse = anthropic_sse_from_message(&message);
+
+        let frames: Vec<Value> = sse
+            .lines()
+            .filter_map(|l| {
+                if l.starts_with("event: ") {
+                    return None;
+                }
+                l.strip_prefix("data: ")
+            })
+            .map(|d| serde_json::from_str::<Value>(d).expect("valid JSON"))
+            .collect();
+
+        // message_delta must carry the real stop_reason, not hardcoded "end_turn".
+        let msg_delta = frames
+            .iter()
+            .find(|f| f["type"] == "message_delta")
+            .expect("message_delta frame");
+        assert_eq!(
+            msg_delta["delta"]["stop_reason"], "tool_use",
+            "stop_reason must not be hardcoded to end_turn"
+        );
+
+        // thinking block: content_block_start with type "thinking".
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["content_block"]["type"] == "thinking"),
+            "thinking block_start must appear"
+        );
+        // thinking_delta event.
+        assert!(
+            frames.iter().any(|f| f["delta"]["type"] == "thinking_delta"
+                && f["delta"]["thinking"] == "I need to call the tool."),
+            "thinking_delta must carry the thinking text"
+        );
+        // signature_delta event.
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["delta"]["type"] == "signature_delta"
+                    && f["delta"]["signature"] == "sig_abc123"),
+            "signature_delta must carry the signature"
+        );
+
+        // tool_use block still present (ADR 0005 I2).
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["content_block"]["type"] == "tool_use"
+                    && f["content_block"]["name"] == "search"),
+            "tool_use block must still appear"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_from_message_handles_redacted_thinking() {
+        let resp = ModelResponse {
+            raw: serde_json::json!({
+                "stop_reason": "end_turn",
+                "content": [
+                    { "type": "redacted_thinking", "data": "base64encodeddata==" }
+                ]
+            }),
+            ..thinking_tool_resp()
+        };
+        let message = anthropic_response_json(&resp);
+        let sse = anthropic_sse_from_message(&message);
+        let frames: Vec<Value> = sse
+            .lines()
+            .filter_map(|l| {
+                if l.starts_with("event: ") {
+                    return None;
+                }
+                l.strip_prefix("data: ")
+            })
+            .map(|d| serde_json::from_str::<Value>(d).expect("valid JSON"))
+            .collect();
+
+        // content_block_start carries the full block (type + data) — no separate delta.
+        assert!(
+            frames.iter().any(|f| {
+                f["type"] == "content_block_start"
+                    && f["content_block"]["type"] == "redacted_thinking"
+                    && f["content_block"]["data"] == "base64encodeddata=="
+            }),
+            "content_block_start must carry the full redacted_thinking block with data"
+        );
+        // The Anthropic SSE spec has no redacted_thinking_delta event type.
+        assert!(
+            !frames
+                .iter()
+                .any(|f| f["delta"]["type"] == "redacted_thinking_delta"),
+            "no redacted_thinking_delta must appear"
+        );
+    }
+
+    // ── Defect 5: OpenAI enforce SSE — index, usage chunk, finish_reason length ─
+
+    #[test]
+    fn openai_response_json_sets_finish_reason_length_when_truncated() {
+        // max_tokens hit → stop_reason "max_tokens" (Anthropic) → truncated() == true.
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: "partial".to_owned(),
+            in_tokens: 5,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 100,
+            raw: serde_json::json!({ "stop_reason": "max_tokens", "content": [{ "type": "text", "text": "partial" }] }),
+        };
+        let json = openai_response_json(&resp);
+        assert_eq!(json["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn openai_sse_from_message_tool_calls_have_index() {
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: String::new(),
+            in_tokens: 10,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 8,
+            raw: serde_json::json!({
+                "content": [
+                    { "type": "tool_use", "id": "c1", "name": "alpha", "input": { "x": 1 } },
+                    { "type": "tool_use", "id": "c2", "name": "beta",  "input": { "y": 2 } }
+                ]
+            }),
+        };
+        let sse = openai_sse_from_message(&openai_response_json(&resp), false);
+        // Find the frame that carries tool_calls.
+        let frames: Vec<Value> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|f| *f != "[DONE]")
+            .map(|d| serde_json::from_str::<Value>(d).expect("valid JSON"))
+            .collect();
+
+        let tc_frame = frames
+            .iter()
+            .find(|f| !f["choices"][0]["delta"]["tool_calls"].is_null())
+            .expect("tool_calls delta frame");
+        let tcs = tc_frame["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        assert_eq!(tcs.len(), 2, "both tool calls present");
+        assert_eq!(tcs[0]["index"], 0, "first call has index 0");
+        assert_eq!(tcs[1]["index"], 1, "second call has index 1");
+    }
+
+    #[test]
+    fn openai_sse_from_message_emits_usage_chunk() {
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: "hi".to_owned(),
+            in_tokens: 3,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 2,
+            raw: serde_json::json!({ "content": [{ "type": "text", "text": "hi" }] }),
+        };
+        let sse = openai_sse_from_message(&openai_response_json(&resp), true);
+        let frames: Vec<Value> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|f| *f != "[DONE]")
+            .map(|d| serde_json::from_str::<Value>(d).expect("valid JSON"))
+            .collect();
+
+        // Usage chunk has choices: [] and non-null usage.
+        let usage_frame = frames
+            .iter()
+            .find(|f| f["choices"].as_array().is_some_and(|a| a.is_empty()))
+            .expect("usage chunk with choices:[] must appear before [DONE]");
+        assert_eq!(usage_frame["usage"]["prompt_tokens"], 3);
+        assert_eq!(usage_frame["usage"]["completion_tokens"], 2);
+
+        // [DONE] is the last item.
+        assert_eq!(
+            sse.lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .next_back()
+                .unwrap(),
+            "[DONE]"
+        );
+    }
+
+    #[test]
+    fn openai_sse_from_message_no_usage_chunk_without_include_usage() {
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: "hi".to_owned(),
+            in_tokens: 3,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 2,
+            raw: serde_json::json!({ "content": [{ "type": "text", "text": "hi" }] }),
+        };
+        let sse = openai_sse_from_message(&openai_response_json(&resp), false);
+        let has_empty_choices_chunk = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|f| *f != "[DONE]")
+            .any(|d| {
+                serde_json::from_str::<Value>(d)
+                    .ok()
+                    .and_then(|v| v.get("choices").cloned())
+                    .and_then(|c| c.as_array().map(|a| a.is_empty()))
+                    .unwrap_or(false)
+            });
+        assert!(
+            !has_empty_choices_chunk,
+            "usage chunk must not appear when include_usage is false"
+        );
+    }
+
+    #[test]
+    fn stream_options_include_usage_parses_correctly() {
+        assert!(stream_options_include_usage(
+            br#"{"stream": true, "stream_options": {"include_usage": true}}"#
+        ));
+        assert!(!stream_options_include_usage(
+            br#"{"stream": true, "stream_options": {"include_usage": false}}"#
+        ));
+        assert!(!stream_options_include_usage(br#"{"stream": true}"#));
+        assert!(!stream_options_include_usage(b"not json"));
+    }
+
+    // ── Gemini auditor findings ─────────────────────────────────────────────────
+
+    #[test]
+    fn translated_tool_use_input_is_always_an_object() {
+        // Anthropic requires tool_use.input to be an object; "null" or "[1]" arguments would be
+        // rejected when the client echoes the turn back.
+        for args in ["null", "[1]", "\"s\""] {
+            let resp = ModelResponse {
+                model: "gpt-4o".to_owned(),
+                text: String::new(),
+                in_tokens: 1,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+                out_tokens: 1,
+                raw: serde_json::json!({"choices": [{"finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": null,
+                    "tool_calls": [{"id": "c", "type": "function",
+                        "function": {"name": "f", "arguments": args}}]}}]}),
+            };
+            let json = anthropic_response_json(&resp);
+            assert!(
+                json["content"][0]["input"].is_object(),
+                "args={args}: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_response_json_translates_openai_tool_calls_to_tool_use_blocks() {
+        // An OpenAI-compatible rung returns tool_calls in choices[0].message.
+        // anthropic_response_json must produce tool_use content blocks.
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: String::new(),
+            in_tokens: 5,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 3,
+            raw: serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_abc123",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{\"location\":\"London\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+            }),
+        };
+        let json = anthropic_response_json(&resp);
+        let content = json["content"].as_array().expect("content must be array");
+        assert_eq!(content.len(), 1, "exactly one tool_use block");
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["id"], "call_abc123");
+        assert_eq!(content[0]["name"], "get_weather");
+        assert_eq!(content[0]["input"]["location"], "London");
+        // stop_reason must map to tool_use (finish_reason "tool_calls" → "tool_use").
+        assert_eq!(json["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn anthropic_response_json_openai_tool_calls_with_text_emits_both_blocks() {
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: "Here is the weather call.".to_owned(),
+            in_tokens: 5,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 10,
+            raw: serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "Here is the weather call.",
+                        "tool_calls": [{
+                            "id": "call_xyz",
+                            "type": "function",
+                            "function": { "name": "search", "arguments": "{}" }
+                        }]
+                    }
+                }]
+            }),
+        };
+        let json = anthropic_response_json(&resp);
+        let content = json["content"].as_array().expect("content array");
+        assert!(
+            content.iter().any(|b| b["type"] == "text"),
+            "text block must appear when message content is non-empty"
+        );
+        assert!(
+            content.iter().any(|b| b["type"] == "tool_use"),
+            "tool_use block must appear"
+        );
+    }
+
+    #[test]
+    fn anthropic_response_json_no_tool_use_blocks_never_emits_tool_use_stop_reason() {
+        // If finish_reason is "tool_calls" but we couldn't build any tool_use block,
+        // stop_reason must fall back to "end_turn" — never leave it as "tool_use" with
+        // zero tool_use blocks in the content array.
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: "some text".to_owned(),
+            in_tokens: 3,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 2,
+            raw: serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "some text",
+                        "tool_calls": [] // empty — no valid tool_use blocks
+                    }
+                }]
+            }),
+        };
+        let json = anthropic_response_json(&resp);
+        assert_eq!(
+            json["stop_reason"], "end_turn",
+            "stop_reason must be end_turn when content has no tool_use blocks"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_from_message_tool_use_block_produces_input_json_delta() {
+        // When anthropic_response_json translates an OpenAI tool call, the SSE path
+        // must emit content_block_start with type tool_use + an input_json_delta.
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: String::new(),
+            in_tokens: 4,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 2,
+            raw: serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "lookup", "arguments": "{\"q\":\"test\"}" }
+                        }]
+                    }
+                }]
+            }),
+        };
+        let message = anthropic_response_json(&resp);
+        let sse = anthropic_sse_from_message(&message);
+        let frames: Vec<Value> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<Value>(d).expect("valid JSON"))
+            .collect();
+
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["content_block"]["type"] == "tool_use"
+                    && f["content_block"]["name"] == "lookup"),
+            "content_block_start with tool_use block must appear"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["delta"]["type"] == "input_json_delta"),
+            "input_json_delta must be emitted for the tool call"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_message_start_has_null_stop_reason() {
+        // Per the Anthropic SSE spec, message_start.message must carry stop_reason: null
+        // and stop_sequence: null — the real values arrive only in message_delta.
+        let resp = thinking_tool_resp();
+        let message = anthropic_response_json(&resp);
+        let sse = anthropic_sse_from_message(&message);
+        let frames: Vec<Value> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<Value>(d).expect("valid JSON"))
+            .collect();
+
+        let start = frames
+            .iter()
+            .find(|f| f["type"] == "message_start")
+            .expect("message_start must appear");
+        assert!(
+            start["message"]["stop_reason"].is_null(),
+            "message_start.message.stop_reason must be null, got: {}",
+            start["message"]["stop_reason"]
+        );
+        assert!(
+            start["message"]["stop_sequence"].is_null(),
+            "message_start.message.stop_sequence must be null"
+        );
+        // The real stop_reason must still appear in message_delta.
+        let delta = frames
+            .iter()
+            .find(|f| f["type"] == "message_delta")
+            .expect("message_delta must appear");
+        assert!(
+            !delta["delta"]["stop_reason"].is_null(),
+            "message_delta.delta.stop_reason must be non-null"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_message_start_has_zero_output_tokens() {
+        // Per the Anthropic SSE spec, message_start.message.usage.output_tokens must be 0.
+        // The real output token count arrives only in the message_delta usage object.
+        // Clients that accumulate streaming usage deltas would double-count if the non-zero
+        // value from the final message JSON were forwarded here.
+        let resp = thinking_tool_resp(); // out_tokens = 10
+        let message = anthropic_response_json(&resp);
+        // Confirm the source message has non-zero output_tokens so this is a real check.
+        assert!(
+            message["usage"]["output_tokens"].as_u64().unwrap_or(0) > 0,
+            "precondition: source message must have non-zero output_tokens"
+        );
+        let sse = anthropic_sse_from_message(&message);
+        let frames: Vec<serde_json::Value> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<serde_json::Value>(d).expect("valid JSON"))
+            .collect();
+        let start = frames
+            .iter()
+            .find(|f| f["type"] == "message_start")
+            .expect("message_start must appear");
+        assert_eq!(
+            start["message"]["usage"]["output_tokens"].as_u64(),
+            Some(0),
+            "message_start.message.usage.output_tokens must be 0, got: {}",
+            start["message"]["usage"]["output_tokens"]
+        );
+    }
+
+    #[test]
+    fn anthropic_response_json_maps_gemini_finish_reason() {
+        // Gemini finishReason is in candidates[0].finishReason (upper-snake-case).
+        // Verify both the MAX_TOKENS and STOP mappings reach anthropic_response_json.
+        for (gemini_reason, expected) in [("MAX_TOKENS", "max_tokens"), ("STOP", "end_turn")] {
+            let resp = ModelResponse {
+                model: "google/gemini-3.5-flash-lite".to_owned(),
+                text: "some text".to_owned(),
+                in_tokens: 5,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+                out_tokens: 3,
+                raw: serde_json::json!({
+                    "candidates": [{"finishReason": gemini_reason,
+                                    "content": {"parts": [{"text": "some text"}]}}]
+                }),
+            };
+            let json = anthropic_response_json(&resp);
+            assert_eq!(
+                json["stop_reason"].as_str(),
+                Some(expected),
+                "Gemini finishReason={gemini_reason} → stop_reason={expected}"
+            );
         }
     }
 
