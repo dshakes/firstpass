@@ -707,11 +707,51 @@ fn cmd_experiment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     };
+    // Issue 5a: do not create or migrate a DB that does not exist.  The "No receipt store
+    // yet" message must remain reachable for a fresh install; migration is only safe on an
+    // existing file (ALTER TABLE on a brand-new empty file would succeed but obscure the
+    // "no data yet" state and leave a stray empty DB behind).
+    if !db.exists() {
+        if json {
+            println!("[]");
+        } else {
+            print!(
+                "{}",
+                cli::experiment_next_step(Some(routing), &config.db_path, false)
+            );
+        }
+        return Ok(());
+    }
+    // Ensure the schema is up to date before reading; callers may have an older DB
+    // that predates the `in_log` column.  Errors here are surfaced, not swallowed.
+    store::ensure_migrated(db)?;
     let traces = store::load_tenant_traces(db, &tenant).unwrap_or_default();
     let deferred = store::load_all_deferred(db).unwrap_or_default();
-    let pairs = store::load_all_experiment_pairs(db).unwrap_or_default();
+    let mut pairs = store::load_all_experiment_pairs(db)?;
+    // Tenant boundary: `--tenant` scopes paired evidence too, not only the traces.
+    pairs.retain(|r| r.tenant == tenant);
+    // With a shared log the cluster's evidence lives in the log; this store holds only the pairs
+    // THIS replica evaluated. Report them as a single-replica snapshot (its InLog and NotInLog
+    // rows) and withhold legacy rows of unknown status, as the server does.
+    let has_shared_log = routing
+        .routes
+        .iter()
+        .any(|r| r.challenger.as_ref().is_some_and(|c| c.redis_url.is_some()));
+    if has_shared_log {
+        pairs.retain(|r| r.in_log != store::InLogStatus::Unknown);
+    }
     let reports = experiment::experiments_from_traces(&traces, &deferred, &pairs, routing);
     let views = experiment::views(reports, routing);
+    // Always to stderr (also with --json, whose stdout stays machine-readable).
+    if has_shared_log {
+        eprintln!(
+            "Note: a shared experiment log is configured. This is a single-replica snapshot: it\n\
+             covers the pairs this replica evaluated, not the cluster. The cluster's evidence lives\n\
+             in the log; a replica's /v1/experiments and panel reflect it once that replica has\n\
+             served traffic on the route.\n"
+        );
+    }
+
     if json {
         println!("{}", serde_json::to_string_pretty(&views)?);
     } else if views.is_empty() {

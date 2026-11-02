@@ -364,6 +364,7 @@ enum AnthropicCredential {
 ///   3. The request's `Authorization: Bearer` OAuth token (Claude Code subscription auth).
 ///   4. The ambient `ANTHROPIC_API_KEY` — only when the client sent no credential, so a server
 ///      key never shadows a client's own OAuth token.
+///
 /// Never the OpenAI key. Pure so the ordering is unit-testable without touching process env.
 fn anthropic_credential(
     configured: Option<String>,
@@ -464,16 +465,16 @@ impl Provider for AnthropicProvider {
         let mut builder = self.http.post(url);
 
         match anthropic_credential(
-            self.api_key_env.as_deref().and_then(|e| std::env::var(e).ok()),
+            self.api_key_env
+                .as_deref()
+                .and_then(|e| std::env::var(e).ok()),
             auth,
             std::env::var("ANTHROPIC_API_KEY").ok(),
         ) {
             Some(AnthropicCredential::ApiKey(key)) => builder = builder.header("x-api-key", key),
             Some(AnthropicCredential::Bearer(token)) => {
-                builder = builder.header(
-                    axum::http::header::AUTHORIZATION,
-                    format!("Bearer {token}"),
-                );
+                builder =
+                    builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
             }
             None => {}
         }
