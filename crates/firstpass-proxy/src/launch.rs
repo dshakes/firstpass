@@ -93,7 +93,16 @@ fn env_for(agent: &Agent, url: &str) -> HashMap<String, String> {
     agent
         .vars
         .iter()
-        .map(|v| ((*v).to_owned(), url.to_owned()))
+        .map(|v| {
+            // OpenAI SDKs (and Codex) treat the base URL as already ending in `/v1` and append
+            // `/responses` or `/chat/completions`; Anthropic SDKs append `/v1/messages` themselves.
+            let base = if v.starts_with("OPENAI") {
+                format!("{url}/v1")
+            } else {
+                url.to_owned()
+            };
+            ((*v).to_owned(), base)
+        })
         .collect()
 }
 
@@ -286,7 +295,7 @@ mod tests {
         let codex = AGENTS.iter().find(|a| a.name == "codex").expect("codex");
         assert_eq!(
             env_for(codex, "http://127.0.0.1:8080").get("OPENAI_BASE_URL"),
-            Some(&"http://127.0.0.1:8080".to_owned())
+            Some(&"http://127.0.0.1:8080/v1".to_owned())
         );
     }
 }
