@@ -292,8 +292,9 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
         return true;
     }
     // Stateful threading: the upstream holds history we do not have, so a translated request is
-    // not the conversation the client is actually continuing.
-    if body.get("previous_response_id").is_some() {
+    // not the conversation the client is actually continuing. `conversation` is the newer,
+    // mutually exclusive form of the same server-side state.
+    if body.get("previous_response_id").is_some() || body.get("conversation").is_some() {
         return true;
     }
     let Some(Value::Array(turns)) = body.get("input") else {
@@ -1131,6 +1132,9 @@ mod tests {
         // conversation the client is actually continuing.
         assert!(has_untranslatable_content(&serde_json::json!({
             "input": "and then?", "previous_response_id": "resp_abc",
+        })));
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "input": "and then?", "conversation": "conv_abc", "stream": true,
         })));
     }
 
