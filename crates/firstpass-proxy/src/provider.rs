@@ -349,6 +349,35 @@ fn resolve_api_key(api_key_env: Option<&str>, byok_override: Option<&str>) -> St
         .unwrap_or_default()
 }
 
+/// The credential an Anthropic-dialect call sends upstream.
+#[derive(Debug, PartialEq, Eq)]
+enum AnthropicCredential {
+    ApiKey(String),
+    Bearer(String),
+}
+
+/// Pick the Anthropic credential, highest priority first:
+///   1. The rung's configured `api_key_env` value. An operator who declared this provider's key
+///      (e.g. a custom Anthropic-compatible host) must never have a client's own Anthropic key
+///      or OAuth token forwarded to that host instead.
+///   2. The request's `x-api-key`.
+///   3. The request's `Authorization: Bearer` OAuth token (Claude Code subscription auth).
+///   4. The ambient `ANTHROPIC_API_KEY` — only when the client sent no credential, so a server
+///      key never shadows a client's own OAuth token.
+/// Never the OpenAI key. Pure so the ordering is unit-testable without touching process env.
+fn anthropic_credential(
+    configured: Option<String>,
+    auth: &Auth,
+    ambient: Option<String>,
+) -> Option<AnthropicCredential> {
+    let non_empty = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+    non_empty(&configured)
+        .map(AnthropicCredential::ApiKey)
+        .or_else(|| non_empty(&auth.anthropic_key).map(AnthropicCredential::ApiKey))
+        .or_else(|| non_empty(&auth.anthropic_bearer).map(AnthropicCredential::Bearer))
+        .or_else(|| non_empty(&ambient).map(AnthropicCredential::ApiKey))
+}
+
 /// Build the Anthropic Messages wire body for `req`: the original inbound JSON **verbatim** with
 /// only `model` swapped to the rung's wire id and `stream` stripped (`complete` is the buffered
 /// call — the gate needs the whole candidate). Falls back to the normalized fields when there is
@@ -434,30 +463,19 @@ impl Provider for AnthropicProvider {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut builder = self.http.post(url);
 
-        // Credential priority (highest to lowest):
-        //   1. Request-supplied `x-api-key` header (auth.anthropic_key).
-        //   2. Request-supplied `Authorization: Bearer` OAuth token (auth.anthropic_bearer).
-        //   3. Configured `api_key_env` env var, or ambient `ANTHROPIC_API_KEY` env fallback.
-        // The third tier is only reached when the client sent neither header, e.g. a server-to-
-        // server call where the operator set a server key. Never use `openai_key` here.
-        if let Some(key) = &auth.anthropic_key {
-            builder = builder.header("x-api-key", key.as_str());
-        } else if let Some(bearer) = &auth.anthropic_bearer {
-            builder = builder.header(
-                axum::http::header::AUTHORIZATION,
-                format!("Bearer {bearer}"),
-            );
-        } else {
-            // No request-supplied credential — fall back to the configured or ambient env key.
-            let env_key = self
-                .api_key_env
-                .as_deref()
-                .and_then(|e| std::env::var(e).ok())
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .unwrap_or_default();
-            if !env_key.is_empty() {
-                builder = builder.header("x-api-key", env_key);
+        match anthropic_credential(
+            self.api_key_env.as_deref().and_then(|e| std::env::var(e).ok()),
+            auth,
+            std::env::var("ANTHROPIC_API_KEY").ok(),
+        ) {
+            Some(AnthropicCredential::ApiKey(key)) => builder = builder.header("x-api-key", key),
+            Some(AnthropicCredential::Bearer(token)) => {
+                builder = builder.header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {token}"),
+                );
             }
+            None => {}
         }
 
         // Forward anthropic-version (inbound header wins; default to the published stable version).
@@ -2814,15 +2832,11 @@ mod tests {
         );
     }
 
-    /// SECURITY: when a server env key is configured (api_key_env) AND the request carries
-    /// only a Bearer OAuth token (no x-api-key), the provider must use Bearer — not the env key.
-    /// This is the priority-inversion bug described in the Gemini audit: without the fix,
-    /// `from_headers` would populate `anthropic_key` from env, making Bearer unreachable.
-    ///
-    /// `api_key_env = "PATH"` simulates a configured server key without `unsafe env::set_var`
-    /// (forbidden workspace-wide; `PATH` is guaranteed set in any test process).
+    /// A rung with its own configured key (e.g. a custom Anthropic-compatible host) sends that
+    /// key, and neither the client's `x-api-key` nor its OAuth Bearer reaches that host.
+    /// `api_key_env = "PATH"` stands in for a configured key without `unsafe env::set_var`.
     #[tokio::test]
-    async fn anthropic_provider_prefers_bearer_over_env_key_when_no_x_api_key() {
+    async fn anthropic_provider_sends_the_configured_key_not_the_clients_credentials() {
         use std::sync::{Arc, Mutex};
         let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
         let captured_clone = Arc::clone(&captured);
@@ -2865,7 +2879,7 @@ mod tests {
         };
         // Client sends Bearer only — no x-api-key.  Bearer must win over the server env key.
         let auth = Auth {
-            anthropic_key: None,
+            anthropic_key: Some("client-anthropic-key".to_owned()),
             openai_key: None,
             anthropic_bearer: Some("client-oauth-token".to_owned()),
             anthropic_beta: None,
@@ -2874,15 +2888,51 @@ mod tests {
         provider.complete(&req, &auth).await.expect("must succeed");
 
         let hdrs = captured.lock().unwrap().take().expect("headers captured");
+        let path = std::env::var("PATH").unwrap_or_default();
+        assert_eq!(
+            hdrs.get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some(path.as_str()),
+            "the rung's configured key must be sent"
+        );
         assert!(
-            hdrs.get("x-api-key").is_none(),
-            "server env key must not appear when client sent Bearer"
+            hdrs.get(axum::http::header::AUTHORIZATION).is_none(),
+            "a client's OAuth token must not reach a host with its own configured key"
+        );
+    }
+
+    /// The credential order, without process env: configured > request key > request Bearer >
+    /// ambient. A server's ambient key never shadows a client's OAuth token.
+    #[test]
+    fn anthropic_credential_order() {
+        let auth = |key: Option<&str>, bearer: Option<&str>| Auth {
+            anthropic_key: key.map(str::to_owned),
+            openai_key: Some("openai".to_owned()),
+            anthropic_bearer: bearer.map(str::to_owned),
+            anthropic_beta: None,
+            anthropic_version: None,
+        };
+        let s = |v: &str| Some(v.to_owned());
+        use AnthropicCredential::{ApiKey, Bearer};
+        assert_eq!(
+            anthropic_credential(None, &auth(None, Some("oauth")), s("ambient")),
+            Some(Bearer("oauth".to_owned()))
         );
         assert_eq!(
-            hdrs.get(axum::http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok()),
-            Some("Bearer client-oauth-token"),
-            "client Bearer must be forwarded when no x-api-key was sent"
+            anthropic_credential(None, &auth(Some("k"), Some("oauth")), s("ambient")),
+            Some(ApiKey("k".to_owned()))
+        );
+        assert_eq!(
+            anthropic_credential(s("cfg"), &auth(Some("k"), Some("oauth")), s("ambient")),
+            Some(ApiKey("cfg".to_owned()))
+        );
+        assert_eq!(
+            anthropic_credential(None, &auth(None, None), s("ambient")),
+            Some(ApiKey("ambient".to_owned()))
+        );
+        assert_eq!(
+            anthropic_credential(s(""), &auth(Some(""), None), None),
+            None,
+            "empty values are absent, and the OpenAI key is never used"
         );
     }
 

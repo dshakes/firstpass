@@ -3276,11 +3276,12 @@ fn openai_message_to_anthropic_content(msg: &Value) -> Value {
 
     if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
         for tc in tool_calls {
+            // Anthropic clients match tool_result to tool_use by id, so an empty id is invalid.
             let id = tc
                 .get("id")
                 .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| format!("toolu_{}", Uuid::now_v7().simple()), str::to_owned);
             let name = tc
                 .pointer("/function/name")
                 .and_then(Value::as_str)
