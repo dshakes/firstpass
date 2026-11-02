@@ -57,9 +57,10 @@ impl Gate for NonEmptyGate {
 
 /// Passes only if the completion parses as JSON. Useful for structured-output routes.
 ///
-/// **Abstains** on a tool-call-only turn (empty text, non-empty tool calls): a `tool_use`
-/// response is not a JSON payload, so there is nothing to validate and failing would force
-/// needless escalation. Use `tool-args-valid` to validate the tool call arguments themselves.
+/// **Passes** (not Abstains) on a tool-call-only turn: there is no text payload to validate,
+/// so the check is trivially satisfied. Abstain would count against GateHealth (auto-disabling
+/// the gate above 25% abstain rate), which would fire on nearly every turn of an agent that
+/// uses tools. Use `tool-args-valid` to validate the tool call arguments themselves.
 #[derive(Debug, Clone, Copy)]
 pub struct JsonValidGate;
 
@@ -69,12 +70,9 @@ impl Gate for JsonValidGate {
         "json-valid"
     }
     async fn evaluate(&self, _req: &ModelRequest, resp: &ModelResponse) -> GateResult {
+        // Tool-call-only: no text to validate — trivially passes.
         if resp.text.trim().is_empty() && resp.has_tool_calls() {
-            return GateResult::abstain(
-                self.id(),
-                "tool-call-only response: no text content to validate as JSON",
-                0,
-            );
+            return GateResult::deterministic(self.id(), Verdict::Pass, 0);
         }
         let ok = serde_json::from_str::<serde_json::Value>(resp.text.trim()).is_ok();
         GateResult::deterministic(self.id(), if ok { Verdict::Pass } else { Verdict::Fail }, 0)
@@ -148,14 +146,10 @@ impl Gate for SchemaGate {
         &self.id
     }
     async fn evaluate(&self, _req: &ModelRequest, resp: &ModelResponse) -> GateResult {
-        // Abstain on tool-call-only turns: no text payload to validate against the schema.
-        // Use `tool-args-valid` to validate tool call arguments.
+        // Tool-call-only: no text payload to validate — trivially passes (same reasoning as
+        // JsonValidGate: Abstain would trigger GateHealth auto-disable on agent traffic).
         if resp.text.trim().is_empty() && resp.has_tool_calls() {
-            return GateResult::abstain(
-                self.id(),
-                "tool-call-only response: no text content to validate against schema",
-                0,
-            );
+            return GateResult::deterministic(self.id(), Verdict::Pass, 0);
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(resp.text.trim()) else {
             let mut r = GateResult::deterministic(self.id(), Verdict::Fail, 0);
@@ -251,12 +245,38 @@ fn validate_tool_args_against_tools(
     None // unknown tool: no schema to validate against — don't fail
 }
 
+/// True if `name` appears in the request's `tools` array (Anthropic or OpenAI format).
+fn tool_name_is_known(name: &str, tools: &serde_json::Value) -> bool {
+    let Some(arr) = tools.as_array() else {
+        return false;
+    };
+    for tool in arr {
+        // Anthropic: {"name": "...", "input_schema": {...}}
+        if tool.get("name").and_then(serde_json::Value::as_str) == Some(name) {
+            return true;
+        }
+        // OpenAI: {"type": "function", "function": {"name": "...", "parameters": {...}}}
+        if tool
+            .pointer("/function/name")
+            .and_then(serde_json::Value::as_str)
+            == Some(name)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Validates every tool call's arguments against the request's tool schema.
 ///
-/// - **Pass**: all tool calls have arguments that parse as valid JSON and satisfy their
-///   definition's `input_schema` (Anthropic) / `parameters` (OpenAI) subset schema.
-/// - **Fail**: any tool call's arguments are invalid JSON or violate its schema.
-/// - **Abstain**: the response contains no tool calls (nothing to validate).
+/// - **Pass**: the response contains no tool calls (not applicable — counts as satisfied,
+///   not as an error), OR all tool calls have valid JSON arguments that satisfy their schema.
+/// - **Fail**: the response calls a tool that was not declared in the request (hallucinated
+///   tool), the request declares no tools but the response contains tool calls, any tool
+///   call's arguments are not valid JSON, or any call violates its schema.
+///
+/// Pass (not Abstain) on no-tool-call turns so GateHealth does not count this as an error
+/// and auto-disable the gate on agent traffic where most turns have no tool calls.
 ///
 /// Registered as the built-in gate id `tool-args-valid`. See AGENTS.md gotchas.
 #[derive(Debug, Clone, Copy)]
@@ -270,9 +290,30 @@ impl Gate for ToolArgsValidGate {
     async fn evaluate(&self, req: &ModelRequest, resp: &ModelResponse) -> GateResult {
         let calls = extract_response_tool_calls(&resp.raw);
         if calls.is_empty() {
-            return GateResult::abstain(self.id(), "no tool calls in response", 0);
+            // No tool calls — trivially satisfied. Pass (not Abstain: see doc comment).
+            return GateResult::deterministic(self.id(), Verdict::Pass, 0);
         }
+
+        // Response has tool calls. Check that the request actually declared any tools.
+        let has_declared_tools = req.tools.as_array().is_some_and(|a| !a.is_empty());
+        if !has_declared_tools {
+            let mut r = GateResult::deterministic(self.id(), Verdict::Fail, 0);
+            r.reason = Some(
+                "response contains tool calls but request declared no tools (hallucinated)"
+                    .to_owned(),
+            );
+            return r;
+        }
+
         for (name, args_str) in &calls {
+            // Fail on any call to a tool not declared in the request.
+            if !tool_name_is_known(name, &req.tools) {
+                let mut r = GateResult::deterministic(self.id(), Verdict::Fail, 0);
+                r.reason = Some(format!(
+                    "tool call {name:?}: tool not declared in request (hallucinated)"
+                ));
+                return r;
+            }
             let args = match serde_json::from_str::<serde_json::Value>(args_str) {
                 Ok(v) => v,
                 Err(_) => {
@@ -1158,14 +1199,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_valid_abstains_on_tool_use_only_response() {
-        // json-valid has nothing to parse; abstain rather than fail (no escalation).
+    async fn json_valid_passes_on_tool_use_only_response() {
+        // json-valid on a tool-only turn has nothing to parse → trivially satisfied (Pass, not
+        // Abstain: Abstain is an operational error that triggers GateHealth auto-disable).
         assert_eq!(
             JsonValidGate
                 .evaluate(&req(), &tool_use_resp())
                 .await
                 .verdict,
-            Verdict::Abstain
+            Verdict::Pass
         );
     }
 
@@ -1181,14 +1223,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_gate_abstains_on_tool_use_only_response() {
+    async fn schema_gate_passes_on_tool_use_only_response() {
+        // Same reasoning as json_valid: trivially passes (not Abstain) on tool-only turns.
         let g = SchemaGate::new(
             "extract",
             serde_json::json!({"type": "object", "required": ["name"]}),
         );
         assert_eq!(
             g.evaluate(&req(), &tool_use_resp()).await.verdict,
-            Verdict::Abstain
+            Verdict::Pass
         );
     }
 
@@ -1204,14 +1247,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_args_valid_abstains_when_no_tool_calls() {
-        // Text-only response: nothing to validate.
+    async fn tool_args_valid_passes_when_no_tool_calls() {
+        // Text-only response: trivially satisfied (Pass, not Abstain — see doc comment).
         assert_eq!(
             ToolArgsValidGate
                 .evaluate(&req(), &resp("hello"))
                 .await
                 .verdict,
-            Verdict::Abstain
+            Verdict::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_args_valid_fails_on_hallucinated_tool_name() {
+        // Response calls "unknown_tool" which is not in the request's tools list.
+        let bad_resp = ModelResponse {
+            text: String::new(),
+            raw: serde_json::json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "unknown_tool",
+                    "input": { "x": 1 }
+                }]
+            }),
+            ..tool_use_resp()
+        };
+        let r = ToolArgsValidGate
+            .evaluate(&tool_req_with_schema(), &bad_resp)
+            .await;
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(
+            r.reason
+                .as_deref()
+                .is_some_and(|s| s.contains("unknown_tool")),
+            "reason must name the hallucinated tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_args_valid_fails_when_no_tools_declared_but_response_has_calls() {
+        // Request declared no tools, but response contains tool calls.
+        assert_eq!(
+            ToolArgsValidGate
+                .evaluate(&req(), &tool_use_resp()) // req() has no tools
+                .await
+                .verdict,
+            Verdict::Fail
         );
     }
 

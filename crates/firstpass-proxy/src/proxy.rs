@@ -1833,7 +1833,7 @@ async fn messages(
                     let shadow_ctx = route.shadow.map(|_| {
                         (
                             body.clone(),
-                            Auth::from_headers(&headers),
+                            Auth::from_headers(&headers, firstpass_core::Dialect::Anthropic),
                             features.clone(),
                             tenant.clone(),
                             session_header
@@ -2283,7 +2283,7 @@ async fn handle_enforce(
             .await;
             let _ = tx.send(out);
         });
-        return sse_keepalive_response(rx, anthropic_sse_from_message);
+        return sse_keepalive_response(rx, Box::new(anthropic_sse_from_message));
     }
     match enforce_pipeline(
         state,
@@ -2986,7 +2986,7 @@ async fn enforce_pipeline(
             "request body is not a valid Anthropic Messages request".to_owned(),
         ));
     };
-    let auth = Auth::from_headers(headers);
+    let auth = Auth::from_headers(headers, firstpass_core::Dialect::Anthropic);
     let resp = enforce_pipeline_inner(
         state,
         body,
@@ -3082,7 +3082,7 @@ async fn enforce_pipeline_openai_as(
             "request body is not a valid OpenAI Chat Completions request".to_owned(),
         ));
     };
-    let auth = Auth::from_headers(headers);
+    let auth = Auth::from_headers(headers, firstpass_core::Dialect::Openai);
     let resp = enforce_pipeline_inner(
         state,
         receipt_body,
@@ -3114,7 +3114,7 @@ const SSE_KEEPALIVE_EVERY: Duration = Duration::from_secs(5);
 /// [`openai_sse_from_message`] for OpenAI clients.
 fn sse_keepalive_response(
     rx: tokio::sync::oneshot::Receiver<Result<Value, ProxyError>>,
-    format_message: fn(&Value) -> String,
+    format_message: Box<dyn Fn(&Value) -> String + Send>,
 ) -> Response {
     let mut ticks = tokio::time::interval(SSE_KEEPALIVE_EVERY);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3142,7 +3142,7 @@ struct KeepaliveStream {
     rx: Option<tokio::sync::oneshot::Receiver<Result<Value, ProxyError>>>,
     ticks: tokio::time::Interval,
     /// Converts the served result `Value` to the caller's dialect SSE frames.
-    format_message: fn(&Value) -> String,
+    format_message: Box<dyn Fn(&Value) -> String + Send>,
 }
 
 impl futures_core::Stream for KeepaliveStream {
@@ -3157,9 +3157,8 @@ impl futures_core::Stream for KeepaliveStream {
             return Poll::Ready(None); // final frame already emitted
         };
         if let Poll::Ready(out) = std::pin::Pin::new(rx).poll(cx) {
-            let fmt = self.format_message;
             let frame = match out {
-                Ok(Ok(message)) => fmt(&message),
+                Ok(Ok(message)) => (self.format_message)(&message),
                 Ok(Err(e)) => sse_error_event(&e),
                 Err(_) => sse_error_event(&ProxyError::Internal(
                     "enforce pipeline task dropped".to_owned(),
@@ -3241,6 +3240,25 @@ fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
     })
 }
 
+/// Map an OpenAI `finish_reason` to the nearest Anthropic `stop_reason`.
+/// Used when an Anthropic-dialect client is served by an OpenAI-compatible rung.
+///
+/// Mapping:
+/// - `"tool_calls"` → `"tool_use"` (model invoked a tool)
+/// - `"length"` → `"max_tokens"` (output-token limit reached)
+/// - `"stop"` → `"end_turn"` (normal completion)
+/// - `"content_filter"` → `"end_turn"` (conservative: treated as end-of-turn)
+/// - anything else → passed through (forward-compatible with future values)
+fn openai_finish_reason_to_anthropic(finish_reason: &str) -> &str {
+    match finish_reason {
+        "tool_calls" => "tool_use",
+        "length" => "max_tokens",
+        "stop" => "end_turn",
+        "content_filter" => "end_turn",
+        other => other,
+    }
+}
+
 /// Render a served [`ModelResponse`] back into an Anthropic Messages response envelope, so the
 /// caller sees the same wire shape regardless of which provider actually answered.
 ///
@@ -3260,11 +3278,21 @@ fn anthropic_response_json(resp: &ModelResponse) -> Value {
 
     // Carry the real stop_reason/stop_sequence from the upstream response so callers (e.g.
     // tool-loop agents) can correctly decide whether to re-invoke.
-    let stop_reason = resp
+    // Cross-provider: when an Anthropic-dialect client is served by an OpenAI-compatible rung,
+    // `resp.raw` has `choices[0].finish_reason` rather than `stop_reason`. Map it to the
+    // Anthropic vocabulary so the client always sees a valid Anthropic stop_reason.
+    let stop_reason_str = resp
         .raw
         .get("stop_reason")
-        .cloned()
-        .unwrap_or_else(|| Value::String("end_turn".to_owned()));
+        .and_then(Value::as_str)
+        .or_else(|| {
+            resp.raw
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .map(openai_finish_reason_to_anthropic)
+        })
+        .unwrap_or("end_turn");
+    let stop_reason = Value::String(stop_reason_str.to_owned());
     let stop_sequence = resp
         .raw
         .get("stop_sequence")
@@ -3374,20 +3402,16 @@ fn anthropic_sse_from_message(message: &Value) -> String {
                 }
             }
             Some("redacted_thinking") => {
-                // Redacted thinking block: start empty, emit redacted_thinking_delta.
-                let data = block.get("data").and_then(Value::as_str).unwrap_or("");
+                // Redacted thinking block: the Anthropic SSE spec does NOT define a
+                // `redacted_thinking_delta` event type. Emit the full block in
+                // `content_block_start` and then `content_block_stop` with no delta.
                 sse_event(
                     &mut out,
                     "content_block_start",
                     &serde_json::json!({ "type": "content_block_start", "index": i,
-                        "content_block": { "type": "redacted_thinking", "data": "" } }),
+                        "content_block": block }),
                 );
-                sse_event(
-                    &mut out,
-                    "content_block_delta",
-                    &serde_json::json!({ "type": "content_block_delta", "index": i,
-                        "delta": { "type": "redacted_thinking_delta", "data": data } }),
-                );
+                // No delta events — fall through to content_block_stop below.
             }
             _ => {
                 // text (and any other text-bearing block): start empty, stream the text as one delta.
@@ -4802,7 +4826,16 @@ fn openai_response_json(resp: &ModelResponse) -> Value {
 /// Re-emit a served OpenAI `chat.completion` envelope as an SSE stream body
 /// (`data: chat.completion.chunk` frames ending with `data: [DONE]`), so a `stream: true`
 /// OpenAI client is served even though enforce buffered the full response to gate it.
-fn openai_sse_from_message(message: &Value) -> String {
+/// Whether `stream_options.include_usage` was set to `true` in the request body.
+fn stream_options_include_usage(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.pointer("/stream_options/include_usage").cloned())
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn openai_sse_from_message(message: &Value, include_usage: bool) -> String {
     let id = message
         .get("id")
         .and_then(Value::as_str)
@@ -4889,9 +4922,9 @@ fn openai_sse_from_message(message: &Value) -> String {
     out.push_str(&finish_chunk.to_string());
     out.push_str("\n\n");
 
-    // Usage chunk — always emitted so clients that set `stream_options.include_usage` receive it;
-    // the OpenAI spec defines it as a chunk with `choices: []` before [DONE].
-    if let Some(usage) = message.get("usage") {
+    // Usage chunk — only emitted when the request set `stream_options.include_usage: true`.
+    // OpenAI spec: a chunk with `choices: []` immediately before [DONE].
+    if include_usage && let Some(usage) = message.get("usage") {
         let usage_chunk = serde_json::json!({
             "id": id,
             "object": "chat.completion.chunk",
@@ -4928,6 +4961,7 @@ async fn handle_enforce_openai(
     routing_mode: RoutingMode,
 ) -> Response {
     if is_stream_request(body) {
+        let include_usage = stream_options_include_usage(body);
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
         let (state_c, headers_c, body_c, route_c) =
             (state.clone(), headers.clone(), body.clone(), route.clone());
@@ -4946,7 +4980,10 @@ async fn handle_enforce_openai(
             .await;
             let _ = tx.send(out);
         });
-        return sse_keepalive_response(rx, openai_sse_from_message);
+        return sse_keepalive_response(
+            rx,
+            Box::new(move |v| openai_sse_from_message(v, include_usage)),
+        );
     }
     match enforce_pipeline_openai(
         state,
@@ -7504,7 +7541,7 @@ mod tests {
         let mut stream = KeepaliveStream {
             rx: Some(rx),
             ticks,
-            format_message: anthropic_sse_from_message,
+            format_message: Box::new(anthropic_sse_from_message),
         };
         /// One poll of the stream: `Some(item)` if ready, `None` if pending right now.
         async fn next(
@@ -7811,7 +7848,7 @@ mod tests {
                 "content": [{ "type": "text", "text": "Hi there!" }]
             }),
         };
-        let sse = openai_sse_from_message(&openai_response_json(&resp));
+        let sse = openai_sse_from_message(&openai_response_json(&resp), false);
         // Every line is either blank or starts with "data: "
         for line in sse.lines() {
             assert!(
@@ -9544,7 +9581,7 @@ mod tests {
             shadow,
             0,
             &user_body(),
-            Auth::from_headers(&HeaderMap::new()),
+            Auth::from_headers(&HeaderMap::new(), firstpass_core::Dialect::Anthropic),
             &Features::new(TaskKind::Other),
             "t".to_owned(),
             "s".to_owned(),
@@ -10849,6 +10886,37 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_response_json_maps_openai_finish_reason_to_anthropic_stop_reason() {
+        // When an Anthropic-dialect client is served by an OpenAI rung, `raw` has
+        // `choices[0].finish_reason` instead of `stop_reason`. Verify the mapping.
+        let cases = [
+            ("tool_calls", "tool_use"),
+            ("length", "max_tokens"),
+            ("stop", "end_turn"),
+            ("content_filter", "end_turn"),
+        ];
+        for (finish_reason, expected_stop_reason) in cases {
+            let resp = ModelResponse {
+                model: "gpt-4o".to_owned(),
+                text: String::new(),
+                in_tokens: 5,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+                out_tokens: 3,
+                raw: serde_json::json!({
+                    "choices": [{ "finish_reason": finish_reason, "message": { "content": null } }]
+                }),
+            };
+            let json = anthropic_response_json(&resp);
+            assert_eq!(
+                json["stop_reason"].as_str(),
+                Some(expected_stop_reason),
+                "finish_reason={finish_reason} → stop_reason={expected_stop_reason}"
+            );
+        }
+    }
+
+    #[test]
     fn anthropic_sse_from_message_uses_real_stop_reason_and_thinking() {
         let resp = thinking_tool_resp();
         let message = anthropic_response_json(&resp);
@@ -10931,18 +10999,21 @@ mod tests {
             .map(|d| serde_json::from_str::<Value>(d).expect("valid JSON"))
             .collect();
 
+        // content_block_start carries the full block (type + data) — no separate delta.
         assert!(
-            frames
-                .iter()
-                .any(|f| f["content_block"]["type"] == "redacted_thinking"),
-            "redacted_thinking block_start must appear"
+            frames.iter().any(|f| {
+                f["type"] == "content_block_start"
+                    && f["content_block"]["type"] == "redacted_thinking"
+                    && f["content_block"]["data"] == "base64encodeddata=="
+            }),
+            "content_block_start must carry the full redacted_thinking block with data"
         );
+        // The Anthropic SSE spec has no redacted_thinking_delta event type.
         assert!(
-            frames
+            !frames
                 .iter()
-                .any(|f| f["delta"]["type"] == "redacted_thinking_delta"
-                    && f["delta"]["data"] == "base64encodeddata=="),
-            "redacted_thinking_delta must carry the data"
+                .any(|f| f["delta"]["type"] == "redacted_thinking_delta"),
+            "no redacted_thinking_delta must appear"
         );
     }
 
@@ -10980,7 +11051,7 @@ mod tests {
                 ]
             }),
         };
-        let sse = openai_sse_from_message(&openai_response_json(&resp));
+        let sse = openai_sse_from_message(&openai_response_json(&resp), false);
         // Find the frame that carries tool_calls.
         let frames: Vec<Value> = sse
             .lines()
@@ -11012,7 +11083,7 @@ mod tests {
             out_tokens: 2,
             raw: serde_json::json!({ "content": [{ "type": "text", "text": "hi" }] }),
         };
-        let sse = openai_sse_from_message(&openai_response_json(&resp));
+        let sse = openai_sse_from_message(&openai_response_json(&resp), true);
         let frames: Vec<Value> = sse
             .lines()
             .filter_map(|l| l.strip_prefix("data: "))
@@ -11036,5 +11107,46 @@ mod tests {
                 .unwrap(),
             "[DONE]"
         );
+    }
+
+    #[test]
+    fn openai_sse_from_message_no_usage_chunk_without_include_usage() {
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: "hi".to_owned(),
+            in_tokens: 3,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 2,
+            raw: serde_json::json!({ "content": [{ "type": "text", "text": "hi" }] }),
+        };
+        let sse = openai_sse_from_message(&openai_response_json(&resp), false);
+        let has_empty_choices_chunk = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|f| *f != "[DONE]")
+            .any(|d| {
+                serde_json::from_str::<Value>(d)
+                    .ok()
+                    .and_then(|v| v.get("choices").cloned())
+                    .and_then(|c| c.as_array().map(|a| a.is_empty()))
+                    .unwrap_or(false)
+            });
+        assert!(
+            !has_empty_choices_chunk,
+            "usage chunk must not appear when include_usage is false"
+        );
+    }
+
+    #[test]
+    fn stream_options_include_usage_parses_correctly() {
+        assert!(stream_options_include_usage(
+            br#"{"stream": true, "stream_options": {"include_usage": true}}"#
+        ));
+        assert!(!stream_options_include_usage(
+            br#"{"stream": true, "stream_options": {"include_usage": false}}"#
+        ));
+        assert!(!stream_options_include_usage(br#"{"stream": true}"#));
+        assert!(!stream_options_include_usage(b"not json"));
     }
 }

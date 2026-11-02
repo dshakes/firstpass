@@ -180,12 +180,19 @@ impl ProviderError {
 /// Never logged or persisted — [`std::fmt::Debug`] redacts all credential fields.
 #[derive(Clone, Default)]
 pub struct Auth {
-    /// Anthropic API key (`x-api-key` header, or `ANTHROPIC_API_KEY`).
+    /// Anthropic API key from `x-api-key` header or `ANTHROPIC_API_KEY` env.
+    /// Never populated from a Bearer token — use `anthropic_bearer` for OAuth/subscription.
     pub anthropic_key: Option<String>,
-    /// Bearer token from `Authorization: Bearer …` — used as `OpenAI` provider key, and
-    /// as the Anthropic OAuth fallback when no `x-api-key` is present (Claude Code with a
-    /// Claude subscription account sends a Bearer token, not a raw API key).
+    /// OpenAI (or OpenAI-compatible) API key from `Authorization: Bearer …` on OpenAI-dialect
+    /// requests, or `OPENAI_API_KEY` env. **Never populated on Anthropic-dialect requests** so
+    /// the server's `OPENAI_API_KEY` cannot accidentally be forwarded to api.anthropic.com, and
+    /// a Claude Code OAuth token arriving on `/v1/messages` cannot be sent to an OpenAI rung.
     pub openai_key: Option<String>,
+    /// Bearer token from `Authorization: Bearer …` on **Anthropic-dialect requests only** (`/v1/messages`,
+    /// count-tokens). Used by [`AnthropicProvider`] as the OAuth/subscription fallback when
+    /// `anthropic_key` is absent (Claude Code with a Claude account). Never populated from env
+    /// vars — only from the inbound request header on the Anthropic path.
+    pub anthropic_bearer: Option<String>,
     /// `anthropic-beta` header value, forwarded verbatim to the Anthropic endpoint.
     pub anthropic_beta: Option<String>,
     /// `anthropic-version` header value. When set, overrides the default `2023-06-01`.
@@ -197,6 +204,10 @@ impl std::fmt::Debug for Auth {
         f.debug_struct("Auth")
             .field("anthropic_key", &self.anthropic_key.as_ref().map(|_| "***"))
             .field("openai_key", &self.openai_key.as_ref().map(|_| "***"))
+            .field(
+                "anthropic_bearer",
+                &self.anthropic_bearer.as_ref().map(|_| "***"),
+            )
             .field("anthropic_beta", &self.anthropic_beta)
             .field("anthropic_version", &self.anthropic_version)
             .finish()
@@ -204,22 +215,55 @@ impl std::fmt::Debug for Auth {
 }
 
 impl Auth {
-    /// Extract BYOK credentials from request headers, falling back to `ANTHROPIC_API_KEY` /
-    /// `OPENAI_API_KEY` environment variables. Also captures `anthropic-beta` and
-    /// `anthropic-version` for forwarding to the Anthropic endpoint.
+    /// Extract BYOK credentials from request headers, scoped to `dialect` so credentials
+    /// cannot leak across provider boundaries.
+    ///
+    /// - On **Anthropic-dialect** requests (`/v1/messages`, count-tokens): an inbound
+    ///   `Authorization: Bearer` token goes into `anthropic_bearer` only — it is the
+    ///   OAuth/subscription credential for Claude accounts and must NOT be forwarded to
+    ///   OpenAI rungs. `openai_key` is populated only from the `OPENAI_API_KEY` env var
+    ///   (no inbound Bearer on this path).
+    ///
+    /// - On **OpenAI-dialect** requests (`/v1/chat/completions`, `/v1/responses`): an inbound
+    ///   `Authorization: Bearer` token goes into `openai_key` only — it is the caller's
+    ///   OpenAI key and must NOT be forwarded to Anthropic rungs. `anthropic_bearer` is
+    ///   always `None` on this path.
+    ///
+    /// This scoping ensures `OPENAI_API_KEY` is never sent to api.anthropic.com and a Claude
+    /// OAuth token is never sent to an OpenAI-compatible endpoint.
     #[must_use]
-    pub fn from_headers(headers: &HeaderMap) -> Self {
+    pub fn from_headers(headers: &HeaderMap, dialect: firstpass_core::Dialect) -> Self {
         let anthropic_key = headers
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
-        let openai_key = headers
+
+        let bearer = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::to_owned)
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+            .map(str::to_owned);
+
+        let (openai_key, anthropic_bearer) = match dialect {
+            firstpass_core::Dialect::Anthropic => {
+                // Bearer on this path is an Anthropic OAuth token — not an OpenAI key.
+                let openai_env = std::env::var("OPENAI_API_KEY").ok();
+                (openai_env, bearer)
+            }
+            firstpass_core::Dialect::Openai => {
+                // Bearer on this path is an OpenAI key — not an Anthropic credential.
+                let openai_key = bearer.or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                (openai_key, None)
+            }
+            firstpass_core::Dialect::Gemini => {
+                // Bearer on this path is a Google API key — neither OpenAI nor Anthropic.
+                // Fall back to env for escalation paths.
+                let openai_env = std::env::var("OPENAI_API_KEY").ok();
+                (openai_env, None)
+            }
+        };
+
         let anthropic_beta = headers
             .get("anthropic-beta")
             .and_then(|v| v.to_str().ok())
@@ -231,6 +275,7 @@ impl Auth {
         Self {
             anthropic_key,
             openai_key,
+            anthropic_bearer,
             anthropic_beta,
             anthropic_version,
         }
@@ -379,10 +424,12 @@ impl Provider for AnthropicProvider {
         let mut builder = self.http.post(url);
 
         // Prefer x-api-key; fall back to Authorization: Bearer for OAuth/subscription clients
-        // (e.g. Claude Code with a Claude account sends a Bearer token, not an API key).
+        // (e.g. Claude Code with a Claude account sends a Bearer token, not a raw API key).
+        // Use `anthropic_bearer` — never `openai_key` — so the OpenAI key cannot reach
+        // api.anthropic.com even when both are set.
         if !key.is_empty() {
             builder = builder.header("x-api-key", key);
-        } else if let Some(bearer) = &auth.openai_key {
+        } else if let Some(bearer) = &auth.anthropic_bearer {
             builder = builder.header(
                 axum::http::header::AUTHORIZATION,
                 format!("Bearer {bearer}"),
@@ -2295,6 +2342,7 @@ mod tests {
         let auth = Auth {
             anthropic_key: Some("sk-ant-super-secret".to_owned()),
             openai_key: Some("sk-oai-super-secret".to_owned()),
+            anthropic_bearer: Some("oauth-super-secret".to_owned()),
             anthropic_beta: None,
             anthropic_version: None,
         };
@@ -2485,6 +2533,7 @@ mod tests {
 
     #[test]
     fn auth_from_headers_captures_beta_and_version() {
+        use firstpass_core::Dialect;
         let mut h = HeaderMap::new();
         h.insert("x-api-key", "sk-ant-key".parse().unwrap());
         h.insert(
@@ -2492,7 +2541,7 @@ mod tests {
             "interleaved-thinking-2025-05-14".parse().unwrap(),
         );
         h.insert("anthropic-version", "2024-01-01".parse().unwrap());
-        let auth = Auth::from_headers(&h);
+        let auth = Auth::from_headers(&h, Dialect::Anthropic);
         assert_eq!(auth.anthropic_key.as_deref(), Some("sk-ant-key"));
         assert_eq!(
             auth.anthropic_beta.as_deref(),
@@ -2500,22 +2549,52 @@ mod tests {
         );
         assert_eq!(auth.anthropic_version.as_deref(), Some("2024-01-01"));
         assert!(auth.openai_key.is_none());
+        assert!(auth.anthropic_bearer.is_none());
     }
 
     #[test]
-    fn auth_from_headers_bearer_only_sets_openai_key_for_anthropic_fallback() {
-        // A Claude account subscription client: Authorization: Bearer <oauth-token>, no x-api-key.
+    fn auth_from_headers_anthropic_dialect_bearer_goes_to_anthropic_bearer_not_openai_key() {
+        // A Claude account subscription client: Bearer arrives on /v1/messages (Anthropic dialect).
+        // It must populate `anthropic_bearer` only — never `openai_key`.
+        use firstpass_core::Dialect;
         let mut h = HeaderMap::new();
         h.insert(
             axum::http::header::AUTHORIZATION,
-            "Bearer claude-sub-oauth-token".parse().unwrap(),
+            "Bearer claude-oauth-token".parse().unwrap(),
         );
-        let auth = Auth::from_headers(&h);
+        let auth = Auth::from_headers(&h, Dialect::Anthropic);
         assert!(auth.anthropic_key.is_none(), "no x-api-key header");
+        assert!(
+            auth.openai_key.is_none(),
+            "Bearer on Anthropic path must NOT populate openai_key"
+        );
+        assert_eq!(
+            auth.anthropic_bearer.as_deref(),
+            Some("claude-oauth-token"),
+            "Bearer on Anthropic path goes to anthropic_bearer"
+        );
+    }
+
+    #[test]
+    fn auth_from_headers_openai_dialect_bearer_goes_to_openai_key_not_anthropic_bearer() {
+        // An OpenAI client: Bearer arrives on /v1/chat/completions (OpenAI dialect).
+        // It must populate `openai_key` only — never `anthropic_bearer`.
+        use firstpass_core::Dialect;
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer sk-openai-key".parse().unwrap(),
+        );
+        let auth = Auth::from_headers(&h, Dialect::Openai);
+        assert!(auth.anthropic_key.is_none());
+        assert!(
+            auth.anthropic_bearer.is_none(),
+            "Bearer on OpenAI path must NOT populate anthropic_bearer"
+        );
         assert_eq!(
             auth.openai_key.as_deref(),
-            Some("claude-sub-oauth-token"),
-            "Bearer token captured in openai_key for Anthropic Bearer fallback"
+            Some("sk-openai-key"),
+            "Bearer on OpenAI path goes to openai_key"
         );
     }
 
@@ -2565,7 +2644,8 @@ mod tests {
         };
         let auth = Auth {
             anthropic_key: None, // no API key — use Bearer fallback
-            openai_key: Some("oauth-bearer-token".to_owned()),
+            openai_key: None,    // OpenAI key must NOT be forwarded to Anthropic
+            anthropic_bearer: Some("oauth-bearer-token".to_owned()),
             anthropic_beta: Some("interleaved-thinking-2025-05-14".to_owned()),
             anthropic_version: Some("2024-01-01".to_owned()),
         };
@@ -2580,7 +2660,7 @@ mod tests {
             hdrs.get(axum::http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok()),
             Some("Bearer oauth-bearer-token"),
-            "OAuth Bearer must be forwarded when x-api-key is absent"
+            "OAuth Bearer from anthropic_bearer must be forwarded when x-api-key is absent"
         );
         assert_eq!(
             hdrs.get("anthropic-version").and_then(|v| v.to_str().ok()),
@@ -2645,5 +2725,68 @@ mod tests {
             ..with_tc.clone()
         };
         assert!(!no_tc.has_tool_calls());
+    }
+
+    /// SECURITY: OPENAI_API_KEY must never be forwarded to the Anthropic endpoint.
+    /// When `anthropic_key` is absent but `openai_key` is set (e.g. from the env fallback on
+    /// a server that has OPENAI_API_KEY set), the Anthropic provider must send NO auth header
+    /// rather than leaking the OpenAI key.
+    #[tokio::test]
+    async fn anthropic_provider_does_not_forward_openai_key_to_anthropic_endpoint() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap| {
+                *captured_clone.lock().unwrap() = Some(headers);
+                async {
+                    axum::Json(serde_json::json!({
+                        "id": "msg_test", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            api_key_env: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: serde_json::json!({"messages": [{"role":"user","content":"hi"}], "max_tokens": 16}),
+            cache_prefix: false,
+        };
+
+        // Auth with an openai_key set (e.g., from OPENAI_API_KEY env) but no anthropic creds.
+        let auth = Auth {
+            anthropic_key: None,
+            openai_key: Some("sk-openai-from-env".to_owned()),
+            anthropic_bearer: None,
+            anthropic_beta: None,
+            anthropic_version: None,
+        };
+        provider.complete(&req, &auth).await.expect("must succeed");
+
+        let hdrs = captured.lock().unwrap().take().expect("headers captured");
+        assert!(hdrs.get("x-api-key").is_none(), "x-api-key must be absent");
+        assert!(
+            hdrs.get(axum::http::header::AUTHORIZATION).is_none(),
+            "SECURITY: openai_key must NOT be forwarded to the Anthropic endpoint"
+        );
     }
 }

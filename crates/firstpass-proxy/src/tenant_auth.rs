@@ -221,11 +221,19 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
 
 /// Whether the request's only tenant-key source is `Authorization: Bearer`.
 ///
-/// Returns `true` when no `x-firstpass-key` is present and a non-empty Bearer token exists.
-/// The middleware uses this to strip the Authorization header before forwarding upstream so that
-/// a tenant credential sent as Bearer is never relayed to the model provider.
+/// Returns `true` when no non-empty `x-firstpass-key` is present and a non-empty Bearer token
+/// exists. The middleware uses this to strip the Authorization header before forwarding upstream
+/// so that a tenant credential sent as Bearer is never relayed to the model provider.
+///
+/// An empty or whitespace-only `x-firstpass-key` is treated as absent: the header value can
+/// carry no real key, so Bearer is still the (only) credential source and must be stripped.
 fn key_came_from_bearer_only(headers: &HeaderMap) -> bool {
-    if headers.get(KEY_HEADER).is_some() {
+    let has_explicit_key = headers
+        .get(KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if has_explicit_key {
         return false; // x-firstpass-key is the credential; Bearer is for the provider.
     }
     headers
@@ -360,6 +368,39 @@ mod tests {
         let mut h4 = HeaderMap::new();
         h4.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
         assert!(!key_came_from_bearer_only(&h4));
+    }
+
+    #[test]
+    fn key_came_from_bearer_only_treats_empty_or_whitespace_custom_header_as_absent() {
+        // x-firstpass-key is present but empty → Bearer is still the only credential; strip it.
+        let mut h = HeaderMap::new();
+        h.insert(KEY_HEADER, "".parse().unwrap());
+        h.insert(header::AUTHORIZATION, "Bearer real-token".parse().unwrap());
+        assert!(
+            key_came_from_bearer_only(&h),
+            "empty x-firstpass-key must not suppress Bearer stripping"
+        );
+
+        // x-firstpass-key is present but whitespace-only → same.
+        let mut h2 = HeaderMap::new();
+        h2.insert(KEY_HEADER, "   ".parse().unwrap());
+        h2.insert(header::AUTHORIZATION, "Bearer real-token".parse().unwrap());
+        assert!(
+            key_came_from_bearer_only(&h2),
+            "whitespace x-firstpass-key must not suppress Bearer stripping"
+        );
+
+        // x-firstpass-key has a real value → Bearer is the provider key; do NOT strip.
+        let mut h3 = HeaderMap::new();
+        h3.insert(KEY_HEADER, "tenant-key".parse().unwrap());
+        h3.insert(
+            header::AUTHORIZATION,
+            "Bearer provider-key".parse().unwrap(),
+        );
+        assert!(
+            !key_came_from_bearer_only(&h3),
+            "non-empty x-firstpass-key means Bearer is a provider key, not the tenant key"
+        );
     }
 
     // ── Defect 4: auth middleware integration tests ──────────────────────────────
