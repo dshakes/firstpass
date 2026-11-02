@@ -168,6 +168,17 @@ fn schema_violation(
                     ));
                 }
             }
+        } else if let Some(extra_schema) =
+            schema.get("additionalProperties").filter(|v| v.is_object())
+        {
+            // `additionalProperties: {schema}` — keys outside `properties` must match it.
+            for (key, child) in obj {
+                if !defined_props.contains(key.as_str())
+                    && let Some(v) = schema_violation(child, extra_schema, &format!("{path}.{key}"))
+                {
+                    return Some(v);
+                }
+            }
         }
 
         // `properties` keyword — recurse into each present property.
@@ -293,13 +304,15 @@ fn extract_response_tool_calls(raw: &serde_json::Value) -> Vec<(String, String)>
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                         .to_owned(),
+                    // Missing or non-string `arguments` is malformed: an empty string fails the
+                    // JSON parse below, so the call fails the gate instead of passing as `{}`.
                     func.get("arguments")
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or("{}")
+                        .unwrap_or("")
                         .to_owned(),
                 )
             } else {
-                (String::new(), "{}".to_owned())
+                (String::new(), String::new())
             };
             out.push((name, args));
         }
@@ -1582,6 +1595,37 @@ mod tests {
 
     /// additionalProperties: false with extra key → Fail.
     /// Guards: `schema_violation` additionalProperties-false check.
+    #[test]
+    fn schema_violation_additional_properties_subschema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "additionalProperties": {"type": "integer"}
+        });
+        assert!(
+            schema_violation(&serde_json::json!({"a": "x", "b": 1}), &schema, "args").is_none()
+        );
+        assert!(
+            schema_violation(&serde_json::json!({"a": "x", "b": "no"}), &schema, "args").is_some()
+        );
+    }
+
+    #[test]
+    fn openai_tool_call_without_string_arguments_is_malformed() {
+        let raw = serde_json::json!({"choices": [{"message": {"tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "f"}},
+            {"id": "c2", "type": "function", "function": {"name": "f", "arguments": {"x": 1}}}
+        ]}}]});
+        let calls = extract_response_tool_calls(&raw);
+        assert_eq!(calls.len(), 2);
+        for (_, args) in &calls {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(args).is_err(),
+                "missing/non-string arguments must not parse as an empty object"
+            );
+        }
+    }
+
     #[test]
     fn schema_violation_additional_properties_false() {
         let schema = json!({
