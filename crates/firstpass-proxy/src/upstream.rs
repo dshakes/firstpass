@@ -63,13 +63,7 @@ pub async fn forward_anthropic(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
-    let response = build_request(client, base, "/v1/messages", headers, body)
-        .send()
-        .await?;
-    let status = response.status();
-    let out_headers = passthrough_headers(&response);
-    let body = response.bytes().await?;
-    Ok((status, out_headers, body))
+    forward_anthropic_path(client, base, "/v1/messages", headers, body).await
 }
 
 /// Forward one `POST /v1/messages` request and return the raw response for **streaming**

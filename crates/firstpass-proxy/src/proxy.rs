@@ -656,7 +656,7 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
     let business = Router::new()
         .route("/v1/messages", post(messages))
         // count_tokens is an Anthropic metadata endpoint: no routing decision, no receipt.
-        // Registered before the catch-all so it takes precedence.
+        // Exact-path route: Claude Code calls it to size its context window.
         .route("/v1/messages/count_tokens", post(count_tokens_passthrough))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))

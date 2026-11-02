@@ -290,7 +290,7 @@ class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
         }
         record(entry)
 
-        if self.path == "/v1/models":
+        if self.path.split("?")[0] == "/v1/models":
             self.send_json(200, OPENAI_MODELS)
         elif self.path == "/healthz":
             self.send_json(200, '{"status":"ok","service":"fake-upstream"}')

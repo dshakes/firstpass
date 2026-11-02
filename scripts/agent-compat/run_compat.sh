@@ -30,7 +30,13 @@ for _arg in "$@"; do [ "$_arg" = "--skip-build" ] && SKIP_BUILD=true; done
 
 if ! $SKIP_BUILD; then
   echo "==> building firstpass proxy (release)..."
-  cargo build --release -p firstpass-proxy 2>&1 | tail -3
+  # Capture the exit status: piping through `tail` alone would hide a failed build and run the
+  # harness against a stale binary.
+  if ! BUILD_OUT=$(cargo build --release -p firstpass-proxy 2>&1); then
+    printf '%s\n' "$BUILD_OUT" | tail -20
+    echo "ERROR: cargo build failed"; exit 1
+  fi
+  printf '%s\n' "$BUILD_OUT" | tail -3
 fi
 
 PROXY_BIN="$REPO_ROOT/target/release/firstpass"
@@ -41,18 +47,18 @@ PROXY_BIN="$REPO_ROOT/target/release/firstpass"
 # ---------------------------------------------------------------------------
 UPSTREAM_PORT=19350
 PROXY_PORT=19351
-REQUEST_LOG="/private/tmp/compat-requests.json"
-DB_PATH="/private/tmp/fp-compat.db"
-
-# Clean up any leftover from a previous run
-[ -f "$REQUEST_LOG" ] && python3 -c "import os; os.unlink('$REQUEST_LOG')" 2>/dev/null || true
-[ -f "$DB_PATH"   ] && python3 -c "import os; os.unlink('$DB_PATH')"   2>/dev/null || true
+# A private, per-run work directory: portable across macOS and Linux, no predictable shared
+# temp names, and parallel runs cannot collide. Removed on exit.
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fp-compat.XXXXXX")" || { echo "ERROR: mktemp failed"; exit 1; }
+REQUEST_LOG="$WORK_DIR/compat-requests.json"
+DB_PATH="$WORK_DIR/fp-compat.db"
 
 UP_PID=""
 FP_PID=""
 _cleanup() {
   [ -n "$UP_PID" ] && kill "$UP_PID" 2>/dev/null || true
   [ -n "$FP_PID" ] && kill "$FP_PID" 2>/dev/null || true
+  [ -n "$WORK_DIR" ] && rm -rf "$WORK_DIR"
 }
 trap _cleanup EXIT
 
@@ -79,7 +85,7 @@ echo "    upstream ready (pid=$UP_PID)"
 # Start proxy in OBSERVE mode
 # ---------------------------------------------------------------------------
 echo "==> starting proxy on $PROXY_PORT..."
-PROXY_STDERR_LOG="/private/tmp/fp-compat-stderr.log"
+PROXY_STDERR_LOG="$WORK_DIR/fp-compat-stderr.log"
 FIRSTPASS_UPSTREAM_ANTHROPIC="http://127.0.0.1:$UPSTREAM_PORT" \
 FIRSTPASS_UPSTREAM_OPENAI="http://127.0.0.1:$UPSTREAM_PORT" \
 FIRSTPASS_MODE=observe \
