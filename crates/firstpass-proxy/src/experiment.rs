@@ -4652,7 +4652,7 @@ mod tests {
             .await
         );
         b.sync_from_backend("t", 0, &fp()).await.unwrap();
-        let inc = b.reports()[0].report.incumbent.clone();
+        let inc = b.reports()[0].report.incumbent;
         assert_eq!(inc.requests, 1, "{inc:?}");
         assert!((inc.cost_usd - 0.10).abs() < 1e-12, "{inc:?}");
     }
