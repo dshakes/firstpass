@@ -3643,6 +3643,7 @@ fn openai_message_to_anthropic_content(msg: &Value) -> Value {
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .filter(Value::is_object)
                 .unwrap_or_else(|| serde_json::json!({}));
             if !name.is_empty() {
                 blocks.push(serde_json::json!({
@@ -12366,6 +12367,31 @@ mod tests {
     }
 
     // ── Gemini auditor findings ─────────────────────────────────────────────────
+
+    #[test]
+    fn translated_tool_use_input_is_always_an_object() {
+        // Anthropic requires tool_use.input to be an object; "null" or "[1]" arguments would be
+        // rejected when the client echoes the turn back.
+        for args in ["null", "[1]", "\"s\""] {
+            let resp = ModelResponse {
+                model: "gpt-4o".to_owned(),
+                text: String::new(),
+                in_tokens: 1,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+                out_tokens: 1,
+                raw: serde_json::json!({"choices": [{"finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": null,
+                    "tool_calls": [{"id": "c", "type": "function",
+                        "function": {"name": "f", "arguments": args}}]}}]}),
+            };
+            let json = anthropic_response_json(&resp);
+            assert!(
+                json["content"][0]["input"].is_object(),
+                "args={args}: {json}"
+            );
+        }
+    }
 
     #[test]
     fn anthropic_response_json_translates_openai_tool_calls_to_tool_use_blocks() {

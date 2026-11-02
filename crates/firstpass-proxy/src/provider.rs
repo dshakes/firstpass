@@ -283,6 +283,8 @@ impl Auth {
         let anthropic_version = headers
             .get("anthropic-version")
             .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
             .map(str::to_owned);
         Self {
             anthropic_key,
@@ -3043,6 +3045,19 @@ mod tests {
         assert!(
             hdrs.get(axum::http::header::AUTHORIZATION).is_none(),
             "Bearer must not be sent when x-api-key is present"
+        );
+    }
+
+    #[test]
+    fn blank_anthropic_version_header_is_absent() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "anthropic-version",
+            "  ".parse().unwrap_or_else(|_| unreachable!()),
+        );
+        assert_eq!(
+            Auth::from_headers(&h, firstpass_core::Dialect::Anthropic).anthropic_version,
+            None
         );
     }
 

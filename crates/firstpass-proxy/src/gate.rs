@@ -283,9 +283,11 @@ fn extract_response_tool_calls(raw: &serde_json::Value) -> Vec<(String, String)>
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                // Missing `input` is malformed: an empty string fails the JSON parse, so the call
+                // fails the gate instead of passing as fabricated `{}` args.
                 let args = b
                     .get("input")
-                    .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
+                    .map_or_else(String::new, std::string::ToString::to_string);
                 out.push((name, args));
             }
         }
@@ -1608,6 +1610,14 @@ mod tests {
         assert!(
             schema_violation(&serde_json::json!({"a": "x", "b": "no"}), &schema, "args").is_some()
         );
+    }
+
+    #[test]
+    fn anthropic_tool_use_without_input_is_malformed() {
+        let raw = serde_json::json!({"content": [{"type": "tool_use", "id": "t1", "name": "f"}]});
+        let calls = extract_response_tool_calls(&raw);
+        assert_eq!(calls.len(), 1);
+        assert!(serde_json::from_str::<serde_json::Value>(&calls[0].1).is_err());
     }
 
     #[test]
