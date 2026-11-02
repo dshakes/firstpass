@@ -76,8 +76,9 @@ Cross-fit per fold: cascade tau=[19, 34], repo-eps=[0.0, 0.0], P4 tau=[-1, -1] (
 | oracle-cascade (bound) | 395/500 (0.790) | $0.679 | $0.859 | [+0.010, +0.036] | [-0.116, -0.032] |
 
 P4 escalation: 500/500 trigger (tau=-1 in both folds).
-Switch overhead (pre-reg cost model): context at switch = 2,328 tokens × $15/1M = $0.035/inst.
-Without switch overhead (restart semantics): P4 = always-top exactly.
+Fitted tau=−1 means P4 escalates before the cheap model takes a step, so no switch happens and no
+switch overhead is charged in either P4 row; both equal always-top. (A switch after the first cheap
+step would have cost ≈ 2,328 tokens × $15/1M ≈ $0.035/inst.)
 
 ### GPT-5-mini→GPT-5.2-high (v2.0.0)  (n=500)
 
@@ -95,7 +96,7 @@ Cross-fit per fold: cascade tau=[6, 8], repo-eps=[0.05, 0.1], P4 tau=[-1, -1] (b
 | oracle-per-instance (bound) [P6] | 383/500 (0.766) | $0.154 | $0.201 | [+0.022, +0.056] | [-0.353, -0.289] |
 | oracle-cascade (bound) | 383/500 (0.766) | $0.317 | $0.414 | [+0.022, +0.056] | [-0.182, -0.133] |
 
-Switch overhead: 1,349 tokens × $5/1M = $0.007/inst. P4 restart = always-top exactly.
+Fitted tau=−1: no switch, no overhead in either P4 row; both equal always-top. (A switch after the first cheap step would have cost ≈ 1,349 tokens × $5/1M ≈ $0.007/inst.)
 
 ### Pool policies  (n=500)
 

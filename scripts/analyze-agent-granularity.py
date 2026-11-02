@@ -766,7 +766,7 @@ def analyse_ladder(
             print(
                 f"    [fold {fold_h}] context at switch = {context_toks:,} tokens, "
                 f"switch overhead = ${overhead:.4f}/inst "
-                f"({'included in P4 prereg cost' if label == 'prereg' else 'not charged to restart variant'})"
+                f"({'charged to P4 prereg' if label == 'prereg' and int(tau_p) > 0 else 'not charged: no cheap step ran, so no switch' if label == 'prereg' else 'not charged to restart variant'})"
             )
     print()
 
