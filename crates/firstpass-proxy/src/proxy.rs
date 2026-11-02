@@ -5989,6 +5989,52 @@ mod tests {
         );
     }
 
+    /// An agent's tool step (a reply that is only a tool call) is served from the cheap rung on a
+    /// `non-empty` route; it used to read as empty, fail the gate and escalate every tool step.
+    /// The reply keeps its real `stop_reason: tool_use` so the agent loop continues.
+    #[tokio::test]
+    async fn enforce_serves_a_tool_only_turn_from_the_cheap_rung() {
+        let haiku = "anthropic/claude-haiku-4-5";
+        let mut tool_turn = model_resp(haiku, "");
+        tool_turn.raw = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "bash",
+                         "input": {"command": "ls"}}],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let (state, mut rx) = enforce_state(
+            &[haiku, "anthropic/claude-sonnet-5"],
+            &["non-empty"],
+            vec![
+                (haiku, Ok(tool_turn)),
+                (
+                    "anthropic/claude-sonnet-5",
+                    Ok(model_resp(
+                        "anthropic/claude-sonnet-5",
+                        "should not be called",
+                    )),
+                ),
+            ],
+        );
+        let resp = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            user_body(),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["stop_reason"], "tool_use", "{json}");
+        let trace = rx.try_recv().expect("trace enqueued");
+        assert_eq!(trace.attempts.len(), 1, "no escalation on a tool step");
+        assert_eq!(trace.final_.served_rung, Some(0));
+    }
+
     #[tokio::test]
     async fn enforce_serves_first_pass_and_returns_anthropic_shape() {
         let (state, mut rx) = enforce_state(
