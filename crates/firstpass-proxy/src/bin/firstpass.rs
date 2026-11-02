@@ -728,6 +728,8 @@ fn cmd_experiment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let traces = store::load_tenant_traces(db, &tenant).unwrap_or_default();
     let deferred = store::load_all_deferred(db).unwrap_or_default();
     let mut pairs = store::load_all_experiment_pairs(db)?;
+    // Tenant boundary: `--tenant` scopes paired evidence too, not only the traces.
+    pairs.retain(|r| r.tenant == tenant);
     // With a shared log the cluster's evidence lives in the log, not in this store. Apply the
     // same rule the server uses at startup: only rows the log never received (`NotInLog`) are
     // evidence here; `InLog` rows belong to the log and legacy `Unknown` rows are withheld.

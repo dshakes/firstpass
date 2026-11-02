@@ -72,6 +72,24 @@ const SYNC_STALENESS_BOUND: std::time::Duration = std::time::Duration::from_secs
 /// acceptable. On timeout, `ensure_synced` fails closed (same as any other backend error).
 const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Bound on a shared-log call made off the request path (the paired task's append and read-back,
+/// and the background sync). A half-open connection must not stall the paired task before it
+/// writes its durable row, nor wedge the background sync loop.
+const LOG_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A shared-log call bounded by [`LOG_OP_TIMEOUT`]; a timeout is reported as a backend error.
+async fn bounded<T>(
+    fut: impl std::future::Future<Output = Result<T, LogError>>,
+) -> Result<T, LogError> {
+    match tokio::time::timeout(LOG_OP_TIMEOUT, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(LogError::Backend(format!(
+            "timed out after {} ms",
+            LOG_OP_TIMEOUT.as_millis()
+        ))),
+    }
+}
+
 // ── Shared log (optional Redis / in-memory backend) ───────────────────────────────────────────
 
 /// An error returned by [`ExperimentLogBackend`] operations.
@@ -1144,6 +1162,7 @@ impl ExperimentMonitor {
                 e.last_synced_at = Some(tokio::time::Instant::now());
                 // A recovered log re-arms the once-per-outage warning for the next outage.
                 e.sync_warn_logged = false;
+                e.sync_failed_at = None;
             }
             return Ok(());
         }
@@ -1197,6 +1216,7 @@ impl ExperimentMonitor {
             e.last_synced_at = Some(tokio::time::Instant::now());
             // A recovered log re-arms the once-per-outage warning for the next outage.
             e.sync_warn_logged = false;
+            e.sync_failed_at = None;
         }
         Ok(())
     }
@@ -1400,24 +1420,23 @@ impl ExperimentMonitor {
         // `apply_log_record` will skip re-tallying for own records (matched by replica_id).
         // An append failure means the evidence will not reach other replicas, which only delays
         // a decision — it does not affect local accounting.
-        if let Err(e) = log
-            .append(
-                tenant,
-                route_ix,
-                fingerprint,
-                LogRecord::Pair {
-                    x_inc,
-                    x_ch,
-                    incumbent_cost_usd,
-                    challenger_cost_usd,
-                    ch_error,
-                    ch_truncated,
-                    ts_unix,
-                    replica_id: self.replica_id,
-                    trace_id,
-                },
-            )
-            .await
+        if let Err(e) = bounded(log.append(
+            tenant,
+            route_ix,
+            fingerprint,
+            LogRecord::Pair {
+                x_inc,
+                x_ch,
+                incumbent_cost_usd,
+                challenger_cost_usd,
+                ch_error,
+                ch_truncated,
+                ts_unix,
+                replica_id: self.replica_id,
+                trace_id,
+            },
+        ))
+        .await
         {
             tracing::warn!(
                 tenant,
@@ -1433,8 +1452,7 @@ impl ExperimentMonitor {
         // to pick up any remote records. If the read-back fails, apply this pair locally now:
         // the record IS in the log, so the later successful sync will see the same trace_id and
         // skip it (no double count), while a decisive halt is not delayed in the meantime.
-        if self
-            .sync_from_backend(tenant, route_ix, fingerprint)
+        if bounded(self.sync_from_backend(tenant, route_ix, fingerprint))
             .await
             .is_err()
         {
@@ -1479,9 +1497,8 @@ impl ExperimentMonitor {
                     v
                 };
                 for (tenant, route_ix, fingerprint) in keys {
-                    if let Err(e) = monitor
-                        .sync_from_backend(&tenant, route_ix, &fingerprint)
-                        .await
+                    if let Err(e) =
+                        bounded(monitor.sync_from_backend(&tenant, route_ix, &fingerprint)).await
                     {
                         // Record the failure time so `ensure_synced` sees the backend as
                         // unavailable and transitions to stale → fail-closed once the
@@ -4550,6 +4567,53 @@ mod tests {
             1,
             "recovery sync deduplicated by trace_id"
         );
+    }
+
+    /// A shared log whose append never completes (a half-open connection).
+    #[derive(Debug)]
+    struct HungAppendLog;
+
+    #[async_trait::async_trait]
+    impl ExperimentLogBackend for HungAppendLog {
+        async fn append(&self, _: &str, _: usize, _: &str, _: LogRecord) -> Result<u64, LogError> {
+            std::future::pending().await
+        }
+        async fn load_since(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: u64,
+        ) -> Result<Vec<Option<LogRecord>>, LogError> {
+            Ok(vec![])
+        }
+        async fn claim_session(&self, _: &str, _: usize, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// A hung append cannot stall the paired task: `record_pair` gives up after the bound and
+    /// reports "not in the log", so the caller writes the durable NotInLog row.
+    #[tokio::test]
+    async fn hung_append_is_bounded_and_reported_as_not_in_log() {
+        tokio::time::pause();
+        let m = ExperimentMonitor::from_config(&config()).with_log(Arc::new(HungAppendLog));
+        let appended = m
+            .record_pair(
+                "t",
+                0,
+                &fp(),
+                1.0,
+                0.0,
+                0.1,
+                0.05,
+                false,
+                0,
+                0,
+                Uuid::now_v7(),
+            )
+            .await;
+        assert!(!appended, "a timed-out append is not in the log");
     }
 
     /// On ONE monitor: synced state stays trusted only within the staleness bound. Once the log
