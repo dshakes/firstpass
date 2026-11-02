@@ -214,7 +214,7 @@ All changes made after e848709 (pre-registration commit), before publication.
 | 11 | Calibration sample uses seeded random (not alphabetical first 20) | `ids[:CALIB_N]` sampled all astropy instances. Fixed to `random.sample(ids, CALIB_N, seed=42)`. I_0 values corrected (haiku: 2816→2328; gpt-5: 1720→1349); qualitative results unchanged. |
 | 12 | P4 split into primary (pre-registration) and secondary (restart) | Pre-registration specifies switch_overhead in the cost model. The restart interpretation (no overhead since top model restarts from scratch) is also valid and reported as a secondary row. |
 | 13 | Trajectory cache writes use atomic tmp+replace; retry once on decode failure | Hardening for concurrent/interrupted writes; no effect on results. |
-| 14 | tau_pin grid restricted to >= 1 (removed -1) | The pre-registration states "Start every session with the cheap model" and switch when `api_calls >= tau_pin`, so tau_pin must be >= 1. The previous grid included -1 as a special value (always-top, no cheap step). Removing -1 changes P4 results materially: fitted tau_pin is now 19/17 (haiku) and 6/8 (gpt-5), matching the cascade threshold. P4 prereg now costs +$0.31/inst (haiku) and +$0.05/inst (gpt-5) more than always-top, not marginally more. The `actual_tau == 0` branch in `escalate_pin_prereg` is now a guarded assertion. |
+| 14 | tau_pin grid restricted to >= 1 (removed -1) | Raised in review by the maintainer, not by an automated auditor. An earlier draft of this analysis allowed tau=−1, which is always-top rather than escalate-and-pin; always-top remains in the tables as the reference row. The pre-registration states "Start every session with the cheap model" and switch when `api_calls >= tau_pin`, so tau_pin must be >= 1. The previous grid included -1 as a special value (always-top, no cheap step). Removing -1 changes P4 results materially: fitted tau_pin is now 19/17 (haiku) and 6/8 (gpt-5), matching the cascade threshold. P4 prereg now costs +$0.31/inst (haiku) and +$0.05/inst (gpt-5) more than always-top, not marginally more. The `actual_tau == 0` branch in `escalate_pin_prereg` is now a guarded assertion. |
 | 15 | P5 arm renamed to "run-level cascade, proxy for P5" | Follows from deviation #2. The table row label now states plainly that this is a run-level proxy, not the pre-registered per-call granularity. |
 | 16 | `_atomic_write` uses buffered write | `os.write` may write partially on large data; replaced with `with open(fd, "wb") as f: f.write(); f.flush(); os.fsync()`. No effect on results. |
 | 17 | `json.loads(path.read_bytes())` everywhere; catch ValueError | Locale-independent; ValueError covers UnicodeDecodeError in addition to JSONDecodeError. No effect on results. |
@@ -242,8 +242,9 @@ All changes made after e848709 (pre-registration commit), before publication.
    Negative result confirmed as replayable proxy. Per-call cascade negative result is prior
    evidence from #239.
 
-5. **The oracle gap is large**: 395/500 at $0.384/inst vs always-top 384/500 at $0.754/inst.
-   P3-pool at $0.122/inst captures much of the oracle gain using only the repo feature.
+5. **The oracle gap on the two-model ladder is large**: 395/500 at $0.384/inst vs always-top
+   384/500 at $0.754/inst. (That oracle chooses between two models only, so it is not comparable
+   with the 11-model pool arms such as P3-pool.)
 
 ---
 
