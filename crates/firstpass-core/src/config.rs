@@ -307,6 +307,9 @@ pub struct PriceDef {
     /// USD per 1M output (completion) tokens.
     pub output_per_mtok: f64,
 }
+/// Gate ids the proxy provides without a `[[gate]]` block. Any other id in a route's `gates` or
+/// `deferred_gates` must be defined by a `[[gate]]` block, or [`Config::parse`] rejects it.
+pub const BUILTIN_GATES: &[&str] = &["non-empty", "json-valid", "tool-args-valid"];
 
 /// A user-defined gate (SPEC §8.1). Exactly one kind per definition:
 /// - **subprocess** (`cmd`): any executable that reads the candidate as JSON on **stdin** (never
@@ -1200,6 +1203,20 @@ impl Config {
         // ramp a different amount of traffic than the operator asked for, and they would only
         // notice via a savings figure that never moved.
         for (i, route) in config.routes.iter().enumerate() {
+            // An unknown gate id would be skipped at runtime with only a log line, silently
+            // removing a check the operator believes is enforcing (e.g. a typo in
+            // `tool-args-valid`). Reject it at parse, like an unpriced rung.
+            for g in route.gates.iter().chain(&route.deferred_gates) {
+                if !BUILTIN_GATES.contains(&g.as_str())
+                    && !config.gate_defs.iter().any(|d| d.id == *g)
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "route[{i}]: gate {g:?} is neither a built-in ({}) nor defined in a \
+                         [[gate]] block",
+                        BUILTIN_GATES.join(", ")
+                    )));
+                }
+            }
             if let Some(r) = &route.rollout {
                 r.validate()
                     .map_err(|e| Error::InvalidConfig(format!("route[{i}]: {e}")))?;
@@ -1633,6 +1650,27 @@ on_exhausted    = "serve_best_attempt"
 [escalation]
 max_rungs_per_request = 3
 session_promotion = { after_failures = 3, window = "30m" }
+# The SPEC example names these gates; a [[gate]] block per id makes them resolvable (an
+# undefined gate id is rejected at parse rather than silently skipped at runtime).
+[[gate]]
+id = "schema"
+cmd = ["true"]
+[[gate]]
+id = "judge-diff"
+cmd = ["true"]
+[[gate]]
+id = "patch-applies"
+cmd = ["true"]
+[[gate]]
+id = "lint-diff"
+cmd = ["true"]
+[[gate]]
+id = "compiles"
+cmd = ["true"]
+[[gate]]
+id = "tests"
+cmd = ["true"]
+
 "#;
 
     #[test]
@@ -1913,6 +1951,26 @@ project = "my-gcp-project"
     fn empty_match_is_wildcard() {
         let m = Match::default();
         assert!(m.matches(&Features::new(TaskKind::Other)));
+    }
+
+    #[test]
+    fn unknown_gate_id_is_rejected_at_parse() {
+        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n";
+        // A typo in a built-in would otherwise be skipped at runtime, silently dropping the check.
+        let typo = format!("{base}gates = [\"tool-args-vaild\"]\n");
+        let e = Config::parse(&typo)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("tool-args-vaild"), "{e}");
+        let deferred = format!("{base}deferred_gates = [\"tests\"]\n");
+        assert!(Config::parse(&deferred).is_err());
+        for ok in [
+            format!("{base}gates = [\"non-empty\", \"json-valid\", \"tool-args-valid\"]\n"),
+            format!("{base}gates = [\"tests\"]\n[[gate]]\nid = \"tests\"\ncmd = [\"true\"]\n"),
+        ] {
+            assert!(Config::parse(&ok).is_ok(), "{ok}");
+        }
     }
 
     #[test]

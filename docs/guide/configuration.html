@@ -132,7 +132,7 @@ match = { agent = &quot;claude-code&quot;, subagent = [&quot;test-runner&quot;, 
 mode  = &quot;enforce&quot;
 ladder = [&quot;anthropic/claude-haiku-4-5&quot;, &quot;anthropic/claude-sonnet-5&quot;]
 gates  = [&quot;non-empty&quot;, &quot;judge&quot;]
-deferred_gates = [&quot;consistency-check&quot;]
+deferred_gates = [&quot;consistency-check&quot;]   # defined by a [[gate]] block (see Gates); an undefined id fails parse
 routing_mode = &quot;quality&quot;   # optional — observe|cost|balanced|quality|latency|max
 
 <span class="tk-c"># catch-all last: an empty match claims everything above it did not</span>
@@ -141,7 +141,7 @@ match = {}
 mode  = &quot;observe&quot;
 ladder = [&quot;anthropic/claude-opus-4-8&quot;]</code></pre></div>
 <div class="note warn"><span class="nt">Common mistake</span> Writing <code>match = "/v1/chat/completions"</code> to scope a route to one wire endpoint. <code>match</code> is a struct of request <b>features</b> — it has no concept of a URL path. Both inbound endpoints share the same route table and are distinguished only by which wire dialect the caller used to talk to Firstpass, translated transparently either way. Scope routes by <code>agent</code> / <code>subagent</code> / <code>task_kind</code> / <code>language</code> instead.</div>
-<div class="note info"><span class="nt">Under the hood</span> An unlisted gate id (misspelled, or never defined by a <code>[[gate]]</code> block) is not a parse error — it is skipped at request time with a logged warning, and the rung serves as if that gate were never named. Check the logs after any route/gate change; a silently-skipped gate looks identical to a passing one until you read them.</div>
+<div class="note info"><span class="nt">Under the hood</span> An unlisted gate id (misspelled, or never defined by a <code>[[gate]]</code> block) is a parse error: the proxy refuses to start and names the id. It used to be skipped at request time with only a log line, which made a silently dropped gate look identical to a passing one.</div>
 <div class="recap">First matching route wins; <code>match</code> is feature-based, not path-based. Order specific routes before the catch-all.</div>
 
 <h2 id="gate">Gates<a class="anchor" href="#gate" aria-label="Link to this section">#</a></h2>
