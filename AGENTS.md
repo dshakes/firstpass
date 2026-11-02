@@ -73,9 +73,9 @@ Config surface (the parser is `deny_unknown_fields`, so a wrong key is a hard fa
   openrouter, xai, cerebras). A `google`/Gemini or local (Ollama, vLLM) ladder needs its own
   `[[provider]]` block or the rung never resolves. Every rung still needs a price.
 - **Built-in gates are `non-empty`, `json-valid`, and `tool-args-valid`.** All others (`schema`, `tests`, `judge`, `consistency`) need a `[[gate]]` block.
-  - `non-empty`: passes when the response has non-blank text OR at least one tool call; fails on truly empty responses.
-  - `json-valid`: fails when text is not valid JSON; **passes** (not abstains) on tool-call-only turns — there is no text payload to check, so the constraint is trivially satisfied.
-  - `schema`: **passes** (not abstains) on tool-call-only turns for the same reason. Use `tool-args-valid` to gate tool schemas.
+  - `non-empty`: passes when the response has non-blank text, or has a tool call AND the request declared tools; an undeclared tool call with empty text fails.
+  - `json-valid`: fails when text is not valid JSON; **passes** (not abstains) on a tool turn — the response has a tool call and the request declared tools. Any text alongside the call is preamble ("I'll check that"), not the JSON answer, so it is not parsed. The JSON contract applies to the final answer turn; tool arguments are `tool-args-valid`'s job. Pair `json-valid` with `tool-args-valid` on agent routes.
+  - `schema`: same tool-turn rule as `json-valid`. Use `tool-args-valid` to gate tool schemas.
   - `tool-args-valid`: validates every tool call's arguments against `input_schema` (Anthropic) / `parameters` (OpenAI); fails if a called tool was not declared in the request (hallucinated tool), if the request declares no tools but the response contains calls, or if any argument violates its schema; **passes** (not abstains) when there are no tool calls. Reserve Abstain for genuine transient errors — `on_abstain = "fail_closed"` converts Abstain to Fail, and high Abstain rates trigger GateHealth auto-disable.
 - **Every ladder rung must resolve to a price** — built-in or a `[[price]]` block. There is no silent fallback:
   an unpriced rung would record `cost_usd: 0.0` in a tamper-evident receipt and leave `[budget]` caps un-trippable,
