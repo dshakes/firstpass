@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coding agents — Firstpass docs</title>
+<meta name="description" content="Using Firstpass with Claude Code, Codex and aider: sessions without a header, tool-call gates, what the routing-granularity eval found, and what has been tested.">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7.5' fill='%2319E3B1'/><path d='M6.5 25.2H14.4V17.2H22.2V9.2H26.4' fill='none' stroke='%23041410' stroke-width='2.5' stroke-opacity='.38' stroke-linecap='round' stroke-linejoin='round'/><path d='M6.5 25.2H14.4' stroke='%23041410' stroke-width='4.6' stroke-linecap='round'/></svg>">
+<link rel="stylesheet" href="../assets/docs.css?v=5">
+<script>(function(){try{var t=localStorage.getItem('fp-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topnav"><div class="bar">
+  <a class="brand" href="../index.html"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass</a>
+  <nav class="navlinks" aria-label="Primary"><a href="../guide/index.html" aria-current="page">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a></nav>
+  <span class="nav-sp"></span>
+  <div class="nav-right">
+    <a class="gh-link" href="https://github.com/dshakes/firstpass" rel="noopener"><svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="txt">GitHub</span></a>
+    <button class="icon-btn theme-toggle" aria-label="Switch to dark theme" aria-pressed="false" type="button"><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg></button>
+    <button class="icon-btn menu-btn" aria-label="Open menu" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  </div>
+</div>
+<div class="mobile-nav"><a href="../guide/index.html">Docs</a><a href="../guide/guarantee.html">Guarantee</a><a href="../guide/benchmarks.html">Benchmarks</a><a href="../guide/cli.html">CLI</a><a href="https://github.com/dshakes/firstpass">GitHub</a></div>
+</header>
+<div class="scrim"></div>
+<div class="docs">
+<aside class="sidebar" aria-label="Docs navigation"><nav>
+<div class="grp"><p class="grp-t">Getting started</p>
+<a href="index.html"><span class="num">01</span>Overview</a>
+<a href="quickstart.html"><span class="num">02</span>Quickstart</a>
+<a href="requests-101.html"><span class="num">03</span>How agents talk</a>
+<a href="how-it-works.html"><span class="num">04</span>How it works</a>
+<a href="request-flow.html"><span class="num">05</span>Every scenario, end to end</a>
+</div>
+<div class="grp"><p class="grp-t">Core mechanics</p>
+<a href="gates.html"><span class="num">06</span>Gates</a>
+<a href="routing.html"><span class="num">07</span>Routing &amp; escalation</a>
+<a href="guarantee.html"><span class="num">08</span>The guarantee</a>
+<a href="receipts.html"><span class="num">09</span>Receipts &amp; audit</a>
+</div>
+<div class="grp"><p class="grp-t">Reference</p>
+<a href="providers.html"><span class="num">10</span>Providers</a>
+<a href="configuration.html"><span class="num">11</span>Configuration</a>
+<a href="cli.html"><span class="num">12</span>CLI reference</a>
+<a href="api.html"><span class="num">13</span>API &amp; MCP</a>
+</div>
+<div class="grp"><p class="grp-t">Research &amp; data</p>
+<a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
+<a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
+<a href="experiments.html"><span class="num">16</span>Choose by proof</a>
+<a href="agents.html" aria-current="page"><span class="num">17</span>Coding agents</a>
+</div>
+</nav></aside>
+<main class="content" id="main">
+<button class="btn sidebar-toggle" aria-label="Open docs menu" aria-expanded="false" type="button" style="margin-bottom:18px">☰ Menu</button>
+<p class="crumb"><a href="index.html">Docs</a> / Coding agents</p>
+<h1>Coding agents</h1>
+<p class="page-sub">Claude Code, Codex and aider are multi-turn, tool-calling clients. This page covers how Firstpass groups their turns into sessions, how it gates tool calls, what the routing-granularity eval found, and what has and has not been tested.</p>
+
+<div class="tldr">Point the agent at the proxy. In <b>observe</b> mode nothing changes and every call gets a receipt. In <b>enforce</b> mode, tool-call turns are judged by <b><code>non-empty</code></b>, <b><code>json-valid</code></b> and <b><code>tool-args-valid</code></b>, turns are grouped into <b>sessions with no header</b>, and the evidence says to <b>keep a session on one model</b>.</div>
+
+<h2 id="setup">1. Point the agent at the proxy<a class="anchor" href="#setup" aria-label="Link to this section">#</a></h2>
+<div class="tblwrap"><table>
+  <thead><tr><th>Agent</th><th>How</th><th>Endpoint</th></tr></thead>
+  <tbody>
+    <tr><td>Claude Code</td><td><code>export ANTHROPIC_BASE_URL=&quot;http://127.0.0.1:8080&quot;</code> or <code>firstpass launch claude</code></td><td><code>POST /v1/messages</code></td></tr>
+    <tr><td>Codex</td><td><code>firstpass launch codex</code> (sets <code>OPENAI_BASE_URL</code>)</td><td><code>POST /v1/responses</code></td></tr>
+    <tr><td>aider</td><td><code>aider --openai-api-base=http://127.0.0.1:8080/v1 …</code></td><td><code>POST /v1/chat/completions</code></td></tr>
+  </tbody>
+</table></div>
+<p>Leaving is unsetting the variable. <code>firstpass launch</code> refuses to start the agent if no proxy is listening.</p>
+<p><b>Observe</b> forwards byte-identical and writes receipts. It also relays the upstream's <code>retry-after</code>, <code>request-id</code>, <code>x-request-id</code>, <code>anthropic-ratelimit-*</code> and <code>x-ratelimit-*</code> response headers, so an agent backs off correctly on a 429. <code>POST /v1/messages/count_tokens</code> is passed through and writes no receipt: it carries no routing decision, so no ladder runs.</p>
+
+<h2 id="sessions">2. Sessions without a header<a class="anchor" href="#sessions" aria-label="Link to this section">#</a></h2>
+<p>Session promotion (a session that had to escalate starts there next turn) and per-session experiments need to know which requests belong together. Firstpass picks the first of these that is present:</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>#</th><th>Source</th><th>Stored as</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>x-firstpass-session</code> header</td><td>verbatim, capped at 256 bytes</td></tr>
+    <tr><td>2</td><td>Agent session header: <code>x-claude-code-session-id</code>, <code>session_id</code>, <code>conversation_id</code></td><td><code>agent:&lt;hash&gt;</code></td></tr>
+    <tr><td>3</td><td>Claude Code <code>metadata.user_id</code>, when it embeds <code>session_</code></td><td><code>meta:&lt;hash&gt;</code></td></tr>
+    <tr><td>4</td><td><code>prompt_cache_key</code>, on agent-shaped requests</td><td><code>pck:&lt;hash&gt;</code></td></tr>
+    <tr><td>5</td><td>Salted hash of the conversation prefix (system or instructions, declared tool names, first user message)</td><td><code>conv:&lt;hash&gt;</code></td></tr>
+  </tbody>
+</table></div>
+<p>Derived ids are salted hashes, so a stored session id never carries raw prompt text or a raw caller id. Header lookups (1 and 2) work on every path. The body-derived ones (3 to 5) are computed only on <b>enforce</b> routes, where the body is already being parsed; an observe-only deployment parses no bodies.</p>
+<div class="note warn"><span class="nt">Known ceiling</span> Two conversations with the same system prompt, first user message and tool names share a session. The cost is an early promotion inside the promotion window, never a wrong answer. Send <code>x-firstpass-session</code> to separate them. Plain single-turn requests get no derived session. Source: <code>body_session</code> in <code>crates/firstpass-proxy/src/proxy.rs</code>.</div>
+
+<h2 id="tools">3. Gating tool-call turns<a class="anchor" href="#tools" aria-label="Link to this section">#</a></h2>
+<p>An agent step often returns a tool call and no text. Read naively that is an empty answer that fails every gate and climbs the ladder on every step. Enforce mode treats it as a tool turn when the request declared tools:</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>Gate</th><th>On a tool turn</th></tr></thead>
+  <tbody>
+    <tr><td><code>non-empty</code></td><td>Passes. An undeclared tool call with empty text fails.</td></tr>
+    <tr><td><code>json-valid</code></td><td>Passes. Text beside the call is preamble and is not parsed; the JSON contract applies to the final answer turn.</td></tr>
+    <tr><td><code>tool-args-valid</code></td><td>Validates every call's arguments against <code>input_schema</code> (Anthropic) or <code>parameters</code> (OpenAI), recursively. Fails on a tool the request did not declare, on calls when the request declared no tools, and on any schema violation. Passes when there are no tool calls.</td></tr>
+  </tbody>
+</table></div>
+<p><code>schema</code> and any test, judge or consistency gate still need a <code>[[gate]]</code> block. These built-ins check structure, not correctness: to know the code is right, gate on your tests.</p>
+<p>Also in enforce mode: <code>thinking</code> and <code>redacted_thinking</code> blocks and <code>tool_use</code> are streamed back intact, <code>stop_reason</code> is carried across providers, and credentials are scoped. A rung's configured <code>api_key_env</code> is the only key used for that rung (it never falls back to the client's), and a Claude Code OAuth Bearer is accepted on the Anthropic path only.</p>
+
+<h2 id="config">4. A route for an agent<a class="anchor" href="#config" aria-label="Link to this section">#</a></h2>
+<div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[route]]
+match  = {}                                    # every request; narrow it with match = { agent = &quot;claude-code&quot; }
+mode   = &quot;enforce&quot;
+ladder = [&quot;anthropic/claude-haiku-4-5&quot;, &quot;anthropic/claude-sonnet-5&quot;]
+gates  = [&quot;non-empty&quot;, &quot;json-valid&quot;, &quot;tool-args-valid&quot;]
+
+[escalation]
+max_rungs_per_request = 2
+session_promotion = { after_failures = 2, window = &quot;30m&quot; }</code></pre></div>
+<div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>FIRSTPASS_CONFIG=./firstpass.toml firstpass doctor   # a wrong key is a hard parse error
+FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy</code></pre></div>
+<p><code>firstpass doctor</code> catches wrong config keys but does not check gate ids, so a misspelled gate name is not caught there. Anthropic rungs are priced built in; any other provider needs a <code>[[price]]</code> for every rung.</p>
+
+<h2 id="granularity">5. Where to switch models: the eval<a class="anchor" href="#granularity" aria-label="Link to this section">#</a></h2>
+<div class="tldr">On 500 real SWE-bench agent runs, <b>switching models mid-session did not pay</b> on either ladder tested. Choosing a model <b>per workload</b> was far cheaper, but quality non-inferiority at 1 point was <b>not shown</b>.</div>
+<p>Replay of public runs, $0, pre-registered. Haiku to opus ladder, n=500, resolved counts against always-top (384/500, $0.754 per instance). Source: <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/agent-granularity.md">agent-granularity.md</a>.</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>Policy</th><th>Resolved</th><th>$ per instance</th><th>Δ $ per instance vs always-top</th></tr></thead>
+  <tbody>
+    <tr><td>always-cheap</td><td>333/500</td><td>$0.331</td><td>[-0.460, -0.387]</td></tr>
+    <tr><td>always-top</td><td>384/500</td><td>$0.754</td><td>—</td></tr>
+    <tr><td>escalate-and-pin (pre-registered cost model)</td><td>384/500</td><td>$1.066</td><td>[+0.309, +0.316]</td></tr>
+    <tr><td>escalate-and-pin (restart, secondary)</td><td>384/500</td><td>$0.838</td><td>[+0.081, +0.086]</td></tr>
+    <tr><td>per-session / repo (cross-fit)</td><td>378/500</td><td>$0.720</td><td>[-0.048, -0.021]</td></tr>
+    <tr><td>run-level cascade (proxy for per-call)</td><td>382/500</td><td>$1.071</td><td>[+0.295, +0.340]</td></tr>
+  </tbody>
+</table></div>
+<ul>
+  <li><b>Mid-session escalate-and-pin costs more than always-top at equal quality</b> on both ladders (gpt-5-mini to gpt-5.2: +$0.052 to +$0.054 per instance). With prompt caching, the top model's first call re-reads the accumulated context at the full input rate.</li>
+  <li><b>Per-session routing on a cheap/top ladder loses quality</b> against always-top: the lower bound of the resolved-rate difference is -0.024 (haiku to opus) and -0.042 (gpt-5-mini to gpt-5.2), below the pre-registered -0.01.</li>
+  <li><b>The run-level cascade costs more.</b> It is a proxy: per-call cascade is not identifiable from recorded whole runs, because there are no per-step gate verdicts.</li>
+  <li><b>Workload-level pool selection</b> resolved 374/500 at $0.219 per instance against 384/500 at $0.754 (Δ $ per instance [-0.582, -0.490]; Δ resolved [-0.050, +0.008]). Non-inferiority at 1 point is <b>not shown</b>.</li>
+  <li><b>Exploratory, not a result:</b> a per-repo pool selection arm resolved 382/500 at $0.122 per instance. It was added after the pre-registration and is labelled exploratory here. It needs per-repo history and was not tested on unseen repos.</li>
+</ul>
+<div class="note"><span class="nt">Practice this implies</span> Route per workload or route with <a href="experiments.html">certified selection</a>, keep a session sticky (that is what session promotion does), and do not switch models mid-session.</div>
+<p>Limits stated by the source: one scaffold (mini-SWE-agent, bash only), one benchmark (SWE-bench Verified, 500 instances), one run per model per instance, and a context model calibrated on 20 cheap-model trajectories, so the overhead figures are estimates. Certified selection also works across replicas: with a shared Redis log, paired mode's spend cap is cluster-wide and log errors fail closed (<a href="experiments.html#limits">details</a>).</p>
+
+<h2 id="compat">6. What has been tested<a class="anchor" href="#compat" aria-label="Link to this section">#</a></h2>
+<p>Generated by <code>scripts/agent-compat/run_compat.sh</code> against firstpass 0.9.2 in <b>observe</b> mode, with a fake local upstream and no real API keys. Source: <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/agent-compat.md">agent-compat.md</a>.</p>
+<div class="tblwrap"><table>
+  <thead><tr><th>CLI</th><th>Result</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Claude Code 2.1.x</td><td>pass</td><td>Turn completed through <code>/v1/messages</code>.</td></tr>
+    <tr><td>aider</td><td>pass</td><td>Turn completed through <code>/v1/chat/completions</code>.</td></tr>
+    <tr><td>Codex</td><td>pass, fixture only</td><td>A <code>/v1/responses</code> request returned 200. The run had a shell alias, not the Codex binary.</td></tr>
+    <tr><td>Gemini CLI 0.26.0</td><td>skip</td><td>Its <code>/v1beta/models/{m}:generateContent</code> protocol is not served; the proxy returns 404.</td></tr>
+    <tr><td>cline</td><td>skip</td><td>Needs interactive auth setup. Its <code>/v1/chat/completions</code> protocol is served.</td></tr>
+    <tr><td>cursor-agent</td><td>skip</td><td>Bound to Cursor cloud OAuth.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="limits">Limits<a class="anchor" href="#limits" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><b>Gemini inbound protocol is unsupported.</b> Supporting it means routes under <code>/v1beta/models/*</code> translating generateContent to and from OpenAI Chat, which the matrix calls non-trivial. (A Gemini <em>upstream</em> rung is a different thing and is supported, see <a href="providers.html">Providers</a>.)</li>
+  <li><b>The compatibility run was observe mode only.</b> Enforce behaviour for tool turns is covered by the proxy's own tests, not by driving the real CLIs through the harness.</li>
+  <li><b>Codex was not run as a binary.</b> Only the Responses API request shape was exercised.</li>
+  <li><b>The structural gates do not prove correctness.</b> <code>tool-args-valid</code> proves a call matches its declared schema, not that it is the right call.</li>
+</ul>
+<div class="recap">Point the agent at the proxy, gate tool turns with <b><code>tool-args-valid</code></b>, let sessions group themselves, and route per workload rather than per step. Claude Code and aider are verified in observe mode; Gemini CLI is not supported.</div>
+
+<nav class="pager" aria-label="Pagination"><a class="prev" href="experiments.html"><span class="dir">← Previous</span><span class="t">Choose by proof</span></a></nav>
+</main>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#setup" class="">1. Setup</a><a href="#sessions" class="">2. Sessions</a><a href="#tools" class="">3. Tool turns</a><a href="#config" class="">4. Route config</a><a href="#granularity" class="">5. Granularity</a><a href="#compat" class="">6. Tested</a><a href="#limits" class="">Limits</a></nav>
+</div>
+<footer class="foot"><div class="wrap">
+  <div class="cols">
+    <div><a class="brand" href="../index.html" style="margin-bottom:14px"><svg class="fp-mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7.5" fill="#19E3B1"/><path class="st" d="M6.5 25.2H14.4V17.2H22.2V9.2H26.4" fill="none" stroke="#041410" stroke-width="2.5" stroke-opacity=".38" stroke-linecap="round" stroke-linejoin="round"/><path class="lit" d="M6.5 25.2H14.4" stroke="#041410" stroke-width="4.6" stroke-linecap="round"/></svg>Firstpass</a>
+      <p class="about">An open-source adaptive LLM router. Proof over prediction — the cheapest model takes the first pass, and it proves the output before it serves it.</p></div>
+    <div><h4>Product</h4><a href="index.html">Overview</a><a href="how-it-works.html">How it works</a><a href="guarantee.html">The guarantee</a><a href="benchmarks.html">Benchmarks</a></div>
+    <div><h4>Reference</h4><a href="configuration.html">Configuration</a><a href="cli.html">CLI</a><a href="api.html">API & MCP</a><a href="providers.html">Providers</a></div>
+    <div><h4>Project</h4><a href="https://github.com/dshakes/firstpass">GitHub</a><a href="https://github.com/dshakes/firstpass/releases">Releases</a><a href="https://github.com/dshakes/firstpass/blob/main/LICENSE">License</a></div>
+  </div>
+  <div class="legal"><span>Firstpass · Apache-2.0 · open source</span><span>Proof over prediction.</span></div>
+</div></footer>
+<script src="../assets/docs.js?v=5"></script>
+</body></html>

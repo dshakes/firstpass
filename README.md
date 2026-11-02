@@ -159,13 +159,50 @@ Leaving is `unset ANTHROPIC_BASE_URL`.
 
 **Let an agent do it.** `firstpass onboard --apply` detects your shell, whether the proxy is running and which agents you have, then does only what is missing. It is idempotent, `firstpass onboard` alone is a dry run, and `firstpass offboard` reverses it. `firstpass kiosk` puts one real request through the ladder and prints the receipt (keyless demo if no key is found). `firstpass handshake` prints one JSON document for callers with no terminal and never writes. `GET /panel` is a live receipts view served by the binary itself. Machine-readable setup: [`llms.txt`](llms.txt), [`AGENTS.md`](AGENTS.md), `GET /v1/capabilities`, `firstpass mcp`.
 
+## Works with coding agents
+
+Point the agent at the proxy; nothing else about the agent changes.
+
+| Agent | Route it through Firstpass | Endpoint it hits |
+|---|---|---|
+| **Claude Code** | `export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"` or `firstpass launch claude` | `POST /v1/messages` |
+| **Codex** | `firstpass launch codex` (sets `OPENAI_BASE_URL`) | `POST /v1/responses` |
+| **aider** | `aider --openai-api-base=http://127.0.0.1:8080/v1 …` | `POST /v1/chat/completions` |
+
+**Observe** (the default) forwards byte-identical, writes receipts, and relays the upstream's `retry-after`, `request-id`, `anthropic-ratelimit-*` and `x-ratelimit-*` headers so an agent backs off correctly on a 429. `POST /v1/messages/count_tokens` is passed through and writes no receipt (it is not a routing decision). **Enforce** adds gates, escalation and sessions:
+
+- **Tool turns are gated, not misread as empty.** A reply that only calls a tool passes `non-empty` and `json-valid` when the request declared tools. The built-in **`tool-args-valid`** gate validates every tool call's arguments against the request's `input_schema` (Anthropic) / `parameters` (OpenAI) and fails on a tool the request never declared.
+- **Sessions need no header.** Turns are grouped by, in order: `x-firstpass-session`, an agent session header (`x-claude-code-session-id`, `session_id`, `conversation_id`), Claude Code's `metadata.user_id` session, `prompt_cache_key`, then a salted hash of the conversation prefix plus tool names. Session promotion (a session that had to escalate starts there next turn) and per-session experiments therefore apply to Claude Code, Codex and aider without config. Derived ids are hashed; body-derived ids are computed only on enforce routes, so observe-only deployments parse no bodies.
+- **Streaming fidelity.** `thinking` / `redacted_thinking` blocks and `tool_use` are streamed, and `stop_reason` is carried across providers.
+- **Credentials stay scoped.** A rung's configured `api_key_env` always wins and never falls back to the client's key; a Claude Code OAuth Bearer is accepted on the Anthropic path only.
+
+A route for an agent (validated with `firstpass doctor`):
+
+```toml
+[[route]]
+match  = {}                                    # every request; narrow it with match = { agent = "claude-code" }
+mode   = "enforce"
+ladder = ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
+gates  = ["non-empty", "json-valid", "tool-args-valid"]
+
+[escalation]
+max_rungs_per_request = 2
+session_promotion = { after_failures = 2, window = "30m" }
+```
+
+`FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy`. These gates check structure, not whether the code is right. For that, add your tests as a `[[gate]]` ([Gates](#gates)).
+
+**What the evidence says about granularity.** On 500 real SWE-bench agent runs ([full eval](docs/benchmarks/agent-granularity.md), $0, replay of public runs), switching models mid-session did not pay on either ladder tested. On haiku to opus: escalate-and-pin cost +$0.309 to +$0.316 per instance versus always-top at the same 384/500 resolved; per-session routing resolved 378/500 against 384/500; a run-level cascade (a proxy for per-call, which that data cannot identify) cost +$0.295 to +$0.340 per instance. Choosing the model per *workload* was far cheaper (374/500 at $0.219 per instance against 384/500 at $0.754), but non-inferiority at 1 point was **not shown**. So the practice is: route per workload or route (certified selection, above), keep a session sticky, and do not switch models mid-session. A per-repo pool selection arm scored better still, but it was a post-hoc arm and is **exploratory**; do not rely on it.
+
+**Compatibility, as measured** ([matrix](docs/benchmarks/agent-compat.md); observe mode, fake upstream, firstpass 0.9.2): Claude Code and aider completed a turn; Codex is covered by a `/v1/responses` fixture request only (no standalone binary in the run); cline and cursor-agent were skipped (interactive or cloud auth); **Gemini CLI does not work** (its `generateContent` protocol is not served). Enforce mode with real CLIs is not in that matrix. More: [agent guide](https://dshakes.github.io/firstpass/guide/agents.html).
+
 ---
 
 ## Architecture
 
 Firstpass is a proxy in front of your provider calls. Your agent keeps its endpoint; the response is byte-identical to the served rung.
 
-<div align="center"><img src="assets/architecture.svg" alt="Architecture: your agent calls the proxy on POST /v1/messages (Anthropic dialect) or POST /v1/chat/completions (OpenAI dialect). Inside, the request flows Route, Gate, Escalate, Serve. Rungs call providers with your own keys, with failover on 5xx. Every decision writes a SHA-256 hash-chained receipt; deferred outcomes on /v1/feedback tune the serve threshold." width="900"></div>
+<div align="center"><img src="assets/architecture.svg" alt="Architecture: your agent calls the proxy on POST /v1/messages (Anthropic dialect) or POST /v1/chat/completions (OpenAI dialect). Inside, the request flows Route, Gate, Escalate, Serve. Rungs call providers with your own keys, with failover on 5xx. Every decision writes a SHA-256 hash-chained receipt; deferred outcomes on /v1/feedback tune the serve threshold. Coding-agent tool-call turns are gated by non-empty, json-valid and tool-args-valid, and agent conversations are grouped into sessions without a header." width="900"></div>
 
 | Endpoint | For |
 | --- | --- |
@@ -185,7 +222,7 @@ Vendors can be crossed mid-ladder: `reasoning_effort` is carried to Anthropic ru
 | **One config line** (consistency gate) | The model answers *k* times; agreement is the confidence (self-consistency, Wang et al. 2022). |
 | **Your existing tests** | The strongest gate: generated code ships only if your suite passes. |
 
-Built-in gates are `non-empty` and `json-valid`; everything else is a `[[gate]]` block. Flaky gates auto-disable on an error budget. Your test runner becomes a gate via `scripts/gates/run-tests.py` ([Gates](https://dshakes.github.io/firstpass/guide/gates.html#wrapper)).
+Built-in gates are `non-empty`, `json-valid` and `tool-args-valid` (agent tool calls); everything else is a `[[gate]]` block. Flaky gates auto-disable on an error budget. Your test runner becomes a gate via `scripts/gates/run-tests.py` ([Gates](https://dshakes.github.io/firstpass/guide/gates.html#wrapper)).
 
 <div align="center"><img src="assets/gate-wrapper.svg" alt="How a test suite becomes a Firstpass gate. The model's reply arrives as JSON on stdin; run-tests.py extracts the code, writes it to a temp directory with your tests, and runs your real command. All tests pass: the gate returns pass and the answer is served. Some fail: it returns fail with the pass fraction as a graded score and the ladder escalates. Runner missing: it abstains rather than fabricating a verdict." width="900"></div>
 
@@ -309,7 +346,7 @@ Multi-tenant deployments add per-tenant auth (Argon2id), rate limits, gate-healt
 
 ## Links
 
-[Website](https://dshakes.github.io/firstpass/) · [Guide](https://dshakes.github.io/firstpass/guide/) · [How it works](https://dshakes.github.io/firstpass/guide/how-it-works.html) · [The guarantee](https://dshakes.github.io/firstpass/guide/guarantee.html) · [SPEC](SPEC.md) · [Example config](firstpass.example.toml) · [ADRs](docs/adr) · [Agent guide](AGENTS.md) · [llms.txt](llms.txt) · [License](LICENSE)
+[Website](https://dshakes.github.io/firstpass/) · [Guide](https://dshakes.github.io/firstpass/guide/) · [How it works](https://dshakes.github.io/firstpass/guide/how-it-works.html) · [The guarantee](https://dshakes.github.io/firstpass/guide/guarantee.html) · [SPEC](SPEC.md) · [Example config](firstpass.example.toml) · [ADRs](docs/adr) · [Coding agents](https://dshakes.github.io/firstpass/guide/agents.html) · [Agent guide](AGENTS.md) · [llms.txt](llms.txt) · [License](LICENSE)
 
 <div align="center">
 

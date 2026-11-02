@@ -51,6 +51,7 @@
 <a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
 <a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
 <a href="experiments.html"><span class="num">16</span>Choose by proof</a>
+<a href="agents.html"><span class="num">17</span>Coding agents</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -142,14 +143,15 @@
 <div class="recap">The gate reads the <b>real output</b> and returns pass / fail / abstain; pass serves and stops the cascade, fail escalates one rung, and multiple gates on a rung are a conjunction — all must pass.</div>
 
 <h2 id="builtin">Built-in inline<a class="anchor" href="#builtin" aria-label="Link to this section">#</a></h2>
-<div class="tldr">Two checks run with <b>zero configuration</b> and add <b>no model calls</b>: <code>non-empty</code> rejects blank or whitespace outputs, and <code>json-valid</code> rejects outputs that don't parse as valid JSON. Enable them as a floor on every rung — they cost nothing and catch a surprising share of model failures before pricier checks ever fire.</div>
-<p>Two checks run with zero configuration and no extra model calls:</p>
+<div class="tldr">Three checks run with <b>zero configuration</b> and add <b>no model calls</b>: <code>non-empty</code> rejects blank or whitespace outputs, <code>json-valid</code> rejects outputs that don't parse as valid JSON, and <code>tool-args-valid</code> checks an agent's tool-call arguments against the request's schema. Enable them as a floor on every rung — they cost nothing and catch a surprising share of model failures before pricier checks ever fire.</div>
+<p>Three checks run with zero configuration and no extra model calls:</p>
 <div class="defs">
   <div class="row"><div class="k">non-empty</div><div class="v">The output is not empty or whitespace. The floor.</div></div>
-  <div class="row"><div class="k">json-valid</div><div class="v">The output parses as JSON. The first line of defense for structured outputs.</div></div>
+  <div class="row"><div class="k">json-valid</div><div class="v">The output parses as JSON. The first line of defense for structured outputs. On a tool turn (the reply calls a tool and the request declared tools) it passes: the JSON contract applies to the final answer.</div></div>
+  <div class="row"><div class="k">tool-args-valid</div><div class="v">Every tool call's arguments satisfy the request's <code>input_schema</code> (Anthropic) or <code>parameters</code> (OpenAI). Fails on an undeclared tool or a schema violation; passes when there are no tool calls. See <a href="agents.html">Coding agents</a>.</div></div>
 </div>
 <div class="note"><span class="nt">Key idea</span> The inline checks run synchronously inside the router before any subprocess or judge fires. A <code>non-empty</code> or <code>json-valid</code> failure stops the gate chain immediately and escalates — so you never wait for a subprocess timeout on a blank output. Put them first; they're free.</div>
-<div class="recap"><b>non-empty</b> and <b>json-valid</b> are zero-cost, always-on floors — add them to every rung before layering pricier checks.</div>
+<div class="recap"><b>non-empty</b>, <b>json-valid</b> and <b>tool-args-valid</b> are zero-cost, always-on floors — add them to every rung before layering pricier checks.</div>
 
 <h2 id="schema">schema<a class="anchor" href="#schema" aria-label="Link to this section">#</a></h2>
 <div class="tldr">The <code>schema</code> gate validates structural shape — top-level <code>type</code>, <code>required</code>, and per-property <code>type</code> — against a JSON-Schema subset. <b>Free</b> (no extra model calls) and synchronous. It enforces the contract on a structured output without running a full schema engine.</div>
