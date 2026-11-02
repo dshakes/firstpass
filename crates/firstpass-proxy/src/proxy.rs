@@ -280,8 +280,19 @@ pub async fn build_promoter_async(
 /// Only touches the store when some route has a paired challenger. An unreadable store seeds
 /// nothing: the experiment monitor already fails closed on the same read, and a blocked
 /// challenger never runs.
+///
+/// When `shared_log` is `true` (a Redis or in-memory log backend is attached), the log is the
+/// authoritative cluster-wide record: the `ExperimentMonitor`'s `apply_log_record` seeds the
+/// ledger from `LogRecord::Pair.ts_unix` as records arrive. Rows marked `InLog` are therefore not
+/// seeded here (that would double-debit them). Rows the log never received (`NotInLog`, written
+/// during an outage) and legacy rows of unknown status (`Unknown`) ARE seeded: their spend must
+/// survive a restart, and over-counting a legacy row can only make the cap stricter.
+///
+/// Staleness: the cluster can overshoot the cap by at most one sync interval (~5 s) of spend,
+/// because `may_spend` is checked before the call and the ledger is updated from the log
+/// asynchronously. This is documented in docs/guide/experiments.html.
 #[must_use]
-pub fn build_paired_ledger(config: &ProxyConfig) -> crate::shadow::ShadowLedger {
+pub fn build_paired_ledger(config: &ProxyConfig, shared_log: bool) -> crate::shadow::ShadowLedger {
     let ledger = crate::shadow::ShadowLedger::new();
     let any_paired = config.routing.as_ref().is_some_and(|r| {
         r.routes
@@ -294,7 +305,15 @@ pub fn build_paired_ledger(config: &ProxyConfig) -> crate::shadow::ShadowLedger 
     match crate::store::load_all_experiment_pairs(&config.db_path) {
         Ok(rows) => {
             let now = jiff::Timestamp::now();
-            for row in &rows {
+            // With a shared log, pairs that reached Redis (in_log=InLog) will be seeded by
+            // `apply_log_record` during the first sync; seed from NotInLog and Unknown rows
+            // that were never confirmed as pushed.  Unknown rows are treated conservatively:
+            // they count against the spend cap (safe to over-count) but not evidence.
+            // Without a shared log, seed from all pairs (original behaviour).
+            for row in rows
+                .iter()
+                .filter(|r| !shared_log || r.in_log != crate::store::InLogStatus::InLog)
+            {
                 ledger.seed(
                     &row.tenant,
                     row.route_ix,
@@ -1563,8 +1582,11 @@ fn spawn_paired_challenger(
     let Some(x_inc) = pair_outcome(served_from) else {
         return;
     };
-    // A halted challenger has been proven worse; live mode stops serving it, and paired mode must
-    // stop paying for it. The halt is final, so further pairs could only spend.
+
+    // Pre-spawn fast path: check local halt state before cloning. If local state is empty (cold
+    // start with a shared log) this may incorrectly allow a spawn; `ensure_synced` inside the
+    // task is the authoritative cluster-wide check. The unconditional guard here catches the
+    // common steady-state case cheaply.
     if state.experiments.challenger_blocked(&tenant, route_ix) {
         return;
     }
@@ -1587,6 +1609,35 @@ fn spawn_paired_challenger(
     let api = api.to_owned();
 
     tokio::spawn(async move {
+        // Pull cluster state for (tenant, route_ix) the first time this process sees it. Without
+        // this a fresh replica starts with an empty map and would bypass a halt or cap that
+        // another replica already established. `ensure_synced` is a no-op (returns true) when no
+        // shared log is configured. Returns false on a log read error → fail closed: skip eval.
+        if !state
+            .experiments
+            .ensure_synced(&tenant, route_ix, &fingerprint)
+            .await
+        {
+            tracing::debug!(
+                tenant,
+                route = route_ix,
+                "paired challenger: ensure_synced failed (log error), skipping evaluation"
+            );
+            return;
+        }
+
+        // Re-check halt status after ensure_synced: a halt from another replica is now visible.
+        if state.experiments.challenger_blocked(&tenant, route_ix) {
+            return;
+        }
+
+        // Issue 4 (in-flight staleness): with a shared log the originating replica only learns
+        // its own spend after append + read-back (`apply_log_record` seeds the ledger). Between
+        // `may_spend` here and the read-back a concurrent pair on this replica could also pass
+        // the cap check. We accept this soft-cap overshoot (bounded by concurrent in-flight
+        // paired calls × cost/call) rather than adding optimistic debit + per-record origin
+        // tagging to avoid double-seeding. `ensure_synced` above ensures the cluster state is
+        // fresh at the start of the first evaluation per process lifetime.
         let now = jiff::Timestamp::now();
         if !state
             .paired_ledger
@@ -1657,19 +1708,34 @@ fn spawn_paired_challenger(
         };
 
         let (_, ch_trace) = route_enforce(ctx).await;
+
+        // Issue 3 fix: sample the pair timestamp AFTER route_enforce completes. Using `now`
+        // (captured before route_enforce) would misattribute pairs that finish just after UTC
+        // midnight: `ShadowLedger::seed` would treat them as yesterday and silently skip the
+        // debit, bypassing the daily cap. Sampling here ensures `ts_unix` and `pair_row.ts`
+        // always carry the actual completion date.
+        let pair_ts = jiff::Timestamp::now();
+
         let challenger_cost = ch_trace.final_.total_cost_usd;
+        let ch_errored = ch_trace.final_.served_from == firstpass_core::ServedFrom::Error;
+        let ch_trunc = crate::experiment::truncated_attempts(&ch_trace);
+
+        // Health and ledger are ALWAYS tallied locally here, regardless of whether a shared log
+        // is attached. `apply_log_record` skips health and ledger for records bearing this
+        // replica's own `replica_id`, preventing double-count. Remote replicas see these values
+        // through the log and tally them in `apply_log_record`.
         state
             .paired_ledger
-            .debit(&tenant, route_ix, challenger_cost, now);
-
+            .debit(&tenant, route_ix, challenger_cost, pair_ts);
         state.experiments.observe_health(
             &tenant,
             route_ix,
             &fingerprint,
             firstpass_core::Arm::Challenger,
-            ch_trace.final_.served_from == firstpass_core::ServedFrom::Error,
-            crate::experiment::truncated_attempts(&ch_trace),
+            ch_errored,
+            ch_trunc,
         );
+
         // Only a gate pass is success. `Served` is not: a ladder whose every rung failed its gates
         // still serves its best attempt. And an error is a failure, not a skipped pair: errors
         // cluster on hard requests, so skipping them would flatter the challenger toward a
@@ -1682,24 +1748,26 @@ fn spawn_paired_challenger(
             firstpass_core::ServedFrom::Cache => return,
         };
 
-        // Persist the pair to the store for startup rebuild and CLI replay.
-        let pair_row = crate::store::ExperimentPairRow {
-            tenant: tenant.clone(),
-            route_ix,
-            fingerprint: fingerprint.clone(),
-            trace_id: ch_trace.trace_id,
-            x_inc,
-            x_ch,
-            challenger_cost_usd: challenger_cost,
-            ts: now,
-        };
-        if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
-            tracing::warn!(%e, "paired challenger: failed to persist pair to store");
-        }
+        // ── Durability-ordered persist and evidence application ────────────────────────────
+        //
+        // Two paths, distinguished by whether the shared log is the durable record:
+        //
+        // InLog path (appended to Redis):
+        //   The log is the durable record. SQLite is a startup-rebuild cache.
+        //   `record_pair` already applied evidence via `sync_from_backend`; the SQLite
+        //   write can follow the append safely.
+        //
+        // NotInLog path (no log, or append failed):
+        //   SQLite is the only durable record. Write it BEFORE applying evidence so that
+        //   a crash between the two leaves the evidence absent (the safe direction).
+        //   A missed pair only delays a decision; evidence without a durable record could
+        //   mislead a halt after restart.  If the SQLite write fails, withhold evidence.
 
-        // Record the pair in the experiment monitor (updates local state and, if a log
-        // backend is configured, propagates to other replicas).
-        state
+        // Try to append to the shared log (no-op if no log configured).
+        // `record_pair` returns true iff the record is now in the log.
+        // Evidence for InLog records is applied inside `record_pair` via sync_from_backend.
+        // For NotInLog records `record_pair` does NOT apply evidence (durability ordering).
+        let appended = state
             .experiments
             .record_pair(
                 &tenant,
@@ -1709,8 +1777,70 @@ fn spawn_paired_challenger(
                 x_ch,
                 incumbent_cost_usd,
                 challenger_cost,
+                ch_errored,
+                ch_trunc,
+                pair_ts.as_second(),
+                ch_trace.trace_id,
             )
             .await;
+
+        let pair_row = crate::store::ExperimentPairRow {
+            tenant: tenant.clone(),
+            route_ix,
+            fingerprint: fingerprint.clone(),
+            trace_id: ch_trace.trace_id,
+            x_inc,
+            x_ch,
+            challenger_cost_usd: challenger_cost,
+            ch_error: ch_errored,
+            ch_truncated: ch_trunc,
+            ts: pair_ts,
+            // `in_log` is always set explicitly (never relying on the schema DEFAULT=Unknown):
+            //   InLog    → appended to Redis; evidence arrives via sync (already done above)
+            //   NotInLog → local-only; SQLite is the durable record; evidence applied below
+            in_log: if appended {
+                crate::store::InLogStatus::InLog
+            } else {
+                crate::store::InLogStatus::NotInLog
+            },
+        };
+
+        if appended {
+            // InLog: log is durable; SQLite is just a startup-rebuild cache.
+            // A write failure here only affects startup (not correctness for this request).
+            if let Err(e) = crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
+                tracing::warn!(%e, "paired challenger: failed to persist InLog row to store");
+            }
+            // Evidence already applied via sync_from_backend inside record_pair.
+        } else {
+            // NotInLog: SQLite is the only durable record.
+            // Write it FIRST; apply evidence only on success (durability ordering).
+            match crate::store::append_experiment_pair(&state.config.db_path, &pair_row) {
+                Ok(()) => {
+                    // Durable write succeeded. Apply evidence to local state.
+                    // `apply_pair_locally` deduplicates by trace_id so even if a concurrent
+                    // log-sync path later sees the same record it will be a no-op.
+                    state.experiments.apply_pair_locally(
+                        &tenant,
+                        route_ix,
+                        &fingerprint,
+                        x_inc,
+                        x_ch,
+                        challenger_cost,
+                        ch_trace.trace_id,
+                    );
+                }
+                Err(e) => {
+                    // SQLite write failed. Withhold evidence: a delay is safer than evidence
+                    // that has no durable backing (the pair would vanish on restart, letting
+                    // a halted challenger run again).
+                    tracing::warn!(
+                        %e,
+                        "paired challenger: SQLite write failed; evidence withheld for this pair"
+                    );
+                }
+            }
+        }
 
         tracing::debug!(
             tenant,
@@ -2347,6 +2477,35 @@ async fn enforce_pipeline_inner(
     //
     // In **paired** mode the challenger never serves any session: arm is always Incumbent, and the
     // challenger is evaluated off-path by `spawn_paired_challenger` after the response is returned.
+
+    // Live-mode only: before checking `challenger_blocked`, ensure this (tenant, route_ix) has
+    // been synced at least once so a fresh replica cannot serve a challenger that another replica
+    // already halted. Only the first request per (tenant, route) per process pays the LRANGE
+    // cost; subsequent requests see `synced_once=true` and skip it immediately.
+    //
+    // Paired challengers are excluded: they evaluate off-path in `spawn_paired_challenger`, which
+    // calls `ensure_synced` itself. Calling it here too would block the user response on Redis.
+    //
+    // Optimisation: compute the arm assignment synchronously first so we can skip `ensure_synced`
+    // entirely for incumbent-assigned sessions — they never serve the challenger and do not need
+    // cluster state. Only challenger-assigned sessions wait on Redis.
+    //
+    // On sync failure (log error): fail closed — treat as halted (serve incumbent only).
+    let live_arm_info: Option<(firstpass_core::Arm, String)> = route
+        .challenger
+        .as_ref()
+        .filter(|ch| allow_challenger && !ch.is_paired())
+        .map(|ch| {
+            let bucket = firstpass_core::Challenger::bucket(&state.config.prompt_salt, &session_id);
+            (ch.arm_of(bucket), ch.fingerprint(&route.ladder))
+        });
+
+    let live_sync_ok = if let Some((firstpass_core::Arm::Challenger, ref fp)) = live_arm_info {
+        state.experiments.ensure_synced(&tenant, route_ix, fp).await
+    } else {
+        true
+    };
+
     let experiment = route
         .challenger
         .as_ref()
@@ -2355,6 +2514,7 @@ async fn enforce_pipeline_inner(
             let bucket = firstpass_core::Challenger::bucket(&state.config.prompt_salt, &session_id);
             let assigned = ch.arm_of(bucket);
             let arm = if ch.is_paired()
+                || (!live_sync_ok && !ch.is_paired() && assigned == firstpass_core::Arm::Challenger)
                 || (assigned == firstpass_core::Arm::Challenger
                     && state.experiments.challenger_blocked(&tenant, route_ix))
             {
@@ -8694,7 +8854,7 @@ mod tests {
         );
 
         // One sync makes B read the shared log and reach the same Halted decision.
-        state_b
+        let _ = state_b
             .experiments
             .sync_from_backend("default", 0, &fp)
             .await;
@@ -9066,7 +9226,10 @@ mod tests {
             x_inc: 1.0,
             x_ch: 1.0,
             challenger_cost_usd: usd,
+            ch_error: false,
+            ch_truncated: 0,
             ts,
+            in_log: crate::store::InLogStatus::InLog,
         };
         let two_days_ago = now - jiff::SignedDuration::from_hours(48);
         for r in [
@@ -9090,7 +9253,7 @@ mod tests {
             _ => None,
         })
         .unwrap();
-        let ledger = build_paired_ledger(&cfg);
+        let ledger = build_paired_ledger(&cfg, false);
         assert!((ledger.spent_today("tenant-a", 0, now) - 1.10).abs() < 1e-9);
         assert!((ledger.spent_today("tenant-b", 0, now) - 0.10).abs() < 1e-9);
         assert!(
@@ -9098,6 +9261,129 @@ mod tests {
             "cap survives restart"
         );
         assert!(ledger.may_spend("tenant-b", 0, 1.0, now));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// With a shared log configured, `build_paired_ledger` seeds spend from `in_log=false` rows
+    /// (written during an outage) and ignores `in_log=true` rows (they come from Redis on sync).
+    #[tokio::test]
+    async fn build_paired_ledger_seeds_offline_pairs_when_shared_log_is_true() {
+        let db =
+            std::env::temp_dir().join(format!("firstpass-offline-ledger-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let now = jiff::Timestamp::now();
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 2.0\n"
+        );
+        let db_s = db.to_string_lossy().into_owned();
+        let cfg = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.clone()),
+            "FIRSTPASS_DB" => Some(db_s.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+        // Write one offline row (in_log=false) and one log row (in_log=true).
+        let offline_row = crate::store::ExperimentPairRow {
+            tenant: "default".to_owned(),
+            route_ix: 0,
+            fingerprint: "fp".to_owned(),
+            trace_id: Uuid::now_v7(),
+            x_inc: 1.0,
+            x_ch: 0.0,
+            challenger_cost_usd: 0.7,
+            ch_error: false,
+            ch_truncated: 0,
+            ts: now,
+            in_log: crate::store::InLogStatus::NotInLog,
+        };
+        let log_row = crate::store::ExperimentPairRow {
+            in_log: crate::store::InLogStatus::InLog,
+            challenger_cost_usd: 0.4,
+            trace_id: Uuid::now_v7(),
+            ..offline_row.clone()
+        };
+        crate::store::append_experiment_pair(&db, &offline_row).unwrap();
+        crate::store::append_experiment_pair(&db, &log_row).unwrap();
+
+        // shared_log=true: only the offline row is seeded.
+        let ledger = build_paired_ledger(&cfg, true);
+        let spent = ledger.spent_today("default", 0, now);
+        assert!(
+            (spent - 0.7).abs() < 1e-9,
+            "only offline row seeded; got {spent}"
+        );
+
+        // shared_log=false: both rows are seeded.
+        let ledger2 = build_paired_ledger(&cfg, false);
+        let spent2 = ledger2.spent_today("default", 0, now);
+        assert!(
+            (spent2 - 1.1).abs() < 1e-9,
+            "both rows seeded with shared_log=false; got {spent2}"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// `in_log=Unknown` rows (legacy / migrated) are seeded into the ledger when shared_log=true,
+    /// so they count against the spend cap (conservative: safer to over-count than under-count).
+    #[tokio::test]
+    async fn build_paired_ledger_unknown_rows_count_toward_spend_with_shared_log() {
+        let db =
+            std::env::temp_dir().join(format!("firstpass-unknown-ledger-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let now = jiff::Timestamp::now();
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 2.0\n"
+        );
+        let db_s = db.to_string_lossy().into_owned();
+        let cfg = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.clone()),
+            "FIRSTPASS_DB" => Some(db_s.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+        let unknown_row = crate::store::ExperimentPairRow {
+            tenant: "default".to_owned(),
+            route_ix: 0,
+            fingerprint: "fp".to_owned(),
+            trace_id: Uuid::now_v7(),
+            x_inc: 1.0,
+            x_ch: 0.0,
+            challenger_cost_usd: 0.6,
+            ch_error: false,
+            ch_truncated: 0,
+            ts: now,
+            in_log: crate::store::InLogStatus::Unknown,
+        };
+        let log_row = crate::store::ExperimentPairRow {
+            in_log: crate::store::InLogStatus::InLog,
+            challenger_cost_usd: 0.3,
+            trace_id: Uuid::now_v7(),
+            ..unknown_row.clone()
+        };
+        crate::store::append_experiment_pair(&db, &unknown_row).unwrap();
+        crate::store::append_experiment_pair(&db, &log_row).unwrap();
+
+        // shared_log=true: Unknown counts toward spend; InLog is skipped.
+        let ledger = build_paired_ledger(&cfg, true);
+        let spent = ledger.spent_today("default", 0, now);
+        assert!(
+            (spent - 0.6).abs() < 1e-9,
+            "Unknown row seeded (conservative); InLog row skipped; got {spent}"
+        );
+
         let _ = std::fs::remove_file(&db);
     }
 
@@ -9208,6 +9494,11 @@ mod tests {
             pairs[0].x_ch, 0.0,
             "challenger failed json-valid on every rung"
         );
+        assert_eq!(
+            pairs[0].in_log,
+            crate::store::InLogStatus::NotInLog,
+            "no shared log is configured, so the pair cannot be in one"
+        );
         let _ = std::fs::remove_file(&db);
     }
 
@@ -9281,6 +9572,306 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
+    /// A shared log whose first read succeeds and every later read fails, while appends succeed.
+    #[derive(Debug)]
+    struct FlakyReadLog {
+        inner: crate::experiment::InMemoryExperimentLog,
+        reads: std::sync::atomic::AtomicUsize,
+        always_fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::experiment::ExperimentLogBackend for FlakyReadLog {
+        async fn append(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            record: crate::experiment::LogRecord,
+        ) -> Result<u64, crate::experiment::LogError> {
+            if self.always_fail {
+                return Err(crate::experiment::LogError::Backend("down".into()));
+            }
+            self.inner
+                .append(tenant, route_ix, fingerprint, record)
+                .await
+        }
+        async fn load_since(
+            &self,
+            tenant: &str,
+            route_ix: usize,
+            fingerprint: &str,
+            offset: u64,
+        ) -> Result<Vec<Option<crate::experiment::LogRecord>>, crate::experiment::LogError>
+        {
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.always_fail || n > 0 {
+                return Err(crate::experiment::LogError::Backend("down".into()));
+            }
+            self.inner
+                .load_since(tenant, route_ix, fingerprint, offset)
+                .await
+        }
+        async fn claim_session(&self, t: &str, r: usize, f: &str, s: &str) -> bool {
+            self.inner.claim_session(t, r, f, s).await
+        }
+    }
+
+    fn flaky_log(always_fail: bool) -> Arc<dyn crate::experiment::ExperimentLogBackend> {
+        Arc::new(FlakyReadLog {
+            inner: crate::experiment::InMemoryExperimentLog::new(),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            always_fail,
+        })
+    }
+
+    /// With a shared log attached, a paired challenger's spend is debited to this replica's
+    /// ledger at completion, even when reading its own record back from the log fails: the cap
+    /// must not depend on the read-back.
+    #[tokio::test]
+    async fn paired_spend_is_debited_locally_when_the_log_read_back_fails() {
+        use tower::ServiceExt;
+        let db = std::env::temp_dir().join(format!("firstpass-paired-flaky-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let (mut state, _rx) = challenger_state(50.0, &db.to_string_lossy());
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 5.0\n"
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
+        state.experiments = Arc::new(
+            crate::experiment::ExperimentMonitor::from_config(cfg.routing.as_ref().unwrap())
+                .with_log(flaky_log(false)),
+        );
+        state.config = Arc::new(cfg);
+        let mut outs = HashMap::new();
+        outs.insert(
+            INCUMBENT.to_owned(),
+            Ok(model_resp(INCUMBENT, "{\"ok\": 1}")),
+        );
+        outs.insert(
+            CHALLENGER.to_owned(),
+            Ok(model_resp(CHALLENGER, "{\"ok\": 1}")),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        state.providers = ProviderRegistry::from_map(map);
+        let ledger = state.paired_ledger.clone();
+        let router = app(state).expect("router");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(user_body()))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+        let mut pairs = Vec::new();
+        for _ in 0..200 {
+            pairs = crate::store::load_all_experiment_pairs(&db).unwrap_or_default();
+            if !pairs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pairs.len(), 1, "the challenger ran (first sync succeeded)");
+        let spent = ledger.spent_today("default", 0, jiff::Timestamp::now());
+        assert!(
+            spent > 0.0,
+            "challenger spend debited locally despite the failed read-back: {spent}"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A shared log that reads fine (empty) but rejects every append.
+    #[derive(Debug)]
+    struct AppendFailLog;
+
+    #[async_trait::async_trait]
+    impl crate::experiment::ExperimentLogBackend for AppendFailLog {
+        async fn append(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: crate::experiment::LogRecord,
+        ) -> Result<u64, crate::experiment::LogError> {
+            Err(crate::experiment::LogError::Backend("rpush failed".into()))
+        }
+        async fn load_since(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: u64,
+        ) -> Result<Vec<Option<crate::experiment::LogRecord>>, crate::experiment::LogError>
+        {
+            Ok(vec![])
+        }
+        async fn claim_session(&self, _: &str, _: usize, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// A paired pair whose shared-log append failed is persisted with `in_log = false`, so a
+    /// restart replays it locally instead of losing its spend and evidence.
+    #[tokio::test]
+    async fn paired_pair_that_missed_the_log_is_persisted_as_offline() {
+        use tower::ServiceExt;
+        let db =
+            std::env::temp_dir().join(format!("firstpass-paired-offline-{}.db", Uuid::now_v7()));
+        let (tx, handle) = crate::store::open(&db).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        let (mut state, _rx) = challenger_state(50.0, &db.to_string_lossy());
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 5.0\n"
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
+        state.experiments = Arc::new(
+            crate::experiment::ExperimentMonitor::from_config(cfg.routing.as_ref().unwrap())
+                .with_log(Arc::new(AppendFailLog)),
+        );
+        state.config = Arc::new(cfg);
+        let mut outs = HashMap::new();
+        outs.insert(
+            INCUMBENT.to_owned(),
+            Ok(model_resp(INCUMBENT, "{\"ok\": 1}")),
+        );
+        outs.insert(
+            CHALLENGER.to_owned(),
+            Ok(model_resp(CHALLENGER, "{\"ok\": 1}")),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        state.providers = ProviderRegistry::from_map(map);
+        let router = app(state).expect("router");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(user_body()))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+        let mut pairs = Vec::new();
+        for _ in 0..200 {
+            pairs = crate::store::load_all_experiment_pairs(&db).unwrap_or_default();
+            if !pairs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0].in_log,
+            crate::store::InLogStatus::NotInLog,
+            "the append failed, so the row must be marked offline"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// When the durable write for a local-only pair fails, the in-memory monitor gets no evidence:
+    /// evidence without a durable record would vanish on restart and could let a halted
+    /// challenger run again. Driven end to end through the router, with an unwritable store.
+    #[tokio::test]
+    async fn sqlite_write_failure_withholds_local_evidence() {
+        use tower::ServiceExt;
+        let bad_db = "/nonexistent-firstpass-dir/firstpass-sqlite-fail.db";
+        let (mut state, _rx) = challenger_state(50.0, bad_db);
+        let toml = format!(
+            "[[route]]\nmatch = {{}}\nmode = \"enforce\"\n\
+             ladder = [\"{INCUMBENT}\"]\ngates = [\"json-valid\"]\n\
+             [route.challenger]\nladder = [\"{CHALLENGER}\"]\nmode = \"paired\"\n\
+             max_usd_per_day = 5.0\n"
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.routing = Some(firstpass_core::Config::parse(&toml).expect("paired config parses"));
+        state.experiments = Arc::new(crate::experiment::ExperimentMonitor::from_config(
+            cfg.routing.as_ref().unwrap(),
+        ));
+        state.config = Arc::new(cfg);
+        let mut outs = HashMap::new();
+        outs.insert(
+            INCUMBENT.to_owned(),
+            Ok(model_resp(INCUMBENT, "{\"ok\": 1}")),
+        );
+        outs.insert(
+            CHALLENGER.to_owned(),
+            Ok(model_resp(CHALLENGER, "{\"ok\": 1}")),
+        );
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outs)),
+        );
+        state.providers = ProviderRegistry::from_map(map);
+        let (ledger, monitor) = (state.paired_ledger.clone(), state.experiments.clone());
+        let router = app(state).expect("router");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(user_body()))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+        // The challenger ran once its spend is debited; the write attempt follows immediately.
+        for _ in 0..200 {
+            if ledger.spent_today("default", 0, jiff::Timestamp::now()) > 0.0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            ledger.spent_today("default", 0, jiff::Timestamp::now()) > 0.0,
+            "challenger ran"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let pairs: u64 = monitor.reports().iter().map(|r| r.report.pairs).sum();
+        assert_eq!(
+            pairs, 0,
+            "the durable write failed, so no evidence was applied"
+        );
+    }
+
+    /// A cold replica that cannot read the shared log does not serve a live challenger: without
+    /// the cluster state it cannot know the challenger was not already halted.
+    #[tokio::test]
+    async fn live_challenger_is_not_served_when_the_cold_start_sync_fails() {
+        use firstpass_core::Arm;
+        let (mut state, mut rx) = challenger_state(50.0, ":memory:");
+        let cfg = state.config.routing.clone().unwrap();
+        state.experiments = Arc::new(
+            crate::experiment::ExperimentMonitor::from_config(&cfg).with_log(flaky_log(true)),
+        );
+        let session = session_in_arm(&state, Arm::Challenger, 0);
+        let trace = serve_session(&state, &mut rx, &session).await;
+        let rec = trace
+            .experiment
+            .expect("experiment record on a challenger route");
+        assert_eq!(rec.arm, Arm::Incumbent, "fail closed: served the incumbent");
+        assert_eq!(trace.attempts[0].model, INCUMBENT);
+    }
+
     /// Once a paired experiment halts, the challenger is not run again: no pair, no spend.
     #[tokio::test]
     async fn halted_paired_challenger_stops_spending() {
@@ -9303,14 +9894,22 @@ mod tests {
         ));
         state.config = Arc::new(cfg);
         let fingerprint = state.experiments.fingerprint(0).unwrap().to_owned();
+        // In a no-log (single-replica) context, `record_pair` returns false and does NOT
+        // apply evidence (durability ordering: SQLite precedes evidence; here we have no
+        // SQLite so we drive evidence directly via `apply_pair_locally`).
         for _ in 0..500 {
             if state.experiments.challenger_blocked("default", 0) {
                 break;
             }
-            state
-                .experiments
-                .record_pair("default", 0, &fingerprint, 1.0, 0.0, 0.01, 0.001)
-                .await;
+            state.experiments.apply_pair_locally(
+                "default",
+                0,
+                &fingerprint,
+                1.0,
+                0.0,
+                0.001,
+                uuid::Uuid::nil(),
+            );
         }
         assert!(
             state.experiments.challenger_blocked("default", 0),

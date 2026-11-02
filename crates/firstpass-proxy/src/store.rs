@@ -193,10 +193,49 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             x_inc REAL NOT NULL,
             x_ch REAL NOT NULL,
             challenger_cost_usd REAL NOT NULL,
-            ts TEXT NOT NULL
+            ch_error INTEGER NOT NULL DEFAULT 0,
+            ch_truncated INTEGER NOT NULL DEFAULT 0,
+            ts TEXT NOT NULL,
+            -- DEFAULT 2 = InLogStatus::Unknown: a missed write surfaces as Unknown,
+            -- not as InLog (1) or NotInLog (0), so tests can detect missing explicit writes.
+            -- Production code always writes this field explicitly.
+            in_log INTEGER NOT NULL DEFAULT 2
         );
         CREATE INDEX IF NOT EXISTS exp_pairs_tenant_idx ON experiment_pairs(tenant, route_ix, fingerprint);",
     )?;
+    // Idempotent migrations: each column is checked and added independently.
+    // PRAGMA table_info returns one row per column; column name is at index 1.
+    // SQLite does not support "ALTER TABLE … ADD COLUMN IF NOT EXISTS", so we check first.
+    let has_column = |name: &str| -> Result<bool, rusqlite::Error> {
+        let mut stmt = conn.prepare("PRAGMA table_info(experiment_pairs)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let col: String = row.get(1)?;
+            if col == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !has_column("ch_error")? {
+        conn.execute_batch(
+            "ALTER TABLE experiment_pairs ADD COLUMN ch_error INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !has_column("ch_truncated")? {
+        conn.execute_batch(
+            "ALTER TABLE experiment_pairs ADD COLUMN ch_truncated INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    // Legacy rows (before the in_log column): stored as Unknown (2) because we cannot
+    // determine whether they reached a shared log. At startup with shared_log=true,
+    // Unknown rows contribute spend toward the cap (safe: stricter) but not evidence
+    // (safe: only delays a decision). With shared_log=false they replay normally.
+    if !has_column("in_log")? {
+        conn.execute_batch(
+            "ALTER TABLE experiment_pairs ADD COLUMN in_log INTEGER NOT NULL DEFAULT 2;",
+        )?;
+    }
     Ok(())
 }
 
@@ -814,6 +853,45 @@ pub fn load_trace_view(
     Ok(Some(trace))
 }
 
+/// Whether a paired-mode row's evidence was successfully pushed to the shared experiment log.
+///
+/// This is a tri-state because we can have three situations at record time:
+/// - `NotInLog` (0): the shared log append failed (Redis outage); the row is local-only and
+///   must be replayed locally on restart with a shared log configured.
+/// - `InLog` (1): the append succeeded; the record lives in Redis and will be re-applied by
+///   `sync_from_backend` on restart — do not replay evidence from SQLite.
+/// - `Unknown` (2): legacy row from before this column was added, or written in single-replica
+///   mode before a shared log was attached; cannot determine where it lives.
+///
+/// ## Restart rules
+/// With a shared log:
+///   - `NotInLog` rows → replay spend AND evidence locally (came from an outage).
+///   - `InLog` rows → replay neither; they arrive from the log on the first sync.
+///   - `Unknown` rows → replay spend only (count toward cap but withhold evidence);
+///     double-counting spend only makes the cap stricter (safe), withholding evidence
+///     only delays a decision (safe).
+///
+/// Without a shared log: all rows → replay everything (original behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InLogStatus {
+    /// Never reached the shared log (written during an outage or when no log was configured).
+    NotInLog = 0,
+    /// Successfully appended to the shared log at record time.
+    InLog = 1,
+    /// Legacy row: cannot determine whether it was in the log.
+    Unknown = 2,
+}
+
+impl InLogStatus {
+    fn from_i64(v: i64) -> Self {
+        match v {
+            0 => Self::NotInLog,
+            1 => Self::InLog,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// One row from the `experiment_pairs` table.
 ///
 /// Used to rebuild paired-mode experiments at startup and in the CLI, so the e-process trajectory
@@ -826,7 +904,7 @@ pub struct ExperimentPairRow {
     pub route_ix: usize,
     /// Fingerprint of the experiment config (incumbent + challenger ladders, margin, alpha).
     pub fingerprint: String,
-    /// Trace id of the served (incumbent) request that triggered this pair.
+    /// Trace id of the challenger request that produced this pair (used for cross-source dedup).
     pub trace_id: uuid::Uuid,
     /// Incumbent gate verdict: 1.0 = gate passed, 0.0 = gate failed / best-attempt.
     pub x_inc: f64,
@@ -834,8 +912,14 @@ pub struct ExperimentPairRow {
     pub x_ch: f64,
     /// USD spent by the challenger on this pair.
     pub challenger_cost_usd: f64,
+    /// Whether the challenger call ended in an error with no output.
+    pub ch_error: bool,
+    /// Number of challenger attempts whose answer was cut off at the output-token limit.
+    pub ch_truncated: u64,
     /// When the pair was recorded.
     pub ts: jiff::Timestamp,
+    /// Whether this row's evidence reached the shared log. See [`InLogStatus`].
+    pub in_log: InLogStatus,
 }
 
 /// Append one experiment pair to the `experiment_pairs` table.
@@ -849,8 +933,9 @@ pub fn append_experiment_pair(
     let conn = connect(db_path.as_ref())?;
     conn.execute(
         "INSERT INTO experiment_pairs \
-         (tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, ts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, \
+          ch_error, ch_truncated, ts, in_log) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             row.tenant,
             row.route_ix as i64,
@@ -859,7 +944,10 @@ pub fn append_experiment_pair(
             row.x_inc,
             row.x_ch,
             row.challenger_cost_usd,
+            i64::from(row.ch_error),
+            row.ch_truncated as i64,
             row.ts.to_string(),
+            row.in_log as i64,
         ],
     )?;
     Ok(())
@@ -877,7 +965,8 @@ pub fn load_all_experiment_pairs(
 ) -> Result<Vec<ExperimentPairRow>, StoreError> {
     let conn = connect(db_path.as_ref())?;
     let mut stmt = conn.prepare(
-        "SELECT tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, ts \
+        "SELECT tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, \
+                ch_error, ch_truncated, ts, in_log \
          FROM experiment_pairs ORDER BY id ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -889,12 +978,27 @@ pub fn load_all_experiment_pairs(
             row.get::<_, f64>(4)?,
             row.get::<_, f64>(5)?,
             row.get::<_, f64>(6)?,
-            row.get::<_, String>(7)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, i64>(10)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (tenant, route_ix, fingerprint, trace_id_s, x_inc, x_ch, ch_cost, ts_s) = row?;
+        let (
+            tenant,
+            route_ix,
+            fingerprint,
+            trace_id_s,
+            x_inc,
+            x_ch,
+            ch_cost,
+            ch_error_i,
+            ch_truncated_i,
+            ts_s,
+            in_log_i,
+        ) = row?;
         let Ok(trace_id) = trace_id_s.parse::<uuid::Uuid>() else {
             tracing::warn!(
                 %trace_id_s,
@@ -917,10 +1021,26 @@ pub fn load_all_experiment_pairs(
             x_inc,
             x_ch,
             challenger_cost_usd: ch_cost,
+            ch_error: ch_error_i != 0,
+            ch_truncated: u64::try_from(ch_truncated_i).unwrap_or(0),
             ts,
+            in_log: InLogStatus::from_i64(in_log_i),
         });
     }
     Ok(out)
+}
+
+/// Open the database, run all schema migrations, and close.
+///
+/// Use this when you need the schema to be up to date (e.g. before calling
+/// [`load_all_experiment_pairs`] in a context where the store was not opened via [`open`]),
+/// without spawning a background writer task.
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] if the database cannot be opened or migrated.
+pub fn ensure_migrated(db_path: impl AsRef<Path>) -> Result<(), StoreError> {
+    let conn = connect(db_path)?;
+    migrate(&conn)
 }
 
 #[cfg(test)]
@@ -1392,5 +1512,111 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&spill_p);
+    }
+
+    /// An existing `experiment_pairs` table without `ch_error`/`ch_truncated` columns gets
+    /// those columns added by `migrate()`, and old rows load with defaults of `false`/`0`.
+    ///
+    /// Mutation test: if the `ALTER TABLE` branch is removed from `migrate`, the load panics on
+    /// a missing column or returns a wrong index — either way this assertion fails.
+    #[tokio::test]
+    async fn experiment_pairs_migration_adds_columns_to_old_schema() {
+        let db_path = std::env::temp_dir().join(format!(
+            "firstpass-pairs-migrate-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        // Create an old-schema DB (no ch_error / ch_truncated).
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE experiment_pairs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant TEXT NOT NULL,
+                    route_ix INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    trace_id TEXT NOT NULL,
+                    x_inc REAL NOT NULL,
+                    x_ch REAL NOT NULL,
+                    challenger_cost_usd REAL NOT NULL,
+                    ts TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO experiment_pairs \
+                 (tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, ts) \
+                 VALUES ('t', 0, 'fp', '00000000-0000-0000-0000-000000000001', 0.5, 0.5, 0.01, \
+                         '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        // Open via `open()` so `migrate()` runs and adds the missing columns, then close.
+        let (tx, handle) = open(&db_path).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        // Now load: old row must have default values for the new columns.
+        let rows = load_all_experiment_pairs(&db_path).unwrap();
+        assert_eq!(rows.len(), 1, "old row must be readable after migration");
+        assert!(!rows[0].ch_error, "old row defaults ch_error = false");
+        assert_eq!(rows[0].ch_truncated, 0, "old row defaults ch_truncated = 0");
+        // Legacy rows (no in_log column before migration) default to Unknown = 2.
+        assert_eq!(
+            rows[0].in_log,
+            InLogStatus::Unknown,
+            "legacy row defaults to Unknown"
+        );
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// `ensure_migrated` + `load_all_experiment_pairs` — the path the CLI uses — must work on a
+    /// pre-`in_log` database (schema without that column) without panicking or returning an error.
+    ///
+    /// Mutation test: if `ensure_migrated` does not call `migrate()`, `load_all_experiment_pairs`
+    /// fails because the column does not exist — the test catches that as an assertion error.
+    #[test]
+    fn ensure_migrated_makes_pre_in_log_db_loadable() {
+        let db_path = std::env::temp_dir().join(format!(
+            "firstpass-ensure-migrated-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        // Create a schema that lacks the in_log column (but has ch_error / ch_truncated).
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE experiment_pairs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant TEXT NOT NULL,
+                    route_ix INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    trace_id TEXT NOT NULL,
+                    x_inc REAL NOT NULL,
+                    x_ch REAL NOT NULL,
+                    challenger_cost_usd REAL NOT NULL,
+                    ch_error INTEGER NOT NULL DEFAULT 0,
+                    ch_truncated INTEGER NOT NULL DEFAULT 0,
+                    ts TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO experiment_pairs \
+                 (tenant, route_ix, fingerprint, trace_id, x_inc, x_ch, challenger_cost_usd, ts) \
+                 VALUES ('t', 0, 'fp', '00000000-0000-0000-0000-000000000002', 0.8, 0.4, 0.05, \
+                         '2026-06-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        // ensure_migrated is the same path the CLI takes before loading pairs.
+        ensure_migrated(&db_path).expect("ensure_migrated must succeed");
+        let rows = load_all_experiment_pairs(&db_path).expect("load must succeed after migration");
+        assert_eq!(rows.len(), 1, "pre-migration row must be readable");
+        assert_eq!(
+            rows[0].in_log,
+            InLogStatus::Unknown,
+            "pre-in_log row defaults to Unknown after migration"
+        );
+        let _ = std::fs::remove_file(&db_path);
     }
 }
