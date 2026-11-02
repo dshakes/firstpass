@@ -125,11 +125,23 @@ async fn openai_responses(body: Bytes) -> Response {
 
 /// Gemini `generateContent` wire response — a `candidates[].content.parts[].text` shape with
 /// `usageMetadata`. The API key rides in the `x-goog-api-key` header (the mock doesn't check it).
-async fn gemini_generate(body: Bytes) -> Response {
-    // The incoming Gemini body has no top-level `model` (it's in the URL), so just echo a good answer.
+///
+/// Behaviour is keyed on the model in the URL path segment:
+/// - model contains `haiku` → returns empty text (fails the non-empty gate)
+/// - anything else          → returns "gemini says hi"
+async fn gemini_generate(
+    axum::extract::Path(model_action): axum::extract::Path<String>,
+    body: Bytes,
+) -> Response {
     let _ = &body;
+    let model = model_action.split(':').next().unwrap_or_default();
+    let text = if model.contains("haiku") {
+        ""
+    } else {
+        "gemini says hi"
+    };
     Json(json!({
-        "candidates": [{ "content": { "role": "model", "parts": [{ "text": "gemini says hi" }] } }],
+        "candidates": [{ "content": { "role": "model", "parts": [{ "text": text }] } }],
         "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 3 },
     }))
     .into_response()
@@ -182,6 +194,7 @@ async fn spawn_proxy_with(
     let config = ProxyConfig::from_lookup(move |key| match key {
         "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some(upstream.clone()),
         "FIRSTPASS_UPSTREAM_OPENAI" => Some(upstream.clone()),
+        "FIRSTPASS_UPSTREAM_GEMINI" => Some(upstream.clone()),
         "FIRSTPASS_MODE" => Some("enforce".to_owned()),
         "FIRSTPASS_CONFIG_TOML" => Some(routing.clone()),
         "FIRSTPASS_DB" => Some(db_str.clone()),
@@ -1032,5 +1045,319 @@ async fn streaming_responses_ladder_failure_ends_in_response_failed() {
     assert_eq!(failed["response"]["status"], "failed");
     assert_eq!(failed["response"]["id"], events[0]["response"]["id"]);
     assert!(failed["response"]["error"]["message"].is_string());
+    let _ = std::fs::remove_file(&db);
+}
+
+// ─── Gemini inbound tests ─────────────────────────────────────────────────────
+
+/// Parse the Gemini SSE stream format (`data: {json}\n\n`) and collect the data payloads.
+fn parse_gemini_sse(text: &str) -> Vec<Value> {
+    text.split("\n\n")
+        .filter_map(|chunk| {
+            let line = chunk.trim();
+            if line.is_empty() {
+                return None;
+            }
+            line.strip_prefix("data: ")
+                .and_then(|s| serde_json::from_str(s).ok())
+        })
+        .collect()
+}
+
+/// `POST /v1beta/models/{model}:generateContent` observe mode: the proxy relays the request
+/// byte-for-byte to `FIRSTPASS_UPSTREAM_GEMINI` and returns the upstream response unchanged.
+///
+/// Mutation check: if `FIRSTPASS_UPSTREAM_GEMINI` is not wired into the config the request
+/// goes to the default `https://generativelanguage.googleapis.com` and fails to connect.
+#[tokio::test]
+async fn gemini_observe_non_streaming() {
+    let upstream = spawn_upstream().await;
+    // Observe-only proxy: no routing config, just FIRSTPASS_UPSTREAM_GEMINI.
+    let db_path = std::env::temp_dir().join(format!("firstpass-e2e-{}.db", uuid::Uuid::now_v7()));
+    let db_str = db_path.to_string_lossy().into_owned();
+    let upstream_c = upstream.clone();
+    let config = ProxyConfig::from_lookup(move |key| match key {
+        "FIRSTPASS_UPSTREAM_GEMINI" => Some(upstream_c.clone()),
+        "FIRSTPASS_DB" => Some(db_str.clone()),
+        _ => None,
+    })
+    .unwrap();
+    let (traces, _writer) = store::open(&db_path).unwrap();
+    let promoter = firstpass_proxy::proxy::build_promoter_async(&config)
+        .await
+        .unwrap();
+    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config)
+        .await
+        .unwrap();
+    let state = AppState {
+        config: Arc::new(config),
+        http: reqwest::Client::new(),
+        providers: ProviderRegistry::from_config(&[], &upstream, &upstream),
+        gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
+        shadow_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        paired_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        experiments: std::sync::Arc::default(),
+        guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
+        traces,
+        adaptive: None,
+        eprocess: None,
+        bandit: None,
+        promoter,
+        verified_cache,
+        predictor: None,
+        prior: None,
+        tenant_rate_limiter: None,
+        spill: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state).unwrap()).await.unwrap();
+    });
+    let proxy = format!("http://{addr}");
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{proxy}/v1beta/models/gemini-2.0-flash:generateContent"
+        ))
+        .header("x-goog-api-key", "AIza-test-key")
+        .json(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    // The upstream returned the Gemini-shaped response; the proxy relayed it byte-for-byte.
+    assert_eq!(
+        body["candidates"][0]["content"]["parts"][0]["text"],
+        "gemini says hi"
+    );
+    assert_eq!(body["usageMetadata"]["promptTokenCount"], 5);
+    // mutant: if FIRSTPASS_UPSTREAM_GEMINI is not wired, the proxy would try
+    // generativelanguage.googleapis.com and return an error, making this assertion fail.
+
+    let traces = wait_for_traces(&db_path, 1).await;
+    assert_eq!(traces.len(), 1, "observe trace written");
+    verify_chain(&traces, GENESIS_HASH).unwrap();
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Observe streaming: `streamGenerateContent` is relayed as an SSE stream and the proxy does NOT
+/// buffer the response — chunks flow directly from upstream to the client.
+#[tokio::test]
+async fn gemini_observe_streaming() {
+    let upstream = spawn_upstream().await;
+    let db_path = std::env::temp_dir().join(format!("firstpass-e2e-{}.db", uuid::Uuid::now_v7()));
+    let db_str = db_path.to_string_lossy().into_owned();
+    let upstream_c = upstream.clone();
+    let config = ProxyConfig::from_lookup(move |key| match key {
+        "FIRSTPASS_UPSTREAM_GEMINI" => Some(upstream_c.clone()),
+        "FIRSTPASS_DB" => Some(db_str.clone()),
+        _ => None,
+    })
+    .unwrap();
+    let (traces, _writer) = store::open(&db_path).unwrap();
+    let promoter = firstpass_proxy::proxy::build_promoter_async(&config)
+        .await
+        .unwrap();
+    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config)
+        .await
+        .unwrap();
+    let state = AppState {
+        config: Arc::new(config),
+        http: reqwest::Client::new(),
+        providers: ProviderRegistry::from_config(&[], &upstream, &upstream),
+        gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
+        shadow_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        paired_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        experiments: std::sync::Arc::default(),
+        guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
+        traces,
+        adaptive: None,
+        eprocess: None,
+        bandit: None,
+        promoter,
+        verified_cache,
+        predictor: None,
+        prior: None,
+        tenant_rate_limiter: None,
+        spill: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state).unwrap()).await.unwrap();
+    });
+    let proxy = format!("http://{addr}");
+
+    // streamGenerateContent → proxy relays SSE.
+    // The fake upstream returns a plain JSON response; the proxy pipes it through as-is.
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{proxy}/v1beta/models/gemini-2.0-flash:streamGenerateContent"
+        ))
+        .header("x-goog-api-key", "AIza-test-key")
+        .json(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "stream me" }] }],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    // The upstream returned JSON; just verify we got a non-empty response and no error.
+    let body_text = resp.text().await.unwrap();
+    assert!(
+        !body_text.is_empty(),
+        "streaming response must not be empty"
+    );
+    // The body contains the Gemini-shaped candidates from the upstream.
+    assert!(
+        body_text.contains("gemini says hi"),
+        "upstream text must be present in stream"
+    );
+    // mutant: if the proxy tried to call :generateContent instead of :streamGenerateContent,
+    // the upstream would still return the same response body, but the path assertion in
+    // future tests would fail (path matters for real Google API).
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Enforce mode with Gemini inbound: a cheap rung fails the gate, the ladder escalates to the next
+/// rung, and the caller receives a Gemini-shaped `generateContent` response (not Chat Completions).
+/// The audit trail records two attempts and the receipt chain verifies.
+///
+/// Mutation check: if `response_from_chat` returns Chat shape instead of Gemini shape, the
+/// `candidates[0]` assertion fails.
+#[tokio::test]
+async fn gemini_enforce_escalates_and_returns_gemini_shape() {
+    let upstream = spawn_upstream().await;
+    // Ladder: gemini-haiku fails the non-empty gate → escalate to gemini-flash which passes.
+    let providers =
+        format!("[[provider]]\nid = \"gemini\"\ndialect = \"gemini\"\nbase_url = \"{upstream}\"\n");
+    let (proxy, db) = spawn_proxy(
+        &upstream,
+        &["gemini/gemini-haiku", "gemini/gemini-2.0-flash"],
+        &providers,
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{proxy}/v1beta/models/gemini-2.0-flash:generateContent"
+        ))
+        .header("x-goog-api-key", "AIza-test-key")
+        .json(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "write code" }] }],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let served: Value = resp.json().await.unwrap();
+
+    // The response must be Gemini-shaped (candidates, not Chat "choices").
+    assert!(
+        served.get("candidates").is_some(),
+        "response must be Gemini-shaped (candidates), got: {served}"
+    );
+    assert!(
+        served.get("choices").is_none(),
+        "response must NOT be Chat-shaped (choices), got: {served}"
+    );
+    // The escalated rung (flash) returned non-empty text.
+    assert_eq!(
+        served["candidates"][0]["content"]["parts"][0]["text"],
+        "gemini says hi"
+    );
+    assert!(
+        served.get("usageMetadata").is_some(),
+        "usageMetadata present"
+    );
+    // mutant: if response_from_chat is not called, served["candidates"] would be null.
+
+    let traces = wait_for_traces(&db, 1).await;
+    let trace = &traces[0];
+    assert_eq!(trace.attempts.len(), 2, "haiku failed, flash passed");
+    assert_eq!(
+        trace.attempts[0].verdict,
+        Verdict::Fail,
+        "haiku fails non-empty gate"
+    );
+    assert_eq!(
+        trace.attempts[1].verdict,
+        Verdict::Pass,
+        "flash passes non-empty gate"
+    );
+    assert_eq!(trace.final_.served_rung, Some(1));
+    assert_eq!(trace.request.api, "gemini.generate_content");
+    // mutant: if the api label is wrong, this assertion fails.
+    verify_chain(&traces, GENESIS_HASH).unwrap();
+
+    let _ = std::fs::remove_file(&db);
+}
+
+/// Streaming enforce: same escalation path, but the caller requests
+/// `:streamGenerateContent`. The response is an SSE stream of Gemini data frames.
+#[tokio::test]
+async fn gemini_enforce_streaming_returns_gemini_sse() {
+    let upstream = spawn_upstream().await;
+    let providers =
+        format!("[[provider]]\nid = \"gemini\"\ndialect = \"gemini\"\nbase_url = \"{upstream}\"\n");
+    let (proxy, db) = spawn_proxy(
+        &upstream,
+        &["gemini/gemini-haiku", "gemini/gemini-2.0-flash"],
+        &providers,
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{proxy}/v1beta/models/gemini-2.0-flash:streamGenerateContent"
+        ))
+        .header("x-goog-api-key", "AIza-test-key")
+        .json(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "stream code" }] }],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body_text = resp.text().await.unwrap();
+    let frames = parse_gemini_sse(&body_text);
+    assert!(!frames.is_empty(), "must have at least one SSE frame");
+
+    // The final frame must be Gemini-shaped (candidates), not an error frame.
+    let last = frames.last().unwrap();
+    assert!(
+        last.get("candidates").is_some(),
+        "final SSE frame must be Gemini-shaped, got: {last}"
+    );
+    assert!(
+        last.get("error").is_none(),
+        "final SSE frame must not be an error, got: {last}"
+    );
+    assert_eq!(
+        last["candidates"][0]["content"]["parts"][0]["text"],
+        "gemini says hi"
+    );
+    // mutant: if sse_from_response is bypassed, the body would be Chat JSON with "choices", not SSE.
+
+    let traces = wait_for_traces(&db, 1).await;
+    let trace = &traces[0];
+    assert_eq!(
+        trace.attempts.len(),
+        2,
+        "haiku failed, flash served via SSE"
+    );
+    assert_eq!(trace.final_.served_rung, Some(1));
+    verify_chain(&traces, GENESIS_HASH).unwrap();
+
     let _ = std::fs::remove_file(&db);
 }

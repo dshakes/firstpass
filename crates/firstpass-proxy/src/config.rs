@@ -42,6 +42,9 @@ pub struct ProxyConfig {
     pub upstream_anthropic: String,
     /// Base URL of the upstream OpenAI-compatible API.
     pub upstream_openai: String,
+    /// Base URL of the upstream Gemini API (overridable via `FIRSTPASS_UPSTREAM_GEMINI`).
+    /// Default: `https://generativelanguage.googleapis.com`.
+    pub upstream_gemini: String,
     /// Path to the SQLite trace database.
     pub db_path: String,
     /// Tenant identifier stamped on every trace when `require_auth` is off (single-operator
@@ -167,6 +170,8 @@ impl ProxyConfig {
             .unwrap_or_else(|| "https://api.anthropic.com".to_owned());
         let upstream_openai = lookup("FIRSTPASS_UPSTREAM_OPENAI")
             .unwrap_or_else(|| "https://api.openai.com".to_owned());
+        let upstream_gemini = lookup("FIRSTPASS_UPSTREAM_GEMINI")
+            .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_owned());
         let db_path = lookup("FIRSTPASS_DB").unwrap_or_else(|| "firstpass.db".to_owned());
         let tenant_id = lookup("FIRSTPASS_TENANT").unwrap_or_else(|| "default".to_owned());
         let prompt_salt = lookup("FIRSTPASS_PROMPT_SALT").unwrap_or_else(|| {
@@ -250,6 +255,7 @@ impl ProxyConfig {
             bind,
             upstream_anthropic,
             upstream_openai,
+            upstream_gemini,
             db_path,
             tenant_id,
             require_auth,
@@ -291,6 +297,10 @@ mod tests {
         let cfg = ProxyConfig::from_lookup(|_| None).unwrap();
         assert_eq!(cfg.bind, "127.0.0.1:8080");
         assert_eq!(cfg.upstream_anthropic, "https://api.anthropic.com");
+        assert_eq!(
+            cfg.upstream_gemini,
+            "https://generativelanguage.googleapis.com"
+        );
         assert_eq!(cfg.db_path, "firstpass.db");
         assert_eq!(cfg.tenant_id, "default");
         assert_eq!(cfg.prompt_salt, DEFAULT_PROMPT_SALT);

@@ -82,6 +82,13 @@ Config surface (the parser is `deny_unknown_fields`, so a wrong key is a hard fa
   so it is rejected at parse. A model you host yourself is free, but must declare `0.0` explicitly.
 - **`[budget]` has no `max_escalations`** — it is `per_request_usd` / `per_session_usd` / `per_day_usd` / `on_exhausted`.
   The escalation cap is `[escalation] max_rungs_per_request`.
+- **`firstpass launch gemini` sets `GOOGLE_GEMINI_BASE_URL` (no `/v1` suffix)** — the Gemini SDK
+  appends `/v1beta/models/{model}:generateContent` directly. The proxy serves this path; `countTokens`
+  is always observe-passthrough. Inbound content with `inlineData`, `executableCode`, `fileData`, or
+  any unrecognised part type falls through to observe passthrough without running the gate.
+- **The Gemini `x-goog-api-key` header is credential-scoped**: it is only set on `Auth::gemini_key`
+  and only forwarded to `GeminiProvider`. It never reaches Anthropic or OpenAI rungs, and those
+  rungs' keys never reach `generativelanguage.googleapis.com`.
 - **A written `firstpass.toml` is inert unless `FIRSTPASS_CONFIG` names it** — `from_env` has no default path.
 - **`route.mode = "enforce"` is what enables enforcement**, not the global `FIRSTPASS_MODE`.
 - **`[escalation.prior]` `rungs` length must equal every `enforce` route's ladder length** — a

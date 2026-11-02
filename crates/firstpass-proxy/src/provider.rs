@@ -198,6 +198,13 @@ pub struct Auth {
     pub anthropic_beta: Option<String>,
     /// `anthropic-version` header value. When set, overrides the default `2023-06-01`.
     pub anthropic_version: Option<String>,
+    /// Google Gemini API key from the inbound request's `x-goog-api-key` header, **only on
+    /// Gemini-dialect requests** (`/v1beta/models/{model}:generateContent`).
+    /// Never populated from env on the Gemini inbound path — callers that need a server-side
+    /// fallback key can set `GOOGLE_API_KEY` and let `GeminiProvider::complete` resolve it.
+    /// Never set on Anthropic/OpenAI paths — scoping prevents the Google key from reaching
+    /// other providers.
+    pub gemini_key: Option<String>,
 }
 
 impl std::fmt::Debug for Auth {
@@ -211,6 +218,7 @@ impl std::fmt::Debug for Auth {
             )
             .field("anthropic_beta", &self.anthropic_beta)
             .field("anthropic_version", &self.anthropic_version)
+            .field("gemini_key", &self.gemini_key.as_ref().map(|_| "***"))
             .finish()
     }
 }
@@ -259,11 +267,23 @@ impl Auth {
                 (openai_key, None)
             }
             firstpass_core::Dialect::Gemini => {
-                // Bearer on this path is a Google API key — neither OpenAI nor Anthropic.
-                // Fall back to env for escalation paths.
+                // Bearer on this path is a Google token — neither OpenAI nor Anthropic.
+                // `openai_key` is still populated from env for mixed-ladder rungs; it is NOT
+                // sourced from the inbound `x-goog-api-key` (that goes into `gemini_key`).
                 let openai_env = std::env::var("OPENAI_API_KEY").ok();
                 (openai_env, None)
             }
+        };
+
+        // Gemini API key from the inbound `x-goog-api-key` header.
+        // Only trusted on the Gemini path; on other paths the header is ignored.
+        let gemini_key = if matches!(dialect, firstpass_core::Dialect::Gemini) {
+            headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        } else {
+            None
         };
 
         // Multiple `anthropic-beta` values (e.g. "extended-thinking-2025-02-19" + another flag)
@@ -292,6 +312,7 @@ impl Auth {
             anthropic_bearer,
             anthropic_beta,
             anthropic_version,
+            gemini_key,
         }
     }
 }
@@ -1111,7 +1132,9 @@ impl Provider for GeminiProvider {
         req: &ModelRequest,
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
-        let key = resolve_api_key(self.api_key_env.as_deref(), auth.openai_key.as_deref());
+        // Use the Gemini-scoped key (from inbound `x-goog-api-key`) first, then the configured
+        // env var. Never use `auth.openai_key` — OpenAI keys must not reach Google's endpoint.
+        let key = resolve_api_key(self.api_key_env.as_deref(), auth.gemini_key.as_deref());
         let body = gemini_request_body(req);
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
@@ -2410,6 +2433,7 @@ mod tests {
             anthropic_bearer: Some("oauth-super-secret".to_owned()),
             anthropic_beta: None,
             anthropic_version: None,
+            gemini_key: None,
         };
         let debug = format!("{auth:?}");
         assert!(!debug.contains("super-secret"));
@@ -2713,6 +2737,7 @@ mod tests {
             anthropic_bearer: Some("oauth-bearer-token".to_owned()),
             anthropic_beta: Some("interleaved-thinking-2025-05-14".to_owned()),
             anthropic_version: Some("2024-01-01".to_owned()),
+            gemini_key: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 
@@ -2844,6 +2869,7 @@ mod tests {
             anthropic_bearer: None,
             anthropic_beta: None,
             anthropic_version: None,
+            gemini_key: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 
@@ -2907,6 +2933,7 @@ mod tests {
             anthropic_bearer: Some("client-oauth-token".to_owned()),
             anthropic_beta: None,
             anthropic_version: None,
+            gemini_key: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 
@@ -2935,6 +2962,7 @@ mod tests {
             anthropic_bearer: bearer.map(str::to_owned),
             anthropic_beta: None,
             anthropic_version: None,
+            gemini_key: None,
         };
         // configured = Option<Option<String>>
         //   None           → api_key_env not set → use client creds + ambient
@@ -3033,6 +3061,7 @@ mod tests {
             anthropic_bearer: Some("oauth-bearer-ignored".to_owned()),
             anthropic_beta: None,
             anthropic_version: None,
+            gemini_key: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 

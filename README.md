@@ -167,6 +167,7 @@ Point the agent at the proxy; nothing else about the agent changes.
 |---|---|---|
 | **Claude Code** | `export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"` or `firstpass launch claude` | `POST /v1/messages` |
 | **Codex** | `firstpass launch codex` (sets `OPENAI_BASE_URL`) | `POST /v1/responses` |
+| **Gemini CLI** | `firstpass launch gemini` (sets `GOOGLE_GEMINI_BASE_URL`) | `POST /v1beta/models/{m}:generateContent` |
 | **aider** | `aider --openai-api-base=http://127.0.0.1:8080/v1 …` | `POST /v1/chat/completions` |
 
 **Observe** (the default) forwards byte-identical, writes receipts, and relays the upstream's `retry-after`, `request-id`, `anthropic-ratelimit-*` and `x-ratelimit-*` headers so an agent backs off correctly on a 429. `POST /v1/messages/count_tokens` is passed through and writes no receipt (it is not a routing decision). **Enforce** adds gates, escalation and sessions:
@@ -194,7 +195,7 @@ session_promotion = { after_failures = 2, window = "30m" }
 
 **What the evidence says about granularity.** On 500 real SWE-bench agent runs ([full eval](docs/benchmarks/agent-granularity.md), $0, replay of public runs), switching models mid-session did not pay on either ladder tested. On haiku to opus: escalate-and-pin cost +$0.309 to +$0.316 per instance versus always-top at the same 384/500 resolved; per-session routing resolved 378/500 against 384/500; a run-level cascade (a proxy for per-call, which that data cannot identify) cost +$0.295 to +$0.340 per instance. Choosing the model per *workload* was far cheaper (374/500 at $0.219 per instance against 384/500 at $0.754), but non-inferiority at 1 point was **not shown**. So the practice is: route per workload or route (certified selection, above), keep a session sticky, and do not switch models mid-session. A per-repo pool selection arm scored better still, but it was a post-hoc arm and is **exploratory**; do not rely on it.
 
-**Compatibility, as measured** ([matrix](docs/benchmarks/agent-compat.md); observe mode, fake upstream, firstpass 0.9.2): Claude Code and aider completed a turn; Codex is covered by a `/v1/responses` fixture request only (no standalone binary in the run); cline and cursor-agent were skipped (interactive or cloud auth); **Gemini CLI does not work** (its `generateContent` protocol is not served). Enforce mode with real CLIs is not in that matrix. More: [agent guide](https://dshakes.github.io/firstpass/guide/agents.html).
+**Compatibility, as measured** ([matrix](docs/benchmarks/agent-compat.md); observe mode, fake upstream, firstpass 0.9.2): Claude Code and aider completed a turn; Codex is covered by a `/v1/responses` fixture request only (no standalone binary in the run); Gemini CLI is covered by a `/v1beta/models/{m}:generateContent` fixture request (no standalone binary in the run); cline and cursor-agent were skipped (interactive or cloud auth). Enforce mode with real CLIs is not in that matrix. More: [agent guide](https://dshakes.github.io/firstpass/guide/agents.html).
 
 ---
 
@@ -209,6 +210,7 @@ Firstpass is a proxy in front of your provider calls. Your agent keeps its endpo
 | `POST /v1/messages` | Anthropic Messages (Claude Code and anything Anthropic-native) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions and OpenAI-compatible clients |
 | `POST /v1/responses` | OpenAI Responses, including tool calls |
+| `POST /v1beta/models/{m}:generateContent` | Gemini CLI inbound (`GOOGLE_GEMINI_BASE_URL`) — observe and enforce |
 | `GET /v1/models` | Model discovery for agent CLIs |
 
 Vendors can be crossed mid-ladder: `reasoning_effort` is carried to Anthropic rungs as `thinking`, and tool calls survive the `/v1/responses` round trip.

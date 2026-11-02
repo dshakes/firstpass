@@ -682,6 +682,12 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
         .route("/v1/messages/count_tokens", post(count_tokens_passthrough))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
+        // Gemini CLI inbound: `GOOGLE_GEMINI_BASE_URL` + `/v1beta/models/{model}:generateContent`
+        // (or `:streamGenerateContent?alt=sse`, or `:countTokens`).
+        .route(
+            "/v1beta/models/{model_action}",
+            post(gemini_generate_content),
+        )
         .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/models", get(models))
@@ -5783,6 +5789,363 @@ async fn responses(
 /// client (OpenAI SDK, Codex) treats as terminal. Client-safe message only, as [`sse_error_event`].
 fn responses_sse_error(e: &ProxyError) -> String {
     crate::responses::sse_failed(&format!("resp_{}", Uuid::now_v7()), &e.client_message())
+}
+
+// ─── Gemini inbound (POST /v1beta/models/{model_action}) ──────────────────────
+
+/// `POST /v1beta/models/{model_action}` — Gemini `generateContent` / `streamGenerateContent`
+/// inbound endpoint.
+///
+/// The `{model_action}` path segment captures everything after `/v1beta/models/`, e.g.
+/// `gemini-2.0-flash:generateContent` or `gemini-2.0-flash:streamGenerateContent`.
+/// The Gemini CLI sends `?alt=sse` on streaming; that query param is NOT part of
+/// `model_action` and is ignored by the gate (we always buffer the full candidate).
+///
+/// **Observe mode** — transparent relay to `FIRSTPASS_UPSTREAM_GEMINI`, streaming or buffered.
+/// The `x-goog-api-key` header is forwarded verbatim; never sent to Anthropic/OpenAI upstreams.
+/// If the client sent the key as a `?key=` query parameter it is stripped from receipts/traces
+/// before storage.
+///
+/// **Enforce mode** — translate Gemini → Chat, run the ladder/gate/escalation, translate back.
+/// Anything not representable in Chat (binary data, executableCode, …) falls through to
+/// observe passthrough.
+///
+/// `countTokens` is always observe-passthrough (no gate, just relay).
+async fn gemini_generate_content(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant)): Extension<TenantId>,
+    axum::extract::Path(model_action): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Split "gemini-2.0-flash:generateContent" → ("gemini-2.0-flash", "generateContent")
+    let (model, action) = model_action
+        .split_once(':')
+        .unwrap_or((model_action.as_str(), "generateContent"));
+
+    // countTokens: metadata endpoint, always observe
+    if action.starts_with("countTokens") {
+        let path = format!("/v1beta/models/{model_action}");
+        let start = Instant::now();
+        let result = crate::upstream::forward_gemini_path(
+            &state.http,
+            &state.config.upstream_gemini,
+            &path,
+            &headers,
+            body.clone(),
+        )
+        .await;
+        let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let session_header = header_session(&headers, &state.config.prompt_salt);
+        match result {
+            Ok((status, resp_headers, resp_body)) => {
+                let for_trace = status.is_success().then_some(resp_body.clone());
+                spawn_trace(
+                    &state,
+                    body,
+                    for_trace,
+                    latency_ms,
+                    session_header,
+                    tenant,
+                    "gemini",
+                );
+                return (status, resp_headers, resp_body).into_response();
+            }
+            Err(err) => {
+                spawn_trace(
+                    &state,
+                    body,
+                    None,
+                    latency_ms,
+                    session_header,
+                    tenant,
+                    "gemini",
+                );
+                return err.into_response();
+            }
+        }
+    }
+
+    let is_streaming = action.starts_with("streamGenerateContent");
+
+    let mut session_header = header_session(&headers, &state.config.prompt_salt);
+
+    let Ok(parsed) = serde_json::from_slice::<Value>(&body) else {
+        return observe_passthrough_gemini(
+            state,
+            headers,
+            body,
+            session_header,
+            tenant,
+            model_action,
+            is_streaming,
+        )
+        .await;
+    };
+
+    session_header = session_header
+        .take()
+        .or_else(|| body_session(&parsed, &state.config.prompt_salt));
+
+    // Content the translation cannot faithfully represent → observe passthrough (allow-list).
+    if crate::gemini::has_untranslatable_content(&parsed) {
+        return observe_passthrough_gemini(
+            state,
+            headers,
+            body,
+            session_header,
+            tenant,
+            model_action,
+            is_streaming,
+        )
+        .await;
+    }
+
+    // Convert to Chat body for routing/features/gating.
+    let chat_body = Bytes::from(crate::gemini::request_to_chat(&parsed, model).to_string());
+
+    if let Some(routing) = state.config.routing.as_ref() {
+        let features = extract_openai_features(&headers, &chat_body);
+        if let Some(route) = routing
+            .route_for(&features)
+            .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
+        {
+            let route_ix = routing
+                .routes
+                .iter()
+                .position(|r| std::ptr::eq(r, route))
+                .unwrap_or(0);
+            let route = route.clone();
+            let routing_mode = resolve_mode(&headers, &route, &state.config);
+            if routing_mode != RoutingMode::Observe
+                && enforce_can_handle_route(
+                    &features,
+                    &chat_body,
+                    routing.escalation.enforce_structured,
+                    &route,
+                    &state.providers,
+                    Dialect::Openai,
+                )
+            {
+                if is_streaming {
+                    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
+                    tokio::spawn(async move {
+                        let out = enforce_pipeline_gemini_as(
+                            &state,
+                            &headers,
+                            &chat_body,
+                            &body,
+                            "gemini.generate_content",
+                            features,
+                            &route,
+                            route_ix,
+                            session_header,
+                            tenant,
+                            routing_mode,
+                        )
+                        .await;
+                        let _ = tx.send(out);
+                    });
+                    return sse_keepalive_response(
+                        rx,
+                        Box::new(|chat| {
+                            crate::gemini::sse_from_response(&crate::gemini::response_from_chat(
+                                chat,
+                            ))
+                        }),
+                        gemini_sse_error,
+                    );
+                }
+                return match enforce_pipeline_gemini_as(
+                    &state,
+                    &headers,
+                    &chat_body,
+                    &body,
+                    "gemini.generate_content",
+                    features,
+                    &route,
+                    route_ix,
+                    session_header,
+                    tenant,
+                    routing_mode,
+                )
+                .await
+                {
+                    Ok(chat) => Json(crate::gemini::response_from_chat(&chat)).into_response(),
+                    Err(e) => e.into_response(),
+                };
+            }
+        }
+    }
+
+    observe_passthrough_gemini(
+        state,
+        headers,
+        body,
+        session_header,
+        tenant,
+        model_action,
+        is_streaming,
+    )
+    .await
+}
+
+/// Observe passthrough for Gemini `generateContent` / `streamGenerateContent`.
+/// Preserves the exact upstream path (`:generateContent` or `:streamGenerateContent`) so the
+/// upstream receives the right verb.
+async fn observe_passthrough_gemini(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    session_header: Option<String>,
+    tenant: String,
+    model_action: String,
+    is_streaming: bool,
+) -> Response {
+    let path = format!("/v1beta/models/{model_action}");
+    if is_streaming {
+        let start = Instant::now();
+        let result = crate::upstream::forward_gemini_streaming_path(
+            &state.http,
+            &state.config.upstream_gemini,
+            &path,
+            &headers,
+            body.clone(),
+        )
+        .await;
+        let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match result {
+            Ok((status, resp_headers, response)) => {
+                let on_done = stream_trace_callback(
+                    &state,
+                    body,
+                    latency_ms,
+                    session_header,
+                    tenant,
+                    "gemini",
+                    status.is_success(),
+                );
+                let tap = SseTap::new(response.bytes_stream(), on_done);
+                let stream_body = Body::from_stream(tap);
+                return (status, resp_headers, stream_body).into_response();
+            }
+            Err(err) => {
+                spawn_trace(
+                    &state,
+                    body,
+                    None,
+                    latency_ms,
+                    session_header,
+                    tenant,
+                    "gemini",
+                );
+                return err.into_response();
+            }
+        }
+    }
+    let start = Instant::now();
+    let result = crate::upstream::forward_gemini_path(
+        &state.http,
+        &state.config.upstream_gemini,
+        &path,
+        &headers,
+        body.clone(),
+    )
+    .await;
+    let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok((status, resp_headers, resp_body)) => {
+            let for_trace = status.is_success().then_some(resp_body.clone());
+            spawn_trace(
+                &state,
+                body,
+                for_trace,
+                latency_ms,
+                session_header,
+                tenant,
+                "gemini",
+            );
+            (status, resp_headers, resp_body).into_response()
+        }
+        Err(err) => {
+            spawn_trace(
+                &state,
+                body,
+                None,
+                latency_ms,
+                session_header,
+                tenant,
+                "gemini",
+            );
+            err.into_response()
+        }
+    }
+}
+
+/// Enforce pipeline for Gemini inbound requests. Translates the Gemini body to Chat Completions,
+/// runs the ladder/gate/escalation with `Dialect::Gemini` auth scoping, and returns the Chat
+/// `Value` for the caller to translate back to Gemini shape.
+///
+/// Parallel to [`enforce_pipeline_openai_as`] but uses `Dialect::Gemini` for auth extraction so
+/// the inbound `x-goog-api-key` goes into `Auth::gemini_key` and never leaks to non-Gemini rungs.
+#[allow(clippy::too_many_arguments)]
+async fn enforce_pipeline_gemini_as(
+    state: &AppState,
+    headers: &HeaderMap,
+    chat_body: &Bytes,
+    receipt_body: &Bytes,
+    api: &str,
+    features: Features,
+    route: &Route,
+    route_ix: usize,
+    session_header: Option<String>,
+    tenant: String,
+    routing_mode: RoutingMode,
+) -> Result<Value, ProxyError> {
+    let providers = &state.providers;
+    let all_openai_of = |ladder: &[String]| {
+        ladder.iter().all(|rung| {
+            let pid = rung.split('/').next().unwrap_or_default();
+            providers
+                .get(pid)
+                .is_some_and(|p| p.carries_structured_verbatim(Dialect::Openai))
+        })
+    };
+    let all_openai = all_openai_of(&route.ladder);
+    let allow_challenger = route
+        .challenger
+        .as_ref()
+        .is_none_or(|c| all_openai_of(&c.ladder) == all_openai);
+    let Some(base_request) = parse_openai_request(chat_body, all_openai) else {
+        return Err(ProxyError::BadRequest(
+            "Gemini request could not be translated to a valid Chat Completions request".to_owned(),
+        ));
+    };
+    // Gemini-scoped auth: x-goog-api-key → Auth::gemini_key only; never populates openai_key
+    // from the inbound Gemini header, never sends the Google key to Anthropic/OpenAI rungs.
+    let auth = Auth::from_headers(headers, Dialect::Gemini);
+    let resp = enforce_pipeline_inner(
+        state,
+        receipt_body,
+        base_request,
+        auth,
+        features,
+        route,
+        session_header,
+        tenant,
+        api,
+        routing_mode,
+        route_ix,
+        allow_challenger,
+    )
+    .await?;
+    Ok(openai_response_json(&resp))
+}
+
+/// A ladder failure on a streaming Gemini request: a single SSE data frame containing an error
+/// JSON object that the `@google/genai` SDK surfaces as a thrown `Error`.
+fn gemini_sse_error(e: &ProxyError) -> String {
+    crate::gemini::sse_error_response(&e.client_message())
 }
 
 #[cfg(test)]
