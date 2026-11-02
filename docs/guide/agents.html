@@ -114,7 +114,7 @@ max_rungs_per_request = 2
 session_promotion = { after_failures = 2, window = &quot;30m&quot; }</code></pre></div>
 <div class="codeblock"><div class="cb-head"><span>bash</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>FIRSTPASS_CONFIG=./firstpass.toml firstpass doctor   # a wrong key is a hard parse error
 FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy</code></pre></div>
-<p><code>firstpass doctor</code> catches wrong config keys but does not check gate ids, so a misspelled gate name is not caught there. Anthropic rungs are priced built in; any other provider needs a <code>[[price]]</code> for every rung.</p>
+<p><code>firstpass doctor</code> catches wrong config keys and undefined gate ids (a misspelled <code>tool-args-valid</code> fails parse instead of being silently skipped). Anthropic rungs are priced built in; any other provider needs a <code>[[price]]</code> for every rung.</p>
 
 <h2 id="granularity">5. Where to switch models: the eval<a class="anchor" href="#granularity" aria-label="Link to this section">#</a></h2>
 <div class="tldr">On 500 real SWE-bench agent runs, <b>switching models mid-session did not pay</b> on either ladder tested. Choosing a model <b>per workload</b> was far cheaper, but quality non-inferiority at 1 point was <b>not shown</b>.</div>
