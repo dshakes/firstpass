@@ -1203,10 +1203,12 @@ impl Config {
         // ramp a different amount of traffic than the operator asked for, and they would only
         // notice via a savings figure that never moved.
         for (i, route) in config.routes.iter().enumerate() {
-            // An unknown gate id would be skipped at runtime with only a log line, silently
+            // An unknown inline gate id would be skipped at runtime with only a log line, silently
             // removing a check the operator believes is enforcing (e.g. a typo in
-            // `tool-args-valid`). Reject it at parse, like an unpriced rung.
-            for g in route.gates.iter().chain(&route.deferred_gates) {
+            // `tool-args-valid`). Reject it at parse, like an unpriced rung. `deferred_gates` are
+            // not checked: they name feedback sources (`/v1/feedback` ids such as `feedback:ci`)
+            // that the proxy never runs, so they need no `[[gate]]` block.
+            for g in &route.gates {
                 if !BUILTIN_GATES.contains(&g.as_str())
                     && !config.gate_defs.iter().any(|d| d.id == *g)
                 {
@@ -1516,6 +1518,18 @@ impl Config {
                     "escalation.elastic.expensive_gates must name at least one gate to skip".into(),
                 ));
             }
+            // A typo here never matches a running gate, so elastic verification silently never
+            // skips anything. Same rule as route gates.
+            for g in &elastic.expensive_gates {
+                if !BUILTIN_GATES.contains(&g.as_str())
+                    && !config.gate_defs.iter().any(|d| d.id == *g)
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "escalation.elastic.expensive_gates: gate {g:?} is neither a built-in nor \
+                         defined in a [[gate]] block"
+                    )));
+                }
+            }
             if !elastic.lambda.is_finite() || !(0.0..=1.0).contains(&elastic.lambda) {
                 return Err(Error::InvalidConfig(format!(
                     "escalation.elastic.lambda must be finite and in [0, 1], got {}",
@@ -1650,8 +1664,8 @@ on_exhausted    = "serve_best_attempt"
 [escalation]
 max_rungs_per_request = 3
 session_promotion = { after_failures = 3, window = "30m" }
-# The SPEC example names these gates; a [[gate]] block per id makes them resolvable (an
-# undefined gate id is rejected at parse rather than silently skipped at runtime).
+# The SPEC example's inline gates need a [[gate]] block each (an undefined inline gate id is
+# rejected at parse rather than silently skipped at runtime); its deferred gates do not.
 [[gate]]
 id = "schema"
 cmd = ["true"]
@@ -1663,12 +1677,6 @@ id = "patch-applies"
 cmd = ["true"]
 [[gate]]
 id = "lint-diff"
-cmd = ["true"]
-[[gate]]
-id = "compiles"
-cmd = ["true"]
-[[gate]]
-id = "tests"
 cmd = ["true"]
 
 "#;
@@ -1954,6 +1962,21 @@ project = "my-gcp-project"
     }
 
     #[test]
+    fn unknown_elastic_expensive_gate_is_rejected_at_parse() {
+        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\ngates = [\"non-empty\", \"judge\"]\n[[gate]]\nid = \"judge\"\ncmd = [\"true\"]\n";
+        let typo =
+            format!("{base}[escalation.elastic]\nexpensive_gates = [\"jugde\"]\nlambda = 0.5\n");
+        let e = Config::parse(&typo)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("jugde"), "{e}");
+        let ok =
+            format!("{base}[escalation.elastic]\nexpensive_gates = [\"judge\"]\nlambda = 0.5\n");
+        assert!(Config::parse(&ok).is_ok(), "{ok}");
+    }
+
+    #[test]
     fn unknown_gate_id_is_rejected_at_parse() {
         let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n";
         // A typo in a built-in would otherwise be skipped at runtime, silently dropping the check.
@@ -1963,8 +1986,9 @@ project = "my-gcp-project"
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(e.contains("tool-args-vaild"), "{e}");
-        let deferred = format!("{base}deferred_gates = [\"tests\"]\n");
-        assert!(Config::parse(&deferred).is_err());
+        // Deferred gates name feedback sources the proxy never runs: no definition required.
+        let deferred = format!("{base}deferred_gates = [\"feedback:ci\"]\n");
+        assert!(Config::parse(&deferred).is_ok());
         for ok in [
             format!("{base}gates = [\"non-empty\", \"json-valid\", \"tool-args-valid\"]\n"),
             format!("{base}gates = [\"tests\"]\n[[gate]]\nid = \"tests\"\ncmd = [\"true\"]\n"),
