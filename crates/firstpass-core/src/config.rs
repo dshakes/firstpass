@@ -307,8 +307,9 @@ pub struct PriceDef {
     /// USD per 1M output (completion) tokens.
     pub output_per_mtok: f64,
 }
-/// Gate ids the proxy provides without a `[[gate]]` block. Any other id in a route's `gates` or
-/// `deferred_gates` must be defined by a `[[gate]]` block, or [`Config::parse`] rejects it.
+/// Gate ids the proxy provides without a `[[gate]]` block. Any other id in a route's `gates` or in
+/// `escalation.elastic.expensive_gates` must be defined by a `[[gate]]` block, or
+/// [`Config::parse`] rejects it. `deferred_gates` are exempt: they name feedback sources.
 pub const BUILTIN_GATES: &[&str] = &["non-empty", "json-valid", "tool-args-valid"];
 
 /// A user-defined gate (SPEC §8.1). Exactly one kind per definition:
