@@ -3259,28 +3259,94 @@ fn openai_finish_reason_to_anthropic(finish_reason: &str) -> &str {
     }
 }
 
+/// Convert an OpenAI `message` object (`choices[0].message`) to an Anthropic `content` array.
+///
+/// Appends a `text` block for non-empty `content`, then one `tool_use` block per valid entry
+/// in `tool_calls`. Returns at least one block (an empty text block when nothing else is present).
+fn openai_message_to_anthropic_content(msg: &Value) -> Value {
+    let mut blocks: Vec<Value> = Vec::new();
+
+    if let Some(text) = msg
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        blocks.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+
+    if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+        for tc in tool_calls {
+            let id = tc
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let name = tc
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let input = tc
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !name.is_empty() {
+                blocks.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": input,
+                }));
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        serde_json::json!([{ "type": "text", "text": "" }])
+    } else {
+        Value::Array(blocks)
+    }
+}
+
+/// Map a Gemini `finishReason` string to an Anthropic `stop_reason`.
+fn gemini_finish_reason_to_anthropic(reason: &str) -> &str {
+    match reason {
+        "MAX_TOKENS" => "max_tokens",
+        "STOP" => "end_turn",
+        other => other,
+    }
+}
+
 /// Render a served [`ModelResponse`] back into an Anthropic Messages response envelope, so the
 /// caller sees the same wire shape regardless of which provider actually answered.
 ///
-/// The `content` blocks come **verbatim** from the upstream response (`resp.raw`) when it is an
-/// Anthropic message — so `tool_use` / `thinking` / multiple text blocks reach the caller intact
-/// (ADR 0005 I2). Only when `raw` has no Anthropic `content` array (a synthetic response, or the
-/// OpenAI adapter, which has `choices` instead) do we fall back to a single reconstructed text
-/// block. The envelope (`id`, `model`, `usage`) is always normalized so the served model id is the
-/// prefixed ladder id, not the bare wire id.
+/// Content translation:
+///   - Anthropic-shaped raw (`content` array): used verbatim — `tool_use`, `thinking`, etc. intact.
+///   - OpenAI-shaped raw (`choices[0].message`): `tool_calls` → `tool_use` blocks; `content` text.
+///   - Gemini or synthetic: falls back to a single text block from `resp.text`.
+///
+/// Stop-reason mapping covers Anthropic, OpenAI (`finish_reason`), and Gemini (`finishReason`).
+/// `stop_reason = "tool_use"` is only emitted when the content array actually contains a
+/// `tool_use` block — a clean tool-call check that guards against OpenAI malformed responses.
 fn anthropic_response_json(resp: &ModelResponse) -> Value {
-    let content = resp
-        .raw
-        .get("content")
-        .filter(|c| c.is_array())
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([{ "type": "text", "text": resp.text }]));
+    // Build content, detecting raw shape by key presence.
+    let content = if let Some(c) = resp.raw.get("content").filter(|c| c.is_array()) {
+        c.clone()
+    } else if let Some(msg) = resp.raw.pointer("/choices/0/message") {
+        openai_message_to_anthropic_content(msg)
+    } else {
+        // Gemini or synthesized response — use normalized text.
+        serde_json::json!([{ "type": "text", "text": resp.text }])
+    };
 
-    // Carry the real stop_reason/stop_sequence from the upstream response so callers (e.g.
-    // tool-loop agents) can correctly decide whether to re-invoke.
-    // Cross-provider: when an Anthropic-dialect client is served by an OpenAI-compatible rung,
-    // `resp.raw` has `choices[0].finish_reason` rather than `stop_reason`. Map it to the
-    // Anthropic vocabulary so the client always sees a valid Anthropic stop_reason.
+    let has_tool_use = content.as_array().is_some_and(|a| {
+        a.iter()
+            .any(|b| b.get("type") == Some(&Value::String("tool_use".to_owned())))
+    });
+
+    // Carry the real stop_reason from the upstream; map cross-provider vocabularies.
+    // Guard: if stop_reason would be "tool_use" but the content has no tool_use blocks
+    // (e.g. malformed OpenAI response), fall back to "end_turn".
     let stop_reason_str = resp
         .raw
         .get("stop_reason")
@@ -3291,7 +3357,18 @@ fn anthropic_response_json(resp: &ModelResponse) -> Value {
                 .and_then(Value::as_str)
                 .map(openai_finish_reason_to_anthropic)
         })
+        .or_else(|| {
+            resp.raw
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str)
+                .map(gemini_finish_reason_to_anthropic)
+        })
         .unwrap_or("end_turn");
+    let stop_reason_str = if stop_reason_str == "tool_use" && !has_tool_use {
+        "end_turn"
+    } else {
+        stop_reason_str
+    };
     let stop_reason = Value::String(stop_reason_str.to_owned());
     let stop_sequence = resp
         .raw
@@ -3341,9 +3418,13 @@ fn sse_event(out: &mut String, event: &str, data: &Value) {
 fn anthropic_sse_from_message(message: &Value) -> String {
     let mut out = String::new();
 
-    // message_start carries the envelope with content emptied — the blocks stream next.
+    // message_start carries the envelope with content emptied.
+    // Per the Anthropic SSE spec, stop_reason and stop_sequence must be null here;
+    // the real values arrive only in message_delta.
     let mut start_msg = message.clone();
     start_msg["content"] = Value::Array(Vec::new());
+    start_msg["stop_reason"] = Value::Null;
+    start_msg["stop_sequence"] = Value::Null;
     sse_event(
         &mut out,
         "message_start",
@@ -10888,9 +10969,8 @@ mod tests {
     #[test]
     fn anthropic_response_json_maps_openai_finish_reason_to_anthropic_stop_reason() {
         // When an Anthropic-dialect client is served by an OpenAI rung, `raw` has
-        // `choices[0].finish_reason` instead of `stop_reason`. Verify the mapping.
+        // `choices[0].finish_reason` instead of `stop_reason`. Verify the non-tool mappings.
         let cases = [
-            ("tool_calls", "tool_use"),
             ("length", "max_tokens"),
             ("stop", "end_turn"),
             ("content_filter", "end_turn"),
@@ -10914,6 +10994,28 @@ mod tests {
                 "finish_reason={finish_reason} → stop_reason={expected_stop_reason}"
             );
         }
+        // "tool_calls" → "tool_use" only when there are actual tool_use blocks in the content.
+        // (Tested fully in anthropic_response_json_translates_openai_tool_calls_to_tool_use_blocks)
+        let resp_with_calls = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: String::new(),
+            in_tokens: 5,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 3,
+            raw: serde_json::json!({
+                "choices": [{ "finish_reason": "tool_calls", "message": {
+                    "content": null,
+                    "tool_calls": [{"id":"c1","type":"function",
+                        "function":{"name":"f","arguments":"{}"}}]
+                }}]
+            }),
+        };
+        assert_eq!(
+            anthropic_response_json(&resp_with_calls)["stop_reason"].as_str(),
+            Some("tool_use"),
+            "finish_reason=tool_calls with tool_call in message → stop_reason=tool_use"
+        );
     }
 
     #[test]
@@ -11148,5 +11250,223 @@ mod tests {
         ));
         assert!(!stream_options_include_usage(br#"{"stream": true}"#));
         assert!(!stream_options_include_usage(b"not json"));
+    }
+
+    // ── Gemini auditor findings ─────────────────────────────────────────────────
+
+    #[test]
+    fn anthropic_response_json_translates_openai_tool_calls_to_tool_use_blocks() {
+        // An OpenAI-compatible rung returns tool_calls in choices[0].message.
+        // anthropic_response_json must produce tool_use content blocks.
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: String::new(),
+            in_tokens: 5,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 3,
+            raw: serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_abc123",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{\"location\":\"London\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+            }),
+        };
+        let json = anthropic_response_json(&resp);
+        let content = json["content"].as_array().expect("content must be array");
+        assert_eq!(content.len(), 1, "exactly one tool_use block");
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["id"], "call_abc123");
+        assert_eq!(content[0]["name"], "get_weather");
+        assert_eq!(content[0]["input"]["location"], "London");
+        // stop_reason must map to tool_use (finish_reason "tool_calls" → "tool_use").
+        assert_eq!(json["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn anthropic_response_json_openai_tool_calls_with_text_emits_both_blocks() {
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: "Here is the weather call.".to_owned(),
+            in_tokens: 5,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 10,
+            raw: serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "Here is the weather call.",
+                        "tool_calls": [{
+                            "id": "call_xyz",
+                            "type": "function",
+                            "function": { "name": "search", "arguments": "{}" }
+                        }]
+                    }
+                }]
+            }),
+        };
+        let json = anthropic_response_json(&resp);
+        let content = json["content"].as_array().expect("content array");
+        assert!(
+            content.iter().any(|b| b["type"] == "text"),
+            "text block must appear when message content is non-empty"
+        );
+        assert!(
+            content.iter().any(|b| b["type"] == "tool_use"),
+            "tool_use block must appear"
+        );
+    }
+
+    #[test]
+    fn anthropic_response_json_no_tool_use_blocks_never_emits_tool_use_stop_reason() {
+        // If finish_reason is "tool_calls" but we couldn't build any tool_use block,
+        // stop_reason must fall back to "end_turn" — never leave it as "tool_use" with
+        // zero tool_use blocks in the content array.
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: "some text".to_owned(),
+            in_tokens: 3,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 2,
+            raw: serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "some text",
+                        "tool_calls": [] // empty — no valid tool_use blocks
+                    }
+                }]
+            }),
+        };
+        let json = anthropic_response_json(&resp);
+        assert_eq!(
+            json["stop_reason"], "end_turn",
+            "stop_reason must be end_turn when content has no tool_use blocks"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_from_message_tool_use_block_produces_input_json_delta() {
+        // When anthropic_response_json translates an OpenAI tool call, the SSE path
+        // must emit content_block_start with type tool_use + an input_json_delta.
+        let resp = ModelResponse {
+            model: "gpt-4o".to_owned(),
+            text: String::new(),
+            in_tokens: 4,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 2,
+            raw: serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "lookup", "arguments": "{\"q\":\"test\"}" }
+                        }]
+                    }
+                }]
+            }),
+        };
+        let message = anthropic_response_json(&resp);
+        let sse = anthropic_sse_from_message(&message);
+        let frames: Vec<Value> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<Value>(d).expect("valid JSON"))
+            .collect();
+
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["content_block"]["type"] == "tool_use"
+                    && f["content_block"]["name"] == "lookup"),
+            "content_block_start with tool_use block must appear"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["delta"]["type"] == "input_json_delta"),
+            "input_json_delta must be emitted for the tool call"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_message_start_has_null_stop_reason() {
+        // Per the Anthropic SSE spec, message_start.message must carry stop_reason: null
+        // and stop_sequence: null — the real values arrive only in message_delta.
+        let resp = thinking_tool_resp();
+        let message = anthropic_response_json(&resp);
+        let sse = anthropic_sse_from_message(&message);
+        let frames: Vec<Value> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<Value>(d).expect("valid JSON"))
+            .collect();
+
+        let start = frames
+            .iter()
+            .find(|f| f["type"] == "message_start")
+            .expect("message_start must appear");
+        assert!(
+            start["message"]["stop_reason"].is_null(),
+            "message_start.message.stop_reason must be null, got: {}",
+            start["message"]["stop_reason"]
+        );
+        assert!(
+            start["message"]["stop_sequence"].is_null(),
+            "message_start.message.stop_sequence must be null"
+        );
+        // The real stop_reason must still appear in message_delta.
+        let delta = frames
+            .iter()
+            .find(|f| f["type"] == "message_delta")
+            .expect("message_delta must appear");
+        assert!(
+            !delta["delta"]["stop_reason"].is_null(),
+            "message_delta.delta.stop_reason must be non-null"
+        );
+    }
+
+    #[test]
+    fn anthropic_response_json_maps_gemini_finish_reason() {
+        // Gemini finishReason is in candidates[0].finishReason (upper-snake-case).
+        // Verify both the MAX_TOKENS and STOP mappings reach anthropic_response_json.
+        for (gemini_reason, expected) in [("MAX_TOKENS", "max_tokens"), ("STOP", "end_turn")] {
+            let resp = ModelResponse {
+                model: "google/gemini-3.5-flash-lite".to_owned(),
+                text: "some text".to_owned(),
+                in_tokens: 5,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+                out_tokens: 3,
+                raw: serde_json::json!({
+                    "candidates": [{"finishReason": gemini_reason,
+                                    "content": {"parts": [{"text": "some text"}]}}]
+                }),
+            };
+            let json = anthropic_response_json(&resp);
+            assert_eq!(
+                json["stop_reason"].as_str(),
+                Some(expected),
+                "Gemini finishReason={gemini_reason} → stop_reason={expected}"
+            );
+        }
     }
 }

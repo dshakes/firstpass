@@ -180,8 +180,9 @@ impl ProviderError {
 /// Never logged or persisted — [`std::fmt::Debug`] redacts all credential fields.
 #[derive(Clone, Default)]
 pub struct Auth {
-    /// Anthropic API key from `x-api-key` header or `ANTHROPIC_API_KEY` env.
-    /// Never populated from a Bearer token — use `anthropic_bearer` for OAuth/subscription.
+    /// Anthropic API key from the request's `x-api-key` header **only**.
+    /// Never populated from env or from a Bearer token — the env fallback is handled by
+    /// [`AnthropicProvider::complete`] at lowest priority after `anthropic_bearer`.
     pub anthropic_key: Option<String>,
     /// OpenAI (or OpenAI-compatible) API key from `Authorization: Bearer …` on OpenAI-dialect
     /// requests, or `OPENAI_API_KEY` env. **Never populated on Anthropic-dialect requests** so
@@ -233,11 +234,12 @@ impl Auth {
     /// OAuth token is never sent to an OpenAI-compatible endpoint.
     #[must_use]
     pub fn from_headers(headers: &HeaderMap, dialect: firstpass_core::Dialect) -> Self {
+        // Only the request header; env fallback is the provider's responsibility so that
+        // a request-supplied Bearer is not shadowed by the server's ANTHROPIC_API_KEY.
         let anthropic_key = headers
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
+            .map(str::to_owned);
 
         let bearer = headers
             .get(axum::http::header::AUTHORIZATION)
@@ -264,10 +266,20 @@ impl Auth {
             }
         };
 
-        let anthropic_beta = headers
-            .get("anthropic-beta")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
+        // Multiple `anthropic-beta` values (e.g. "extended-thinking-2025-02-19" + another flag)
+        // are joined into a comma-separated string so the upstream receives all of them.
+        let anthropic_beta = {
+            let vals: Vec<&str> = headers
+                .get_all("anthropic-beta")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.join(", "))
+            }
+        };
         let anthropic_version = headers
             .get("anthropic-version")
             .and_then(|v| v.to_str().ok())
@@ -417,23 +429,35 @@ impl Provider for AnthropicProvider {
         req: &ModelRequest,
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
-        let key = resolve_api_key(self.api_key_env.as_deref(), auth.anthropic_key.as_deref());
         let body = anthropic_wire_body(req);
 
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut builder = self.http.post(url);
 
-        // Prefer x-api-key; fall back to Authorization: Bearer for OAuth/subscription clients
-        // (e.g. Claude Code with a Claude account sends a Bearer token, not a raw API key).
-        // Use `anthropic_bearer` — never `openai_key` — so the OpenAI key cannot reach
-        // api.anthropic.com even when both are set.
-        if !key.is_empty() {
-            builder = builder.header("x-api-key", key);
+        // Credential priority (highest to lowest):
+        //   1. Request-supplied `x-api-key` header (auth.anthropic_key).
+        //   2. Request-supplied `Authorization: Bearer` OAuth token (auth.anthropic_bearer).
+        //   3. Configured `api_key_env` env var, or ambient `ANTHROPIC_API_KEY` env fallback.
+        // The third tier is only reached when the client sent neither header, e.g. a server-to-
+        // server call where the operator set a server key. Never use `openai_key` here.
+        if let Some(key) = &auth.anthropic_key {
+            builder = builder.header("x-api-key", key.as_str());
         } else if let Some(bearer) = &auth.anthropic_bearer {
             builder = builder.header(
                 axum::http::header::AUTHORIZATION,
                 format!("Bearer {bearer}"),
             );
+        } else {
+            // No request-supplied credential — fall back to the configured or ambient env key.
+            let env_key = self
+                .api_key_env
+                .as_deref()
+                .and_then(|e| std::env::var(e).ok())
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .unwrap_or_default();
+            if !env_key.is_empty() {
+                builder = builder.header("x-api-key", env_key);
+            }
         }
 
         // Forward anthropic-version (inbound header wins; default to the published stable version).
@@ -2787,6 +2811,170 @@ mod tests {
         assert!(
             hdrs.get(axum::http::header::AUTHORIZATION).is_none(),
             "SECURITY: openai_key must NOT be forwarded to the Anthropic endpoint"
+        );
+    }
+
+    /// SECURITY: when a server env key is configured (api_key_env) AND the request carries
+    /// only a Bearer OAuth token (no x-api-key), the provider must use Bearer — not the env key.
+    /// This is the priority-inversion bug described in the Gemini audit: without the fix,
+    /// `from_headers` would populate `anthropic_key` from env, making Bearer unreachable.
+    ///
+    /// `api_key_env = "PATH"` simulates a configured server key without `unsafe env::set_var`
+    /// (forbidden workspace-wide; `PATH` is guaranteed set in any test process).
+    #[tokio::test]
+    async fn anthropic_provider_prefers_bearer_over_env_key_when_no_x_api_key() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap| {
+                *captured_clone.lock().unwrap() = Some(headers);
+                async {
+                    axum::Json(serde_json::json!({
+                        "id": "msg_test", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            // "PATH" is always set; its value is used as the api key — doesn't matter
+            // for this test, we only care that x-api-key does NOT appear in the request.
+            api_key_env: Some("PATH".to_owned()),
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":16}),
+            cache_prefix: false,
+        };
+        // Client sends Bearer only — no x-api-key.  Bearer must win over the server env key.
+        let auth = Auth {
+            anthropic_key: None,
+            openai_key: None,
+            anthropic_bearer: Some("client-oauth-token".to_owned()),
+            anthropic_beta: None,
+            anthropic_version: None,
+        };
+        provider.complete(&req, &auth).await.expect("must succeed");
+
+        let hdrs = captured.lock().unwrap().take().expect("headers captured");
+        assert!(
+            hdrs.get("x-api-key").is_none(),
+            "server env key must not appear when client sent Bearer"
+        );
+        assert_eq!(
+            hdrs.get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer client-oauth-token"),
+            "client Bearer must be forwarded when no x-api-key was sent"
+        );
+    }
+
+    /// When a request x-api-key is present it must be used even when a Bearer is also present.
+    #[tokio::test]
+    async fn anthropic_provider_prefers_x_api_key_over_bearer() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap| {
+                *captured_clone.lock().unwrap() = Some(headers);
+                async {
+                    axum::Json(serde_json::json!({
+                        "id": "msg_t", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            api_key_env: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":16}),
+            cache_prefix: false,
+        };
+        // Both x-api-key and Bearer present: x-api-key must win.
+        let auth = Auth {
+            anthropic_key: Some("sk-real-api-key".to_owned()),
+            openai_key: None,
+            anthropic_bearer: Some("oauth-bearer-ignored".to_owned()),
+            anthropic_beta: None,
+            anthropic_version: None,
+        };
+        provider.complete(&req, &auth).await.expect("must succeed");
+
+        let hdrs = captured.lock().unwrap().take().expect("headers captured");
+        assert_eq!(
+            hdrs.get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some("sk-real-api-key"),
+            "x-api-key must be sent when present"
+        );
+        assert!(
+            hdrs.get(axum::http::header::AUTHORIZATION).is_none(),
+            "Bearer must not be sent when x-api-key is present"
+        );
+    }
+
+    #[test]
+    fn auth_from_headers_multiple_anthropic_beta_values_are_joined() {
+        use firstpass_core::Dialect;
+        let mut h = HeaderMap::new();
+        h.append(
+            "anthropic-beta",
+            "extended-thinking-2025-02-19".parse().unwrap(),
+        );
+        h.append(
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14".parse().unwrap(),
+        );
+        let auth = Auth::from_headers(&h, Dialect::Anthropic);
+        // Both values must appear joined — order preserved, separated by ", ".
+        let beta = auth.anthropic_beta.expect("anthropic_beta must be Some");
+        assert!(
+            beta.contains("extended-thinking-2025-02-19"),
+            "first beta value missing: {beta}"
+        );
+        assert!(
+            beta.contains("interleaved-thinking-2025-05-14"),
+            "second beta value missing: {beta}"
+        );
+        assert!(
+            beta.contains(", "),
+            "values must be comma-separated: {beta}"
         );
     }
 }
