@@ -10,6 +10,7 @@ Usage: analyze-agent-granularity.py [CACHE_DIR]  |  analyze-agent-granularity.py
 from __future__ import annotations
 
 import json
+import re
 import os
 import random
 import sys
@@ -96,11 +97,15 @@ def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def load(cache: Path, system: str) -> dict:
@@ -136,8 +141,15 @@ def rows_for(cache: Path, ladder: list[str]) -> list[Row]:
 # ── context model ─────────────────────────────────────────────────────────────
 
 
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
 def _fetch_traj(cache: Path, system: str, instance_id: str) -> bytes | None:
     """Fetch trajectory JSON, writing atomically and retrying once on decode failure."""
+    # Names come from downloaded data and become cache file names and URL parts: refuse
+    # anything that could escape the cache directory or the URL path.
+    if not (_SAFE_NAME.match(system) and _SAFE_NAME.match(instance_id)) or ".." in instance_id:
+        return None
     path = cache / f"{system}.ctx.{instance_id}.json"
     if path.exists():
         try:
@@ -178,7 +190,7 @@ def _traj_context(
     msgs = d.get("messages") or d.get("history") or []
     if not msgs:
         return None
-    n_steps = d.get("info", {}).get("model_stats", {}).get("api_calls") or 0
+    n_steps = ((d.get("info") or {}).get("model_stats") or {}).get("api_calls") or 0
     if n_steps <= 0:
         return None
 
@@ -343,6 +355,9 @@ def paired_ci(
             dp.append(ac / ao - bc / bo)
     out = []
     for v in (dr, dc, dp):
+        if not v:  # an arm with zero resolves has no $/resolved distribution
+            out.append((float("nan"), float("nan")))
+            continue
         v.sort()
         out.append((v[int(0.025 * len(v))], v[int(0.975 * len(v))]))
     return out
@@ -497,6 +512,10 @@ def escalate_pin_prereg(
     if cheap_steps < tau:
         return cheap_res, cheap_cost
     actual_tau = max(0, int(tau))
+    if actual_tau == 0:
+        # Escalating before the cheap model has taken a step is not a switch: the top model
+        # just runs, and its recorded cost already includes its own first read.
+        return top_res, top_cost
     partial_frac = actual_tau / cheap_steps if cheap_steps > 0 else 0.0
     overhead = switch_overhead_usd(actual_tau, price_top_in, I0, delta)
     return top_res, cheap_cost * partial_frac + overhead + top_cost
@@ -721,7 +740,7 @@ def analyse_ladder(
             dr_ci = f"[{r0:+.3f}, {r1:+.3f}] | [{c0:+.3f}, {c1:+.3f}]"
         print(
             f"| {arm} | {ok_w}/{n} ({ok_w / n:.3f}) | ${cost_w / n:.3f} | "
-            f"${cost_w / ok_w:.3f} | {dr_ci} |"
+            f"{f'${cost_w / ok_w:.3f}' if ok_w else '—'} | {dr_ci} |"
         )
     print()
 
@@ -912,14 +931,21 @@ def _self_check() -> None:
         f"prereg above tau: got {cwc2}, expected {expected}"
     )
 
-    # escalate_pin_prereg: tau=-1 → overhead = I0 * price_top (no cheap steps)
+    # escalate_pin_prereg: tau=-1 → no cheap step ran, so no switch and no overhead:
+    # the top model's recorded run already includes its own first read.
     _, cwc_neg1 = escalate_pin_prereg(
         row, tau=-1.0, I0=1000, delta=300, price_top_in=15.0
     )
-    expected_neg1 = switch_overhead_usd(0, 15.0, 1000, 300) + 5.0
+    expected_neg1 = 5.0
     assert abs(cwc_neg1 - expected_neg1) < 1e-9, (
         f"prereg tau=-1: {cwc_neg1} != {expected_neg1}"
     )
+
+    # path-unsafe names never reach the filesystem or the URL
+    assert _fetch_traj(Path("/nonexistent"), "sys", "../etc/passwd") is None
+    assert _fetch_traj(Path("/nonexistent"), "../x", "astropy__astropy-1") is None
+    # an arm with zero resolves does not crash the CI
+    assert paired_ci([(False, 1.0)] * 4, [(True, 1.0)] * 4, n_boot=10)[2] != ()
 
     # escalate_pin_restart: no overhead; tau=-1 = top only
     _, cwc_rst = escalate_pin_restart(row, tau=-1.0)

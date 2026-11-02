@@ -22,7 +22,9 @@ pre-registration §Validity caveat).
 **Two P4 rows** are reported:
 - **Primary (pre-registration)**: cost = partial_cheap + switch_overhead + top_leaderboard_cost,
   per the pre-registration cost model. The top model's first call re-reads the accumulated
-  prefix at the full uncached input rate.
+  prefix at the full uncached input rate. The overhead applies only when a switch actually
+  happens after at least one cheap step: escalating at step 0 is not a switch, and the top
+  model's recorded run already includes its own first read.
 - **Secondary (restart-semantics)**: cost = partial_cheap + top_leaderboard_cost. No separate
   overhead because the top model restarts from scratch and its full recorded cost already
   includes its own first read. Listed as a deviation below.
@@ -67,7 +69,7 @@ Cross-fit per fold: cascade tau=[19, 34], repo-eps=[0.0, 0.0], P4 tau=[-1, -1] (
 | always-top [P1] | 384/500 (0.768) | $0.754 | $0.982 | — | — |
 | run-level cascade (cross-fit) [P5] | 382/500 (0.764) | $1.071 | $1.401 | [-0.010, +0.000] | [+0.295, +0.340] |
 | per-session / repo (cross-fit) [P3] | 378/500 (0.756) | $0.720 | $0.953 | [-0.024, -0.002] | [-0.048, -0.021] |
-| escalate-and-pin prereg [P4] | 384/500 (0.768) | $0.789 | $1.027 | [+0.000, +0.000] | [+0.035, +0.035] |
+| escalate-and-pin prereg [P4] | 384/500 (0.768) | $0.754 | $0.982 | [+0.000, +0.000] | [+0.000, +0.000] |
 | escalate-and-pin restart (secondary) | 384/500 (0.768) | $0.754 | $0.982 | [+0.000, +0.000] | [+0.000, +0.000] |
 | random (seed=42) [P6] | 359/500 (0.718) | $0.555 | $0.772 | [-0.074, -0.026] | [-0.232, -0.170] |
 | oracle-per-instance (bound) [P6] | 395/500 (0.790) | $0.384 | $0.486 | [+0.010, +0.036] | [-0.408, -0.334] |
@@ -87,7 +89,7 @@ Cross-fit per fold: cascade tau=[6, 8], repo-eps=[0.05, 0.1], P4 tau=[-1, -1] (b
 | always-top [P1] | 364/500 (0.728) | $0.474 | $0.651 | — | — |
 | run-level cascade (cross-fit) [P5] | 364/500 (0.728) | $0.520 | $0.714 | [+0.000, +0.000] | [+0.043, +0.050] |
 | per-session / repo (cross-fit) [P3] | 353/500 (0.706) | $0.416 | $0.589 | [-0.042, -0.002] | [-0.074, -0.042] |
-| escalate-and-pin prereg [P4] | 364/500 (0.728) | $0.480 | $0.660 | [+0.000, +0.000] | [+0.007, +0.007] |
+| escalate-and-pin prereg [P4] | 364/500 (0.728) | $0.474 | $0.651 | [+0.000, +0.000] | [+0.000, +0.000] |
 | escalate-and-pin restart (secondary) | 364/500 (0.728) | $0.474 | $0.651 | [+0.000, +0.000] | [+0.000, +0.000] |
 | random (seed=42) [P6] | 321/500 (0.642) | $0.284 | $0.442 | [-0.116, -0.056] | [-0.215, -0.166] |
 | oracle-per-instance (bound) [P6] | 383/500 (0.766) | $0.154 | $0.201 | [+0.022, +0.056] | [-0.353, -0.289] |
@@ -129,9 +131,9 @@ P3-pool: fitted eps per fold = [0.2, 0.05]; repo_router picks cheapest within ep
 | P3-pool vs always-opus | −0.032 | −$0.585 | **loses on quality** vs always-opus (lb=−0.032 < −0.01) |
 | P3: per-session/repo, haiku→opus | −0.024 | −$0.021 | **loses on quality** (lb < −0.01) |
 | P3: per-session/repo, gpt-5-mini→5.2 | −0.042 | −$0.042 | **loses on quality** (lb < −0.01) |
-| P4 prereg: haiku→opus | +0.000 | +$0.035 | **costs more than always-top** — same quality, +$0.035/inst switch overhead |
-| P4 prereg: gpt-5-mini→5.2 | +0.000 | +$0.007 | **marginally costs more** — same quality, +$0.007/inst overhead |
-| P4 restart (secondary): both | +0.000 | +$0.000 | **equals always-top exactly** — tau=−1; noted as deviation |
+| P4 prereg: haiku→opus | +0.000 | +$0.000 | **no gain — equals always-top** (fitted tau=−1: escalate at step 0, never a mid-run switch) |
+| P4 prereg: gpt-5-mini→5.2 | +0.000 | +$0.000 | **no gain — equals always-top** (fitted tau=−1) |
+| P4 restart (secondary): both | +0.000 | +$0.000 | **equals always-top exactly** — same as primary at tau=−1 |
 | P5: cascade, haiku→opus | −0.010 | +$0.340 | **negative** — more expensive; quality borderline (lb=−0.010, at threshold) |
 | P5: cascade, gpt-5-mini→5.2 | +0.000 | +$0.050 | **negative** — more expensive, same quality |
 
@@ -161,16 +163,11 @@ With provider prompt caching, a mid-session model switch forces the top model's 
 re-read the accumulated context at full (uncached) input price. Under the calibrated context
 model (cheap model only):
 
-| ladder | tau (prereg) | context at switch | switch overhead | overhead as % of always-top |
-|---|---|---|---|---|
-| haiku→opus | −1 (step 0) | 2,328 tokens (I_0 only) | $0.035/inst | +4.7% |
-| gpt-5-mini→5.2 | −1 (step 0) | 1,349 tokens (I_0 only) | $0.007/inst | +1.5% |
-
-tau=−1 is optimal even with overhead included in the cross-fit objective: any tau > −1 accumulates
-a larger context (higher overhead) plus partial cheap-model spend, net-worse than tau=−1. So the
-optimal pre-registration policy is: immediately restart on top model, paying only the I_0-sized
-overhead. Under restart semantics (secondary row), the overhead is 0 since the top model's full
-recorded run already paid its own first read.
+What a switch would cost if it happened after the cheap model's first step (the smallest real
+switch, context ≈ I_0): about 2,328 tokens × $15/M ≈ $0.035/inst on haiku→opus and 1,349 tokens ×
+$5/M ≈ $0.007/inst on gpt-5-mini→5.2. The cross-fit, which includes this overhead, still picks
+tau=−1 (escalate before any cheap step). That is not a switch, so no overhead is charged and P4
+equals always-top under both cost readings.
 
 ---
 
@@ -212,18 +209,17 @@ All changes made after e848709 (pre-registration commit), before publication.
    pool limits to cheap/top with no very cheap near-frontier options) and the repo feature is
    not strong enough to compensate.
 
-3. **P4 (escalate-and-pin) costs slightly more than always-top** under the pre-registration
-   cost model: the switch overhead at tau=−1 (optimal) is $0.035/inst (haiku→opus) and
-   $0.007/inst (gpt-5-mini→5.2). Under restart semantics, P4 equals always-top exactly.
-   The difference is an interpretation of whether the top model's "first read" is already
-   paid by its recorded run.
+3. **P4 (escalate-and-pin) gains nothing**: the cross-fitted trigger is tau=−1 on both ladders,
+   i.e. escalate before the cheap model takes a step. Any later switch point wastes cheap spend
+   without closing the resolve gap, so the best mid-session policy is "use the top model from
+   the start" — always-top. Both cost readings agree at tau=−1.
 
 4. **Run-level cascade (P5) costs more** with no quality gain. Negative result confirmed
    from #239 on both ladders.
 
-5. **The oracle gap is large**: 395/500 at $0.384/inst vs always-top 384/500 at $0.754/inst.
-   The gap from oracle to P3-pool ($0.122/inst) shows how much of the oracle gain is
-   capturable with just the repo feature.
+5. **The oracle gap on the two-model ladder is large**: 395/500 at $0.384/inst vs always-top
+   384/500 at $0.754/inst. (This oracle chooses between two models only, so it is not comparable
+   with the 11-model pool arms.)
 
 ---
 
