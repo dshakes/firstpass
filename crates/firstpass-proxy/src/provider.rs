@@ -338,15 +338,21 @@ fn wire_model(model: &str) -> &str {
     model.split_once('/').map_or(model, |(_, m)| m)
 }
 
-/// Resolve the API key for a provider call. A configured `api_key_env` wins (that env var is *this*
-/// provider's key — e.g. `GROQ_API_KEY` for a Groq rung); otherwise fall back to the per-request
-/// BYOK override from headers/env (the built-in `anthropic`/`openai` path). Empty string when
-/// neither is set (a keyless local endpoint).
+/// Resolve the API key for a provider call.
+///
+/// - If `api_key_env` is `Some(env_name)`, the resolved value is **only** the content of that
+///   env var. If the env var is unset or empty the function returns `""` — it never falls through
+///   to the BYOK override. An operator who wires `api_key_env = "GROQ_API_KEY"` for a custom host
+///   must never inadvertently receive the client's own OpenAI key when the Groq var is missing.
+/// - If `api_key_env` is `None`, the BYOK override is used (may itself be empty/`""`).
 fn resolve_api_key(api_key_env: Option<&str>, byok_override: Option<&str>) -> String {
-    api_key_env
-        .and_then(|e| std::env::var(e).ok())
-        .or_else(|| byok_override.map(str::to_owned))
-        .unwrap_or_default()
+    match api_key_env {
+        Some(env_name) => std::env::var(env_name)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default(),
+        None => byok_override.unwrap_or("").to_owned(),
+    }
 }
 
 /// The credential an Anthropic-dialect call sends upstream.
@@ -357,26 +363,41 @@ enum AnthropicCredential {
 }
 
 /// Pick the Anthropic credential, highest priority first:
-///   1. The rung's configured `api_key_env` value. An operator who declared this provider's key
-///      (e.g. a custom Anthropic-compatible host) must never have a client's own Anthropic key
-///      or OAuth token forwarded to that host instead.
-///   2. The request's `x-api-key`.
-///   3. The request's `Authorization: Bearer` OAuth token (Claude Code subscription auth).
-///   4. The ambient `ANTHROPIC_API_KEY` — only when the client sent no credential, so a server
-///      key never shadows a client's own OAuth token.
+///   1. The rung's configured `api_key_env` value (outer `Some`). An operator who declared this
+///      provider's key must never have a client credential forwarded to that host instead.
+///      If the env var is configured but **unset/empty** (`Some(None)` or `Some(Some(""))`), the
+///      function returns `None` — no credential is sent rather than falling through to the client.
+///   2. (only when `configured = None`) The request's `x-api-key`.
+///   3. (only when `configured = None`) The request's `Authorization: Bearer` OAuth token.
+///   4. (only when `configured = None`) The ambient `ANTHROPIC_API_KEY` env fallback.
+///
+/// `configured: Option<Option<String>>`
+///   - `None`           → api_key_env not configured; proceed with client creds + ambient.
+///   - `Some(None)`     → api_key_env configured but the env var is unset.
+///   - `Some(Some(k))`  → api_key_env configured and resolved to `k`.
 ///
 /// Never the OpenAI key. Pure so the ordering is unit-testable without touching process env.
 fn anthropic_credential(
-    configured: Option<String>,
+    configured: Option<Option<String>>,
     auth: &Auth,
     ambient: Option<String>,
 ) -> Option<AnthropicCredential> {
-    let non_empty = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
-    non_empty(&configured)
-        .map(AnthropicCredential::ApiKey)
-        .or_else(|| non_empty(&auth.anthropic_key).map(AnthropicCredential::ApiKey))
-        .or_else(|| non_empty(&auth.anthropic_bearer).map(AnthropicCredential::Bearer))
-        .or_else(|| non_empty(&ambient).map(AnthropicCredential::ApiKey))
+    match configured {
+        Some(key) => {
+            // api_key_env IS configured. Use its value if non-empty; otherwise no credential
+            // (never fall through to client creds — the operator intended this provider's key).
+            key.filter(|s| !s.is_empty())
+                .map(AnthropicCredential::ApiKey)
+        }
+        None => {
+            // api_key_env NOT configured — use client creds + ambient.
+            let non_empty = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+            non_empty(&auth.anthropic_key)
+                .map(AnthropicCredential::ApiKey)
+                .or_else(|| non_empty(&auth.anthropic_bearer).map(AnthropicCredential::Bearer))
+                .or_else(|| non_empty(&ambient).map(AnthropicCredential::ApiKey))
+        }
+    }
 }
 
 /// Build the Anthropic Messages wire body for `req`: the original inbound JSON **verbatim** with
@@ -465,9 +486,7 @@ impl Provider for AnthropicProvider {
         let mut builder = self.http.post(url);
 
         match anthropic_credential(
-            self.api_key_env
-                .as_deref()
-                .and_then(|e| std::env::var(e).ok()),
+            self.api_key_env.as_deref().map(|e| std::env::var(e).ok()),
             auth,
             std::env::var("ANTHROPIC_API_KEY").ok(),
         ) {
@@ -2289,10 +2308,11 @@ mod tests {
         let path = std::env::var("PATH").expect("PATH is set");
         // Configured env wins over any BYOK override (the env var is *this* provider's key).
         assert_eq!(resolve_api_key(Some("PATH"), Some("byok")), path);
-        // An unset configured env → fall back to the per-request BYOK override.
+        // Configured env unset → return "" (never fall through to the client's BYOK override).
+        // Sending no credential is safer than leaking a key to the wrong host.
         assert_eq!(
             resolve_api_key(Some("FIRSTPASS_DEFINITELY_UNSET_KEY"), Some("byok")),
-            "byok"
+            ""
         );
         // No configured env → fall back to BYOK.
         assert_eq!(resolve_api_key(None, Some("byok")), "byok");
@@ -2901,8 +2921,10 @@ mod tests {
         );
     }
 
-    /// The credential order, without process env: configured > request key > request Bearer >
-    /// ambient. A server's ambient key never shadows a client's OAuth token.
+    /// The credential order: configured > request key > request Bearer > ambient.
+    ///
+    /// Key security invariant: when `api_key_env` is configured (outer `Some`) but the env var is
+    /// unset (`Some(None)`), the function returns `None` — it never falls through to client creds.
     #[test]
     fn anthropic_credential_order() {
         let auth = |key: Option<&str>, bearer: Option<&str>| Auth {
@@ -2912,28 +2934,52 @@ mod tests {
             anthropic_beta: None,
             anthropic_version: None,
         };
-        let s = |v: &str| Some(v.to_owned());
+        // configured = Option<Option<String>>
+        //   None           → api_key_env not set → use client creds + ambient
+        //   Some(None)     → api_key_env set but env var unset → send nothing
+        //   Some(Some(k))  → api_key_env set and resolved → use k
+        let cfg = |v: &str| Some(Some(v.to_owned())); // Some(Some(k))
+        let no_env: Option<Option<String>> = Some(None); // configured, env var unset
+        let s = |v: &str| Some(v.to_owned()); // ambient / auth helper
         use AnthropicCredential::{ApiKey, Bearer};
+
+        // Not configured, bearer present — bearer wins over ambient.
         assert_eq!(
             anthropic_credential(None, &auth(None, Some("oauth")), s("ambient")),
             Some(Bearer("oauth".to_owned()))
         );
+        // Not configured, api-key + bearer — api-key wins.
         assert_eq!(
             anthropic_credential(None, &auth(Some("k"), Some("oauth")), s("ambient")),
             Some(ApiKey("k".to_owned()))
         );
+        // Configured key wins over every client credential and ambient.
         assert_eq!(
-            anthropic_credential(s("cfg"), &auth(Some("k"), Some("oauth")), s("ambient")),
-            Some(ApiKey("cfg".to_owned()))
+            anthropic_credential(cfg("cfgkey"), &auth(Some("k"), Some("oauth")), s("ambient")),
+            Some(ApiKey("cfgkey".to_owned()))
         );
+        // Not configured, no client creds — ambient fallback.
         assert_eq!(
             anthropic_credential(None, &auth(None, None), s("ambient")),
             Some(ApiKey("ambient".to_owned()))
         );
+        // Configured but env var unset → None (never leak client creds to the wrong host).
         assert_eq!(
-            anthropic_credential(s(""), &auth(Some(""), None), None),
+            anthropic_credential(no_env, &auth(Some("k"), Some("oauth")), s("ambient")),
             None,
-            "empty values are absent, and the OpenAI key is never used"
+            "configured-but-unset must not fall through to client credentials"
+        );
+        // Configured but resolved to empty string → also None.
+        assert_eq!(
+            anthropic_credential(cfg(""), &auth(Some("k"), None), None),
+            None,
+            "empty configured value must not fall through to client key"
+        );
+        // OpenAI key is never used (different provider).
+        assert_eq!(
+            anthropic_credential(None, &auth(None, None), None),
+            None,
+            "the OpenAI key is never used for Anthropic requests"
         );
     }
 

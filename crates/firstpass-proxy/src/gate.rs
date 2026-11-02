@@ -34,9 +34,15 @@ pub trait Gate: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// True when the request's `tools` field is a non-empty array (Anthropic or OpenAI format).
+/// Used by inline gates to decide whether tool-call-only responses are valid for this request.
+fn request_has_declared_tools(req: &ModelRequest) -> bool {
+    req.tools.as_array().is_some_and(|a| !a.is_empty())
+}
+
 /// Fails an empty (whitespace-only) completion with no tool calls.
-/// Passes when the text is non-empty **or** the response contains at least one tool call —
-/// a tool-use-only turn has no text but is not an empty response.
+/// Passes when the text is non-empty **or** the response contains at least one tool call AND
+/// the request declared tools — an undeclared tool call with empty text is a Fail.
 #[derive(Debug, Clone, Copy)]
 pub struct NonEmptyGate;
 
@@ -45,8 +51,11 @@ impl Gate for NonEmptyGate {
     fn id(&self) -> &str {
         "non-empty"
     }
-    async fn evaluate(&self, _req: &ModelRequest, resp: &ModelResponse) -> GateResult {
-        let verdict = if !resp.text.trim().is_empty() || resp.has_tool_calls() {
+    async fn evaluate(&self, req: &ModelRequest, resp: &ModelResponse) -> GateResult {
+        let verdict = if !resp.text.trim().is_empty() {
+            Verdict::Pass
+        } else if resp.has_tool_calls() && request_has_declared_tools(req) {
+            // Tool-call-only turn with declared tools: the tool call IS the non-empty output.
             Verdict::Pass
         } else {
             Verdict::Fail
@@ -57,10 +66,12 @@ impl Gate for NonEmptyGate {
 
 /// Passes only if the completion parses as JSON. Useful for structured-output routes.
 ///
-/// **Passes** (not Abstains) on a tool-call-only turn: there is no text payload to validate,
-/// so the check is trivially satisfied. Abstain would count against GateHealth (auto-disabling
-/// the gate above 25% abstain rate), which would fire on nearly every turn of an agent that
-/// uses tools. Use `tool-args-valid` to validate the tool call arguments themselves.
+/// **Passes** (not Abstains) when the response has tool calls AND the request declared tools:
+/// there is no text payload to validate (the JSON answer IS the tool call). Abstain would count
+/// against GateHealth (auto-disabling the gate above 25% abstain rate) on every agent turn.
+///
+/// **Note**: preamble text alongside tool calls (tools declared) also passes — the text is not
+/// the structured JSON answer in that case. Use `tool-args-valid` to validate tool call args.
 #[derive(Debug, Clone, Copy)]
 pub struct JsonValidGate;
 
@@ -69,9 +80,11 @@ impl Gate for JsonValidGate {
     fn id(&self) -> &str {
         "json-valid"
     }
-    async fn evaluate(&self, _req: &ModelRequest, resp: &ModelResponse) -> GateResult {
-        // Tool-call-only: no text to validate — trivially passes.
-        if resp.text.trim().is_empty() && resp.has_tool_calls() {
+    async fn evaluate(&self, req: &ModelRequest, resp: &ModelResponse) -> GateResult {
+        let has_tools = request_has_declared_tools(req);
+        // Tool calls present AND tools were declared: the text (preamble or absent) is not the
+        // JSON answer — the tool call IS the structured output.
+        if resp.has_tool_calls() && has_tools {
             return GateResult::deterministic(self.id(), Verdict::Pass, 0);
         }
         let ok = serde_json::from_str::<serde_json::Value>(resp.text.trim()).is_ok();
@@ -79,11 +92,117 @@ impl Gate for JsonValidGate {
     }
 }
 
-/// Validates the candidate (parsed as JSON) against a minimal JSON-Schema subset: top-level
-/// `type`, `required`, and per-property `type`. Covers tool-call args and extraction tasks.
+/// Recursive minimal JSON-Schema validator for the subset tool schemas use.
 ///
-// ponytail: not full JSON Schema draft 2020-12 — just type/required/properties, the 90% that
-// structured-output routes need. Swap for the `jsonschema` crate if nested/`$ref` schemas appear.
+/// Supported keywords: `type` (string or array of strings, incl. `["x","null"]` for nullable),
+/// `required`, `properties` (recursive), `items` (recursive, for arrays), `enum`,
+/// `additionalProperties: false`. Unknown keywords are silently ignored — don't fail on them.
+///
+/// Pure function so it is used by both [`SchemaGate`] and [`validate_tool_args_against_tools`].
+fn schema_violation(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+) -> Option<String> {
+    use serde_json::Value;
+
+    /// True when `v` matches a single JSON Schema type name.
+    fn type_matches(v: &Value, ty: &str) -> bool {
+        match ty {
+            "object" => v.is_object(),
+            "array" => v.is_array(),
+            "string" => v.is_string(),
+            // "integer" is strict: floats with fractional parts are not integers.
+            "integer" => v.is_i64() || v.is_u64() || v.as_f64().is_some_and(|f| f.fract() == 0.0),
+            "number" => v.is_number(),
+            "boolean" => v.is_boolean(),
+            "null" => v.is_null(),
+            _ => true, // unknown type keyword: don't fail on it
+        }
+    }
+
+    // `type` keyword — may be a string or an array of strings (e.g. ["string","null"]).
+    if let Some(type_kw) = schema.get("type") {
+        let ok = match type_kw {
+            Value::String(ty) => type_matches(value, ty),
+            Value::Array(types) => types
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|ty| type_matches(value, ty)),
+            _ => true,
+        };
+        if !ok {
+            return Some(format!("{path} has wrong type"));
+        }
+    }
+
+    // `enum` keyword — value must be one of the listed literals.
+    if let Some(Value::Array(variants)) = schema.get("enum")
+        && !variants.contains(value)
+    {
+        return Some(format!("{path} is not one of the allowed enum values"));
+    }
+
+    if let Some(obj) = value.as_object() {
+        // `required` keyword — every listed field must be present.
+        if let Some(Value::Array(req)) = schema.get("required") {
+            for field in req.iter().filter_map(Value::as_str) {
+                if !obj.contains_key(field) {
+                    return Some(format!("{path}.{field:?} is required but missing"));
+                }
+            }
+        }
+
+        // `additionalProperties: false` — no keys outside `properties`.
+        let ap_false = schema.get("additionalProperties").and_then(Value::as_bool) == Some(false);
+        let defined_props: std::collections::HashSet<&str> = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|p| p.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        if ap_false {
+            for key in obj.keys() {
+                if !defined_props.contains(key.as_str()) {
+                    return Some(format!(
+                        "{path}.{key:?} is an additional property not allowed by the schema"
+                    ));
+                }
+            }
+        }
+
+        // `properties` keyword — recurse into each present property.
+        if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+            for (name, subschema) in props {
+                if let Some(child) = obj.get(name) {
+                    let child_path = format!("{path}.{name}");
+                    if let Some(v) = schema_violation(child, subschema, &child_path) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+
+    // `items` keyword — recurse into each array element.
+    if let (Some(arr), Some(items_schema)) = (value.as_array(), schema.get("items")) {
+        for (i, elem) in arr.iter().enumerate() {
+            let child_path = format!("{path}[{i}]");
+            if let Some(v) = schema_violation(elem, items_schema, &child_path) {
+                return Some(v);
+            }
+        }
+    }
+
+    None
+}
+
+/// Validates the candidate (parsed as JSON) against a minimal JSON-Schema subset.
+///
+/// Supports: `type` (string or `["x","null"]`), `required`, `properties` (recursive),
+/// `items` (recursive), `enum`, `additionalProperties: false`. Unknown keywords ignored.
+///
+// ponytail: not full JSON Schema draft 2020-12 — no `$ref`, `if/then/else`, `anyOf`, `oneOf`.
+// Swap for the `jsonschema` crate if those are needed.
 #[derive(Debug, Clone)]
 pub struct SchemaGate {
     id: String,
@@ -100,43 +219,9 @@ impl SchemaGate {
         }
     }
 
-    /// Check `value` against the minimal schema subset; returns the first violation, if any.
-    fn violation(&self, value: &serde_json::Value) -> Option<String> {
-        use serde_json::Value;
-        let type_ok = |v: &Value, ty: &str| match ty {
-            "object" => v.is_object(),
-            "array" => v.is_array(),
-            "string" => v.is_string(),
-            "number" => v.is_number(),
-            "integer" => v.is_i64() || v.is_u64(),
-            "boolean" => v.is_boolean(),
-            "null" => v.is_null(),
-            _ => true, // unknown type keyword: don't fail on it
-        };
-        if let Some(ty) = self.schema.get("type").and_then(Value::as_str)
-            && !type_ok(value, ty)
-        {
-            return Some(format!("root is not of type {ty}"));
-        }
-        if let Some(req) = self.schema.get("required").and_then(Value::as_array) {
-            for field in req.iter().filter_map(Value::as_str) {
-                if value.get(field).is_none() {
-                    return Some(format!("missing required field {field:?}"));
-                }
-            }
-        }
-        if let Some(props) = self.schema.get("properties").and_then(Value::as_object) {
-            for (name, subschema) in props {
-                if let (Some(actual), Some(ty)) = (
-                    value.get(name),
-                    subschema.get("type").and_then(Value::as_str),
-                ) && !type_ok(actual, ty)
-                {
-                    return Some(format!("property {name:?} is not of type {ty}"));
-                }
-            }
-        }
-        None
+    /// Check `value` against the schema; returns the first violation, if any.
+    pub(crate) fn violation(&self, value: &serde_json::Value) -> Option<String> {
+        schema_violation(value, &self.schema, "root")
     }
 }
 
@@ -145,10 +230,11 @@ impl Gate for SchemaGate {
     fn id(&self) -> &str {
         &self.id
     }
-    async fn evaluate(&self, _req: &ModelRequest, resp: &ModelResponse) -> GateResult {
-        // Tool-call-only: no text payload to validate — trivially passes (same reasoning as
-        // JsonValidGate: Abstain would trigger GateHealth auto-disable on agent traffic).
-        if resp.text.trim().is_empty() && resp.has_tool_calls() {
+    async fn evaluate(&self, req: &ModelRequest, resp: &ModelResponse) -> GateResult {
+        let has_tools = request_has_declared_tools(req);
+        // Tool calls with declared tools: text (if any) is preamble, not the JSON answer.
+        // Pass without schema-checking it — use tool-args-valid to validate tool call args.
+        if resp.has_tool_calls() && has_tools {
             return GateResult::deterministic(self.id(), Verdict::Pass, 0);
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(resp.text.trim()) else {
@@ -170,12 +256,17 @@ impl Gate for SchemaGate {
 /// Extract `(tool_name, args_json_string)` pairs from a provider raw response.
 /// Handles Anthropic `content[*].type == "tool_use"` (input is a JSON object)
 /// and OpenAI `choices[0].message.tool_calls[*].function` (arguments is a JSON string).
+///
+/// Malformed entries (missing `name` in Anthropic, missing `function` in OpenAI) are recorded
+/// with an empty name so `ToolArgsValidGate` fails the hallucinated-tool check rather than
+/// silently skipping the entry and treating the call list as empty.
 fn extract_response_tool_calls(raw: &serde_json::Value) -> Vec<(String, String)> {
     let mut out = Vec::new();
     // Anthropic format
     if let Some(blocks) = raw.get("content").and_then(serde_json::Value::as_array) {
         for b in blocks {
             if b.get("type").and_then(serde_json::Value::as_str) == Some("tool_use") {
+                // Missing `name` → empty string triggers hallucinated-tool Fail downstream.
                 let name = b
                     .get("name")
                     .and_then(serde_json::Value::as_str)
@@ -195,26 +286,29 @@ fn extract_response_tool_calls(raw: &serde_json::Value) -> Vec<(String, String)>
         .and_then(serde_json::Value::as_array)
     {
         for call in calls {
-            if let Some(func) = call.get("function") {
-                let name = func
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let args = func
-                    .get("arguments")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("{}")
-                    .to_owned();
-                out.push((name, args));
-            }
+            // Missing `function` → record entry with empty name to trigger Fail, not silent skip.
+            let (name, args) = if let Some(func) = call.get("function") {
+                (
+                    func.get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    func.get("arguments")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("{}")
+                        .to_owned(),
+                )
+            } else {
+                (String::new(), "{}".to_owned())
+            };
+            out.push((name, args));
         }
     }
     out
 }
 
 /// Validate `tool_args` against a tool's `input_schema` (Anthropic) or `parameters` (OpenAI)
-/// using the subset validator already in [`SchemaGate`]. Returns `None` on success, or the
+/// using the recursive [`schema_violation`] validator. Returns `None` on success, or the
 /// first violation message.
 fn validate_tool_args_against_tools(
     name: &str,
@@ -229,7 +323,7 @@ fn validate_tool_args_against_tools(
             tool.get("input_schema"),
         ) && n == name
         {
-            return SchemaGate::new("_", schema.clone()).violation(args);
+            return schema_violation(args, schema, "args");
         }
         // OpenAI format: {"type":"function","function":{"name":"...","parameters":{...}}}
         if let Some(func) = tool.get("function")
@@ -239,7 +333,7 @@ fn validate_tool_args_against_tools(
             )
             && n == name
         {
-            return SchemaGate::new("_", schema.clone()).violation(args);
+            return schema_violation(args, schema, "args");
         }
     }
     None // unknown tool: no schema to validate against — don't fail
@@ -1175,14 +1269,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_empty_passes_on_tool_use_only_response() {
-        // A tool-call-only turn has no text but is not "empty" — it must not escalate.
+    async fn non_empty_passes_on_tool_use_when_tools_declared() {
+        // A tool-call-only turn with declared tools is not "empty" — it must not escalate.
+        // Uses tool_req_with_schema() which has a non-empty tools array.
+        assert_eq!(
+            NonEmptyGate
+                .evaluate(&tool_req_with_schema(), &tool_use_resp())
+                .await
+                .verdict,
+            Verdict::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn non_empty_fails_on_tool_call_when_no_tools_declared() {
+        // Finding 2: tool-call bypass only when request declared tools.
+        // req() has tools: Value::Null — so tool call with empty text is treated as empty.
         assert_eq!(
             NonEmptyGate
                 .evaluate(&req(), &tool_use_resp())
                 .await
                 .verdict,
-            Verdict::Pass
+            Verdict::Fail,
+            "tool call without declared tools must Fail non-empty (undeclared/hallucinated)"
         );
     }
 
@@ -1199,15 +1308,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_valid_passes_on_tool_use_only_response() {
-        // json-valid on a tool-only turn has nothing to parse → trivially satisfied (Pass, not
-        // Abstain: Abstain is an operational error that triggers GateHealth auto-disable).
+    async fn json_valid_passes_on_tool_use_when_tools_declared() {
+        // json-valid on a tool-only turn (tools declared) has nothing to parse → Pass, not Abstain.
+        assert_eq!(
+            JsonValidGate
+                .evaluate(&tool_req_with_schema(), &tool_use_resp())
+                .await
+                .verdict,
+            Verdict::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn json_valid_fails_on_tool_call_when_no_tools_declared() {
+        // Finding 2: tool-call bypass only when request declared tools.
+        // req() has no tools, so the call is treated as a non-JSON text response.
         assert_eq!(
             JsonValidGate
                 .evaluate(&req(), &tool_use_resp())
                 .await
                 .verdict,
-            Verdict::Pass
+            Verdict::Fail,
+            "tool call without declared tools must Fail json-valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_valid_passes_on_preamble_text_plus_tool_calls() {
+        // Finding 4: preamble text alongside tool calls (with declared tools) must Pass.
+        // The text is not the JSON answer — tool-args-valid validates the call args instead.
+        let resp_with_preamble = ModelResponse {
+            text: "I will look that up for you.".to_owned(),
+            raw: serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "I will look that up for you."},
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {"q": "hello"}}
+                ]
+            }),
+            ..tool_use_resp()
+        };
+        assert_eq!(
+            JsonValidGate
+                .evaluate(&tool_req_with_schema(), &resp_with_preamble)
+                .await
+                .verdict,
+            Verdict::Pass,
+            "preamble text + tool calls with declared tools must Pass json-valid"
         );
     }
 
@@ -1223,15 +1369,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_gate_passes_on_tool_use_only_response() {
-        // Same reasoning as json_valid: trivially passes (not Abstain) on tool-only turns.
+    async fn schema_gate_passes_on_tool_use_when_tools_declared() {
+        // Trivially passes (not Abstain) on tool-only turns when tools are declared.
         let g = SchemaGate::new(
             "extract",
             serde_json::json!({"type": "object", "required": ["name"]}),
         );
         assert_eq!(
-            g.evaluate(&req(), &tool_use_resp()).await.verdict,
+            g.evaluate(&tool_req_with_schema(), &tool_use_resp())
+                .await
+                .verdict,
             Verdict::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_gate_passes_on_preamble_text_plus_tool_calls() {
+        // Finding 4: preamble text alongside tool calls (with declared tools) must Pass schema-gate.
+        let g = SchemaGate::new(
+            "extract",
+            serde_json::json!({"type": "object", "required": ["name"]}),
+        );
+        let resp_with_preamble = ModelResponse {
+            text: "Here is the result:".to_owned(),
+            raw: serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "Here is the result:"},
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {"q": "hello"}}
+                ]
+            }),
+            ..tool_use_resp()
+        };
+        assert_eq!(
+            g.evaluate(&tool_req_with_schema(), &resp_with_preamble)
+                .await
+                .verdict,
+            Verdict::Pass,
+            "preamble text + tool calls with declared tools must Pass schema-gate"
         );
     }
 
@@ -1335,6 +1509,182 @@ mod tests {
         assert_eq!(
             gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
             ["tool-args-valid"]
+        );
+    }
+
+    // ── Finding 1: recursive schema_violation ──────────────────────────────────────────────────
+
+    /// Nested required field missing → Fail.
+    /// Guards: `schema_violation` required-check inside a `properties` child schema.
+    #[test]
+    fn schema_violation_nested_required_missing() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "object",
+                    "required": ["street"],
+                    "properties": { "street": {"type": "string"} }
+                }
+            }
+        });
+        // address.street is required but missing → violation
+        assert!(
+            schema_violation(&json!({"address": {}}), &schema, "root").is_some(),
+            "nested required field must produce a violation"
+        );
+        // address.street present → no violation
+        assert!(
+            schema_violation(
+                &json!({"address": {"street": "1 Main St"}}),
+                &schema,
+                "root"
+            )
+            .is_none(),
+            "valid nested object must produce no violation"
+        );
+    }
+
+    /// Enum violation → Fail.
+    /// Guards: `schema_violation` enum-keyword check.
+    #[test]
+    fn schema_violation_enum_check() {
+        let schema = json!({ "enum": ["red", "green", "blue"] });
+        assert!(
+            schema_violation(&json!("purple"), &schema, "root").is_some(),
+            "value outside enum must produce a violation"
+        );
+        assert!(
+            schema_violation(&json!("red"), &schema, "root").is_none(),
+            "value inside enum must produce no violation"
+        );
+    }
+
+    /// items type wrong → Fail.
+    /// Guards: `schema_violation` items-keyword recursive check.
+    #[test]
+    fn schema_violation_items_type_wrong() {
+        let schema = json!({
+            "type": "array",
+            "items": { "type": "integer" }
+        });
+        // Array containing a string → violation
+        assert!(
+            schema_violation(&json!([1, 2, "three"]), &schema, "root").is_some(),
+            "array item of wrong type must produce a violation"
+        );
+        // All integers → no violation
+        assert!(
+            schema_violation(&json!([1, 2, 3]), &schema, "root").is_none(),
+            "array of correct type must produce no violation"
+        );
+    }
+
+    /// additionalProperties: false with extra key → Fail.
+    /// Guards: `schema_violation` additionalProperties-false check.
+    #[test]
+    fn schema_violation_additional_properties_false() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "name": {"type": "string"} },
+            "additionalProperties": false
+        });
+        // extra key "age" not in properties → violation
+        assert!(
+            schema_violation(&json!({"name": "Alice", "age": 30}), &schema, "root").is_some(),
+            "extra key with additionalProperties:false must produce a violation"
+        );
+        // only declared keys → no violation
+        assert!(
+            schema_violation(&json!({"name": "Alice"}), &schema, "root").is_none(),
+            "object with only declared keys must produce no violation"
+        );
+    }
+
+    /// Full nested valid value → Pass.
+    /// Guards: all checks passing silently together.
+    #[test]
+    fn schema_violation_complex_valid_nested() {
+        let schema = json!({
+            "type": "object",
+            "required": ["id", "tags"],
+            "additionalProperties": false,
+            "properties": {
+                "id": {"type": "integer"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            }
+        });
+        assert!(
+            schema_violation(
+                &json!({"id": 1, "tags": ["rust", "agent"]}),
+                &schema,
+                "root"
+            )
+            .is_none(),
+            "fully valid complex value must produce no violation"
+        );
+    }
+
+    // ── Finding 5: malformed tool calls produce Fail, not silent Pass ──────────────────────────
+
+    /// OpenAI tool call missing `function` → empty name → ToolArgsValidGate Fail.
+    /// Guards: `extract_response_tool_calls` OpenAI missing-function branch (line 302-303).
+    #[tokio::test]
+    async fn tool_args_valid_fails_on_openai_tool_call_missing_function_key() {
+        // An OpenAI-format tool_calls entry without a `function` key is malformed.
+        // extract_response_tool_calls must record it as ("", "{}") rather than skipping it,
+        // so ToolArgsValidGate can Fail the response (tool "" is not in the request schema).
+        let malformed_resp = ModelResponse {
+            text: String::new(),
+            raw: serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            // Missing "function" key entirely — malformed call
+                            {"id": "call_1", "type": "function"}
+                        ]
+                    }
+                }]
+            }),
+            ..tool_use_resp()
+        };
+        let r = ToolArgsValidGate
+            .evaluate(&tool_req_with_schema(), &malformed_resp)
+            .await;
+        assert_eq!(
+            r.verdict,
+            Verdict::Fail,
+            "malformed OpenAI tool call (missing function) must Fail, not Pass"
+        );
+    }
+
+    /// Anthropic tool_use missing `name` → empty name → ToolArgsValidGate Fail.
+    /// Guards: `extract_response_tool_calls` Anthropic missing-name branch (line 273-275).
+    #[tokio::test]
+    async fn tool_args_valid_fails_on_anthropic_tool_use_missing_name() {
+        let malformed_resp = ModelResponse {
+            text: String::new(),
+            raw: serde_json::json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "t1",
+                    // "name" is absent — malformed
+                    "input": {"q": "hello"}
+                }]
+            }),
+            ..tool_use_resp()
+        };
+        let r = ToolArgsValidGate
+            .evaluate(&tool_req_with_schema(), &malformed_resp)
+            .await;
+        assert_eq!(
+            r.verdict,
+            Verdict::Fail,
+            "Anthropic tool_use missing name must Fail, not Pass"
         );
     }
 }

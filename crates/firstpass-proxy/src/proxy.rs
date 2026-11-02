@@ -3620,12 +3620,16 @@ fn anthropic_sse_from_message(message: &Value) -> String {
     let mut out = String::new();
 
     // message_start carries the envelope with content emptied.
-    // Per the Anthropic SSE spec, stop_reason and stop_sequence must be null here;
-    // the real values arrive only in message_delta.
+    // Per the Anthropic SSE spec:
+    //   - stop_reason / stop_sequence must be null here; real values arrive in message_delta.
+    //   - usage.output_tokens must be 0 here; the real count arrives in message_delta.usage.
+    //     Clients that sum deltas would double-count if the non-zero value from the final message
+    //     were forwarded in message_start.
     let mut start_msg = message.clone();
     start_msg["content"] = Value::Array(Vec::new());
     start_msg["stop_reason"] = Value::Null;
     start_msg["stop_sequence"] = Value::Null;
+    start_msg["usage"]["output_tokens"] = Value::from(0u64);
     sse_event(
         &mut out,
         "message_start",
@@ -6336,11 +6340,19 @@ mod tests {
                 ),
             ],
         );
+        // Request must declare tools — NonEmptyGate only bypasses the empty-text check when the
+        // request actually declared tools (a tool-call response on a no-tools request is a bug).
+        let body_with_tools = Bytes::from_static(br#"{
+            "model": "ignored",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "run ls"}],
+            "tools": [{"name": "bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}]
+        }"#);
         let resp = messages(
             State(state),
             Extension(TenantId("default".to_owned())),
             HeaderMap::new(),
-            user_body(),
+            body_with_tools,
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
@@ -12081,6 +12093,37 @@ mod tests {
         assert!(
             !delta["delta"]["stop_reason"].is_null(),
             "message_delta.delta.stop_reason must be non-null"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_message_start_has_zero_output_tokens() {
+        // Per the Anthropic SSE spec, message_start.message.usage.output_tokens must be 0.
+        // The real output token count arrives only in the message_delta usage object.
+        // Clients that accumulate streaming usage deltas would double-count if the non-zero
+        // value from the final message JSON were forwarded here.
+        let resp = thinking_tool_resp(); // out_tokens = 10
+        let message = anthropic_response_json(&resp);
+        // Confirm the source message has non-zero output_tokens so this is a real check.
+        assert!(
+            message["usage"]["output_tokens"].as_u64().unwrap_or(0) > 0,
+            "precondition: source message must have non-zero output_tokens"
+        );
+        let sse = anthropic_sse_from_message(&message);
+        let frames: Vec<serde_json::Value> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<serde_json::Value>(d).expect("valid JSON"))
+            .collect();
+        let start = frames
+            .iter()
+            .find(|f| f["type"] == "message_start")
+            .expect("message_start must appear");
+        assert_eq!(
+            start["message"]["usage"]["output_tokens"].as_u64(),
+            Some(0),
+            "message_start.message.usage.output_tokens must be 0, got: {}",
+            start["message"]["usage"]["output_tokens"]
         );
     }
 
