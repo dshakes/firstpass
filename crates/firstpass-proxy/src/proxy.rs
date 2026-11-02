@@ -1939,7 +1939,7 @@ async fn messages(
     body: Bytes,
 ) -> Response {
     // Header-only here: an observe-only deployment does zero on-path parsing.
-    let session_header = header_session(&headers, &state.config.prompt_salt);
+    let mut session_header = header_session(&headers, &state.config.prompt_salt);
 
     // Only parse the request for routing when a routing config is loaded — an observe-only
     // deployment does zero on-path parsing and keeps its zero-added-latency guarantee.
@@ -1950,8 +1950,9 @@ async fn messages(
             .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
         {
             // The body is already being parsed for routing; derive body-based session ids now.
-            let session_header = session_header
-                .clone()
+            // Re-bind the OUTER variable so the observe fallback below sees it too.
+            session_header = session_header
+                .take()
                 .or_else(|| body_session_bytes(&body, &state.config.prompt_salt));
             // Index of the matched route, so shadow spend is budgeted per route rather than
             // pooled across a config that may define several.
@@ -2227,7 +2228,10 @@ fn hashed_session(kind: &str, salt: &str, raw: &str) -> Option<String> {
 /// including the observe-only one that promises zero on-path parsing.
 fn header_session(headers: &HeaderMap, salt: &str) -> Option<String> {
     if let Some(v) = header_str(headers, SESSION_HEADER) {
-        return Some(cap_session(&v).to_owned());
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(cap_session(v).to_owned());
+        }
     }
     for name in AGENT_SESSION_HEADERS {
         if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
@@ -2274,7 +2278,13 @@ fn body_session(json: &Value, salt: &str) -> Option<String> {
         .and_then(Value::as_array)
         .is_some_and(|t| !t.is_empty());
     if n_items <= 1 && !has_tools {
-        return None;
+        // Weakest fallback: `previous_response_id` changes every turn, so it cannot group a
+        // conversation by itself; it only links a follow-up to the response it continues.
+        return json
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .filter(|p| !p.trim().is_empty())
+            .and_then(|p| hashed_session("prev", salt, p.trim()));
     }
     if let Some(k) = json.get("prompt_cache_key").and_then(Value::as_str) {
         let k = k.trim();
@@ -2311,9 +2321,27 @@ fn body_session(json: &Value, salt: &str) -> Option<String> {
                 break;
             }
         }
-    } else if let Some(first) = input.and_then(|i| i.as_array().and_then(|a| a.first()).or(Some(i)))
-    {
-        prefix.push(first.clone());
+    } else if let Some(input) = input {
+        // Responses: a string `input` is one user message; an array item is normalised to
+        // (role, text) so turn 1 (string) and turn 2 (array) hash alike.
+        let (role, text) = match input {
+            Value::String(s) => ("user", s.clone()),
+            other => {
+                let first = other.as_array().and_then(|a| a.first())?;
+                let role = first.get("role").and_then(Value::as_str).unwrap_or("user");
+                let text = match first.get("content") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => first.to_string(),
+                };
+                (role, text)
+            }
+        };
+        prefix.push(serde_json::json!([role, text]));
     }
     let bytes = serde_json::to_vec(&prefix).ok()?;
     let h = prompt_hash(salt, &bytes);
@@ -5317,7 +5345,7 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let session_header = header_session(&headers, &state.config.prompt_salt);
+    let mut session_header = header_session(&headers, &state.config.prompt_salt);
 
     if let Some(routing) = state.config.routing.as_ref() {
         let features = extract_openai_features(&headers, &body);
@@ -5325,8 +5353,9 @@ async fn chat_completions(
             .route_for(&features)
             .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
         {
-            let session_header = session_header
-                .clone()
+            // Re-bind the OUTER variable so the observe fallback below sees it too.
+            session_header = session_header
+                .take()
                 .or_else(|| body_session_bytes(&body, &state.config.prompt_salt));
             // Index of the matched route, for outcome attribution (ADR 0009 D3).
             let route_ix = routing
@@ -5385,7 +5414,7 @@ async fn responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let session_header = header_session(&headers, &state.config.prompt_salt);
+    let mut session_header = header_session(&headers, &state.config.prompt_salt);
 
     // Streaming cannot be gated, so it never enters the enforce path. Passing the ORIGINAL body
     // through matters: the upstream speaks Responses too, and handing it a translated body would
@@ -5436,8 +5465,8 @@ async fn responses(
             .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
         {
             // `parsed` already exists; reuse it rather than parse again.
-            let session_header = session_header
-                .clone()
+            session_header = session_header
+                .take()
                 .or_else(|| body_session(&parsed, &state.config.prompt_salt));
             let route_ix = routing
                 .routes
@@ -5551,6 +5580,38 @@ mod tests {
         assert_eq!(v.len(), 256, "explicit header is verbatim but capped");
         assert_eq!(cap_session(&"é".repeat(300)).len(), 256); // char boundary safe
         assert_eq!(sess(&[("session_id", "  ")], json!({})), None);
+    }
+
+    #[test]
+    fn blank_explicit_header_is_absent() {
+        let body =
+            json!({"tools": [{"name": "t"}], "messages": [{"role": "user", "content": "x"}]});
+        for blank in ["", "   "] {
+            let id = sess(&[("x-firstpass-session", blank)], body.clone()).unwrap();
+            assert!(
+                id.starts_with("conv:"),
+                "blank header must fall through, got {id:?}"
+            );
+        }
+        assert_eq!(
+            sess(&[("x-firstpass-session", "  a ")], json!({})).as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn responses_string_input_turn_one_matches_array_turn_two() {
+        let tools = json!([{"type": "function", "name": "shell"}]);
+        let t1 = json!({"instructions": "i", "tools": tools, "input": "list files"});
+        let t2 = json!({"instructions": "i", "tools": tools, "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "list files"}]},
+            {"type": "function_call_output", "call_id": "c", "output": "a b"}]});
+        let a = sess(&[], t1).unwrap();
+        assert!(a.starts_with("conv:"));
+        assert_eq!(Some(a), sess(&[], t2));
+        // previous_response_id is only a last-resort fallback for non-agent-shaped requests
+        let p = json!({"input": "more", "previous_response_id": "resp_1"});
+        assert!(sess(&[], p).unwrap().starts_with("prev:"));
     }
 
     #[test]
@@ -6913,6 +6974,53 @@ mod tests {
                 .any(|f| f["delta"]["type"] == "input_json_delta"
                     && f["delta"]["partial_json"] == r#"{"city":"Paris"}"#)
         );
+    }
+
+    /// The derived session must survive the enforce -> observe fallback (structured request the
+    /// ladder is configured not to carry): the observe trace records the same `conv:` id.
+    #[tokio::test]
+    async fn derived_session_survives_the_observe_fallback() {
+        let toml = "[[price]]\nmodel = \"anthropic/m\"\ninput_per_mtok = 1.0\noutput_per_mtok = 5.0\n[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/m\"]\ngates = [\"non-empty\"]\n[escalation]\nenforce_structured = false\n";
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.to_owned()),
+            "FIRSTPASS_MODE" => Some("enforce".to_owned()),
+            "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some("http://127.0.0.1:1".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let (traces, mut rx) = mpsc::channel(8);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(HashMap::new()),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+        let body = Bytes::from_static(
+            br#"{"model":"m","tools":[{"name":"get_weather"}],"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let _ = messages(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        let t = rx.recv().await.expect("observe fallback records a trace");
+        assert!(t.session_id.starts_with("conv:"), "{}", t.session_id);
     }
 
     /// ADR 0005, default-on: an enforce route now serves BOTH plain text and tool requests (the
