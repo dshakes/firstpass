@@ -165,6 +165,10 @@ pub async fn auth_middleware(
     }
     // Argon2 is deliberately slow CPU work; on the async worker it would stall every other
     // request on that thread for the length of a verify. A failed join fails closed (401).
+    //
+    // Determine the credential source BEFORE the verify so we can strip the Authorization header
+    // if Bearer was used as the tenant credential — preventing it from being forwarded upstream.
+    let bearer_was_tenant = key_came_from_bearer_only(req.headers());
     let verified = match extract_key(req.headers()) {
         Some(key) => {
             let config = state.config.clone();
@@ -178,29 +182,58 @@ pub async fn auth_middleware(
     match verified {
         Some(tenant) => {
             req.extensions_mut().insert(tenant);
+            // SECURITY: if the tenant credential was taken from Authorization: Bearer, strip it
+            // now so it is never forwarded to the upstream model provider (observe or enforce path).
+            if bearer_was_tenant {
+                req.headers_mut().remove(header::AUTHORIZATION);
+            }
             next.run(req).await
         }
         None => ProxyError::Unauthorized.into_response(),
     }
 }
 
-/// Read the tenant API key from `Authorization: Bearer <key>` or the `x-firstpass-key` header.
+/// Read the tenant API key from `x-firstpass-key` (preferred) or `Authorization: Bearer <key>`.
+///
+/// `x-firstpass-key` takes precedence so that OpenAI-compatible clients which send
+/// `Authorization: Bearer sk-…` as their *provider* key are not mistaken for a tenant credential.
+/// When a client sends both, `x-firstpass-key` is the tenant credential and Authorization reaches
+/// the provider unchanged.
 fn extract_key(headers: &HeaderMap) -> Option<String> {
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix(BEARER_PREFIX))
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if let Some(key) = bearer {
-        return Some(key.to_owned());
-    }
-    headers
+    // Prefer the dedicated header — leaves Authorization for the upstream provider.
+    if let Some(key) = headers
         .get(KEY_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty())
+    {
+        return Some(key.to_owned());
+    }
+    // Fall back to Bearer — but auth_middleware will strip it before forwarding upstream.
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix(BEARER_PREFIX))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+/// Whether the request's only tenant-key source is `Authorization: Bearer`.
+///
+/// Returns `true` when no `x-firstpass-key` is present and a non-empty Bearer token exists.
+/// The middleware uses this to strip the Authorization header before forwarding upstream so that
+/// a tenant credential sent as Bearer is never relayed to the model provider.
+fn key_came_from_bearer_only(headers: &HeaderMap) -> bool {
+    if headers.get(KEY_HEADER).is_some() {
+        return false; // x-firstpass-key is the credential; Bearer is for the provider.
+    }
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix(BEARER_PREFIX))
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -272,20 +305,161 @@ mod tests {
     }
 
     #[test]
-    fn extract_key_reads_bearer_and_custom_header() {
+    fn extract_key_prefers_custom_header_over_bearer() {
+        // Custom header only → used.
         let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, "Bearer abc123".parse().unwrap());
-        assert_eq!(extract_key(&h).as_deref(), Some("abc123"));
+        h.insert(KEY_HEADER, "xyz789".parse().unwrap());
+        assert_eq!(extract_key(&h).as_deref(), Some("xyz789"));
 
+        // Bearer only → used as fallback.
         let mut h2 = HeaderMap::new();
-        h2.insert(KEY_HEADER, "xyz789".parse().unwrap());
-        assert_eq!(extract_key(&h2).as_deref(), Some("xyz789"));
+        h2.insert(header::AUTHORIZATION, "Bearer abc123".parse().unwrap());
+        assert_eq!(extract_key(&h2).as_deref(), Some("abc123"));
+
+        // Both present → custom header wins (Bearer is for the provider, not the tenant).
+        let mut h3 = HeaderMap::new();
+        h3.insert(KEY_HEADER, "tenant-key".parse().unwrap());
+        h3.insert(
+            header::AUTHORIZATION,
+            "Bearer provider-key".parse().unwrap(),
+        );
+        assert_eq!(extract_key(&h3).as_deref(), Some("tenant-key"));
 
         // No key header at all.
         assert!(extract_key(&HeaderMap::new()).is_none());
         // Empty bearer token is not a key.
+        let mut h4 = HeaderMap::new();
+        h4.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
+        assert!(extract_key(&h4).is_none());
+    }
+
+    #[test]
+    fn key_came_from_bearer_only_detects_bearer_without_custom_header() {
+        // Bearer only → true.
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, "Bearer abc123".parse().unwrap());
+        assert!(key_came_from_bearer_only(&h));
+
+        // Custom header present (with or without Bearer) → false.
+        let mut h2 = HeaderMap::new();
+        h2.insert(KEY_HEADER, "tenant-key".parse().unwrap());
+        assert!(!key_came_from_bearer_only(&h2));
+
         let mut h3 = HeaderMap::new();
-        h3.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
-        assert!(extract_key(&h3).is_none());
+        h3.insert(KEY_HEADER, "tenant-key".parse().unwrap());
+        h3.insert(
+            header::AUTHORIZATION,
+            "Bearer provider-key".parse().unwrap(),
+        );
+        assert!(!key_came_from_bearer_only(&h3));
+
+        // No headers → false.
+        assert!(!key_came_from_bearer_only(&HeaderMap::new()));
+
+        // Empty bearer → false (not a valid key).
+        let mut h4 = HeaderMap::new();
+        h4.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
+        assert!(!key_came_from_bearer_only(&h4));
+    }
+
+    // ── Defect 4: auth middleware integration tests ──────────────────────────────
+
+    /// Build a minimal `AppState` with auth enabled and the given tenant hash JSON.
+    fn auth_state(hash_json: &str) -> crate::proxy::AppState {
+        use std::sync::Arc;
+        let config = crate::config::ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_REQUIRE_AUTH" => Some("true".to_owned()),
+            "FIRSTPASS_TENANT_KEYS_JSON" => Some(hash_json.to_owned()),
+            _ => None,
+        })
+        .expect("minimal auth config");
+        let (traces, _rx) = tokio::sync::mpsc::channel(1);
+        crate::proxy::AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: crate::provider::ProviderRegistry::from_map(Default::default()),
+            gate_health: Arc::new(crate::gate::GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        }
+    }
+
+    /// Build an axum app that runs `auth_middleware` and then echoes the `Authorization` header
+    /// value (or empty string) from the downstream view.
+    fn auth_echo_app(state: crate::proxy::AppState) -> axum::Router {
+        let inner = axum::routing::get(|req: axum::extract::Request| async move {
+            req.headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_owned()
+        });
+        axum::Router::new()
+            .route("/test", inner)
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_strips_bearer_when_used_as_tenant_key() {
+        use tower::ServiceExt;
+        let hash = TenantKeys::hash_key("my-secret").unwrap();
+        let json = format!("{{\"acme\": {hash:?}}}");
+        let app = auth_echo_app(auth_state(&json));
+
+        // Bearer carries the tenant credential "acme.my-secret" — no x-firstpass-key.
+        let req = axum::http::Request::builder()
+            .uri("/test")
+            .header(header::AUTHORIZATION, "Bearer acme.my-secret")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "tenant verified");
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let downstream_auth = String::from_utf8_lossy(&body);
+        assert!(
+            downstream_auth.is_empty(),
+            "Authorization must be stripped downstream when Bearer was the tenant credential, \
+             got: {downstream_auth:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_leaves_provider_bearer_when_custom_header_is_tenant_key() {
+        use tower::ServiceExt;
+        let hash = TenantKeys::hash_key("my-secret").unwrap();
+        let json = format!("{{\"acme\": {hash:?}}}");
+        let app = auth_echo_app(auth_state(&json));
+
+        // x-firstpass-key carries the tenant credential; Authorization carries the provider key.
+        let req = axum::http::Request::builder()
+            .uri("/test")
+            .header(KEY_HEADER, "acme.my-secret")
+            .header(header::AUTHORIZATION, "Bearer sk-provider-key")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "tenant verified");
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let downstream_auth = String::from_utf8_lossy(&body);
+        assert_eq!(
+            downstream_auth, "Bearer sk-provider-key",
+            "provider Bearer must reach downstream unchanged when x-firstpass-key is the tenant credential"
+        );
     }
 }

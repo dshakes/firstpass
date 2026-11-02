@@ -72,7 +72,10 @@ Config surface (the parser is `deny_unknown_fields`, so a wrong key is a hard fa
   `firstpass_core::config::BUILTIN_OPENAI_COMPATIBLE`** (groq, deepseek, together, fireworks, mistral,
   openrouter, xai, cerebras). A `google`/Gemini or local (Ollama, vLLM) ladder needs its own
   `[[provider]]` block or the rung never resolves. Every rung still needs a price.
-- **Only `non-empty` and `json-valid` are built-in gates.** `schema`, tests, judge, and consistency each need a `[[gate]]`.
+- **Built-in gates are `non-empty`, `json-valid`, and `tool-args-valid`.** All others (`schema`, `tests`, `judge`, `consistency`) need a `[[gate]]` block.
+  - `non-empty`: passes when the response has non-blank text OR at least one tool call; fails on truly empty responses.
+  - `json-valid`: fails when text is not valid JSON; **abstains** (does not escalate) on tool-call-only turns.
+  - `tool-args-valid`: passes when every tool call's arguments satisfy its `input_schema` (Anthropic) / `parameters` (OpenAI) schema; fails on schema violations; **abstains** when the response has no tool calls.
 - **Every ladder rung must resolve to a price** — built-in or a `[[price]]` block. There is no silent fallback:
   an unpriced rung would record `cost_usd: 0.0` in a tamper-evident receipt and leave `[budget]` caps un-trippable,
   so it is rejected at parse. A model you host yourself is free, but must declare `0.0` explicitly.

@@ -34,7 +34,9 @@ pub trait Gate: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Fails an empty (whitespace-only) completion. The cheapest possible sanity gate.
+/// Fails an empty (whitespace-only) completion with no tool calls.
+/// Passes when the text is non-empty **or** the response contains at least one tool call —
+/// a tool-use-only turn has no text but is not an empty response.
 #[derive(Debug, Clone, Copy)]
 pub struct NonEmptyGate;
 
@@ -44,16 +46,20 @@ impl Gate for NonEmptyGate {
         "non-empty"
     }
     async fn evaluate(&self, _req: &ModelRequest, resp: &ModelResponse) -> GateResult {
-        let verdict = if resp.text.trim().is_empty() {
-            Verdict::Fail
-        } else {
+        let verdict = if !resp.text.trim().is_empty() || resp.has_tool_calls() {
             Verdict::Pass
+        } else {
+            Verdict::Fail
         };
         GateResult::deterministic(self.id(), verdict, 0)
     }
 }
 
 /// Passes only if the completion parses as JSON. Useful for structured-output routes.
+///
+/// **Abstains** on a tool-call-only turn (empty text, non-empty tool calls): a `tool_use`
+/// response is not a JSON payload, so there is nothing to validate and failing would force
+/// needless escalation. Use `tool-args-valid` to validate the tool call arguments themselves.
 #[derive(Debug, Clone, Copy)]
 pub struct JsonValidGate;
 
@@ -63,6 +69,13 @@ impl Gate for JsonValidGate {
         "json-valid"
     }
     async fn evaluate(&self, _req: &ModelRequest, resp: &ModelResponse) -> GateResult {
+        if resp.text.trim().is_empty() && resp.has_tool_calls() {
+            return GateResult::abstain(
+                self.id(),
+                "tool-call-only response: no text content to validate as JSON",
+                0,
+            );
+        }
         let ok = serde_json::from_str::<serde_json::Value>(resp.text.trim()).is_ok();
         GateResult::deterministic(self.id(), if ok { Verdict::Pass } else { Verdict::Fail }, 0)
     }
@@ -135,6 +148,15 @@ impl Gate for SchemaGate {
         &self.id
     }
     async fn evaluate(&self, _req: &ModelRequest, resp: &ModelResponse) -> GateResult {
+        // Abstain on tool-call-only turns: no text payload to validate against the schema.
+        // Use `tool-args-valid` to validate tool call arguments.
+        if resp.text.trim().is_empty() && resp.has_tool_calls() {
+            return GateResult::abstain(
+                self.id(),
+                "tool-call-only response: no text content to validate against schema",
+                0,
+            );
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(resp.text.trim()) else {
             let mut r = GateResult::deterministic(self.id(), Verdict::Fail, 0);
             r.reason = Some("candidate is not valid JSON".to_owned());
@@ -148,6 +170,124 @@ impl Gate for SchemaGate {
                 r
             }
         }
+    }
+}
+
+/// Extract `(tool_name, args_json_string)` pairs from a provider raw response.
+/// Handles Anthropic `content[*].type == "tool_use"` (input is a JSON object)
+/// and OpenAI `choices[0].message.tool_calls[*].function` (arguments is a JSON string).
+fn extract_response_tool_calls(raw: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    // Anthropic format
+    if let Some(blocks) = raw.get("content").and_then(serde_json::Value::as_array) {
+        for b in blocks {
+            if b.get("type").and_then(serde_json::Value::as_str) == Some("tool_use") {
+                let name = b
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let args = b
+                    .get("input")
+                    .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
+                out.push((name, args));
+            }
+        }
+        return out;
+    }
+    // OpenAI format
+    if let Some(calls) = raw
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(serde_json::Value::as_array)
+    {
+        for call in calls {
+            if let Some(func) = call.get("function") {
+                let name = func
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let args = func
+                    .get("arguments")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("{}")
+                    .to_owned();
+                out.push((name, args));
+            }
+        }
+    }
+    out
+}
+
+/// Validate `tool_args` against a tool's `input_schema` (Anthropic) or `parameters` (OpenAI)
+/// using the subset validator already in [`SchemaGate`]. Returns `None` on success, or the
+/// first violation message.
+fn validate_tool_args_against_tools(
+    name: &str,
+    args: &serde_json::Value,
+    tools: &serde_json::Value,
+) -> Option<String> {
+    let arr = tools.as_array()?;
+    for tool in arr {
+        // Anthropic format: {"name": "...", "input_schema": {...}}
+        if let (Some(n), Some(schema)) = (
+            tool.get("name").and_then(serde_json::Value::as_str),
+            tool.get("input_schema"),
+        ) && n == name
+        {
+            return SchemaGate::new("_", schema.clone()).violation(args);
+        }
+        // OpenAI format: {"type":"function","function":{"name":"...","parameters":{...}}}
+        if let Some(func) = tool.get("function")
+            && let (Some(n), Some(schema)) = (
+                func.get("name").and_then(serde_json::Value::as_str),
+                func.get("parameters"),
+            )
+            && n == name
+        {
+            return SchemaGate::new("_", schema.clone()).violation(args);
+        }
+    }
+    None // unknown tool: no schema to validate against — don't fail
+}
+
+/// Validates every tool call's arguments against the request's tool schema.
+///
+/// - **Pass**: all tool calls have arguments that parse as valid JSON and satisfy their
+///   definition's `input_schema` (Anthropic) / `parameters` (OpenAI) subset schema.
+/// - **Fail**: any tool call's arguments are invalid JSON or violate its schema.
+/// - **Abstain**: the response contains no tool calls (nothing to validate).
+///
+/// Registered as the built-in gate id `tool-args-valid`. See AGENTS.md gotchas.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolArgsValidGate;
+
+#[async_trait]
+impl Gate for ToolArgsValidGate {
+    fn id(&self) -> &str {
+        "tool-args-valid"
+    }
+    async fn evaluate(&self, req: &ModelRequest, resp: &ModelResponse) -> GateResult {
+        let calls = extract_response_tool_calls(&resp.raw);
+        if calls.is_empty() {
+            return GateResult::abstain(self.id(), "no tool calls in response", 0);
+        }
+        for (name, args_str) in &calls {
+            let args = match serde_json::from_str::<serde_json::Value>(args_str) {
+                Ok(v) => v,
+                Err(_) => {
+                    let mut r = GateResult::deterministic(self.id(), Verdict::Fail, 0);
+                    r.reason = Some(format!("tool call {name:?}: arguments is not valid JSON"));
+                    return r;
+                }
+            };
+            if let Some(violation) = validate_tool_args_against_tools(name, &args, &req.tools) {
+                let mut r = GateResult::deterministic(self.id(), Verdict::Fail, 0);
+                r.reason = Some(format!("tool call {name:?}: {violation}"));
+                return r;
+            }
+        }
+        GateResult::deterministic(self.id(), Verdict::Pass, 0)
     }
 }
 
@@ -327,6 +467,7 @@ pub fn resolve_gates(
         match name.as_str() {
             "non-empty" => push(Box::new(NonEmptyGate), None),
             "json-valid" => push(Box::new(JsonValidGate), None),
+            "tool-args-valid" => push(Box::new(ToolArgsValidGate), None),
             other => match defs.iter().find(|d| d.id == other) {
                 Some(def) if def.judge.is_some() => {
                     // `Config::parse` guarantees exactly one kind, so this `if let` always binds.
@@ -949,6 +1090,169 @@ mod tests {
         assert_eq!(
             aggregate_with_policy(&[pass, abstain], &closed),
             Verdict::Fail
+        );
+    }
+
+    // ── Defect 1: gates must handle tool-call-only responses correctly ────────
+
+    fn tool_use_resp() -> ModelResponse {
+        ModelResponse {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            text: String::new(), // tool-only: no text
+            in_tokens: 10,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 5,
+            raw: serde_json::json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "search",
+                    "input": { "q": "hello" }
+                }]
+            }),
+        }
+    }
+
+    fn tool_req_with_schema() -> ModelRequest {
+        ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![],
+            max_tokens: 64,
+            tools: serde_json::json!([{
+                "name": "search",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["q"],
+                    "properties": { "q": { "type": "string" } }
+                }
+            }]),
+            raw: serde_json::Value::Null,
+            cache_prefix: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn non_empty_passes_on_tool_use_only_response() {
+        // A tool-call-only turn has no text but is not "empty" — it must not escalate.
+        assert_eq!(
+            NonEmptyGate
+                .evaluate(&req(), &tool_use_resp())
+                .await
+                .verdict,
+            Verdict::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn non_empty_still_fails_on_truly_empty_response() {
+        assert_eq!(
+            NonEmptyGate.evaluate(&req(), &resp("")).await.verdict,
+            Verdict::Fail
+        );
+        assert_eq!(
+            NonEmptyGate.evaluate(&req(), &resp("   ")).await.verdict,
+            Verdict::Fail
+        );
+    }
+
+    #[tokio::test]
+    async fn json_valid_abstains_on_tool_use_only_response() {
+        // json-valid has nothing to parse; abstain rather than fail (no escalation).
+        assert_eq!(
+            JsonValidGate
+                .evaluate(&req(), &tool_use_resp())
+                .await
+                .verdict,
+            Verdict::Abstain
+        );
+    }
+
+    #[tokio::test]
+    async fn json_valid_still_fails_on_non_json_text_response() {
+        assert_eq!(
+            JsonValidGate
+                .evaluate(&req(), &resp("not json"))
+                .await
+                .verdict,
+            Verdict::Fail
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_gate_abstains_on_tool_use_only_response() {
+        let g = SchemaGate::new(
+            "extract",
+            serde_json::json!({"type": "object", "required": ["name"]}),
+        );
+        assert_eq!(
+            g.evaluate(&req(), &tool_use_resp()).await.verdict,
+            Verdict::Abstain
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_args_valid_passes_with_valid_args() {
+        assert_eq!(
+            ToolArgsValidGate
+                .evaluate(&tool_req_with_schema(), &tool_use_resp())
+                .await
+                .verdict,
+            Verdict::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_args_valid_abstains_when_no_tool_calls() {
+        // Text-only response: nothing to validate.
+        assert_eq!(
+            ToolArgsValidGate
+                .evaluate(&req(), &resp("hello"))
+                .await
+                .verdict,
+            Verdict::Abstain
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_args_valid_fails_on_missing_required_field() {
+        let bad_resp = ModelResponse {
+            text: String::new(),
+            raw: serde_json::json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "search",
+                    "input": {} // missing required "q"
+                }]
+            }),
+            ..tool_use_resp()
+        };
+        let r = ToolArgsValidGate
+            .evaluate(&tool_req_with_schema(), &bad_resp)
+            .await;
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(
+            r.reason.as_deref().is_some_and(|s| s.contains("search")),
+            "reason must name the failing tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_args_valid_resolves_as_builtin() {
+        // "tool-args-valid" is a built-in id: resolve_gates must return it.
+        let gates = resolve_gates(
+            &["tool-args-valid".to_owned()],
+            &[],
+            &empty_registry(),
+            &Auth::default(),
+            &PriceTable::default(),
+            &reqwest::Client::new(),
+        );
+        assert_eq!(
+            gates.iter().map(|g| g.id()).collect::<Vec<_>>(),
+            ["tool-args-valid"]
         );
     }
 }

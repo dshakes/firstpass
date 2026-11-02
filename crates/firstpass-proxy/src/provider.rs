@@ -111,6 +111,24 @@ impl ModelResponse {
     pub fn truncated(&self) -> bool {
         hit_output_limit(&self.raw)
     }
+
+    /// Whether the response contains at least one tool call.
+    /// Handles Anthropic (`content[*].type == "tool_use"`) and
+    /// OpenAI (`choices[0].message.tool_calls` non-empty) formats.
+    #[must_use]
+    pub fn has_tool_calls(&self) -> bool {
+        // Anthropic: a content array that contains at least one tool_use block.
+        if let Some(blocks) = self.raw.get("content").and_then(Value::as_array) {
+            return blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"));
+        }
+        // OpenAI: choices[0].message.tool_calls is a non-empty array.
+        self.raw
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|tc| !tc.is_empty())
+    }
 }
 
 /// Whether a raw provider response says generation stopped at the output-token limit:
@@ -159,13 +177,19 @@ impl ProviderError {
 
 /// BYOK credentials for one request, extracted from headers with env-var fallback.
 ///
-/// Never logged or persisted — [`std::fmt::Debug`] redacts both fields.
+/// Never logged or persisted — [`std::fmt::Debug`] redacts all credential fields.
 #[derive(Clone, Default)]
 pub struct Auth {
     /// Anthropic API key (`x-api-key` header, or `ANTHROPIC_API_KEY`).
     pub anthropic_key: Option<String>,
-    /// OpenAI API key (`authorization: Bearer ...` header, or `OPENAI_API_KEY`).
+    /// Bearer token from `Authorization: Bearer …` — used as `OpenAI` provider key, and
+    /// as the Anthropic OAuth fallback when no `x-api-key` is present (Claude Code with a
+    /// Claude subscription account sends a Bearer token, not a raw API key).
     pub openai_key: Option<String>,
+    /// `anthropic-beta` header value, forwarded verbatim to the Anthropic endpoint.
+    pub anthropic_beta: Option<String>,
+    /// `anthropic-version` header value. When set, overrides the default `2023-06-01`.
+    pub anthropic_version: Option<String>,
 }
 
 impl std::fmt::Debug for Auth {
@@ -173,13 +197,16 @@ impl std::fmt::Debug for Auth {
         f.debug_struct("Auth")
             .field("anthropic_key", &self.anthropic_key.as_ref().map(|_| "***"))
             .field("openai_key", &self.openai_key.as_ref().map(|_| "***"))
+            .field("anthropic_beta", &self.anthropic_beta)
+            .field("anthropic_version", &self.anthropic_version)
             .finish()
     }
 }
 
 impl Auth {
     /// Extract BYOK credentials from request headers, falling back to `ANTHROPIC_API_KEY` /
-    /// `OPENAI_API_KEY` environment variables.
+    /// `OPENAI_API_KEY` environment variables. Also captures `anthropic-beta` and
+    /// `anthropic-version` for forwarding to the Anthropic endpoint.
     #[must_use]
     pub fn from_headers(headers: &HeaderMap) -> Self {
         let anthropic_key = headers
@@ -193,9 +220,19 @@ impl Auth {
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(str::to_owned)
             .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+        let anthropic_beta = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let anthropic_version = headers
+            .get("anthropic-version")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         Self {
             anthropic_key,
             openai_key,
+            anthropic_beta,
+            anthropic_version,
         }
     }
 }
@@ -339,11 +376,29 @@ impl Provider for AnthropicProvider {
         let body = anthropic_wire_body(req);
 
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .post(url)
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
+        let mut builder = self.http.post(url);
+
+        // Prefer x-api-key; fall back to Authorization: Bearer for OAuth/subscription clients
+        // (e.g. Claude Code with a Claude account sends a Bearer token, not an API key).
+        if !key.is_empty() {
+            builder = builder.header("x-api-key", key);
+        } else if let Some(bearer) = &auth.openai_key {
+            builder = builder.header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {bearer}"),
+            );
+        }
+
+        // Forward anthropic-version (inbound header wins; default to the published stable version).
+        let version = auth.anthropic_version.as_deref().unwrap_or("2023-06-01");
+        builder = builder.header("anthropic-version", version);
+
+        // Forward anthropic-beta verbatim (extended thinking, interleaved-thinking, …).
+        if let Some(beta) = &auth.anthropic_beta {
+            builder = builder.header("anthropic-beta", beta);
+        }
+
+        let resp = builder
             .json(&body)
             .send()
             .await
@@ -2240,6 +2295,8 @@ mod tests {
         let auth = Auth {
             anthropic_key: Some("sk-ant-super-secret".to_owned()),
             openai_key: Some("sk-oai-super-secret".to_owned()),
+            anthropic_beta: None,
+            anthropic_version: None,
         };
         let debug = format!("{auth:?}");
         assert!(!debug.contains("super-secret"));
@@ -2424,5 +2481,169 @@ mod tests {
         assert_eq!(wire["messages"][0]["content"], "be terse");
         assert_eq!(wire["messages"][1]["role"], "user");
         assert_eq!(wire["messages"][2]["role"], "assistant");
+    }
+
+    #[test]
+    fn auth_from_headers_captures_beta_and_version() {
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "sk-ant-key".parse().unwrap());
+        h.insert(
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14".parse().unwrap(),
+        );
+        h.insert("anthropic-version", "2024-01-01".parse().unwrap());
+        let auth = Auth::from_headers(&h);
+        assert_eq!(auth.anthropic_key.as_deref(), Some("sk-ant-key"));
+        assert_eq!(
+            auth.anthropic_beta.as_deref(),
+            Some("interleaved-thinking-2025-05-14")
+        );
+        assert_eq!(auth.anthropic_version.as_deref(), Some("2024-01-01"));
+        assert!(auth.openai_key.is_none());
+    }
+
+    #[test]
+    fn auth_from_headers_bearer_only_sets_openai_key_for_anthropic_fallback() {
+        // A Claude account subscription client: Authorization: Bearer <oauth-token>, no x-api-key.
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer claude-sub-oauth-token".parse().unwrap(),
+        );
+        let auth = Auth::from_headers(&h);
+        assert!(auth.anthropic_key.is_none(), "no x-api-key header");
+        assert_eq!(
+            auth.openai_key.as_deref(),
+            Some("claude-sub-oauth-token"),
+            "Bearer token captured in openai_key for Anthropic Bearer fallback"
+        );
+    }
+
+    /// Verifies that `AnthropicProvider` sends `anthropic-beta`, uses the inbound
+    /// `anthropic-version`, and falls back to `Authorization: Bearer` when no `x-api-key` is
+    /// present — all three changes required for OAuth/subscription clients (e.g. Claude Code).
+    #[tokio::test]
+    async fn anthropic_provider_forwards_beta_version_and_bearer_fallback() {
+        use std::sync::{Arc, Mutex};
+        // Spin up a local axum server that records the incoming request headers.
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap| {
+                *captured_clone.lock().unwrap() = Some(headers);
+                async {
+                    axum::Json(serde_json::json!({
+                        "id": "msg_test", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            api_key_env: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: serde_json::json!({"messages": [{"role":"user","content":"hi"}], "max_tokens": 16}),
+            cache_prefix: false,
+        };
+        let auth = Auth {
+            anthropic_key: None, // no API key — use Bearer fallback
+            openai_key: Some("oauth-bearer-token".to_owned()),
+            anthropic_beta: Some("interleaved-thinking-2025-05-14".to_owned()),
+            anthropic_version: Some("2024-01-01".to_owned()),
+        };
+        provider.complete(&req, &auth).await.expect("must succeed");
+
+        let hdrs = captured.lock().unwrap().take().expect("headers captured");
+        assert!(
+            hdrs.get("x-api-key").is_none(),
+            "x-api-key must be absent when no API key is configured"
+        );
+        assert_eq!(
+            hdrs.get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer oauth-bearer-token"),
+            "OAuth Bearer must be forwarded when x-api-key is absent"
+        );
+        assert_eq!(
+            hdrs.get("anthropic-version").and_then(|v| v.to_str().ok()),
+            Some("2024-01-01"),
+            "inbound anthropic-version must override the default"
+        );
+        assert_eq!(
+            hdrs.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+            Some("interleaved-thinking-2025-05-14"),
+            "anthropic-beta must be forwarded verbatim"
+        );
+    }
+
+    #[test]
+    fn response_has_tool_calls_anthropic_format() {
+        let with_tool = ModelResponse {
+            model: "m".to_owned(),
+            text: String::new(),
+            in_tokens: 0,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 0,
+            raw: serde_json::json!({
+                "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}]
+            }),
+        };
+        assert!(with_tool.has_tool_calls());
+
+        let text_only = ModelResponse {
+            raw: serde_json::json!({"content": [{"type": "text", "text": "hi"}]}),
+            ..with_tool.clone()
+        };
+        assert!(!text_only.has_tool_calls());
+
+        let no_content = ModelResponse {
+            raw: serde_json::Value::Null,
+            ..with_tool.clone()
+        };
+        assert!(!no_content.has_tool_calls());
+    }
+
+    #[test]
+    fn response_has_tool_calls_openai_format() {
+        let with_tc = ModelResponse {
+            model: "m".to_owned(),
+            text: String::new(),
+            in_tokens: 0,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 0,
+            raw: serde_json::json!({
+                "choices": [{"message": {"role": "assistant",
+                    "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "f", "arguments": "{}"}}]
+                }}]
+            }),
+        };
+        assert!(with_tc.has_tool_calls());
+
+        let no_tc = ModelResponse {
+            raw: serde_json::json!({"choices": [{"message": {"content": "hi"}}]}),
+            ..with_tc.clone()
+        };
+        assert!(!no_tc.has_tool_calls());
     }
 }
