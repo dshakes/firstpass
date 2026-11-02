@@ -483,9 +483,14 @@ def escalate_pin(
     actual_tau = max(0, int(tau))
     partial_frac = actual_tau / cheap_steps if cheap_steps > 0 else 0.0
     partial_cheap_obs = cheap_cost * partial_frac
-    overhead = switch_overhead_usd(int(tau), price_top_in, I0, delta)
+    # RESTART semantics: the top model's recorded run starts from scratch, so its recorded cost
+    # already includes its own uncached first read (a cache write of the initial prompt). Adding
+    # a separate "switch overhead" here would charge that read twice. A mid-run HANDOFF would pay
+    # the overhead on the accumulated context instead, but its quality is not identifiable by
+    # replay (The Replay Gap, arXiv 2608.08239), so it is not scored here.
+    del price_top_in  # kept in the signature for the handoff cost-only analysis below
 
-    cost_withcache = partial_cheap_obs + overhead + top_cost
+    cost_withcache = partial_cheap_obs + top_cost
     # Without caching: no switch overhead; scale each model's portion
     cost_nocache = partial_cheap_obs * nc_cheap_factor + top_cost * nc_top_factor
     return top_res, cost_withcache, cost_nocache
@@ -702,11 +707,13 @@ def analyse_ladder(
         f"  escalate-and-pin: {n_switched}/{n} instances trigger escalation at tau={fitted_pin[0]}"
     )
     print(
-        f"  estimated switch overhead per escalated instance: ${avg_overhead:.3f} "
-        f"(context_at_tau={I0 + max(0, int(fitted_pin[0])) * delta:,} tokens × ${price_top_in:.2f}/1M)"
+        f"  [cost-only] a mid-run HANDOFF at this tau would re-read "
+        f"{I0 + max(0, int(fitted_pin[0])) * delta:,} tokens uncached (${avg_overhead:.3f}/instance); "
+        "not charged to escalate-by-restart, whose top-model run already includes it"
     )
     print(
-        "  [validity] post-switch outcome = top model's full recorded run (optimistic for quality, pessimistic for cost)\n"
+        "  [validity] escalate-by-restart = cheap run to the trigger + the top model's own full run "
+        "(exact, no stitching); per-call cascade quality is NOT identifiable by replay\n"
     )
 
 
@@ -788,7 +795,10 @@ def _self_check() -> None:
     res2, cwc2, cnc2 = escalate_pin(row, tau=5.0, I0=1000, delta=300, price_top_in=15.0)
     assert res2 is True and cwc2 > 5.0, "above tau: pay top model + overhead"
     overhead = switch_overhead_usd(5, 15.0, 1000, 300)
-    expected_cwc = 1.0 * (5 / 10) + overhead + 5.0
+    # Restart semantics: partial cheap spend + the top model's full run; no separate overhead
+    # (the top run's own first read is already in its recorded cost).
+    expected_cwc = 1.0 * (5 / 10) + 5.0
+    assert overhead > 0  # the handoff re-read is still computed, for the cost-only illustration
     assert abs(cwc2 - expected_cwc) < 1e-9, f"got {cwc2}, expected {expected_cwc}"
     # switch overhead is present in cwc2 but absent from cnc2 (no-cache has no cache-miss penalty)
     # cnc2 scales up the observed costs by the no-cache multiplier but does NOT add switch overhead
