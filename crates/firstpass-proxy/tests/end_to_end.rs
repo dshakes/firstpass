@@ -57,6 +57,23 @@ async fn anthropic_messages(body: Bytes) -> Response {
     if model.contains("fail5xx") {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "upstream down").into_response();
     }
+    // A tool-using answer: preamble text plus one `tool_use` block.
+    if model.contains("tools") {
+        return Json(json!({
+            "id": "msg_e2e_tools",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [
+                { "type": "text", "text": "Checking the weather." },
+                { "type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                  "input": { "city": "Paris" } },
+            ],
+            "stop_reason": "tool_use",
+            "usage": { "input_tokens": 1000, "output_tokens": 200 },
+        }))
+        .into_response();
+    }
     let text = if model.contains("haiku") {
         ""
     } else {
@@ -600,18 +617,23 @@ async fn responses_api_is_gated_by_the_same_ladder() {
 /// A Responses request that cannot be gated must still reach the **Responses** upstream endpoint.
 ///
 /// Caught in review: the fallback relayed a Responses-shaped body to `/v1/chat/completions`, which
-/// the upstream rejects — breaking the exact client class the endpoint exists to serve. Observe
-/// mode is the reachable fallback here; streaming takes the same path.
+/// the upstream rejects — breaking the exact client class the endpoint exists to serve.
+///
+/// Streaming no longer makes a request un-gateable (it is buffered and re-streamed on enforce
+/// routes), so this uses `previous_response_id` — stateful threading the translation cannot carry —
+/// to force the streaming passthrough fallback.
 #[tokio::test]
 async fn a_responses_request_that_cannot_be_gated_still_reaches_the_responses_endpoint() {
     let upstream = spawn_upstream().await;
-    // No enforce route → every request falls through to observe passthrough.
     let (proxy, _db) = spawn_proxy_with(&upstream, &["anthropic/claude-haiku-4-5"], "", "").await;
 
     let resp = reqwest::Client::new()
         .post(format!("{proxy}/v1/responses"))
         .header("x-api-key", "byok-test")
-        .json(&json!({ "model": "gpt-5.5", "input": "hi", "stream": true }))
+        .json(&json!({
+            "model": "gpt-5.5", "input": "hi", "stream": true,
+            "previous_response_id": "resp_prev",
+        }))
         .send()
         .await
         .unwrap();
@@ -853,4 +875,162 @@ async fn receipt_carries_the_risk_certificate_it_was_served_under() {
     assert!((risk.threshold - 0.5).abs() < 1e-12);
     assert_eq!(risk.alpha, None, "a fixed threshold claims no guarantee");
     verify_chain(&store::load_all_traces(&db).unwrap(), GENESIS_HASH).unwrap();
+}
+
+/// Strict parser for an OpenAI Responses SSE body: every frame is `event: <type>` + `data: <json>`
+/// whose `type` matches, every type is one this test knows, `sequence_number` strictly increases,
+/// the first event is `response.created`, and the stream ends in exactly one terminal event.
+/// Keepalive comments (`: ...`) are skipped as any EventSource parser would.
+fn parse_responses_sse(body: &str) -> Vec<Value> {
+    const KNOWN: &[&str] = &[
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+        "response.failed",
+    ];
+    let mut events: Vec<Value> = Vec::new();
+    for frame in body.split("\n\n").filter(|f| !f.trim().is_empty()) {
+        if frame.starts_with(':') {
+            continue;
+        }
+        let mut lines = frame.lines();
+        let ev = lines.next().unwrap().strip_prefix("event: ").unwrap();
+        let data = lines.next().unwrap().strip_prefix("data: ").unwrap();
+        assert!(lines.next().is_none(), "one data line per frame: {frame}");
+        let v: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(v["type"], ev, "event line and payload type agree");
+        assert!(KNOWN.contains(&ev), "unknown event type {ev}");
+        let seq = v["sequence_number"].as_u64().unwrap();
+        if let Some(prev) = events.last() {
+            assert!(seq > prev["sequence_number"].as_u64().unwrap(), "{seq}");
+        }
+        events.push(v);
+    }
+    assert_eq!(events.first().unwrap()["type"], "response.created");
+    let terminal = |e: &Value| {
+        matches!(
+            e["type"].as_str(),
+            Some("response.completed" | "response.failed")
+        )
+    };
+    assert!(
+        terminal(events.last().unwrap()),
+        "stream ends in a terminal event"
+    );
+    assert_eq!(events.iter().filter(|e| terminal(e)).count(), 1);
+    events
+}
+
+/// Codex's case, end to end: a `stream: true` Responses request on an enforce route. The cheap
+/// rung returns empty text and fails `non-empty`; the next (Anthropic) rung answers with text plus
+/// a `tool_use`, passes, and is re-emitted as a Responses event stream whose deltas reassemble
+/// exactly the served answer. Before this change the request bypassed enforce entirely (relayed
+/// un-gated to the upstream's /v1/responses) and no receipt recorded an escalation.
+#[tokio::test]
+async fn streaming_responses_request_is_gated_and_restreamed() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy(
+        &upstream,
+        &["anthropic/claude-haiku-4-5", "anthropic/claude-tools-5"],
+        "",
+    )
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/responses"))
+        .header("authorization", "Bearer byok-test")
+        .json(&json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": [{ "role": "user", "content": "weather in Paris?" }],
+            "tools": [{ "type": "function", "name": "get_weather", "parameters": {
+                "type": "object", "required": ["city"],
+                "properties": { "city": { "type": "string" } } } }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    let events = parse_responses_sse(&resp.text().await.unwrap());
+
+    let text: String = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_text.delta")
+        .map(|e| e["delta"].as_str().unwrap())
+        .collect();
+    let args: String = events
+        .iter()
+        .filter(|e| e["type"] == "response.function_call_arguments.delta")
+        .map(|e| e["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(text, "Checking the weather.");
+    assert_eq!(
+        serde_json::from_str::<Value>(&args).unwrap(),
+        json!({ "city": "Paris" })
+    );
+
+    let done = &events.last().unwrap()["response"];
+    assert_eq!(events.last().unwrap()["type"], "response.completed");
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["model"], "anthropic/claude-tools-5");
+    assert_eq!(done["output"][0]["content"][0]["text"], text);
+    assert_eq!(done["output"][1]["type"], "function_call");
+    assert_eq!(done["output"][1]["call_id"], "toolu_1");
+    assert_eq!(done["output"][1]["name"], "get_weather");
+    assert_eq!(done["output"][1]["arguments"], args);
+    assert_eq!(
+        done["usage"],
+        json!({ "input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200 })
+    );
+
+    let traces = wait_for_traces(&db, 1).await;
+    assert_eq!(traces.len(), 1);
+    let trace = &traces[0];
+    assert_eq!(trace.request.api, "openai.responses");
+    assert_eq!(
+        trace.attempts.len(),
+        2,
+        "haiku failed the gate, tools rung served"
+    );
+    assert_eq!(trace.attempts[0].verdict, Verdict::Fail);
+    assert_eq!(trace.attempts[1].verdict, Verdict::Pass);
+    assert_eq!(trace.final_.served_rung, Some(1));
+    verify_chain(&traces, GENESIS_HASH).unwrap();
+    let _ = std::fs::remove_file(&db);
+}
+
+/// A streaming Responses request whose ladder fails outright ends in `response.failed`, the
+/// terminal event a Responses client recognises — not an Anthropic-shaped `error` frame it ignores.
+#[tokio::test]
+async fn streaming_responses_ladder_failure_ends_in_response_failed() {
+    let upstream = spawn_upstream().await;
+    let (proxy, db) = spawn_proxy(&upstream, &["anthropic/claude-fail5xx"], "").await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/responses"))
+        .header("authorization", "Bearer byok-test")
+        .json(&json!({ "model": "gpt-5.5", "stream": true, "input": "hi" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let events = parse_responses_sse(&resp.text().await.unwrap());
+    let failed = events.last().unwrap();
+    assert_eq!(failed["type"], "response.failed");
+    assert_eq!(failed["response"]["status"], "failed");
+    assert_eq!(failed["response"]["id"], events[0]["response"]["id"]);
+    assert!(failed["response"]["error"]["message"].is_string());
+    let _ = std::fs::remove_file(&db);
 }
