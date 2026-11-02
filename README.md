@@ -180,7 +180,7 @@ A route for an agent (validated with `firstpass doctor`):
 
 ```toml
 [[route]]
-match  = {}                                    # every request; narrow it with match = { agent = "claude-code" }
+match  = {}                                    # every request; match = { agent = "…" } needs the client to send x-firstpass-agent
 mode   = "enforce"
 ladder = ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
 gates  = ["non-empty", "json-valid", "tool-args-valid"]

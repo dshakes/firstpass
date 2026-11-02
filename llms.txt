@@ -11,8 +11,8 @@ What is genuinely new (the cascade mechanism itself is prior art in the model-ca
 ## Docs
 - [README](README.md): product pitch, the receipt (audit trace), proof-vs-prediction comparison, install, roadmap.
 - [Coding agents guide](https://dshakes.github.io/firstpass/guide/agents.html): Claude Code / Codex / aider setup, header-less session grouping, the `tool-args-valid` gate, and granularity guidance (docs/guide/agents.html).
-- [Routing granularity eval](docs/benchmarks/agent-granularity.md): 500 real SWE-bench agent runs; mid-session escalate-and-pin costs more than always-top at equal quality; workload-level selection is cheaper but non-inferiority at 1 point is not shown; per-repo pool selection is exploratory.
-- [Agent compatibility matrix](docs/benchmarks/agent-compat.md): which agent CLIs were run through the proxy (observe mode, fake upstream) and which were skipped; Gemini inbound protocol unsupported.
+- [Routing granularity eval](https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/agent-granularity.md): 500 real SWE-bench agent runs; mid-session escalate-and-pin costs more than always-top at equal quality; workload-level selection is cheaper but non-inferiority at 1 point is not shown; per-repo pool selection is exploratory.
+- [Agent compatibility matrix](https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/agent-compat.md): which agent CLIs were run through the proxy (observe mode, fake upstream) and which were skipped; Gemini inbound protocol unsupported.
 - [SPEC](SPEC.md): founding spec v0.1 — the source of truth. Positioning (§0), prior art & novelty (§0.1), agent-first tenet (§0.2), architecture (§7), gate framework (§8), trace/feature schema (§9), distribution, milestones (§16).
 - [AGENTS.md](AGENTS.md): agent/contributor onboarding — repo layout, build/test/lint gates, the invariants that must not regress.
 
