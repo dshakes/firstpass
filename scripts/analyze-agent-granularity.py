@@ -97,11 +97,10 @@ def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        with open(fd, "wb") as f:  # fd closed when 'with' exits
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -115,7 +114,7 @@ def load(cache: Path, system: str) -> dict:
             f"{RAW}/{system}/per_instance_details.json", timeout=60
         ) as r:
             _atomic_write(path, r.read())
-    return json.loads(path.read_text())
+    return json.loads(path.read_bytes())
 
 
 def rows_for(cache: Path, ladder: list[str]) -> list[Row]:
@@ -148,14 +147,18 @@ def _fetch_traj(cache: Path, system: str, instance_id: str) -> bytes | None:
     """Fetch trajectory JSON, writing atomically and retrying once on decode failure."""
     # Names come from downloaded data and become cache file names and URL parts: refuse
     # anything that could escape the cache directory or the URL path.
-    if not (_SAFE_NAME.match(system) and _SAFE_NAME.match(instance_id)) or ".." in instance_id:
+    if (
+        not (_SAFE_NAME.match(system) and _SAFE_NAME.match(instance_id))
+        or ".." in instance_id
+    ):
         return None
     path = cache / f"{system}.ctx.{instance_id}.json"
     if path.exists():
         try:
-            json.loads(path.read_text())
-            return path.read_bytes()
-        except (json.JSONDecodeError, OSError):
+            data = path.read_bytes()
+            json.loads(data)
+            return data
+        except (ValueError, OSError):
             path.unlink(missing_ok=True)
     # Fetch (or re-fetch after corrupt cache)
     try:
@@ -512,10 +515,11 @@ def escalate_pin_prereg(
     if cheap_steps < tau:
         return cheap_res, cheap_cost
     actual_tau = max(0, int(tau))
-    if actual_tau == 0:
-        # Escalating before the cheap model has taken a step is not a switch: the top model
-        # just runs, and its recorded cost already includes its own first read.
-        return top_res, top_cost
+    # tau_pin must be >= 1: at least one cheap step runs before any switch.
+    # (tau < 1 is not a valid grid value after pre-registration fix #1.)
+    assert actual_tau >= 1, (
+        f"tau_pin must be >= 1 per pre-registration (start cheap, then switch); got tau={tau}"
+    )
     partial_frac = actual_tau / cheap_steps if cheap_steps > 0 else 0.0
     overhead = switch_overhead_usd(actual_tau, price_top_in, I0, delta)
     return top_res, cheap_cost * partial_frac + overhead + top_cost
@@ -540,11 +544,17 @@ def escalate_pin_restart(row: Row, tau: float) -> tuple[bool, float]:
 def fit_tau_pin_prereg(
     train: list[Row], I0: int, delta: int, price_top_in: float
 ) -> float:
-    """Cross-fit tau_pin for P4 pre-registration variant (switch overhead in objective)."""
+    """Cross-fit tau_pin for P4 pre-registration variant (switch overhead in objective).
+
+    tau_pin >= 1: pre-registration requires at least one cheap step before any switch.
+    -1 is excluded from the grid.
+    """
     steps = sorted(r["runs"][0][2] for r in train)
     grid = sorted(
-        {steps[min(int(q * (len(steps) - 1)), len(steps) - 1)] for q in QUANTILES}
-        | {-1}
+        {
+            max(1, steps[min(int(q * (len(steps) - 1)), len(steps) - 1)])
+            for q in QUANTILES
+        }
     )
     bar = sum(r["runs"][-1][0] for r in train)
 
@@ -558,11 +568,16 @@ def fit_tau_pin_prereg(
 
 
 def fit_tau_pin_restart(train: list[Row]) -> float:
-    """Cross-fit tau_pin for P4 restart-semantics variant (no switch overhead)."""
+    """Cross-fit tau_pin for P4 restart-semantics variant (no switch overhead).
+
+    tau_pin >= 1: mirrors pre-registration constraint (start cheap, then switch).
+    """
     steps = sorted(r["runs"][0][2] for r in train)
     grid = sorted(
-        {steps[min(int(q * (len(steps) - 1)), len(steps) - 1)] for q in QUANTILES}
-        | {-1}
+        {
+            max(1, steps[min(int(q * (len(steps) - 1)), len(steps) - 1)])
+            for q in QUANTILES
+        }
     )
     bar = sum(r["runs"][-1][0] for r in train)
 
@@ -717,7 +732,7 @@ def analyse_ladder(
     arms: dict[str, list[tuple[bool, float]]] = {
         "always-cheap [P1]": always_cheap,
         "always-top [P1]": always_top,
-        "run-level cascade (cross-fit) [P5]": list(fp),  # type: ignore[arg-type]
+        "run-level cascade, proxy for P5 (cross-fit)": list(fp),  # type: ignore[arg-type]
         "per-session / repo (cross-fit) [P3]": list(rp),  # type: ignore[arg-type]
         "escalate-and-pin prereg (cross-fit) [P4]": list(ep_pre),  # type: ignore[arg-type]
         "  escalate-and-pin restart (secondary)": list(ep_rst),  # type: ignore[arg-type]
@@ -931,15 +946,12 @@ def _self_check() -> None:
         f"prereg above tau: got {cwc2}, expected {expected}"
     )
 
-    # escalate_pin_prereg: tau=-1 → no cheap step ran, so no switch and no overhead:
-    # the top model's recorded run already includes its own first read.
-    _, cwc_neg1 = escalate_pin_prereg(
-        row, tau=-1.0, I0=1000, delta=300, price_top_in=15.0
-    )
-    expected_neg1 = 5.0
-    assert abs(cwc_neg1 - expected_neg1) < 1e-9, (
-        f"prereg tau=-1: {cwc_neg1} != {expected_neg1}"
-    )
+    # tau_pin must be >= 1: assert fires if grid ever includes tau < 1
+    try:
+        escalate_pin_prereg(row, tau=0, I0=1000, delta=300, price_top_in=15.0)
+        raise AssertionError("escalate_pin_prereg should assert on tau=0")
+    except AssertionError as e:
+        assert "tau_pin must be >= 1" in str(e), f"unexpected assertion: {e}"
 
     # path-unsafe names never reach the filesystem or the URL
     assert _fetch_traj(Path("/nonexistent"), "sys", "../etc/passwd") is None
@@ -947,10 +959,11 @@ def _self_check() -> None:
     # an arm with zero resolves does not crash the CI
     assert paired_ci([(False, 1.0)] * 4, [(True, 1.0)] * 4, n_boot=10)[2] != ()
 
-    # escalate_pin_restart: no overhead; tau=-1 = top only
-    _, cwc_rst = escalate_pin_restart(row, tau=-1.0)
-    assert abs(cwc_rst - 5.0) < 1e-9, (
-        f"restart tau=-1: cost should be top=5.0, got {cwc_rst}"
+    # escalate_pin_restart: tau=1 (minimum valid per-prereg), partial cheap + top cost
+    _, cwc_rst1 = escalate_pin_restart(row, tau=1.0)
+    # cheap_steps=10, partial_frac=1/10, cheap_cost=1.0, top_cost=5.0
+    assert abs(cwc_rst1 - (1.0 * (1 / 10) + 5.0)) < 1e-9, (
+        f"restart tau=1: expected {1.0 * 0.1 + 5.0}, got {cwc_rst1}"
     )
 
     # escalate_pin_restart: at equality (steps==tau): should escalate
