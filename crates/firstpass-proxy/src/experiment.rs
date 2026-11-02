@@ -1045,7 +1045,7 @@ impl ExperimentMonitor {
             LogRecord::Pair {
                 x_inc,
                 x_ch,
-                incumbent_cost_usd: _,
+                incumbent_cost_usd,
                 challenger_cost_usd,
                 ch_error,
                 ch_truncated,
@@ -1100,6 +1100,12 @@ impl ExperimentMonitor {
                 // health and spend were tallied in `spawn_paired_challenger` before append.
                 let is_own = *record_replica_id == self.replica_id;
                 if !already_applied && !is_own {
+                    // The originating replica counted the incumbent's cost when it served the
+                    // request; every other replica learns it only from the log. Without this a
+                    // cluster's incumbent looks ~N times cheaper and a certified, cheaper
+                    // challenger would be reported "certified, no saving" instead of "adopt".
+                    e.experiment
+                        .observe_cost(Arm::Incumbent, *incumbent_cost_usd);
                     if *ch_error || *ch_truncated > 0 {
                         e.health.challenger.errors += u64::from(*ch_error);
                         e.health.challenger.truncated += *ch_truncated;
@@ -4618,6 +4624,37 @@ mod tests {
             )
             .await;
         assert!(!appended, "a timed-out append is not in the log");
+    }
+
+    /// A replica that did not serve the incumbent request still learns its cost from the log, so
+    /// the incumbent's $/request is not deflated in a cluster.
+    #[tokio::test]
+    async fn remote_pairs_carry_the_incumbent_cost() {
+        let shared = Arc::new(InMemoryExperimentLog::new());
+        let a = ExperimentMonitor::from_config(&config())
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+        let b = ExperimentMonitor::from_config(&config())
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+        assert!(
+            a.record_pair(
+                "t",
+                0,
+                &fp(),
+                1.0,
+                1.0,
+                0.10,
+                0.02,
+                false,
+                0,
+                0,
+                Uuid::now_v7()
+            )
+            .await
+        );
+        b.sync_from_backend("t", 0, &fp()).await.unwrap();
+        let inc = b.reports()[0].report.incumbent.clone();
+        assert_eq!(inc.requests, 1, "{inc:?}");
+        assert!((inc.cost_usd - 0.10).abs() < 1e-12, "{inc:?}");
     }
 
     /// A pair stored twice in the local table is replayed once at startup.

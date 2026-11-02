@@ -310,9 +310,12 @@ pub fn build_paired_ledger(config: &ProxyConfig, shared_log: bool) -> crate::sha
             // that were never confirmed as pushed.  Unknown rows are treated conservatively:
             // they count against the spend cap (safe to over-count) but not evidence.
             // Without a shared log, seed from all pairs (original behaviour).
+            // A pair stored twice (the table has no unique trace_id) is debited once.
+            let mut seen = std::collections::HashSet::new();
             for row in rows
                 .iter()
                 .filter(|r| !shared_log || r.in_log != crate::store::InLogStatus::InLog)
+                .filter(|r| r.trace_id.is_nil() || seen.insert(r.trace_id))
             {
                 ledger.seed(
                     &row.tenant,
@@ -1631,13 +1634,10 @@ fn spawn_paired_challenger(
             return;
         }
 
-        // Issue 4 (in-flight staleness): with a shared log the originating replica only learns
-        // its own spend after append + read-back (`apply_log_record` seeds the ledger). Between
-        // `may_spend` here and the read-back a concurrent pair on this replica could also pass
-        // the cap check. We accept this soft-cap overshoot (bounded by concurrent in-flight
-        // paired calls × cost/call) rather than adding optimistic debit + per-record origin
-        // tagging to avoid double-seeding. `ensure_synced` above ensures the cluster state is
-        // fresh at the start of the first evaluation per process lifetime.
+        // The cap is soft by design: this replica debits its own spend when each evaluation
+        // completes (and skips its own records on log replay, by replica_id), so concurrent
+        // evaluations already in flight here can overshoot by at most their own cost; other
+        // replicas' spend arrives via the log within one sync interval.
         let now = jiff::Timestamp::now();
         if !state
             .paired_ledger
