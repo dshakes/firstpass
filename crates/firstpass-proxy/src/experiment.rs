@@ -1649,6 +1649,10 @@ pub fn monitor_from_traces(
         let mut map = monitor.lock();
         if let Some(e) = monitor.entry(&mut map, &row.tenant, row.route_ix) {
             if monitor.fingerprint(row.route_ix) == Some(row.fingerprint.as_str()) {
+                // The same pair stored twice (the table has no unique trace_id) counts once.
+                if !row.trace_id.is_nil() && e.applied_pair_ids.contains(&row.trace_id) {
+                    continue;
+                }
                 if e.experiment.observe_pair(row.x_inc, row.x_ch) {
                     e.experiment
                         .observe_cost(Arm::Challenger, row.challenger_cost_usd);
@@ -4614,6 +4618,29 @@ mod tests {
             )
             .await;
         assert!(!appended, "a timed-out append is not in the log");
+    }
+
+    /// A pair stored twice in the local table is replayed once at startup.
+    #[test]
+    fn startup_replay_counts_a_duplicated_pair_row_once() {
+        let tid = Uuid::now_v7();
+        let row = crate::store::ExperimentPairRow {
+            tenant: "t".to_owned(),
+            route_ix: 0,
+            fingerprint: fp(),
+            trace_id: tid,
+            x_inc: 1.0,
+            x_ch: 0.0,
+            challenger_cost_usd: 0.05,
+            ch_error: true,
+            ch_truncated: 0,
+            ts: jiff::Timestamp::now(),
+            in_log: crate::store::InLogStatus::NotInLog,
+        };
+        let m = monitor_from_traces(&[], &[], &[row.clone(), row], &config());
+        let r = &m.reports()[0];
+        assert_eq!(r.report.pairs, 1);
+        assert_eq!(r.health.challenger.errors, 1);
     }
 
     /// On ONE monitor: synced state stays trusted only within the staleness bound. Once the log

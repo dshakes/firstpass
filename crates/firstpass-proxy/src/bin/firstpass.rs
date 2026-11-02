@@ -730,24 +730,25 @@ fn cmd_experiment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut pairs = store::load_all_experiment_pairs(db)?;
     // Tenant boundary: `--tenant` scopes paired evidence too, not only the traces.
     pairs.retain(|r| r.tenant == tenant);
-    // With a shared log the cluster's evidence lives in the log, not in this store. Apply the
-    // same rule the server uses at startup: only rows the log never received (`NotInLog`) are
-    // evidence here; `InLog` rows belong to the log and legacy `Unknown` rows are withheld.
+    // With a shared log the cluster's evidence lives in the log; this store holds only the pairs
+    // THIS replica evaluated. Report them as a single-replica snapshot (its InLog and NotInLog
+    // rows) and withhold legacy rows of unknown status, as the server does.
     let has_shared_log = routing
         .routes
         .iter()
         .any(|r| r.challenger.as_ref().is_some_and(|c| c.redis_url.is_some()));
     if has_shared_log {
-        pairs.retain(|r| r.in_log == store::InLogStatus::NotInLog);
+        pairs.retain(|r| r.in_log != store::InLogStatus::Unknown);
     }
     let reports = experiment::experiments_from_traces(&traces, &deferred, &pairs, routing);
     let views = experiment::views(reports, routing);
-    if has_shared_log && !json {
+    // Always to stderr (also with --json, whose stdout stays machine-readable).
+    if has_shared_log {
         eprintln!(
-            "Note: a shared experiment log is configured, so this report covers only the pairs\n\
-             this store holds locally (those the log never received). The cluster's evidence\n\
-             lives in the log; a replica's /v1/experiments and panel reflect it once that\n\
-             replica has served traffic on the route.\n"
+            "Note: a shared experiment log is configured. This is a single-replica snapshot: it\n\
+             covers the pairs this replica evaluated, not the cluster. The cluster's evidence lives\n\
+             in the log; a replica's /v1/experiments and panel reflect it once that replica has\n\
+             served traffic on the route.\n"
         );
     }
 
