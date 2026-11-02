@@ -4,24 +4,16 @@
 Compares routing granularities on n=500 SWE-bench Verified mini-SWE-agent instances.
 Policies and decision rules pre-registered in docs/benchmarks/agent-granularity-preregistration.md.
 
-Corrections vs initial draft (see Deviations section in results doc):
-  - P4 trigger: >= tau_pin (was > tau_pin, off-by-one vs pre-registration)
-  - Per-call cascade (P5): whole recorded runs, quality IS identifiable; previous "not identifiable"
-    label was wrong
-  - Removed "est. no caching" column: mixed-model nc-factor scaling is invalid
-  - Random arm (P6) implemented
-  - _traj_context: I_0 = system + first user message only (was summing all user messages)
-  - P3-pool added: per-session from 11-model pool to isolate pool-vs-granularity confound
-  - n_switched uses fold-specific fitted tau
-
 Usage: analyze-agent-granularity.py [CACHE_DIR]  |  analyze-agent-granularity.py --self-check
 """
 
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
+import tempfile
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -60,8 +52,10 @@ POOL = [
     )
 ]
 SELECT_EPS = 0.01
+# Index of the quality-reference model (claude-4-5-opus-high) within POOL.
+POOL_REF_IDX: int = next(k for k, s in enumerate(POOL) if "claude-4-5-opus-high" in s)
 
-# Price table ($/1M tokens); used only for the handoff re-read illustration.
+# Price table: $/1M tokens. Used for P4 switch-overhead and the handoff illustration.
 MODEL_PRICES: dict[str, tuple[float, float]] = {
     "claude-4-5-haiku-high": (1.0, 5.0),
     "claude-4-5-sonnet-high": (3.0, 15.0),
@@ -79,12 +73,13 @@ MODEL_PRICES: dict[str, tuple[float, float]] = {
 
 CACHE_WRITE_MULT = 1.25
 CACHE_READ_MULT = 0.1
-CHARS_PER_TOKEN = 2.5  # for role-based trajectory format only
+CHARS_PER_TOKEN = 2.5  # role-based trajectory format only
 
 FALLBACK_I0 = 2333
 FALLBACK_DELTA = 574
 FALLBACK_OUT = 219
 CALIB_N = 20
+CALIB_SEED = 42  # seeded random for calibration sample (not alphabetical)
 
 QUANTILES = [i / 10 for i in range(11)]
 EPS_GRID = [0.0, 0.05, 0.1, 0.2, 0.3]
@@ -96,14 +91,25 @@ Row = dict  # {"id", "repo", "runs": [Run]}
 # ── data loading ──────────────────────────────────────────────────────────────
 
 
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write data atomically via a temp file in the same directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
 def load(cache: Path, system: str) -> dict:
     path = cache / f"{system}.json"
     if not path.exists():
-        cache.mkdir(parents=True, exist_ok=True)
         with urllib.request.urlopen(
             f"{RAW}/{system}/per_instance_details.json", timeout=60
         ) as r:
-            path.write_bytes(r.read())
+            _atomic_write(path, r.read())
     return json.loads(path.read_text())
 
 
@@ -127,7 +133,27 @@ def rows_for(cache: Path, ladder: list[str]) -> list[Row]:
     ]
 
 
-# ── context model: calibrated from trajectory sample ─────────────────────────
+# ── context model ─────────────────────────────────────────────────────────────
+
+
+def _fetch_traj(cache: Path, system: str, instance_id: str) -> bytes | None:
+    """Fetch trajectory JSON, writing atomically and retrying once on decode failure."""
+    path = cache / f"{system}.ctx.{instance_id}.json"
+    if path.exists():
+        try:
+            json.loads(path.read_text())
+            return path.read_bytes()
+        except (json.JSONDecodeError, OSError):
+            path.unlink(missing_ok=True)
+    # Fetch (or re-fetch after corrupt cache)
+    try:
+        url = TRAJ.format(s=system, i=instance_id)
+        with urllib.request.urlopen(url, timeout=30) as r:
+            raw = r.read()
+    except OSError:
+        return None
+    _atomic_write(path, raw)
+    return raw
 
 
 def _traj_context(
@@ -135,25 +161,19 @@ def _traj_context(
 ) -> tuple[int, int, int] | None:
     """(I_0, step_delta, out_per_step) in tokens.
 
-    I_0 = system prompt + first user message (the initial problem statement only).
-    Later user/tool/assistant messages count toward per-step growth (delta).
+    I_0 = system prompt + first user message only.
+    Later messages count toward per-step growth (delta).
 
     Two formats:
-    - OpenAI Responses API: response objects with 'usage' field give authoritative per-step counts.
+    - OpenAI Responses API: 'usage' field per response gives authoritative token counts.
     - Claude role-based: char-length estimate; I_0 from system + FIRST user message only.
     """
-    path = cache / f"{system}.ctx.{instance_id}.json"
-    if not path.exists():
-        try:
-            url = TRAJ.format(s=system, i=instance_id)
-            with urllib.request.urlopen(url, timeout=30) as r:
-                raw = r.read()
-        except OSError:
-            return None
-        path.write_bytes(raw)
+    raw = _fetch_traj(cache, system, instance_id)
+    if raw is None:
+        return None
     try:
-        d = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
+        d = json.loads(raw)
+    except json.JSONDecodeError:
         return None
     msgs = d.get("messages") or d.get("history") or []
     if not msgs:
@@ -190,7 +210,6 @@ def _traj_context(
         chars += sum(len(json.dumps(t)) for t in tc)
         return int(chars / CHARS_PER_TOKEN)
 
-    # I_0 = system + FIRST user message only; subsequent messages count toward delta.
     system_len = 0
     first_user_len = 0
     seen_first_user = False
@@ -214,8 +233,9 @@ def _traj_context(
 
 
 def calibrate_context(cache: Path, system: str, ids: list[str]) -> tuple[int, int, int]:
-    """Median (I_0, delta, out_per_step) from up to CALIB_N trajectories."""
-    sample = ids[:CALIB_N]
+    """Median (I_0, delta, out_per_step) from CALIB_N seeded-random trajectory samples."""
+    rng = random.Random(CALIB_SEED)
+    sample = rng.sample(ids, min(CALIB_N, len(ids)))
 
     def fetch(i: str) -> tuple[int, int, int] | None:
         return _traj_context(cache, system, i)
@@ -238,7 +258,7 @@ def calibrate_context(cache: Path, system: str, ids: list[str]) -> tuple[int, in
     delta = median([r[1] for r in valid])
     out = median([r[2] for r in valid])
     print(
-        f"  [context model] calibrated from {len(valid)}/{len(sample)}: "
+        f"  [context model] seeded-random sample ({len(valid)}/{len(sample)}): "
         f"I_0={I_0}, delta={delta}, out_per_step={out}"
     )
     return I_0, delta, out
@@ -253,12 +273,13 @@ def get_price(system: str) -> tuple[float, float]:
     return MODEL_PRICES.get(model_suffix(system), (0.0, 0.0))
 
 
-# ── cost model (used only for handoff re-read illustration) ───────────────────
+# ── cost model ────────────────────────────────────────────────────────────────
 
 
 def nocache_cost(
     N: int, I0: int, delta: int, out: int, price_in: float, price_out: float
 ) -> float:
+    """Estimated cost without provider caching (flat token pricing)."""
     total_in = sum(I0 + k * delta for k in range(N))
     return (total_in * price_in + N * out * price_out) / 1e6
 
@@ -266,20 +287,29 @@ def nocache_cost(
 def withcache_cost(
     N: int, I0: int, delta: int, out: int, price_in: float, price_out: float
 ) -> float:
+    """Estimated cost with prefix caching (1.25× write, 0.1× read).
+
+    At step k (k=0..N-1):
+      k=0: write I0 tokens (no prior cache); output out tokens.
+      k>=1: read cached prefix I0+(k-1)*delta at 0.1×; write delta new tokens at 1.25×.
+    """
     if N == 0:
         return 0.0
     cost = I0 * CACHE_WRITE_MULT * price_in / 1e6 + out * price_out / 1e6
     for k in range(1, N):
-        prefix = I0 + k * delta
+        prefix = I0 + (k - 1) * delta  # cached prefix BEFORE this step's new tokens
         cost += (prefix * CACHE_READ_MULT + delta * CACHE_WRITE_MULT) * price_in / 1e6
         cost += out * price_out / 1e6
     return cost
 
 
 def switch_overhead_usd(tau: int, price_top_in: float, I0: int, delta: int) -> float:
-    """Cost for top model's uncached re-read of prefix at a mid-run HANDOFF point.
-    Not charged to escalate-by-restart (top model's recorded run already paid its first read).
-    tau < 0 treated as 0 (switch before any cheap step: context = I_0 only)."""
+    """Cost for top model's uncached re-read of accumulated context at a mid-session switch.
+
+    Pre-registration P4 cost model: the top model's first call pays the full (uncached) input
+    price for the prefix accumulated by the cheap model.
+    tau < 0 is treated as 0 (switch before any cheap step: context = I_0 only).
+    """
     actual_steps = max(0, tau)
     return (I0 + actual_steps * delta) * price_top_in / 1e6
 
@@ -297,7 +327,7 @@ def paired_ci(
     n_boot: int = 4000,
     seed: int = 42,
 ) -> list[tuple[float, float]]:
-    """Paired bootstrap CI a − b: [Δresolved-rate, Δ$/instance, Δ$/resolved] (95%)."""
+    """Paired bootstrap CI a − b: [Δresolved-rate, Δ$/inst, Δ$/resolved] (95%)."""
     n = len(a)
     rng = random.Random(seed)
     dr, dc, dp = [], [], []
@@ -319,9 +349,8 @@ def paired_ci(
 
 
 def cascade(row: Row, taus: list[float]) -> tuple[bool, float]:
-    """Run-level cascade (P5): run cheap model to completion; if cheap api_calls <= tau
-    serve cheap outcome; else run top model from scratch. Both are whole recorded runs —
-    no stitching, quality IS identifiable."""
+    """Run-level cascade (P5): run cheap to completion; if api_calls <= tau serve cheap,
+    else run top from scratch. Both are whole recorded runs; quality IS identifiable."""
     spent = 0.0
     for k, (ok, cost, steps) in enumerate(row["runs"]):
         spent += cost
@@ -345,15 +374,14 @@ def oracle_predictive(row: Row) -> tuple[bool, float]:
 
 
 def random_arm(rows: list[Row], seed: int = 42) -> list[tuple[bool, float]]:
-    """P6 random: serve cheap or top with equal probability per instance (seeded)."""
+    """P6 random: cheap or top with equal probability per instance (seeded)."""
     rng = random.Random(seed)
-    result = []
-    for r in rows:
-        if rng.random() < 0.5:
-            result.append((r["runs"][0][0], r["runs"][0][1]))
-        else:
-            result.append((r["runs"][-1][0], r["runs"][-1][1]))
-    return result
+    return [
+        (r["runs"][0][0], r["runs"][0][1])
+        if rng.random() < 0.5
+        else (r["runs"][-1][0], r["runs"][-1][1])
+        for r in rows
+    ]
 
 
 def fit_taus(train: list[Row]) -> list[float]:
@@ -383,28 +411,52 @@ def fit_taus(train: list[Row]) -> list[float]:
 
 
 def repo_router(train: list[Row], eps: float):
+    """Route each instance to the cheapest model within eps of the best resolve rate.
+
+    For each repo (or overall if unseen): compute per-rung resolve rates and average costs
+    on training instances, then pick the minimum-cost rung whose rate is within eps of max.
+    This is the same selection rule as select_cheapest (cheapest within quality band).
+    """
     n_rungs = len(train[0]["runs"])
-    stats: dict[str, list[list[int]]] = {}
+    # per-repo: [resolved_sum, count, cost_sum] per rung
+    stats: dict[str, list[list[float]]] = {}
     for r in train:
-        s = stats.setdefault(r["repo"], [[0, 0] for _ in range(n_rungs)])
-        for k, (ok, _, _) in enumerate(r["runs"]):
+        s = stats.setdefault(r["repo"], [[0.0, 0.0, 0.0] for _ in range(n_rungs)])
+        for k, (ok, cost, _) in enumerate(r["runs"]):
             s[k][0] += ok
-            s[k][1] += 1
-    overall = [sum(r["runs"][k][0] for r in train) / len(train) for k in range(n_rungs)]
+            s[k][1] += 1.0
+            s[k][2] += cost
+    overall_rate = [
+        sum(r["runs"][k][0] for r in train) / len(train) for k in range(n_rungs)
+    ]
+    overall_avg_cost = [
+        sum(r["runs"][k][1] for r in train) / len(train) for k in range(n_rungs)
+    ]
 
     def route(row: Row) -> tuple[bool, float]:
         s = stats.get(row["repo"])
-        rates = [s[k][0] / s[k][1] for k in range(n_rungs)] if s else overall
-        k = next(k for k in range(n_rungs) if rates[k] >= max(rates) - eps)
+        if s:
+            rates = [s[k][0] / s[k][1] for k in range(n_rungs)]
+            avg_costs = [s[k][2] / s[k][1] for k in range(n_rungs)]
+        else:
+            rates = overall_rate
+            avg_costs = overall_avg_cost
+        eligible = [k for k in range(n_rungs) if rates[k] >= max(rates) - eps]
+        k = min(eligible, key=lambda k: avg_costs[k])
         ok, cost, _ = row["runs"][k]
         return ok, cost
 
     return route
 
 
-def fit_eps(train: list[Row]) -> float:
+def fit_eps(train: list[Row], ref_idx: int = -1) -> float:
+    """Cross-fit eps: cheapest eps (from EPS_GRID) where repo router resolved >= ref model.
+
+    ref_idx: index into row["runs"] of the quality reference model. Default -1 (last rung)
+    is correct for 2-model ladders. For the 11-model pool pass POOL_REF_IDX (opus-high).
+    """
     routers = {eps: repo_router(train, eps) for eps in EPS_GRID}
-    bar = sum(r["runs"][-1][0] for r in train)
+    bar = sum(r["runs"][ref_idx][0] for r in train)
     scored = [
         (
             sum(routers[eps](r)[0] for r in train),
@@ -428,30 +480,48 @@ def select_cheapest(train: list[list[tuple[bool, float]]], eps: float) -> int:
     return min(ok, key=lambda k: costs[k])
 
 
-# ── P4: escalate-and-pin (escalate-by-restart) ───────────────────────────────
+# ── P4: escalate-and-pin, two variants ───────────────────────────────────────
 
 
-def escalate_pin(row: Row, tau: float) -> tuple[bool, float]:
-    """Escalate-by-restart (P4): escalate when cheap api_calls >= tau_pin (pre-reg rule).
+def escalate_pin_prereg(
+    row: Row, tau: float, I0: int, delta: int, price_top_in: float
+) -> tuple[bool, float]:
+    """P4 (pre-registration): partial_cheap + switch_overhead + top_cost.
 
-    Post-switch outcome = top model's own full recorded run (restart; no stitching).
-    Cost = partial cheap spend (proportional to tau/cheap_steps) + top model full run.
-    tau = -1 means always escalate with zero partial cheap spend.
+    Pre-registration cost model: the top model's first call re-reads the accumulated
+    prefix at the full uncached input rate (switch_overhead). This is the PRIMARY P4 arm.
+    Trigger: escalate when cheap api_calls >= tau_pin.
     """
     cheap_res, cheap_cost, cheap_steps = row["runs"][0]
     top_res, top_cost, _ = row["runs"][-1]
-
-    # Pre-registration: keep cheap if api_calls < tau_pin; escalate if api_calls >= tau_pin
     if cheap_steps < tau:
         return cheap_res, cheap_cost
+    actual_tau = max(0, int(tau))
+    partial_frac = actual_tau / cheap_steps if cheap_steps > 0 else 0.0
+    overhead = switch_overhead_usd(actual_tau, price_top_in, I0, delta)
+    return top_res, cheap_cost * partial_frac + overhead + top_cost
 
+
+def escalate_pin_restart(row: Row, tau: float) -> tuple[bool, float]:
+    """P4 restart-semantics (secondary): partial_cheap + top_cost.
+
+    No separate switch overhead because the top model restarts from scratch and its
+    full recorded run cost already includes its own first (uncached) read. Listed as
+    a deviation in the results doc.
+    """
+    cheap_res, cheap_cost, cheap_steps = row["runs"][0]
+    top_res, top_cost, _ = row["runs"][-1]
+    if cheap_steps < tau:
+        return cheap_res, cheap_cost
     actual_tau = max(0, int(tau))
     partial_frac = actual_tau / cheap_steps if cheap_steps > 0 else 0.0
     return top_res, cheap_cost * partial_frac + top_cost
 
 
-def fit_tau_pin(train: list[Row]) -> float:
-    """Cross-fit tau_pin: cheapest tau (step-count quantile grid) where resolved >= always-top."""
+def fit_tau_pin_prereg(
+    train: list[Row], I0: int, delta: int, price_top_in: float
+) -> float:
+    """Cross-fit tau_pin for P4 pre-registration variant (switch overhead in objective)."""
     steps = sorted(r["runs"][0][2] for r in train)
     grid = sorted(
         {steps[min(int(q * (len(steps) - 1)), len(steps) - 1)] for q in QUANTILES}
@@ -460,7 +530,25 @@ def fit_tau_pin(train: list[Row]) -> float:
     bar = sum(r["runs"][-1][0] for r in train)
 
     def run_policy(tau: float) -> tuple[int, float]:
-        outs = [escalate_pin(r, tau) for r in train]
+        outs = [escalate_pin_prereg(r, tau, I0, delta, price_top_in) for r in train]
+        return sum(o for o, _ in outs), sum(c for _, c in outs)
+
+    scored = [(*run_policy(tau), tau) for tau in grid]
+    feasible = [(cost, tau) for ok, cost, tau in scored if ok >= bar]
+    return min(feasible)[1] if feasible else max(scored, key=lambda x: (x[0], -x[1]))[2]
+
+
+def fit_tau_pin_restart(train: list[Row]) -> float:
+    """Cross-fit tau_pin for P4 restart-semantics variant (no switch overhead)."""
+    steps = sorted(r["runs"][0][2] for r in train)
+    grid = sorted(
+        {steps[min(int(q * (len(steps) - 1)), len(steps) - 1)] for q in QUANTILES}
+        | {-1}
+    )
+    bar = sum(r["runs"][-1][0] for r in train)
+
+    def run_policy(tau: float) -> tuple[int, float]:
+        outs = [escalate_pin_restart(r, tau) for r in train]
         return sum(o for o, _ in outs), sum(c for _, c in outs)
 
     scored = [(*run_policy(tau), tau) for tau in grid]
@@ -472,7 +560,6 @@ def fit_tau_pin(train: list[Row]) -> float:
 
 
 def load_pool_data(cache: Path) -> tuple[list[str], list[dict]]:
-    """Returns (sorted_ids, list_of_per_instance_dicts_per_model)."""
     data = [load(cache, s) for s in POOL]
     ids = sorted(set.intersection(*(set(d) for d in data)))
     return ids, data
@@ -491,16 +578,18 @@ def workload_selection(
         select_cheapest(res[0::2], SELECT_EPS),
     ]
     sel = [r[picks[j % 2]] for j, r in enumerate(res)]
-    ref_idx = next(k for k, s in enumerate(POOL) if "opus-high" in s and "4-5" in s)
-    ref = [r[ref_idx] for r in res]
+    ref = [r[POOL_REF_IDX] for r in res]
     return {"pool-selection (P2, cross-fit)": sel, "always-opus (pool ref)": ref}
 
 
 def pool_session_selection(
     ids: list[str], data: list[dict]
 ) -> tuple[list[tuple[bool, float]], list[float]]:
-    """P3-pool: per-session repo-level selection from 11-model pool, cross-fit.
-    Returns (outcomes, fitted_eps_vals)."""
+    """P3-pool: per-session repo-level selection from 11-model pool (cross-fit).
+
+    Uses POOL_REF_IDX as the quality bar for fit_eps (opus-high, not minimax).
+    repo_router picks the cheapest eligible model, not the first in list order.
+    """
     rows = [
         {
             "id": i,
@@ -522,7 +611,7 @@ def pool_session_selection(
     fitted_eps_vals = []
     for h in (0, 1):
         train = halves[1 - h]
-        eps_val = fit_eps(train)
+        eps_val = fit_eps(train, ref_idx=POOL_REF_IDX)
         fitted_eps_vals.append(eps_val)
         route = repo_router(train, eps_val)
         for j in range(h, n, 2):
@@ -539,14 +628,14 @@ def analyse_ladder(
     ladder: list[str],
     ctx: tuple[int, int, int],
 ) -> tuple[list[str], list[tuple[bool, float]]]:
-    """Analyse one ladder. Returns (instance_ids, p3_outcomes) for cross-ladder comparison."""
+    """Analyse one ladder. Returns (instance_ids, p3_outcomes) for cross-ladder CI."""
     rows = rows_for(cache, ladder)
     n = len(rows)
     cheap_sys, top_sys = ladder[0], ladder[-1]
     price_top_in = get_price(top_sys)[0]
     I0, delta, out_per_step = ctx
 
-    # Compute avg nc_factor for cheap model (informational only; not in table)
+    # Informational: avg nc_factor for cheap model (not in table; pure-analytical estimate)
     price_cheap_in, price_cheap_out = get_price(cheap_sys)
     cheap_nc_factors = []
     for row in rows:
@@ -568,51 +657,54 @@ def analyse_ladder(
     halves = [rows[0::2], rows[1::2]]
     fp: list[tuple[bool, float] | None] = [None] * n
     rp: list[tuple[bool, float] | None] = [None] * n
-    ep: list[tuple[bool, float] | None] = [None] * n
+    ep_pre: list[tuple[bool, float] | None] = [None] * n
+    ep_rst: list[tuple[bool, float] | None] = [None] * n
     fitted_cascade: list[list[float]] = []
-    fitted_pin: list[float] = []
+    fitted_pin_pre: list[float] = []
+    fitted_pin_rst: list[float] = []
     fitted_eps_val: list[float] = []
 
     for h in (0, 1):
         train = halves[1 - h]
         taus = fit_taus(train)
-        tau_pin = fit_tau_pin(train)
-        eps_val = fit_eps(train)
+        tau_pre = fit_tau_pin_prereg(train, I0, delta, price_top_in)
+        tau_rst = fit_tau_pin_restart(train)
+        eps_val = fit_eps(train)  # 2-model ladder: ref_idx=-1 (top = last = correct)
         route = repo_router(train, eps_val)
         fitted_cascade.append(taus)
-        fitted_pin.append(tau_pin)
+        fitted_pin_pre.append(tau_pre)
+        fitted_pin_rst.append(tau_rst)
         fitted_eps_val.append(eps_val)
         for j in range(h, n, 2):
             fp[j] = cascade(rows[j], taus)
             rp[j] = route(rows[j])
-            ep[j] = escalate_pin(rows[j], tau_pin)
+            ep_pre[j] = escalate_pin_prereg(rows[j], tau_pre, I0, delta, price_top_in)
+            ep_rst[j] = escalate_pin_restart(rows[j], tau_rst)
 
     print(f"## {name}  (n={n})\n")
     print(
         f"cascade tau per fold: {fitted_cascade}  repo-eps per fold: {fitted_eps_val}"
     )
-    print(f"escalate-by-restart tau per fold: {fitted_pin}")
+    print(f"P4 tau per fold: prereg={fitted_pin_pre}  restart={fitted_pin_rst}")
     print(
-        f"context model (cheap model only): I_0={I0}, delta={delta}, "
-        f"out/step={out_per_step} tokens  (avg nc_factor={avg_cheap_nc:.2f}×)"
+        f"context model (cheap model, seeded-random sample): "
+        f"I_0={I0}, delta={delta}, out/step={out_per_step}  (avg nc_factor={avg_cheap_nc:.2f}×)"
     )
     print()
 
     always_cheap = [(r["runs"][0][0], r["runs"][0][1]) for r in rows]
     always_top = [(r["runs"][-1][0], r["runs"][-1][1]) for r in rows]
-    rand = random_arm(rows)
-    oracle_pi = [oracle_predictive(r) for r in rows]
-    oracle_cas = [oracle_cascade(r) for r in rows]
 
     arms: dict[str, list[tuple[bool, float]]] = {
         "always-cheap [P1]": always_cheap,
         "always-top [P1]": always_top,
         "run-level cascade (cross-fit) [P5]": list(fp),  # type: ignore[arg-type]
         "per-session / repo (cross-fit) [P3]": list(rp),  # type: ignore[arg-type]
-        "escalate-by-restart (cross-fit) [P4]": list(ep),  # type: ignore[arg-type]
-        "random (seed=42) [P6]": rand,
-        "oracle-per-instance (bound) [P6]": oracle_pi,
-        "oracle-cascade (bound)": oracle_cas,
+        "escalate-and-pin prereg (cross-fit) [P4]": list(ep_pre),  # type: ignore[arg-type]
+        "  escalate-and-pin restart (secondary)": list(ep_rst),  # type: ignore[arg-type]
+        "random (seed=42) [P6]": random_arm(rows),
+        "oracle-per-instance (bound) [P6]": [oracle_predictive(r) for r in rows],
+        "oracle-cascade (bound)": [oracle_cascade(r) for r in rows],
     }
     top_wc = arms["always-top [P1]"]
 
@@ -633,29 +725,30 @@ def analyse_ladder(
         )
     print()
 
-    # Escalate-by-restart summary and handoff re-read illustration
-    n_switched_folds = [0, 0]
-    for j, row in enumerate(rows):
-        fold = j % 2
-        tau = fitted_pin[fold]
-        if row["runs"][0][2] >= int(tau):  # >= per pre-registration
-            n_switched_folds[fold] += 1
-    n_switched = sum(n_switched_folds)
-
-    print(
-        f"  escalate-by-restart: {n_switched_folds[0]}/{n // 2} (fold 0, tau={fitted_pin[0]}) "
-        f"+ {n_switched_folds[1]}/{n - n // 2} (fold 1, tau={fitted_pin[1]}) "
-        f"= {n_switched}/{n} trigger"
-    )
-    for fold_h, tau_p in enumerate(fitted_pin):
-        context_toks = I0 + max(0, int(tau_p)) * delta
-        overhead = switch_overhead_usd(int(tau_p), price_top_in, I0, delta)
+    # P4 breakdown
+    for label, fitted_pin, ep_list in [
+        ("prereg", fitted_pin_pre, ep_pre),
+        ("restart", fitted_pin_rst, ep_rst),
+    ]:
+        n_sw = [0, 0]
+        for j, row in enumerate(rows):
+            fold = j % 2
+            tau = fitted_pin[fold]
+            if row["runs"][0][2] >= int(tau):
+                n_sw[fold] += 1
         print(
-            f"  [handoff illustration, fold {fold_h}] a mid-run HANDOFF at tau={tau_p} "
-            f"would re-read {context_toks:,} tokens uncached "
-            f"(est. ${overhead:.3f}/inst from context model, cheap-model calibration only); "
-            "not charged to escalate-by-restart"
+            f"  P4 {label}: {n_sw[0]}/{n // 2} (fold 0, tau={fitted_pin[0]}) "
+            f"+ {n_sw[1]}/{n - n // 2} (fold 1, tau={fitted_pin[1]}) "
+            f"= {sum(n_sw)}/{n} trigger"
         )
+        for fold_h, tau_p in enumerate(fitted_pin):
+            context_toks = I0 + max(0, int(tau_p)) * delta
+            overhead = switch_overhead_usd(int(tau_p), price_top_in, I0, delta)
+            print(
+                f"    [fold {fold_h}] context at switch = {context_toks:,} tokens, "
+                f"switch overhead = ${overhead:.4f}/inst "
+                f"({'included in P4 prereg cost' if label == 'prereg' else 'not charged to restart variant'})"
+            )
     print()
 
     instance_ids = [r["id"] for r in rows]
@@ -672,11 +765,11 @@ def report(cache: Path) -> None:
     )
     print("## Validity caveat\n")
     print(
-        "Whole-run policies (always-X, per-session, workload, run-level cascade, "
-        "escalate-by-restart) are scored exactly from recorded runs. "
-        "Escalate-by-restart post-switch quality ≈ top model's own full run (optimistic; "
-        "see pre-registration). Context growth model calibrated on the cheap model only; "
-        "I_0 = system + first user message. See pre-registration for full caveats.\n"
+        "Whole-run policies are scored exactly from recorded runs. "
+        "P4 post-switch quality ≈ top model's own full run (optimistic; see pre-registration). "
+        "Context model calibrated from CALIB_N seeded-random cheap-model trajectories. "
+        "P4 primary row follows the pre-registration cost model (switch overhead included). "
+        "P4 secondary row uses restart semantics (no separate overhead). See results doc.\n"
     )
 
     ladder_ids_map: dict[str, list[str]] = {}
@@ -693,12 +786,14 @@ def report(cache: Path) -> None:
         ladder_ids_map[lname] = lids
         ladder_p3_map[lname] = lp3
 
-    # Pool policies: P2 and P3-pool
-    print("## Pool policies (P2 workload-selection and P3-pool session-selection)\n")
+    # Pool policies
+    print("## Pool policies (P2 and P3-pool)\n")
     print("Loading pool data ...")
     pool_ids, pool_data = load_pool_data(cache)
     n_pool = len(pool_ids)
-    print(f"  pool n={n_pool}")
+    print(
+        f"  pool n={n_pool}, reference model index = {POOL_REF_IDX} ({model_suffix(POOL[POOL_REF_IDX])})"
+    )
 
     wl = workload_selection(pool_ids, pool_data)
     p3pool_outs, p3pool_eps = pool_session_selection(pool_ids, pool_data)
@@ -728,7 +823,6 @@ def report(cache: Path) -> None:
         )
     print()
 
-    # P3-pool vs P2 paired CI (same instances, clean comparison)
     (r0, r1), (c0, c1), _ = paired_ci(p3pool_outs, p2_sel)
     print(
         f"P3-pool vs P2 paired CI (P3-pool − P2): "
@@ -736,16 +830,13 @@ def report(cache: Path) -> None:
     )
     print()
 
-    # P3 (2-model ladder) vs P2 paired CI: match by instance ID
-    print("## P3 (2-model ladder) vs P2 (pool): cross-comparison\n")
-    pool_id_set = set(pool_ids)
+    # P3-ladder vs P2: match by instance ID
+    print("## P3-ladder vs P2: cross-comparison (confounded: pool vs ladder)\n")
     for lname in LADDERS:
         lids = ladder_ids_map[lname]
         lp3 = ladder_p3_map[lname]
         lid_to_p3 = dict(zip(lids, lp3))
-        # Match ladder P3 to pool P2 by instance ID
-        matched_p3 = []
-        matched_p2 = []
+        matched_p3, matched_p2 = [], []
         for pid, p2_out in zip(pool_ids, p2_sel):
             if pid in lid_to_p3:
                 matched_p3.append(lid_to_p3[pid])
@@ -754,82 +845,138 @@ def report(cache: Path) -> None:
         n_total = len(lids)
         if n_matched < n_total:
             print(
-                f"  NOTE: {n_total - n_matched} ladder instances have no pool match; "
-                f"CI on {n_matched} shared instances"
+                f"  NOTE: {n_total - n_matched} ladder instances not in pool; CI on {n_matched}"
             )
         if n_matched > 0:
             (r0, r1), (c0, c1), _ = paired_ci(matched_p3, matched_p2)
             p3_ok, p3_cost = total(matched_p3)
             p2_ok, p2_cost = total(matched_p2)
-            print(f"  {lname}: P3-ladder vs P2 on n={n_matched} shared instances")
+            print(f"  {lname}: P3-ladder vs P2  n={n_matched}")
             print(
-                f"    P3-ladder: {p3_ok}/{n_matched} (${p3_cost / n_matched:.3f}/inst)  "
-                f"P2: {p2_ok}/{n_matched} (${p2_cost / n_matched:.3f}/inst)"
+                f"    P3-ladder {p3_ok}/{n_matched} ${p3_cost / n_matched:.3f}/inst  "
+                f"P2 {p2_ok}/{n_matched} ${p2_cost / n_matched:.3f}/inst"
             )
             print(
-                f"    P3-ladder − P2 paired CI: "
-                f"Δresolved [{r0:+.3f}, {r1:+.3f}], Δ$/inst [{c0:+.3f}, {c1:+.3f}]"
+                f"    P3-ladder − P2: Δresolved [{r0:+.3f}, {r1:+.3f}], "
+                f"Δ$/inst [{c0:+.3f}, {c1:+.3f}]"
             )
             print(
                 "    CONFOUND: P3 uses 2-model ladder; P2 uses 11-model pool. "
-                "Use P3-pool vs P2 for the pool-controlled comparison."
+                "Use P3-pool vs P2 for pool-controlled comparison."
             )
         print()
 
 
-# ── self-check ─────────────────────────────────────────────────────────────────
+# ── self-check ────────────────────────────────────────────────────────────────
 
 
 def _self_check() -> None:
-    # nocache cost must exceed withcache cost (caching saves money)
+    # withcache_cost: fixed prefix billing (k-1 not k)
     nc_10 = nocache_cost(10, 1000, 500, 100, 1.0, 5.0)
     wc_10 = withcache_cost(10, 1000, 500, 100, 1.0, 5.0)
-    assert nc_10 > wc_10, "uncached must cost more than cached"
-
-    # longer session → higher nc/wc ratio
+    assert nc_10 > wc_10, "uncached must cost more than cached (10 steps)"
     nc_factor_10 = nc_10 / wc_10
     nc_factor_50 = nocache_cost(50, 1000, 500, 100, 1.0, 5.0) / withcache_cost(
         50, 1000, 500, 100, 1.0, 5.0
     )
     assert nc_factor_50 > nc_factor_10, "longer sessions benefit more from caching"
+    # Verify k-1 fix: at k=1 the cached prefix is I0 (not I0+delta)
+    wc_2 = withcache_cost(2, 1000, 500, 0, 1.0, 0.0)
+    # step 0: write 1000 at 1.25 = 1250; step 1: read 1000 at 0.1=100, write 500 at 1.25=625 → 725
+    assert abs(wc_2 - (1000 * 1.25 + 1000 * 0.1 + 500 * 1.25) / 1e6) < 1e-12, (
+        f"withcache_cost k=1 prefix should be I0=1000, got wc_2={wc_2}"
+    )
 
-    # switch overhead scales with context size at tau
+    # switch_overhead_usd
     sw5 = switch_overhead_usd(5, 15.0, 1000, 500)
     sw20 = switch_overhead_usd(20, 15.0, 1000, 500)
     assert sw20 > sw5, "later switch = larger context = higher overhead"
+    assert abs(switch_overhead_usd(0, 15.0, 1000, 300) - 1000 * 15.0 / 1e6) < 1e-12
 
-    row = {
-        "id": "x__1",
-        "repo": "x",
-        "runs": [(True, 1.0, 10), (True, 5.0, 20)],
-    }
+    row = {"id": "x__1", "repo": "x", "runs": [(True, 1.0, 10), (True, 5.0, 20)]}
 
-    # below tau: serve cheap
-    res, cwc = escalate_pin(row, tau=15.0)
-    assert res is True and cwc == 1.0, f"below tau: expected cheap; got {cwc}"
-
-    # above tau: escalate; cost = partial cheap + top
-    res2, cwc2 = escalate_pin(row, tau=5.0)
-    assert res2 is True, "above tau: should return top model result"
-    expected = 1.0 * (5 / 10) + 5.0  # partial (5/10 of cheap) + top
-    assert abs(cwc2 - expected) < 1e-9, f"above tau cost: {cwc2} != {expected}"
-
-    # at equality (cheap_steps == tau): pre-reg says escalate (api_calls >= tau_pin)
-    res3, cwc3 = escalate_pin(row, tau=10.0)
-    assert res3 is True, "at equality (steps==tau): should escalate per pre-reg"
-    expected3 = 1.0 * (10 / 10) + 5.0  # full cheap partial + top
-    assert abs(cwc3 - expected3) < 1e-9, f"at equality cost: {cwc3} != {expected3}"
-
-    # tau=-1: always escalate, zero partial cheap spend (actual_tau=0)
-    _, cwc_neg1 = escalate_pin(row, tau=-1.0)
-    assert abs(cwc_neg1 - 5.0) < 1e-9, (
-        f"tau=-1: cost should be top only=5.0, got {cwc_neg1}"
+    # escalate_pin_prereg: below tau
+    res, cwc = escalate_pin_prereg(row, tau=15.0, I0=1000, delta=300, price_top_in=15.0)
+    assert res is True and cwc == 1.0, (
+        f"prereg below tau: expected cheap cost=1.0, got {cwc}"
     )
 
-    # switch_overhead_usd: tau=0 boundary
-    overhead_at_0 = switch_overhead_usd(0, 15.0, 1000, 300)
-    assert abs(overhead_at_0 - 1000 * 15.0 / 1e6) < 1e-12, (
-        "tau=0: overhead = I0 × price_top"
+    # escalate_pin_prereg: above tau (includes switch overhead)
+    res2, cwc2 = escalate_pin_prereg(
+        row, tau=5.0, I0=1000, delta=300, price_top_in=15.0
+    )
+    assert res2 is True, "prereg above tau: top model result"
+    overhead = switch_overhead_usd(5, 15.0, 1000, 300)  # (1000+5*300)*15/1e6 = 0.0375
+    expected = 1.0 * (5 / 10) + overhead + 5.0
+    assert abs(cwc2 - expected) < 1e-9, (
+        f"prereg above tau: got {cwc2}, expected {expected}"
+    )
+
+    # escalate_pin_prereg: tau=-1 → overhead = I0 * price_top (no cheap steps)
+    _, cwc_neg1 = escalate_pin_prereg(
+        row, tau=-1.0, I0=1000, delta=300, price_top_in=15.0
+    )
+    expected_neg1 = switch_overhead_usd(0, 15.0, 1000, 300) + 5.0
+    assert abs(cwc_neg1 - expected_neg1) < 1e-9, (
+        f"prereg tau=-1: {cwc_neg1} != {expected_neg1}"
+    )
+
+    # escalate_pin_restart: no overhead; tau=-1 = top only
+    _, cwc_rst = escalate_pin_restart(row, tau=-1.0)
+    assert abs(cwc_rst - 5.0) < 1e-9, (
+        f"restart tau=-1: cost should be top=5.0, got {cwc_rst}"
+    )
+
+    # escalate_pin_restart: at equality (steps==tau): should escalate
+    res3, cwc3 = escalate_pin_restart(row, tau=10.0)
+    assert res3 is True, "restart at tau==steps: should escalate"
+    assert abs(cwc3 - (1.0 + 5.0)) < 1e-9, (
+        f"restart at equality: full cheap + top = 6.0, got {cwc3}"
+    )
+
+    # repo_router: picks cheapest eligible, not first in list
+    rr_train = [
+        {"id": "rr__1", "repo": "rr", "runs": [(True, 3.0, 5), (True, 1.0, 3)]},
+        {"id": "rr__2", "repo": "rr", "runs": [(True, 3.0, 5), (True, 1.0, 3)]},
+    ]
+    # both models resolve all; model 0 costs 3.0, model 1 costs 1.0
+    # eps=0.0: both eligible (rate=1.0 >= 1.0-0.0); cheapest = model 1
+    rr_route = repo_router(rr_train, eps=0.0)
+    _, rr_cost = rr_route(rr_train[0])
+    assert rr_cost == 1.0, (
+        f"repo_router: tied rates must pick cheapest (1.0), got {rr_cost}"
+    )
+    assert rr_cost != 3.0, (
+        "repo_router must not pick first-in-list when it is more expensive"
+    )
+
+    # fit_eps: uses ref_idx to set quality bar correctly
+    # 5 instances, same repo; 3 models: good/expensive(0), mediocre/cheap(1), bad/last(2)
+    # With ref_idx=0 (bar=5): only eps where router routes to model 0 is valid
+    # With ref_idx=-1 (bar=0): any eps feasible; picks cheapest routing (model 1)
+    fe_train = [
+        {
+            "id": f"fe__{i}",
+            "repo": "fe",
+            "runs": [
+                (True, 5.0, 10),
+                (i < 4, 0.5, 4),  # model 1: resolves 4/5
+                (False, 0.1, 2),
+            ],
+        }
+        for i in range(5)
+    ]
+    # rates: model 0=1.0, model 1=0.8, model 2=0.0
+    # eps=0.2: models 0 and 1 eligible (0.8 >= 1.0-0.2); cheapest = model 1 → ok=4 < bar=5
+    # With ref_idx=0: eps=0.2 infeasible; only eps<=0.1 route to model 0 (0.8 < 1.0-0.1=0.9)
+    # With ref_idx=-1: bar=0; eps=0.2 feasible and cheaper than eps=0 → picks eps=0.2
+    eps_strict = fit_eps(fe_train, ref_idx=0)
+    eps_loose = fit_eps(fe_train, ref_idx=-1)
+    assert eps_strict <= 0.1, (
+        f"fit_eps ref_idx=0 (bar=5): must route to model 0, eps must be <=0.1, got {eps_strict}"
+    )
+    assert eps_loose >= 0.2, (
+        f"fit_eps ref_idx=-1 (bar=0): can pick cheap model 1 at eps>=0.2, got {eps_loose}"
     )
 
     print("self-check ok")
