@@ -39,13 +39,33 @@ fn build_request(
     req.body(body)
 }
 
-/// Copy the response's content-type (the only response header observe mode relays).
+/// Response headers observe mode relays verbatim. Beyond content-type, agents need the upstream's
+/// back-off and correlation signals: Claude Code, Codex and the SDKs honour `retry-after` and the
+/// rate-limit headers on a 429/529, and a `request-id` is what a provider's support asks for.
+/// Framing headers (content-length, transfer-encoding, content-encoding) are deliberately not
+/// relayed: the body is re-framed by this server.
+const RELAYED_RESPONSE_HEADERS: &[&str] = &["retry-after", "request-id", "x-request-id"];
+const RELAYED_RESPONSE_HEADER_PREFIXES: &[&str] = &["anthropic-ratelimit-", "x-ratelimit-"];
+
+fn relayed(name: &str) -> bool {
+    RELAYED_RESPONSE_HEADERS.contains(&name)
+        || RELAYED_RESPONSE_HEADER_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// Copy the response headers observe mode relays (see [`RELAYED_RESPONSE_HEADERS`]).
 fn passthrough_headers(response: &reqwest::Response) -> HeaderMap {
     // reqwest and axum both build on the same `http` crate, so header types carry over
     // without re-encoding.
     let mut out = HeaderMap::new();
     if let Some(content_type) = response.headers().get(header::CONTENT_TYPE) {
         out.insert(header::CONTENT_TYPE, content_type.clone());
+    }
+    for (name, value) in response.headers() {
+        if relayed(name.as_str()) {
+            out.append(name.clone(), value.clone());
+        }
     }
     out
 }
@@ -157,4 +177,42 @@ pub async fn forward_openai_streaming_path(
     let status = response.status();
     let out_headers = passthrough_headers(&response);
     Ok((status, out_headers, response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passthrough_relays_backoff_and_correlation_headers_only() {
+        let upstream = axum::http::Response::builder()
+            .status(429)
+            .header("content-type", "application/json")
+            .header("retry-after", "7")
+            .header("request-id", "req_123")
+            .header("anthropic-ratelimit-requests-remaining", "0")
+            .header("x-ratelimit-reset-tokens", "6s")
+            .header("content-length", "2")
+            .header("set-cookie", "a=b")
+            .body("{}")
+            .unwrap_or_default();
+        let out = passthrough_headers(&reqwest::Response::from(upstream));
+        for (k, v) in [
+            ("content-type", "application/json"),
+            ("retry-after", "7"),
+            ("request-id", "req_123"),
+            ("anthropic-ratelimit-requests-remaining", "0"),
+            ("x-ratelimit-reset-tokens", "6s"),
+        ] {
+            assert_eq!(out.get(k).and_then(|h| h.to_str().ok()), Some(v), "{k}");
+        }
+        assert!(
+            out.get("content-length").is_none(),
+            "framing is not relayed"
+        );
+        assert!(
+            out.get("set-cookie").is_none(),
+            "unlisted headers are not relayed"
+        );
+    }
 }
