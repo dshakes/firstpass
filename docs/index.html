@@ -244,6 +244,43 @@
   </div>
 </div></section>
 
+<!-- 5b · CODING AGENTS -->
+<section class="s" id="agents" aria-labelledby="h-agents"><div class="w">
+  <div class="head">
+    <p class="kicker">Coding agents</p>
+    <h2 id="h-agents">Works with the agents you already run.</h2>
+    <p class="lede">Claude Code, Codex and aider talk to Firstpass over the wire formats they already speak. Observe mode forwards byte-identical and writes receipts. Enforce mode gates tool calls, groups turns into sessions with no header, and keeps a session on one model.</p>
+  </div>
+  <div class="story" style="margin-top:0">
+    <article class="beat" style="overflow-wrap:anywhere">
+      <p class="verdict v-fix">Setup</p>
+      <h3>One base URL.</h3>
+      <p class="ds">Claude Code · Codex · aider</p>
+      <p><b>Claude Code:</b> <code>ANTHROPIC_BASE_URL</code> or <code>firstpass launch claude</code>. <b>Codex:</b> <code>firstpass launch codex</code>, which sets <code>OPENAI_BASE_URL</code>. <b>aider:</b> <code>--openai-api-base</code>.</p>
+      <p>In observe mode the upstream’s <code>retry-after</code>, <code>request-id</code> and rate-limit headers are relayed so agents back off correctly, and <code>count_tokens</code> is passed through.</p>
+    </article>
+    <article class="beat" style="overflow-wrap:anywhere">
+      <p class="verdict v-fix">Enforce</p>
+      <h3>Tool turns are gated, not misread.</h3>
+      <p class="ds">built-in gate: tool-args-valid</p>
+      <p>A reply that only calls a tool is not “empty”. The <code>tool-args-valid</code> gate checks every call’s arguments against the request’s own schema and fails on a tool that was never declared.</p>
+      <p>Turns are grouped into sessions with no header (explicit header, agent session header, <code>prompt_cache_key</code>, then a salted prefix hash), so session promotion applies to these agents without config.</p>
+    </article>
+    <article class="beat" style="overflow-wrap:anywhere">
+      <p class="verdict v-und">Measured</p>
+      <h3>Don’t switch models mid-session.</h3>
+      <p class="ds">500 real SWE-bench agent runs · $0 replay</p>
+      <p>Escalate-and-pin cost <b>+$0.309 to +$0.316</b> per instance more than always-top at the same <b>384/500</b> resolved (haiku to opus). Per-session routing resolved <b>378/500</b>. Choosing the model per workload was far cheaper (<b>374/500 at $0.219</b> vs <b>384/500 at $0.754</b>), but non-inferiority at 1 point was <b>not shown</b>.</p>
+    </article>
+  </div>
+  <div class="story-foot">
+    <span>Compatibility as measured, in observe mode against a fake upstream: Claude Code and aider completed a turn, Codex was covered by a fixture request only, and Gemini CLI is not supported.</span>
+    <a href="guide/agents.html">Coding agents guide →</a>
+    <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/agent-granularity.md" rel="noopener">The granularity eval →</a>
+    <a href="https://github.com/dshakes/firstpass/blob/main/docs/benchmarks/agent-compat.md" rel="noopener">The compatibility matrix →</a>
+  </div>
+</div></section>
+
 <!-- 6 · FIT -->
 <section class="s" id="fit" aria-labelledby="h-fit"><div class="w">
   <div class="head">

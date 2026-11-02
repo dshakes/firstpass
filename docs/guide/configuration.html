@@ -51,6 +51,7 @@
 <a href="elastic-verification.html"><span class="num">14</span>Elastic verification</a>
 <a href="benchmarks.html"><span class="num">15</span>Benchmarks</a>
 <a href="experiments.html"><span class="num">16</span>Choose by proof</a>
+<a href="agents.html"><span class="num">17</span>Coding agents</a>
 </div>
 </nav></aside>
 <main class="content" id="main">
@@ -74,7 +75,7 @@
 <text x="580" y="113" text-anchor="end" class="m ink-mut" font-size="10.5">ordered rungs · cheap → capable</text>
 <rect x="64" y="130" width="532" height="32" rx="8" class="n-fill pass-s glow-p"/>
 <text x="80" y="151" class="m pass" font-size="13">[[route]] gates</text>
-<text x="580" y="151" text-anchor="end" class="m ink-mut" font-size="10.5">non-empty/json-valid built in, no block needed</text>
+<text x="580" y="151" text-anchor="end" class="m ink-mut" font-size="10.5">non-empty/json-valid/tool-args-valid built in</text>
 
 <text x="64" y="186" class="m ink-mut" font-size="11" style="letter-spacing:.09em">OPTIONAL — EVERY SECTION BELOW HAS A DEFAULT</text>
 <rect x="64" y="194" width="532" height="30" rx="8" class="n-fill n-stroke" stroke-dasharray="5 4"/>
@@ -99,7 +100,7 @@
 
 <h2 id="shape">Config shape<a class="anchor" href="#shape" aria-label="Link to this section">#</a></h2>
 <div class="tldr">One required block: <code>[[route]]</code>, with a <code>match</code>, a <code>mode</code>, and a <code>ladder</code>. Everything else — custom gates, budgets, escalation tuning, providers — has a default and ships off. <code>FIRSTPASS_CONFIG</code> has <b>no default path</b>: an unset env var means routing config is inert, full stop, regardless of whether a <code>firstpass.toml</code> sits next to the binary.</div>
-<p>A minimal config is one <code>[[route]]</code>: match the traffic, pick a mode, list the ladder. The built-in gate ids <code>non-empty</code> and <code>json-valid</code> need no extra block — only custom gate kinds (<code>schema</code>, subprocess, <code>judge</code>, <code>consistency</code>, <code>decision</code>) do. Point Firstpass at the file with <code>FIRSTPASS_CONFIG=/path/to/firstpass.toml</code>; there is no default path, so leaving it unset means routing runs with <b>no config at all</b>, not a config named <code>firstpass.toml</code> in the working directory.</p>
+<p>A minimal config is one <code>[[route]]</code>: match the traffic, pick a mode, list the ladder. The built-in gate ids <code>non-empty</code>, <code>json-valid</code> and <code>tool-args-valid</code> need no extra block — only custom gate kinds (<code>schema</code>, subprocess, <code>judge</code>, <code>consistency</code>, <code>decision</code>) do. Point Firstpass at the file with <code>FIRSTPASS_CONFIG=/path/to/firstpass.toml</code>; there is no default path, so leaving it unset means routing runs with <b>no config at all</b>, not a config named <code>firstpass.toml</code> in the working directory.</p>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code><span class="tk-c"># firstpass.toml — a minimal, working config</span>
 [[route]]
 match  = {}
@@ -145,7 +146,7 @@ ladder = [&quot;anthropic/claude-opus-4-8&quot;]</code></pre></div>
 <div class="recap">First matching route wins; <code>match</code> is feature-based, not path-based. Order specific routes before the catch-all.</div>
 
 <h2 id="gate">Gates<a class="anchor" href="#gate" aria-label="Link to this section">#</a></h2>
-<div class="tldr"><code>non-empty</code> and <code>json-valid</code> are built in — reference them directly in <code>gates</code>/<code>deferred_gates</code>, no block needed. Every other kind (<code>schema</code>, subprocess, <code>judge</code>, <code>consistency</code>, <code>decision</code>) needs a <code>[[gate]]</code> block with a unique <code>id</code> and <b>exactly one</b> kind-defining field. <b>All gates on a rung must pass.</b> See <a href="gates.html">Gates</a> for full semantics.</div>
+<div class="tldr"><code>non-empty</code>, <code>json-valid</code> and <code>tool-args-valid</code> are built in — reference them directly in <code>gates</code>/<code>deferred_gates</code>, no block needed. Every other kind (<code>schema</code>, subprocess, <code>judge</code>, <code>consistency</code>, <code>decision</code>) needs a <code>[[gate]]</code> block with a unique <code>id</code> and <b>exactly one</b> kind-defining field. <b>All gates on a rung must pass.</b> See <a href="gates.html">Gates</a> for full semantics.</div>
 <p>A <code>[[gate]]</code> block has an <code>id</code> plus <b>exactly one</b> of <code>cmd</code> (subprocess), <code>judge</code>, <code>consistency</code>, <code>schema</code>, or <code>decision</code> — there is no <code>kind</code> field; the kind is inferred from which one is set, and setting zero or more than one is rejected at parse.</p>
 <div class="tblwrap"><table>
   <thead><tr><th>Field</th><th>Sets kind</th><th>Required sub-fields</th><th>Meaning</th></tr></thead>
