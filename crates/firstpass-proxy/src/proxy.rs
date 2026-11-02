@@ -655,6 +655,9 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
     // when `FIRSTPASS_TENANT_RATE_PER_SEC` is unset.
     let business = Router::new()
         .route("/v1/messages", post(messages))
+        // count_tokens is an Anthropic metadata endpoint: no routing decision, no receipt.
+        // Registered before the catch-all so it takes precedence.
+        .route("/v1/messages/count_tokens", post(count_tokens_passthrough))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
         .route("/v1/feedback", post(feedback))
@@ -1760,6 +1763,37 @@ fn resolve_mode(headers: &HeaderMap, route: &Route, config: &ProxyConfig) -> Rou
     }
     // (c) global default (env FIRSTPASS_MODE_PROFILE, default Balanced)
     config.default_routing_mode
+}
+
+/// `POST /v1/messages/count_tokens` — Anthropic token-counting metadata endpoint.
+///
+/// Forwarded byte-for-byte to the configured Anthropic upstream in **both** observe and enforce
+/// mode. Token counting involves no model-selection decision, no gate, and no ladder traversal,
+/// so no receipt is written.
+///
+/// # Why no receipt
+/// A receipt models a routing decision. `count_tokens` has no rung selection, no gate result,
+/// and no cost to attribute — synthesizing one would inflate attempt counts and skew the
+/// per-gate pass-rate summaries that operators read.  The original request bytes still reach
+/// the upstream unchanged; only the routing layer is silent.
+async fn count_tokens_passthrough(
+    State(state): State<AppState>,
+    Extension(TenantId(_tenant)): Extension<TenantId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match crate::upstream::forward_anthropic_path(
+        &state.http,
+        &state.config.upstream_anthropic,
+        "/v1/messages/count_tokens",
+        &headers,
+        body,
+    )
+    .await
+    {
+        Ok((status, resp_headers, resp_body)) => (status, resp_headers, resp_body).into_response(),
+        Err(err) => err.into_response(),
+    }
 }
 
 /// `POST /v1/messages` — dispatch on the matched route's mode. **Enforce** routes run the
@@ -10627,5 +10661,68 @@ mod tests {
             );
             assert!(trace.attempts.is_empty(), "no attempts on 429");
         }
+    }
+
+    // ── count_tokens passthrough tests ───────────────────────────────────────
+
+    /// Spin up a mock that answers `POST /v1/messages/count_tokens` with a token count, then
+    /// drive the handler and assert the response is relayed byte-for-byte. No trace is expected.
+    #[tokio::test]
+    async fn count_tokens_passthrough_relays_upstream_response() {
+        let mock = axum::Router::new().route(
+            "/v1/messages/count_tokens",
+            axum::routing::post(|| async { axum::Json(serde_json::json!({"input_tokens": 42})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock).await.unwrap();
+        });
+        let upstream = format!("http://{addr}");
+
+        let config = ProxyConfig::from_lookup(move |k| match k {
+            "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some(upstream.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let (traces, mut rx) = mpsc::channel(64);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+
+        let body = Bytes::from_static(br#"{"model":"claude-3-haiku-20240307","messages":[]}"#);
+        let resp = count_tokens_passthrough(
+            State(state),
+            Extension(TenantId("default".to_owned())),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["input_tokens"], 42, "token count must be relayed");
+        // No receipt for a metadata call.
+        assert!(
+            rx.try_recv().is_err(),
+            "count_tokens must not enqueue a trace"
+        );
     }
 }

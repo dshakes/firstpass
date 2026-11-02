@@ -92,6 +92,29 @@ pub async fn forward_anthropic_streaming(
     Ok((status, out_headers, response))
 }
 
+/// Forward one Anthropic request to an explicit upstream path and return its response **buffered**.
+///
+/// Factored out so sub-paths like `/v1/messages/count_tokens` can be forwarded byte-for-byte
+/// without duplicating `build_request` or the header allow-list.
+///
+/// # Errors
+/// Returns [`ProxyError::Upstream`] on a transport-level failure.
+pub async fn forward_anthropic_path(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
+    let response = build_request(client, base, path, headers, body)
+        .send()
+        .await?;
+    let status = response.status();
+    let out_headers = passthrough_headers(&response);
+    let body = response.bytes().await?;
+    Ok((status, out_headers, body))
+}
+
 /// The OpenAI-compatible inbound paths this proxy relays for.
 pub const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 /// The Responses API path. A Responses-shaped body relayed to [`OPENAI_CHAT_PATH`] is rejected by
