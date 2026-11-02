@@ -1581,6 +1581,7 @@ fn spawn_paired_challenger(
     api: &str,
     served_from: firstpass_core::ServedFrom,
     incumbent_cost_usd: f64,
+    incumbent_trace_id: uuid::Uuid,
 ) {
     let Some(x_inc) = pair_outcome(served_from) else {
         return;
@@ -1781,6 +1782,7 @@ fn spawn_paired_challenger(
                 ch_trunc,
                 pair_ts.as_second(),
                 ch_trace.trace_id,
+                incumbent_trace_id,
             )
             .await;
 
@@ -3113,6 +3115,7 @@ async fn enforce_pipeline_inner(
                 api,
                 served_from,
                 incumbent_cost,
+                trace.trace_id,
             );
         }
     }

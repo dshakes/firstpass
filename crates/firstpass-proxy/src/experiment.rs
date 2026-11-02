@@ -153,6 +153,12 @@ pub enum LogRecord {
         /// deserialize to `Uuid::nil()`, which is never deduplicated.
         #[serde(default)]
         trace_id: Uuid,
+        /// The served incumbent trace-id. A replica restarted on the same trace store has already
+        /// counted that request's incumbent cost from its stored receipt, but it has a new
+        /// `replica_id`, so without this its own pre-restart records would look remote and the
+        /// incumbent cost would count twice. `Uuid::nil()` for older records (never matched).
+        #[serde(default)]
+        incumbent_trace_id: Uuid,
     },
 }
 
@@ -467,6 +473,11 @@ struct Entry {
     /// Capped at `MAX_TRACKED_SESSIONS` with the same saturation policy: once full, new
     /// pairs are skipped rather than evicting old ids (evicting would let a pair count twice).
     applied_pair_ids: HashSet<Uuid>,
+    /// Incumbent trace-ids whose cost was counted from stored receipts at startup. A log record
+    /// naming one does not count the incumbent cost again; matched ids are removed, so the set
+    /// only shrinks after startup. Capped at `MAX_TRACKED_SESSIONS` (beyond that, a pre-restart
+    /// own record can still double-count the incumbent cost: biased toward "no saving", safe).
+    locally_costed: HashSet<Uuid>,
     /// How many records have been consumed from the shared log so far (incremental LRANGE).
     remote_log_offset: u64,
     /// Whether a `tracing::warn!` has already been emitted for a failed cold-start sync on this
@@ -817,6 +828,7 @@ impl ExperimentMonitor {
                         sessions: HashSet::new(),
                         saturated_logged: false,
                         applied_pair_ids: HashSet::new(),
+                        locally_costed: HashSet::new(),
                         remote_log_offset: 0,
                         sync_warn_logged: false,
                         sync_failed_at: None,
@@ -1052,6 +1064,7 @@ impl ExperimentMonitor {
                 ts_unix,
                 replica_id: record_replica_id,
                 trace_id: record_trace_id,
+                incumbent_trace_id,
             } => {
                 let Some(e) = self.entry(map, tenant, route_ix) else {
                     return false;
@@ -1100,12 +1113,16 @@ impl ExperimentMonitor {
                 // health and spend were tallied in `spawn_paired_challenger` before append.
                 let is_own = *record_replica_id == self.replica_id;
                 if !already_applied && !is_own {
+                    let costed_here =
+                        !incumbent_trace_id.is_nil() && e.locally_costed.remove(incumbent_trace_id);
                     // The originating replica counted the incumbent's cost when it served the
                     // request; every other replica learns it only from the log. Without this a
                     // cluster's incumbent looks ~N times cheaper and a certified, cheaper
                     // challenger would be reported "certified, no saving" instead of "adopt".
-                    e.experiment
-                        .observe_cost(Arm::Incumbent, *incumbent_cost_usd);
+                    if !costed_here {
+                        e.experiment
+                            .observe_cost(Arm::Incumbent, *incumbent_cost_usd);
+                    }
                     if *ch_error || *ch_truncated > 0 {
                         e.health.challenger.errors += u64::from(*ch_error);
                         e.health.challenger.truncated += *ch_truncated;
@@ -1403,6 +1420,7 @@ impl ExperimentMonitor {
         ch_truncated: u64,
         ts_unix: i64,
         trace_id: Uuid,
+        incumbent_trace_id: Uuid,
     ) -> bool {
         if self.fingerprint(route_ix) != Some(fingerprint) {
             return false;
@@ -1440,6 +1458,7 @@ impl ExperimentMonitor {
                 ts_unix,
                 replica_id: self.replica_id,
                 trace_id,
+                incumbent_trace_id,
             },
         ))
         .await
@@ -1629,6 +1648,14 @@ pub fn monitor_from_traces(
             t.final_.served_from == firstpass_core::ServedFrom::Error,
             truncated_attempts(t),
         );
+        if rec.arm == Arm::Incumbent {
+            let mut map = monitor.lock();
+            if let Some(e) = monitor.entry(&mut map, &t.tenant_id, route_ix)
+                && e.locally_costed.len() < MAX_TRACKED_SESSIONS
+            {
+                e.locally_costed.insert(t.trace_id);
+            }
+        }
         by_id.insert(t.trace_id, t);
     }
     for (id, verdict) in deferred {
@@ -2390,6 +2417,7 @@ mod tests {
                     0,
                     0,
                     Uuid::nil(),
+                    Uuid::nil(),
                 )
                 .await;
             assert!(
@@ -2417,6 +2445,7 @@ mod tests {
                 false,
                 0,
                 0,
+                Uuid::nil(),
                 Uuid::nil(),
             )
             .await;
@@ -3270,6 +3299,7 @@ mod tests {
                 2,
                 now.as_second(),
                 Uuid::nil(),
+                Uuid::nil(),
             )
             .await;
         assert!(!accepted, "nothing reached the log");
@@ -3314,6 +3344,7 @@ mod tests {
                 false,
                 1,
                 now.as_second(),
+                Uuid::nil(),
                 Uuid::nil(),
             )
             .await;
@@ -3391,6 +3422,7 @@ mod tests {
                 1,
                 now_secs,
                 Uuid::nil(),
+                Uuid::nil(),
             )
             .await;
         assert!(accepted, "pair must be accepted");
@@ -3451,6 +3483,7 @@ mod tests {
                 false,
                 0,
                 now_secs,
+                Uuid::nil(),
                 Uuid::nil(),
             )
             .await;
@@ -3559,6 +3592,7 @@ mod tests {
                         replica_id: uuid::Uuid::nil(),
                         // nil: no per-pair dedup for this test.
                         trace_id: uuid::Uuid::nil(),
+                        incumbent_trace_id: Uuid::nil(),
                     },
                 )
                 .await;
@@ -3639,6 +3673,7 @@ mod tests {
                 false,
                 0,
                 now_ts.as_second(),
+                Uuid::nil(),
                 Uuid::nil(),
             )
             .await;
@@ -4014,6 +4049,7 @@ mod tests {
                     0,
                     0,
                     Uuid::nil(),
+                    Uuid::nil(),
                 )
                 .await;
             assert!(!accepted, "append failing log returns false");
@@ -4055,6 +4091,7 @@ mod tests {
                     false,
                     0,
                     0,
+                    Uuid::nil(),
                     Uuid::nil(),
                 )
                 .await;
@@ -4216,6 +4253,7 @@ mod tests {
                         ts_unix: 0,
                         replica_id: uuid::Uuid::nil(),
                         trace_id: uuid::Uuid::nil(),
+                        incumbent_trace_id: Uuid::nil(),
                     },
                 )
                 .await;
@@ -4336,6 +4374,7 @@ mod tests {
                 1,
                 now_ts.as_second(),
                 tid,
+                Uuid::nil(),
             )
             .await;
         assert!(!appended, "append returned Err → record_pair returns false");
@@ -4469,6 +4508,7 @@ mod tests {
                 ts_unix: now.as_second(),
                 replica_id: before_restart.replica_id,
                 trace_id: tid,
+                incumbent_trace_id: Uuid::nil(),
             },
         )
         .await
@@ -4561,7 +4601,20 @@ mod tests {
         log.failing.store(true, std::sync::atomic::Ordering::SeqCst);
         let tid = Uuid::now_v7();
         let appended = m
-            .record_pair("t", 0, &fp_str, 1.0, 0.0, 0.1, 0.05, false, 0, 0, tid)
+            .record_pair(
+                "t",
+                0,
+                &fp_str,
+                1.0,
+                0.0,
+                0.1,
+                0.05,
+                false,
+                0,
+                0,
+                tid,
+                Uuid::nil(),
+            )
             .await;
         assert!(appended, "the append itself succeeded");
         assert_eq!(
@@ -4621,6 +4674,7 @@ mod tests {
                 0,
                 0,
                 Uuid::now_v7(),
+                Uuid::nil(),
             )
             .await;
         assert!(!appended, "a timed-out append is not in the log");
@@ -4647,7 +4701,8 @@ mod tests {
                 false,
                 0,
                 0,
-                Uuid::now_v7()
+                Uuid::now_v7(),
+                Uuid::nil(),
             )
             .await
         );
@@ -4655,6 +4710,46 @@ mod tests {
         let inc = b.reports()[0].report.incumbent;
         assert_eq!(inc.requests, 1, "{inc:?}");
         assert!((inc.cost_usd - 0.10).abs() < 1e-12, "{inc:?}");
+    }
+
+    /// A replica restarted on the same trace store counts the incumbent cost of its own
+    /// pre-restart pairs once (from the stored receipt), even though its new `replica_id` makes
+    /// those log records look remote.
+    #[tokio::test]
+    async fn restart_counts_own_pre_restart_incumbent_cost_once() {
+        let shared = Arc::new(InMemoryExperimentLog::new());
+        let before = ExperimentMonitor::from_config(&config())
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+        let served = trace("t", "s", Arm::Incumbent, 0.10);
+        assert!(
+            before
+                .record_pair(
+                    "t",
+                    0,
+                    &fp(),
+                    1.0,
+                    1.0,
+                    0.10,
+                    0.02,
+                    false,
+                    0,
+                    0,
+                    Uuid::now_v7(),
+                    served.trace_id,
+                )
+                .await
+        );
+        let after = monitor_from_traces(std::slice::from_ref(&served), &[], &[], &config())
+            .with_log(Arc::clone(&shared) as Arc<dyn ExperimentLogBackend>);
+        after.sync_from_backend("t", 0, &fp()).await.unwrap();
+        let r = &after.reports()[0].report;
+        assert_eq!(r.pairs, 1, "the pair's evidence still arrives from the log");
+        assert_eq!(r.incumbent.requests, 1, "{:?}", r.incumbent);
+        assert!(
+            (r.incumbent.cost_usd - 0.10).abs() < 1e-12,
+            "{:?}",
+            r.incumbent
+        );
     }
 
     /// A pair stored twice in the local table is replayed once at startup.
