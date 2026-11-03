@@ -481,6 +481,25 @@ fn part_to_chat(part: &Value) -> Option<Value> {
 /// translated request is not the conversation the client is continuing.
 #[must_use]
 pub fn has_untranslatable_content(body: &Value) -> bool {
+    // A served call is emitted as `custom_tool_call` by name. If the same name is also declared
+    // as a function tool, the reply type would be a guess, and Codex dispatches on the type.
+    let custom = custom_tool_names(body);
+    if !custom.is_empty()
+        && body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|ts| {
+                ts.iter().any(|t| {
+                    t.get("type").and_then(Value::as_str) == Some("function")
+                        && t.get("name")
+                            .or_else(|| t.pointer("/function/name"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|n| custom.iter().any(|c| c == n))
+                })
+            })
+    {
+        return true;
+    }
     // Hosted tools (web_search, file_search, computer_use) run inside the provider and have no
     // Chat Completions equivalent. Sending a partial tool set is worse than not routing: a model
     // missing one of its tools produces a confidently wrong plan.
@@ -1476,6 +1495,18 @@ mod tests {
                 "must not translate {item}"
             );
         }
+    }
+
+    #[test]
+    fn a_name_declared_as_both_custom_and_function_is_not_translated() {
+        let body = |fname: &str| {
+            serde_json::json!({"model": "m", "input": "hi", "store": false, "tools": [
+                {"type": "custom", "name": "apply_patch", "description": "d"},
+                {"type": "function", "name": fname, "parameters": {"type": "object"}}
+            ]})
+        };
+        assert!(has_untranslatable_content(&body("apply_patch")));
+        assert!(!has_untranslatable_content(&body("shell")));
     }
 
     #[test]
