@@ -1,0 +1,164 @@
+# Certified selection (ADR 0014) — REPLAY of recorded outcomes, NOT a live run
+
+data source: ~/.cache/firstpass-swebench-experiments  ·  sessions: 500  ·  spend: $0
+
+## Pre-registered
+
+- PROCEED iff a challenger is certified-and-adopted in > 50% of orders, AND selection's $/success is ≥ 10% below always-top with the paired 95% CI of the difference below 0, AND the CI lower bound of success − always-top ≥ −0.05.
+- incumbent (always-top): 20260217_mini-v2.0.0_claude-4-5-opus-high (highest recorded success; ties → cheaper)
+- candidates, cheapest first, one experiment at a time at alpha/k = 0.0050: 20260217_mini-v2.0.0_gpt-5-mini, 20260217_mini-v2.0.0_minimax-2-5-high, 20260217_mini-v2.0.0_kimi-k2-5-high, 20260217_mini-v2.0.0_claude-4-5-haiku-high, 20260217_mini-v2.0.0_gemini-3-flash-high, 20260217_mini-v2.0.0_deepseek-3-2-high, 20260217_mini-v2.0.0_gpt-5-2-high, 20260217_mini-v2.0.0_glm-5-high, 20260217_mini-v2.0.0_claude-4-6-opus, 20260217_mini-v2.0.0_claude-4-5-sonnet-high
+- 200 random orders, 2000 bootstrap resamples, seed 20261103
+
+## Policies
+
+| policy | success [CI] | $/session | $/success [CI] | Δsuccess vs top [CI] | Δ$/success vs top [CI] |
+|---|---|---|---|---|---|
+| always 20260217_mini-v2.0.0_claude-4-5-opus-high | 0.768 [0.732, 0.804] | 0.7539 | 0.9817 [0.8965, 1.0735] | 0.000 [0.000, 0.000] | 0.0000 [0.0000, 0.0000] |
+| always 20260217_mini-v2.0.0_gpt-5-mini | 0.562 [0.520, 0.604] | 0.0472 | 0.0840 [0.0751, 0.0942] | -0.206 [-0.246, -0.164] | -0.8977 [-0.9848, -0.8162] |
+| always 20260217_mini-v2.0.0_minimax-2-5-high | 0.758 [0.722, 0.794] | 0.0733 | 0.0967 [0.0855, 0.1088] | -0.010 [-0.040, 0.020] | -0.8850 [-0.9710, -0.8061] |
+| always 20260217_mini-v2.0.0_kimi-k2-5-high | 0.708 [0.668, 0.748] | 0.1466 | 0.2070 [0.1838, 0.2320] | -0.060 [-0.088, -0.030] | -0.7747 [-0.8516, -0.7017] |
+| always 20260217_mini-v2.0.0_claude-4-5-haiku-high | 0.666 [0.624, 0.706] | 0.3309 | 0.4969 [0.4486, 0.5490] | -0.102 [-0.134, -0.070] | -0.4848 [-0.5519, -0.4255] |
+| always 20260217_mini-v2.0.0_gemini-3-flash-high | 0.758 [0.722, 0.794] | 0.3560 | 0.4696 [0.4404, 0.5029] | -0.010 [-0.038, 0.018] | -0.5120 [-0.5874, -0.4414] |
+| always 20260217_mini-v2.0.0_deepseek-3-2-high | 0.700 [0.660, 0.742] | 0.4478 | 0.6398 [0.5828, 0.7042] | -0.068 [-0.098, -0.038] | -0.3419 [-0.4149, -0.2738] |
+| always 20260217_mini-v2.0.0_gpt-5-2-high | 0.728 [0.690, 0.768] | 0.4736 | 0.6505 [0.5885, 0.7152] | -0.040 [-0.070, -0.010] | -0.3311 [-0.3968, -0.2708] |
+| always 20260217_mini-v2.0.0_glm-5-high | 0.728 [0.688, 0.766] | 0.5344 | 0.7341 [0.6565, 0.8185] | -0.040 [-0.070, -0.012] | -0.2476 [-0.3288, -0.1663] |
+| always 20260217_mini-v2.0.0_claude-4-6-opus | 0.756 [0.718, 0.792] | 0.5515 | 0.7295 [0.6471, 0.8195] | -0.012 [-0.040, 0.016] | -0.2521 [-0.3130, -0.1918] |
+| always 20260217_mini-v2.0.0_claude-4-5-sonnet-high | 0.714 [0.676, 0.754] | 0.6579 | 0.9214 [0.8494, 1.0020] | -0.054 [-0.080, -0.026] | -0.0602 [-0.1195, -0.0030] |
+| cascade 20260217_mini-v2.0.0_gpt-5-mini → 20260217_mini-v2.0.0_claude-4-5-opus-high (cross-fit gate) | 0.764 [0.726, 0.798] | 0.7848 | 1.0272 [0.9362, 1.1220] | -0.004 [-0.012, 0.004] | 0.0456 [0.0294, 0.0605] |
+| cascade 20260217_mini-v2.0.0_minimax-2-5-high → 20260217_mini-v2.0.0_claude-4-5-opus-high (cross-fit gate) | 0.756 [0.720, 0.794] | 0.4216 | 0.5577 [0.4844, 0.6380] | -0.012 [-0.034, 0.010] | -0.4239 [-0.4975, -0.3532] |
+| cascade 20260217_mini-v2.0.0_kimi-k2-5-high → 20260217_mini-v2.0.0_claude-4-5-opus-high (cross-fit gate) | 0.764 [0.726, 0.800] | 0.8688 | 1.1372 [1.0350, 1.2480] | -0.004 [-0.010, 0.000] | 0.1555 [0.1301, 0.1842] |
+| cascade 20260217_mini-v2.0.0_claude-4-5-haiku-high → 20260217_mini-v2.0.0_claude-4-5-opus-high (cross-fit gate) | 0.762 [0.726, 0.798] | 1.0595 | 1.3904 [1.2691, 1.5181] | -0.006 [-0.014, 0.000] | 0.4088 [0.3700, 0.4518] |
+| cascade 20260217_mini-v2.0.0_gemini-3-flash-high → 20260217_mini-v2.0.0_claude-4-5-opus-high (cross-fit gate) | 0.756 [0.720, 0.792] | 0.7598 | 1.0050 [0.9080, 1.1061] | -0.012 [-0.028, 0.004] | 0.0233 [-0.0432, 0.0845] |
+| cascade 20260217_mini-v2.0.0_deepseek-3-2-high → 20260217_mini-v2.0.0_claude-4-5-opus-high (cross-fit gate) | 0.764 [0.726, 0.800] | 1.1705 | 1.5320 [1.4100, 1.6678] | -0.004 [-0.010, 0.000] | 0.5504 [0.5002, 0.6060] |
+| cascade 20260217_mini-v2.0.0_gpt-5-2-high → 20260217_mini-v2.0.0_claude-4-5-opus-high (cross-fit gate) | 0.736 [0.698, 0.774] | 1.0021 | 1.3615 [1.2190, 1.5165] | -0.032 [-0.050, -0.016] | 0.3799 [0.3038, 0.4614] |
+| cascade 20260217_mini-v2.0.0_glm-5-high → 20260217_mini-v2.0.0_claude-4-5-opus-high (cross-fit gate) | 0.748 [0.710, 0.786] | 0.9030 | 1.2073 [1.0725, 1.3443] | -0.020 [-0.038, -0.002] | 0.2256 [0.1352, 0.3213] |
+| cascade 20260217_mini-v2.0.0_claude-4-6-opus → 20260217_mini-v2.0.0_claude-4-5-opus-high (cross-fit gate) | 0.766 [0.728, 0.802] | 1.3030 | 1.7011 [1.5411, 1.8786] | -0.002 [-0.006, 0.000] | 0.7194 [0.6390, 0.8107] |
+| cascade 20260217_mini-v2.0.0_claude-4-5-sonnet-high → 20260217_mini-v2.0.0_claude-4-5-opus-high (cross-fit gate) | 0.758 [0.720, 0.794] | 1.3266 | 1.7502 [1.6027, 1.9103] | -0.010 [-0.020, -0.002] | 0.7685 [0.6989, 0.8445] |
+| selection, paired (both agents run per task) | 0.767 [0.731, 0.802] | 0.7981 | 1.0407 [0.9519, 1.1363] | -0.001 [-0.002, -0.000] | 0.0591 [0.0515, 0.0677] |
+| selection, live A/B (50% challenger) | 0.686 [0.652, 0.717] | 0.4033 | 0.5881 [0.5355, 0.6441] | -0.082 [-0.100, -0.065] | -0.3935 [-0.4350, -0.3548] |
+
+## selection, paired (both agents run per task)
+
+- final model over 200 orders: {"20260217_mini-v2.0.0_minimax-2-5-high": 20, "<incumbent>": 180}
+- median pairs consumed before adopting: 387
+- 20260217_mini-v2.0.0_gpt-5-mini: {"halted": 200}
+- 20260217_mini-v2.0.0_minimax-2-5-high: {"adopt": 20, "keep_running": 180}
+- **STOP** — certified adoption in 10% of orders (bar > 50%): MISSED; $/success +6.0% vs always-top (bar: ≤ −10% with CI hi < 0; CI [+0.0515, +0.0677]): MISSED; success − top CI lo -0.002 (bar ≥ −0.05): met
+
+## selection, live A/B (50% challenger)
+
+- final model over 200 orders: {"20260217_mini-v2.0.0_gpt-5-mini": 1, "<incumbent>": 199}
+- median pairs consumed before adopting: 38
+- 20260217_mini-v2.0.0_gpt-5-mini: {"adopt": 1, "halted": 118, "keep_running": 81}
+- 20260217_mini-v2.0.0_minimax-2-5-high: {"keep_running": 118}
+- **STOP** — certified adoption in 0% of orders (bar > 50%): MISSED; $/success -40.1% vs always-top (bar: ≤ −10% with CI hi < 0; CI [-0.4350, -0.3548]): met; success − top CI lo -0.100 (bar ≥ −0.05): MISSED
+
+## Diagnostic: each candidate alone at alpha = 0.05 (NOT multiplicity-corrected)
+
+| challenger | mode | decisions over 200 orders | median pairs to decide |
+|---|---|---|---|
+| 20260217_mini-v2.0.0_gpt-5-mini | paired | {"halted": 200} | 51 |
+| 20260217_mini-v2.0.0_minimax-2-5-high | paired | {"adopt": 112, "keep_running": 88} | 291 |
+| 20260217_mini-v2.0.0_kimi-k2-5-high | paired | {"adopt": 3, "halted": 5, "keep_running": 192} | 114 |
+| 20260217_mini-v2.0.0_claude-4-5-haiku-high | paired | {"halted": 200} | 272 |
+| 20260217_mini-v2.0.0_gemini-3-flash-high | paired | {"adopt": 115, "keep_running": 85} | 276 |
+| 20260217_mini-v2.0.0_deepseek-3-2-high | paired | {"halted": 13, "keep_running": 187} | 127 |
+| 20260217_mini-v2.0.0_gpt-5-2-high | paired | {"adopt": 7, "keep_running": 193} | 60 |
+| 20260217_mini-v2.0.0_glm-5-high | paired | {"adopt": 5, "halted": 1, "keep_running": 194} | 83 |
+| 20260217_mini-v2.0.0_claude-4-6-opus | paired | {"adopt": 77, "keep_running": 123} | 239 |
+| 20260217_mini-v2.0.0_claude-4-5-sonnet-high | paired | {"adopt": 3, "halted": 2, "keep_running": 195} | 76 |
+| 20260217_mini-v2.0.0_gpt-5-mini | live 50% | {"adopt": 1, "halted": 177, "keep_running": 22} | 95 |
+| 20260217_mini-v2.0.0_minimax-2-5-high | live 50% | {"adopt": 17, "halted": 2, "keep_running": 181} | 47 |
+| 20260217_mini-v2.0.0_kimi-k2-5-high | live 50% | {"adopt": 7, "halted": 4, "keep_running": 189} | 30 |
+| 20260217_mini-v2.0.0_claude-4-5-haiku-high | live 50% | {"adopt": 1, "halted": 29, "keep_running": 170} | 64 |
+| 20260217_mini-v2.0.0_gemini-3-flash-high | live 50% | {"adopt": 17, "keep_running": 183} | 52 |
+| 20260217_mini-v2.0.0_deepseek-3-2-high | live 50% | {"adopt": 3, "halted": 10, "keep_running": 187} | 32 |
+| 20260217_mini-v2.0.0_gpt-5-2-high | live 50% | {"adopt": 6, "halted": 4, "keep_running": 190} | 30 |
+| 20260217_mini-v2.0.0_glm-5-high | live 50% | {"adopt": 6, "halted": 9, "keep_running": 185} | 38 |
+| 20260217_mini-v2.0.0_claude-4-6-opus | live 50% | {"adopt": 19, "halted": 2, "keep_running": 179} | 54 |
+| 20260217_mini-v2.0.0_claude-4-5-sonnet-high | live 50% | {"adopt": 5, "halted": 6, "keep_running": 189} | 34 |
+
+CIs are over sessions with each session's served outcome averaged over the replayed orders; order-to-order variation is the decision distribution above. Recorded outcomes are one run per model per task, so a model's run-to-run variance is not in these intervals.
+# Certified selection (ADR 0014) — REPLAY of recorded outcomes, NOT a live run
+
+data source: docs/benchmarks/swebench-60-stratified.checkpoint.jsonl  ·  sessions: 60  ·  spend: $0
+
+## Pre-registered
+
+- PROCEED iff a challenger is certified-and-adopted in > 50% of orders, AND selection's $/success is ≥ 10% below always-top with the paired 95% CI of the difference below 0, AND the CI lower bound of success − always-top ≥ −0.05.
+- incumbent (always-top): anthropic/claude-sonnet-5 (highest recorded success; ties → cheaper)
+- candidates, cheapest first, one experiment at a time at alpha/k = 0.0500: anthropic/claude-haiku-4-5
+- 200 random orders, 2000 bootstrap resamples, seed 20261103
+
+## Policies
+
+| policy | success [CI] | $/session | $/success [CI] | Δsuccess vs top [CI] | Δ$/success vs top [CI] |
+|---|---|---|---|---|---|
+| always anthropic/claude-sonnet-5 | 0.100 [0.033, 0.183] | 0.0945 | 0.9451 [0.4613, 2.9827] | 0.000 [0.000, 0.000] | 0.0000 [0.0000, 0.0000] |
+| always anthropic/claude-haiku-4-5 | 0.050 [0.000, 0.117] | 0.0125 | 0.2508 [0.0000, 0.8086] | -0.050 [-0.133, 0.033] | -0.6943 [-2.6949, 0.0533] |
+| cascade anthropic/claude-haiku-4-5 → anthropic/claude-sonnet-5 (cross-fit gate) | 0.133 [0.050, 0.217] | 0.1005 | 0.7537 [0.3970, 1.9791] | 0.033 [0.000, 0.083] | -0.1914 [-1.4783, 0.1830] |
+| selection, paired (both agents run per task) | 0.100 [0.033, 0.183] | 0.1071 | 1.0705 [0.5342, 3.3703] | 0.000 [0.000, 0.000] | 0.1254 [0.0702, 0.3785] |
+| selection, live A/B (50% challenger) | 0.073 [0.031, 0.124] | 0.0534 | 0.7308 [0.3900, 1.8841] | -0.027 [-0.070, 0.016] | -0.2143 [-1.4042, 0.1984] |
+
+## selection, paired (both agents run per task)
+
+- final model over 200 orders: {"<incumbent>": 200}
+- anthropic/claude-haiku-4-5: {"keep_running": 200}
+- **STOP** — certified adoption in 0% of orders (bar > 50%): MISSED; $/success +13.3% vs always-top (bar: ≤ −10% with CI hi < 0; CI [+0.0702, +0.3785]): MISSED; success − top CI lo +0.000 (bar ≥ −0.05): met
+
+## selection, live A/B (50% challenger)
+
+- final model over 200 orders: {"<incumbent>": 200}
+- anthropic/claude-haiku-4-5: {"keep_running": 200}
+- **STOP** — certified adoption in 0% of orders (bar > 50%): MISSED; $/success -22.7% vs always-top (bar: ≤ −10% with CI hi < 0; CI [-1.4042, +0.1984]): MISSED; success − top CI lo -0.070 (bar ≥ −0.05): MISSED
+
+## Diagnostic: each candidate alone at alpha = 0.05 (NOT multiplicity-corrected)
+
+| challenger | mode | decisions over 200 orders | median pairs to decide |
+|---|---|---|---|
+| anthropic/claude-haiku-4-5 | paired | {"keep_running": 200} | — |
+| anthropic/claude-haiku-4-5 | live 50% | {"keep_running": 200} | — |
+
+CIs are over sessions with each session's served outcome averaged over the replayed orders; order-to-order variation is the decision distribution above. Recorded outcomes are one run per model per task, so a model's run-to-run variance is not in these intervals.
+# Certified selection (ADR 0014) — REPLAY of recorded outcomes, NOT a live run
+
+data source: docs/benchmarks/mbpp-974-agentic-multiturn.checkpoint.jsonl  ·  sessions: 974  ·  spend: $0
+
+## Pre-registered
+
+- PROCEED iff a challenger is certified-and-adopted in > 50% of orders, AND selection's $/success is ≥ 10% below always-top with the paired 95% CI of the difference below 0, AND the CI lower bound of success − always-top ≥ −0.05.
+- incumbent (always-top): anthropic/claude-sonnet-5 (highest recorded success; ties → cheaper)
+- candidates, cheapest first, one experiment at a time at alpha/k = 0.0500: anthropic/claude-haiku-4-5
+- 200 random orders, 2000 bootstrap resamples, seed 20261103
+
+## Policies
+
+| policy | success [CI] | $/session | $/success [CI] | Δsuccess vs top [CI] | Δ$/success vs top [CI] |
+|---|---|---|---|---|---|
+| always anthropic/claude-sonnet-5 | 0.928 [0.911, 0.944] | 0.0025 | 0.0027 [0.0024, 0.0031] | 0.000 [0.000, 0.000] | 0.0000 [0.0000, 0.0000] |
+| always anthropic/claude-haiku-4-5 | 0.808 [0.782, 0.832] | 0.0010 | 0.0013 [0.0012, 0.0014] | -0.120 [-0.142, -0.098] | -0.0014 [-0.0018, -0.0012] |
+| cascade anthropic/claude-haiku-4-5 → anthropic/claude-sonnet-5 (cross-fit gate) | 0.928 [0.911, 0.944] | 0.0035 | 0.0038 [0.0035, 0.0042] | 0.000 [0.000, 0.000] | 0.0011 [0.0010, 0.0012] |
+| selection, paired (both agents run per task) | 0.928 [0.911, 0.944] | 0.0027 | 0.0029 [0.0026, 0.0033] | 0.000 [0.000, 0.000] | 0.0002 [0.0002, 0.0002] |
+| selection, live A/B (50% challenger) | 0.894 [0.877, 0.909] | 0.0021 | 0.0023 [0.0021, 0.0027] | -0.034 [-0.040, -0.028] | -0.0004 [-0.0004, -0.0003] |
+
+## selection, paired (both agents run per task)
+
+- final model over 200 orders: {"<incumbent>": 200}
+- anthropic/claude-haiku-4-5: {"halted": 200}
+- **STOP** — certified adoption in 0% of orders (bar > 50%): MISSED; $/success +6.8% vs always-top (bar: ≤ −10% with CI hi < 0; CI [+0.0002, +0.0002]): MISSED; success − top CI lo +0.000 (bar ≥ −0.05): met
+
+## selection, live A/B (50% challenger)
+
+- final model over 200 orders: {"<incumbent>": 199, "anthropic/claude-haiku-4-5": 1}
+- median pairs consumed before adopting: 23
+- anthropic/claude-haiku-4-5: {"adopt": 1, "halted": 165, "keep_running": 34}
+- **STOP** — certified adoption in 0% of orders (bar > 50%): MISSED; $/success -13.2% vs always-top (bar: ≤ −10% with CI hi < 0; CI [-0.0004, -0.0003]): met; success − top CI lo -0.040 (bar ≥ −0.05): met
+
+## Diagnostic: each candidate alone at alpha = 0.05 (NOT multiplicity-corrected)
+
+| challenger | mode | decisions over 200 orders | median pairs to decide |
+|---|---|---|---|
+| anthropic/claude-haiku-4-5 | paired | {"halted": 200} | 137 |
+| anthropic/claude-haiku-4-5 | live 50% | {"adopt": 1, "halted": 165, "keep_running": 34} | 197 |
+
+CIs are over sessions with each session's served outcome averaged over the replayed orders; order-to-order variation is the decision distribution above. Recorded outcomes are one run per model per task, so a model's run-to-run variance is not in these intervals.

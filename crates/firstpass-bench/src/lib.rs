@@ -24,6 +24,7 @@ pub mod live;
 pub mod metaverify;
 pub mod metrics;
 pub mod multiturn;
+pub mod paired_replay;
 pub mod policy;
 pub mod prior;
 pub mod prior_sweep;
