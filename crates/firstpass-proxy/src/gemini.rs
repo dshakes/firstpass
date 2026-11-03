@@ -59,8 +59,8 @@ pub fn request_to_chat(body: &Value, model: &str) -> Value {
 
     // contents → messages
     if let Some(Value::Array(contents)) = obj.get("contents") {
-        for c in contents {
-            messages.extend(content_to_messages(c));
+        for (turn, c) in contents.iter().enumerate() {
+            messages.extend(content_to_messages(c, turn));
         }
     }
     out.insert("messages".to_owned(), Value::Array(messages));
@@ -102,9 +102,13 @@ pub fn request_to_chat(body: &Value, model: &str) -> Value {
 /// when the model issued parallel calls. Each response is emitted as its own `{role:"tool"}`
 /// message so downstream providers see one message per call ID, matching the OpenAI wire format.
 ///
-/// Tool call IDs use a positional suffix (`call_{name}_{idx}`) so two parallel calls to the
+/// Tool call IDs are positional (`call_{turn}_{idx}`) so two parallel calls to the
 /// same function get distinct IDs and neither clobbers the other's result.
-fn content_to_messages(content: &Value) -> Vec<Value> {
+/// `turn` is this content's index in `contents`. Call ids embed the turn so they are unique
+/// across the conversation (Anthropic rejects a repeated `tool_use` id); a functionResponse turn
+/// answers the model turn right before it (`function_pairing_is_exact` guarantees that), so it
+/// uses `turn - 1`.
+fn content_to_messages(content: &Value, turn: usize) -> Vec<Value> {
     let Some(obj) = content.as_object() else {
         return vec![];
     };
@@ -115,7 +119,7 @@ fn content_to_messages(content: &Value) -> Vec<Value> {
     };
 
     // functionCall parts → single assistant message with tool_calls list.
-    // Positional IDs: call_{name}_{idx} so parallel calls to the same function differ.
+    // Positional IDs: call_{turn}_{idx} so parallel calls to the same function differ.
     // The index counts functionCall parts only (not text), so it matches the ordinal of the
     // paired functionResponse in the next turn; `has_untranslatable_content` rejects any
     // history where that pairing is not exact.
@@ -130,7 +134,7 @@ fn content_to_messages(content: &Value) -> Vec<Value> {
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new()));
             Some(serde_json::json!({
-                "id": format!("call_{}_{idx}", name.as_str().unwrap_or("fn")),
+                "id": format!("call_{turn}_{idx}"),
                 "type": "function",
                 "function": { "name": name, "arguments": args.to_string() },
             }))
@@ -157,7 +161,7 @@ fn content_to_messages(content: &Value) -> Vec<Value> {
         .filter_map(|p| p.as_object()?.get("functionResponse")?.as_object())
         .enumerate()
         .filter_map(|(idx, fr)| {
-            let name = fr.get("name").and_then(Value::as_str)?;
+            fr.get("name").and_then(Value::as_str)?;
             let output = fr
                 .get("response")
                 .cloned()
@@ -165,7 +169,7 @@ fn content_to_messages(content: &Value) -> Vec<Value> {
                 .to_string();
             Some(serde_json::json!({
                 "role": "tool",
-                "tool_call_id": format!("call_{name}_{idx}"),
+                "tool_call_id": format!("call_{}_{idx}", turn.saturating_sub(1)),
                 "content": output,
             }))
         })
@@ -545,7 +549,7 @@ mod tests {
         let msgs = out["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "tool");
         // positional ID: the functionResponse is at index 0
-        assert_eq!(msgs[0]["tool_call_id"], "call_get_weather_0");
+        assert_eq!(msgs[0]["tool_call_id"], "call_0_0");
         assert!(msgs[0]["content"].as_str().is_some());
         // mutant: if we emit role "user" instead of "tool", assertion fails
     }
@@ -571,9 +575,9 @@ mod tests {
             "must emit one message per functionResponse part"
         );
         assert_eq!(msgs[0]["role"], "tool");
-        assert_eq!(msgs[0]["tool_call_id"], "call_lookup_0");
+        assert_eq!(msgs[0]["tool_call_id"], "call_0_0");
         assert_eq!(msgs[1]["role"], "tool");
-        assert_eq!(msgs[1]["tool_call_id"], "call_lookup_1");
+        assert_eq!(msgs[1]["tool_call_id"], "call_0_1");
         // mutant: revert to old `return Some(...)` on first match → msgs.len() == 1
     }
 
@@ -599,9 +603,9 @@ mod tests {
             calls[0]["id"], calls[1]["id"],
             "parallel calls must have distinct IDs"
         );
-        assert_eq!(calls[0]["id"], "call_search_0");
-        assert_eq!(calls[1]["id"], "call_search_1");
-        // mutant: use name-only ID → both get "call_search" → ids are equal → assertion fails
+        assert_eq!(calls[0]["id"], "call_0_0");
+        assert_eq!(calls[1]["id"], "call_0_1");
+        // mutant: use name-only ID → both get "call_0" → ids are equal → assertion fails
     }
 
     // ── response_from_chat ──────────────────────────────────────────────────
@@ -781,6 +785,36 @@ mod tests {
         assert_eq!(call_ids.len(), 2);
         assert_eq!(call_ids, result_ids);
         assert_ne!(call_ids[0], call_ids[1]);
+    }
+
+    #[test]
+    fn tool_call_ids_are_unique_across_turns() {
+        // Two turns that each call `ls` first: a repeated id is rejected by Anthropic.
+        let call = serde_json::json!({ "functionCall": { "name": "ls", "args": {} } });
+        let resp = serde_json::json!({ "functionResponse": { "name": "ls", "response": {} } });
+        let body = serde_json::json!({ "contents": [
+            { "role": "user", "parts": [{ "text": "go" }] },
+            { "role": "model", "parts": [call.clone()] },
+            { "role": "user", "parts": [resp.clone()] },
+            { "role": "model", "parts": [call] },
+            { "role": "user", "parts": [resp] }
+        ] });
+        assert!(!has_untranslatable_content(&body));
+        let chat = request_to_chat(&body, "gemini-2.5-flash");
+        let msgs = chat["messages"].as_array().unwrap();
+        let call_ids: Vec<&str> = msgs
+            .iter()
+            .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        let result_ids: Vec<&str> = msgs
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(call_ids.len(), 2);
+        assert_ne!(call_ids[0], call_ids[1]);
+        assert_eq!(call_ids, result_ids);
     }
 
     #[test]

@@ -6117,20 +6117,11 @@ async fn gemini_generate_content(
                 let decision =
                     firstpass_core::rollout::decide(&state.config.prompt_salt, rollout, &key_value);
                 if !decision.enforced {
-                    // Control arm: observe passthrough, with optional shadow.
-                    let shadow_ctx = route.shadow.map(|_| {
-                        (
-                            chat_body.clone(),
-                            Auth::from_headers(&headers, Dialect::Gemini),
-                            features.clone(),
-                            tenant.clone(),
-                            session_header
-                                .clone()
-                                .unwrap_or_else(|| Uuid::now_v7().to_string()),
-                        )
-                    });
-                    let resp = observe_passthrough_gemini(
-                        state.clone(),
+                    // Control arm: observe passthrough. No shadow: `evaluate_shadow` reads an
+                    // Anthropic Messages body (the only handler that shadows), same as
+                    // `responses` and `chat_completions`.
+                    return observe_passthrough_gemini(
+                        state,
                         headers,
                         body,
                         session_header,
@@ -6141,12 +6132,6 @@ async fn gemini_generate_content(
                         Some(model_owned.clone()),
                     )
                     .await;
-                    if let Some((b, auth, feats, ten, sess)) = shadow_ctx {
-                        spawn_shadow(
-                            &state, &route, route_ix, b, auth, feats, ten, sess, "gemini",
-                        );
-                    }
-                    return resp;
                 }
             }
             if enforce_can_handle_route(
