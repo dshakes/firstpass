@@ -2207,6 +2207,30 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The agent this request belongs to: the explicit `x-firstpass-agent` header, else inferred from
+/// the User-Agent the well-known coding agents send, so `match = { agent = "..." }` routes work
+/// with no client-side header setup. Prefixes verified against each agent's source (2026-11-03):
+/// Claude Code `claude-cli/{ver}` (published cli.js), Codex `codex_cli_rs/{ver}`
+/// (codex-rs/login/src/auth/default_client.rs `DEFAULT_ORIGINATOR`), Gemini CLI `GeminiCLI` /
+/// `GeminiCLI-{client}` (gemini-cli packages/core/src/core/contentGenerator.ts).
+// ponytail: aider/Cline/Cursor use generic SDK User-Agents; they still need the header.
+fn agent_label(headers: &HeaderMap) -> Option<String> {
+    if let Some(a) = header_str(headers, AGENT_HEADER).filter(|a| !a.trim().is_empty()) {
+        return Some(a);
+    }
+    let ua = headers.get("user-agent")?.to_str().ok()?;
+    let agent = if ua.starts_with("claude-cli/") {
+        "claude-code"
+    } else if ua.starts_with("codex_cli_rs/") {
+        "codex"
+    } else if ua.starts_with("GeminiCLI") {
+        "gemini-cli"
+    } else {
+        return None;
+    };
+    Some(agent.to_owned())
+}
+
 /// Headers coding agents set per conversation, checked after the explicit Firstpass header.
 const AGENT_SESSION_HEADERS: [&str; 3] =
     ["x-claude-code-session-id", "session_id", "conversation_id"];
@@ -2551,7 +2575,7 @@ fn openai_tool_content_looks_like_error(message: &Value) -> bool {
 fn extract_features(headers: &HeaderMap, body: &[u8]) -> Features {
     let (_model, tool_count, has_images) = request_features(body);
     let mut f = Features::new(TaskKind::Other);
-    f.agent = header_str(headers, AGENT_HEADER);
+    f.agent = agent_label(headers);
     f.subagent = header_str(headers, SUBAGENT_HEADER);
     f.tool_count = tool_count;
     f.has_images = has_images;
@@ -4998,7 +5022,7 @@ fn extract_openai_features(headers: &HeaderMap, body: &[u8]) -> Features {
         .map_or(0, |tools| u32::try_from(tools.len()).unwrap_or(u32::MAX));
     let has_images = openai_messages_have_images(body);
     let mut f = Features::new(TaskKind::Other);
-    f.agent = header_str(headers, AGENT_HEADER);
+    f.agent = agent_label(headers);
     f.subagent = header_str(headers, SUBAGENT_HEADER);
     f.tool_count = tool_count;
     f.has_images = has_images;
@@ -5129,13 +5153,24 @@ pub fn parse_openai_request(body: &[u8], carry_raw: bool) -> Option<ModelRequest
     for msg in messages_json {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
         match role {
-            "system" => {
-                // First system message wins; subsequent ones are appended as user blocks.
-                // ponytail: Anthropic doesn't support multiple system messages inline;
-                // we take the last one here. A proper multi-system-message implementation
-                // would concatenate them, but that's rare in practice.
-                if let Some(s) = msg.get("content").and_then(Value::as_str) {
-                    system = Some(s.to_owned());
+            // `developer` is OpenAI's newer spelling of `system` (Codex sends its whole base
+            // prompt that way). Every one is kept, in order: dropping or overwriting one would
+            // serve the turn without the agent's instructions.
+            "system" | "developer" => {
+                let text = match msg.get("content") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => String::new(),
+                };
+                if !text.is_empty() {
+                    system = Some(match system {
+                        Some(prev) => format!("{prev}\n\n{text}"),
+                        None => text,
+                    });
                 }
             }
             "user" => {
@@ -5225,11 +5260,16 @@ pub fn parse_openai_request(body: &[u8], carry_raw: bool) -> Option<ModelRequest
         tools = json.get("tools").cloned().unwrap_or(Value::Null);
     }
 
+    // Anthropic requires a cap; OpenAI callers often send none (Codex never does), or spell it
+    // `max_completion_tokens`. 1024 truncated ordinary code edits.
+    // ponytail: 4096 is the smallest output limit of any Claude model still served; per-model
+    // limits would allow more.
     let max_tokens = json
         .get("max_tokens")
+        .or_else(|| json.get("max_completion_tokens"))
         .and_then(Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(1024);
+        .unwrap_or(4096);
 
     let model = json
         .get("model")
@@ -6404,6 +6444,58 @@ fn gemini_sse_error(e: &ProxyError) -> String {
 mod tests {
     use bytes::Bytes;
     use serde_json::json;
+
+    #[test]
+    fn agent_is_inferred_from_known_user_agents_and_header_wins() {
+        let label = |h: &[(&str, &str)]| {
+            let mut headers = HeaderMap::new();
+            for (k, v) in h {
+                headers.insert(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            agent_label(&headers)
+        };
+        let cc = "claude-cli/2.0.14 (external, cli)";
+        assert_eq!(label(&[("user-agent", cc)]).as_deref(), Some("claude-code"));
+        assert_eq!(
+            label(&[(
+                "user-agent",
+                "codex_cli_rs/0.50.0 (Mac OS 15.1; arm64) iTerm.app"
+            )])
+            .as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            label(&[("user-agent", "GeminiCLI/0.12.0 (darwin; arm64)")]).as_deref(),
+            Some("gemini-cli")
+        );
+        assert_eq!(label(&[("user-agent", "OpenAI/Python 1.99.0")]), None);
+        assert_eq!(label(&[]), None);
+        // An explicit header always beats inference (subagents, custom names).
+        assert_eq!(
+            label(&[("user-agent", cc), ("x-firstpass-agent", "architect")]).as_deref(),
+            Some("architect")
+        );
+        // Both feature extractors use it, so a header-less Claude Code turn matches agent routes.
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", cc.parse().unwrap());
+        assert_eq!(
+            extract_features(&headers, b"{}").agent.as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            extract_openai_features(&headers, b"{}").agent.as_deref(),
+            Some("claude-code")
+        );
+        // A blank header (an unset env var forwarded as "") must not mask inference.
+        headers.insert("x-firstpass-agent", " ".parse().unwrap());
+        assert_eq!(
+            extract_features(&headers, b"{}").agent.as_deref(),
+            Some("claude-code")
+        );
+    }
 
     fn sess(h: &[(&str, &str)], body: serde_json::Value) -> Option<String> {
         let mut headers = HeaderMap::new();
@@ -9154,6 +9246,25 @@ mod tests {
         let result_blocks = tool_msg.content.as_array().expect("result blocks");
         assert_eq!(result_blocks[0]["type"], "tool_result");
         assert_eq!(result_blocks[0]["tool_use_id"], "call_1");
+    }
+
+    #[test]
+    fn parse_openai_request_keeps_every_system_and_developer_message() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "developer", "content": "base prompt"},
+                {"role": "system", "content": [{"type": "text", "text": "env context"}]},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let req = parse_openai_request(body.to_string().as_bytes(), false).unwrap();
+        assert_eq!(req.system.as_deref(), Some("base prompt\n\nenv context"));
+        assert_eq!(req.max_tokens, 4096);
+        let body = json!({"model": "m", "max_completion_tokens": 77,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let req = parse_openai_request(body.to_string().as_bytes(), false).unwrap();
+        assert_eq!(req.max_tokens, 77);
     }
 
     #[test]
