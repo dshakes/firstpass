@@ -5153,13 +5153,24 @@ pub fn parse_openai_request(body: &[u8], carry_raw: bool) -> Option<ModelRequest
     for msg in messages_json {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
         match role {
-            "system" => {
-                // First system message wins; subsequent ones are appended as user blocks.
-                // ponytail: Anthropic doesn't support multiple system messages inline;
-                // we take the last one here. A proper multi-system-message implementation
-                // would concatenate them, but that's rare in practice.
-                if let Some(s) = msg.get("content").and_then(Value::as_str) {
-                    system = Some(s.to_owned());
+            // `developer` is OpenAI's newer spelling of `system` (Codex sends its whole base
+            // prompt that way). Every one is kept, in order: dropping or overwriting one would
+            // serve the turn without the agent's instructions.
+            "system" | "developer" => {
+                let text = match msg.get("content") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => String::new(),
+                };
+                if !text.is_empty() {
+                    system = Some(match system {
+                        Some(prev) => format!("{prev}\n\n{text}"),
+                        None => text,
+                    });
                 }
             }
             "user" => {
@@ -5249,11 +5260,16 @@ pub fn parse_openai_request(body: &[u8], carry_raw: bool) -> Option<ModelRequest
         tools = json.get("tools").cloned().unwrap_or(Value::Null);
     }
 
+    // Anthropic requires a cap; OpenAI callers often send none (Codex never does), or spell it
+    // `max_completion_tokens`. 1024 truncated ordinary code edits.
+    // ponytail: 4096 is the smallest output limit of any Claude model still served; per-model
+    // limits would allow more.
     let max_tokens = json
         .get("max_tokens")
+        .or_else(|| json.get("max_completion_tokens"))
         .and_then(Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(1024);
+        .unwrap_or(4096);
 
     let model = json
         .get("model")
@@ -9227,6 +9243,25 @@ mod tests {
         let result_blocks = tool_msg.content.as_array().expect("result blocks");
         assert_eq!(result_blocks[0]["type"], "tool_result");
         assert_eq!(result_blocks[0]["tool_use_id"], "call_1");
+    }
+
+    #[test]
+    fn parse_openai_request_keeps_every_system_and_developer_message() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "developer", "content": "base prompt"},
+                {"role": "system", "content": [{"type": "text", "text": "env context"}]},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let req = parse_openai_request(body.to_string().as_bytes(), false).unwrap();
+        assert_eq!(req.system.as_deref(), Some("base prompt\n\nenv context"));
+        assert_eq!(req.max_tokens, 4096);
+        let body = json!({"model": "m", "max_completion_tokens": 77,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let req = parse_openai_request(body.to_string().as_bytes(), false).unwrap();
+        assert_eq!(req.max_tokens, 77);
     }
 
     #[test]
