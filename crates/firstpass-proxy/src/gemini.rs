@@ -212,21 +212,15 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
             let Some(obj) = part.as_object() else {
                 return true;
             };
-            // Known-good fields that translate faithfully
-            let translatable = obj.contains_key("text")
-                || obj.contains_key("functionCall")
-                || obj.contains_key("functionResponse");
-            if translatable {
-                // `thoughtSignature` on a functionCall part is an opaque signed token
-                // required for Gemini 2.5+/3 extended-thinking replay. Chat Completions
-                // has no equivalent field, so the translation would silently drop it.
-                // gemini-cli replays thoughtSignature in every subsequent history turn
-                // after the first tool call — for those models, most agentic turns that
-                // involve tool use will take the observe-passthrough path.
-                return obj.contains_key("thoughtSignature");
-            }
-            // Known-bad: binary/code/video/server-state
-            true
+            // Strict allow-list: every field on the part must translate faithfully. Anything
+            // else (inlineData, `thought: true`, and `thoughtSignature`, an opaque signed
+            // token Gemini 2.5+/3 needs replayed) would be silently dropped. gemini-cli
+            // replays thoughtSignature in history after the first tool call, so for those
+            // models most agentic tool turns take the observe passthrough.
+            obj.is_empty()
+                || obj
+                    .keys()
+                    .any(|k| !matches!(k.as_str(), "text" | "functionCall" | "functionResponse"))
         })
     })
 }
@@ -556,6 +550,27 @@ mod tests {
         // mutant: if we remove `obj.contains_key("thoughtSignature")` from the guard,
         // has_untranslatable_content returns false (the functionCall makes it "translatable")
         // and this assertion fails — the thoughtSignature would be silently dropped.
+    }
+
+    #[test]
+    fn a_translatable_part_with_any_extra_field_is_untranslatable() {
+        // Presence of `text` must not launder a sibling field the translation drops.
+        for part in [
+            serde_json::json!({ "text": "hi", "inlineData": { "mimeType": "image/png", "data": "AA==" } }),
+            serde_json::json!({ "text": "pondering", "thought": true }),
+            serde_json::json!({ "text": "ok", "thoughtSignature": "sig" }),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                has_untranslatable_content(&serde_json::json!({
+                    "contents": [{ "role": "user", "parts": [part.clone()] }]
+                })),
+                "must not translate {part}"
+            );
+        }
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
+        })));
     }
 
     #[test]
