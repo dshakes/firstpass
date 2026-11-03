@@ -682,6 +682,12 @@ pub fn app(state: AppState) -> Result<Router, ProxyError> {
         .route("/v1/messages/count_tokens", post(count_tokens_passthrough))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
+        // Gemini CLI inbound: `GOOGLE_GEMINI_BASE_URL` + `/v1beta/models/{model}:generateContent`
+        // (or `:streamGenerateContent?alt=sse`, or `:countTokens`).
+        .route(
+            "/v1beta/models/{model_action}",
+            post(gemini_generate_content),
+        )
         .route("/v1/feedback", post(feedback))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/models", get(models))
@@ -1007,11 +1013,11 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
         "feature_version": FEATURE_VERSION,
         "modes": ["observe", "enforce"],
         "routing_modes": routing_modes,
-        "wire_apis": ["anthropic.messages", "openai.chat_completions", "openai.responses"],
+        "wire_apis": ["anthropic.messages", "openai.chat_completions", "openai.responses", "gemini.generate_content"],
         "ladder": ladder,
         "gates": gates,
         "feedback_api": "POST /v1/feedback",
-        "offboarding": "unset ANTHROPIC_BASE_URL (or OPENAI_BASE_URL for OpenAI clients)",
+        "offboarding": "unset ANTHROPIC_BASE_URL (or OPENAI_BASE_URL for OpenAI clients, GOOGLE_GEMINI_BASE_URL for Gemini CLI)",
     }))
 }
 
@@ -3948,6 +3954,8 @@ async fn observe_passthrough(
                 session_header,
                 tenant,
                 "anthropic",
+                "anthropic.messages",
+                None,
             );
             (status, resp_headers, resp_body).into_response()
         }
@@ -3960,6 +3968,8 @@ async fn observe_passthrough(
                 session_header,
                 tenant,
                 "anthropic",
+                "anthropic.messages",
+                None,
             );
             err.into_response()
         }
@@ -3998,6 +4008,8 @@ async fn observe_stream(
                 tenant,
                 "anthropic",
                 status.is_success(),
+                "anthropic.messages",
+                None,
             );
             let tap = SseTap::new(response.bytes_stream(), on_done);
             let stream_body = Body::from_stream(tap);
@@ -4012,6 +4024,8 @@ async fn observe_stream(
                 session_header,
                 tenant,
                 "anthropic",
+                "anthropic.messages",
+                None,
             );
             err.into_response()
         }
@@ -4024,6 +4038,7 @@ async fn observe_stream(
 ///
 /// `upstream_success` is `true` when the upstream HTTP status was 2xx. For non-2xx responses
 /// we record an error trace even if the stream delivered some bytes.
+#[allow(clippy::too_many_arguments)]
 fn stream_trace_callback(
     state: &AppState,
     req_body: Bytes,
@@ -4032,6 +4047,8 @@ fn stream_trace_callback(
     tenant: String,
     provider: &'static str,
     upstream_success: bool,
+    api: &'static str,
+    model_hint: Option<String>,
 ) -> impl FnOnce(SseUsage, SseEndReason) + Send + 'static {
     let config = state.config.clone();
     let traces = state.traces.clone();
@@ -4046,6 +4063,7 @@ fn stream_trace_callback(
                 latency_ms,
                 session_header.as_deref(),
                 provider,
+                api,
             )
         } else {
             match reason {
@@ -4063,6 +4081,8 @@ fn stream_trace_callback(
                         usage,
                         provider,
                         StreamOutcome::MidStreamError,
+                        api,
+                        model_hint.as_deref(),
                     )
                 }
                 SseEndReason::Dropped => {
@@ -4083,6 +4103,8 @@ fn stream_trace_callback(
                         usage,
                         provider,
                         outcome,
+                        api,
+                        model_hint.as_deref(),
                     )
                 }
                 SseEndReason::Eof => {
@@ -4105,6 +4127,8 @@ fn stream_trace_callback(
                         usage,
                         provider,
                         outcome,
+                        api,
+                        model_hint.as_deref(),
                     )
                 }
             }
@@ -4309,6 +4333,32 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
         }
         Some("message_stop") => usage.completed = true,
         _ => {
+            // Gemini: each SSE chunk carries the cumulative `usageMetadata`. The last chunk
+            // also sets `candidates[0].finishReason`. Model is in the URL path, not in the
+            // response body, so `usage.model` stays `None` — the caller supplies a `model_hint`.
+            // finishReason and usageMetadata may arrive in different chunks: track each alone.
+            let is_gemini = json.get("candidates").is_some() || json.get("usageMetadata").is_some();
+            if let Some(fr) = json
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str)
+                .filter(|fr| !fr.is_empty() && *fr != "FINISH_REASON_UNSPECIFIED")
+            {
+                usage.stop_reason = Some(fr.to_owned());
+                usage.completed = true;
+            }
+            if json.pointer("/usageMetadata/promptTokenCount").is_some() {
+                let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
+                // promptTokenCount includes cached content; price that part as a cache read.
+                let cached = u("/usageMetadata/cachedContentTokenCount");
+                usage.in_tokens = u("/usageMetadata/promptTokenCount").saturating_sub(cached);
+                usage.cache_read_tokens = cached;
+                // thoughtsTokenCount: extended-thinking tokens on Gemini 2.5+/3.
+                usage.out_tokens = u("/usageMetadata/candidatesTokenCount")
+                    + u("/usageMetadata/thoughtsTokenCount");
+            }
+            if is_gemini {
+                return;
+            }
             // OpenAI-compatible: final usage chunk (only populated when
             // `stream_options.include_usage` was set in the request).
             if let Some(pt) = json.pointer("/usage/prompt_tokens").and_then(Value::as_u64) {
@@ -4343,6 +4393,7 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
 /// path. Fire-and-forget: if the writer has shut down we log rather than propagate — recording
 /// must never affect what the caller sees. `resp_body` is `Some` for a forwarded response and
 /// `None` when the upstream call failed outright.
+#[allow(clippy::too_many_arguments)]
 fn spawn_trace(
     state: &AppState,
     req_body: Bytes,
@@ -4351,6 +4402,8 @@ fn spawn_trace(
     session_header: Option<String>,
     tenant: String,
     provider: &'static str,
+    api: &'static str,
+    model_hint: Option<String>,
 ) {
     let config = state.config.clone();
     let traces = state.traces.clone();
@@ -4364,6 +4417,8 @@ fn spawn_trace(
                 latency_ms,
                 session_header.as_deref(),
                 provider,
+                api,
+                model_hint.as_deref(),
             ),
             None => build_error_trace(
                 &config,
@@ -4371,6 +4426,7 @@ fn spawn_trace(
                 latency_ms,
                 session_header.as_deref(),
                 provider,
+                api,
             ),
         };
         // Stamp the resolved tenant identity — never the config default nor anything request-borne.
@@ -4449,6 +4505,20 @@ fn response_usage(body: &[u8]) -> ResponseUsage {
     };
     let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
     let model = json.get("model").and_then(Value::as_str).map(str::to_owned);
+    // Gemini `usageMetadata` format: promptTokenCount / candidatesTokenCount / thoughtsTokenCount.
+    // thoughtsTokenCount counts extended-thinking tokens (Gemini 2.5+/3) as output.
+    if json.pointer("/usageMetadata/promptTokenCount").is_some() {
+        // promptTokenCount includes cachedContentTokenCount; price the cached part as a read.
+        let cached = u("/usageMetadata/cachedContentTokenCount");
+        return ResponseUsage {
+            model, // Gemini responses don't carry a top-level model field; caller supplies hint
+            in_tokens: u("/usageMetadata/promptTokenCount").saturating_sub(cached),
+            cache_write_tokens: 0,
+            cache_read_tokens: cached,
+            out_tokens: u("/usageMetadata/candidatesTokenCount")
+                + u("/usageMetadata/thoughtsTokenCount"),
+        };
+    }
     // OpenAI Chat Completions reports `prompt_tokens` INCLUDING cached tokens; split the cached
     // part out so it is priced as a cache read, matching the Anthropic split below.
     if json.pointer("/usage/prompt_tokens").is_some() {
@@ -4471,6 +4541,11 @@ fn response_usage(body: &[u8]) -> ResponseUsage {
 }
 
 /// Build the observe-mode trace for a request that was successfully forwarded and answered.
+///
+/// `api` is the wire API name recorded in the trace (e.g. `"anthropic.messages"`,
+/// `"gemini.generate_content"`). `model_hint` is used when neither the response body nor the
+/// request body carries the model name (Gemini responses have no top-level `model` field).
+#[allow(clippy::too_many_arguments)]
 fn build_trace(
     config: &ProxyConfig,
     req_body: &Bytes,
@@ -4478,17 +4553,21 @@ fn build_trace(
     latency_ms: u64,
     session_header: Option<&str>,
     provider: &str,
+    api: &str,
+    model_hint: Option<&str>,
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
     let usage = response_usage(resp_body);
     let (cache_write_tokens, cache_read_tokens) =
         (usage.cache_write_tokens, usage.cache_read_tokens);
     let (in_tokens, out_tokens) = (usage.in_tokens, usage.out_tokens);
-    // Prefer the response model (authoritative); fall back to the request model, then "unknown".
+    // Prefer the response model (authoritative); fall back to the request model, then the
+    // caller-supplied hint (e.g. model from URL path for Gemini), then "unknown".
     let model = usage
         .model
         .as_deref()
         .or(req_model.as_deref())
+        .or(model_hint)
         .unwrap_or("unknown")
         .to_owned();
 
@@ -4551,7 +4630,7 @@ fn build_trace(
             .is_ok_and(|v| crate::provider::hit_output_limit(&v)),
     };
 
-    let mut trace = base_trace(config, req_body, latency_ms, session_header);
+    let mut trace = base_trace(config, req_body, latency_ms, session_header, api);
     trace.request.features.prompt_token_bucket = token_bucket(in_tokens);
     trace.request.features.tool_count = tool_count;
     trace.request.features.has_images = has_images;
@@ -4594,6 +4673,7 @@ enum StreamOutcome {
     Partial,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_stream_trace_from_usage(
     config: &ProxyConfig,
     req_body: &Bytes,
@@ -4602,6 +4682,8 @@ fn build_stream_trace_from_usage(
     usage: SseUsage,
     provider: &str,
     outcome: StreamOutcome,
+    api: &str,
+    model_hint: Option<&str>,
 ) -> Trace {
     let (req_model, tool_count, has_images) = request_features(req_body);
     let (in_tokens, cache_write_tokens, cache_read_tokens, out_tokens) = (
@@ -4611,11 +4693,13 @@ fn build_stream_trace_from_usage(
         usage.out_tokens,
     );
     // Prefer the model name seen in the SSE events (authoritative); fall back to the
-    // request-side model field, then "unknown".
+    // request-side model field, then the caller-supplied hint (e.g. from URL path for Gemini),
+    // then "unknown".
     let model = usage
         .model
         .as_deref()
         .or(req_model.as_deref())
+        .or(model_hint)
         .unwrap_or("unknown")
         .to_owned();
 
@@ -4669,7 +4753,7 @@ fn build_stream_trace_from_usage(
     // the same condition.
     let truncated = matches!(
         usage.stop_reason.as_deref(),
-        Some("max_tokens") | Some("length")
+        Some("max_tokens") | Some("length") | Some("MAX_TOKENS")
     );
 
     let (verdict, served_from, served_rung) = match outcome {
@@ -4693,7 +4777,7 @@ fn build_stream_trace_from_usage(
         truncated,
     };
 
-    let mut trace = base_trace(config, req_body, latency_ms, session_header);
+    let mut trace = base_trace(config, req_body, latency_ms, session_header, api);
     trace.request.features.prompt_token_bucket = token_bucket(in_tokens);
     trace.request.features.tool_count = tool_count;
     trace.request.features.has_images = has_images;
@@ -4755,9 +4839,10 @@ fn build_error_trace(
     latency_ms: u64,
     session_header: Option<&str>,
     provider: &str,
+    api: &str,
 ) -> Trace {
     let (_, tool_count, has_images) = request_features(req_body);
-    let mut trace = base_trace(config, req_body, latency_ms, session_header);
+    let mut trace = base_trace(config, req_body, latency_ms, session_header, api);
     trace.request.features.tool_count = tool_count;
     trace.request.features.has_images = has_images;
     trace.upstream_provider = provider.to_owned();
@@ -4783,6 +4868,7 @@ fn base_trace(
     req_body: &Bytes,
     latency_ms: u64,
     session_header: Option<&str>,
+    api: &str,
 ) -> Trace {
     let trace_id = Uuid::now_v7();
     let mut features = Features::new(TaskKind::Other);
@@ -4802,7 +4888,7 @@ fn base_trace(
             mode_profile: None,
         },
         request: RequestInfo {
-            api: "anthropic.messages".to_owned(),
+            api: api.to_owned(),
             prompt_hash: prompt_hash(&config.prompt_salt, req_body),
             features,
         },
@@ -5510,6 +5596,8 @@ async fn observe_passthrough_openai_path(
                 session_header,
                 tenant,
                 "openai",
+                "openai.chat_completions",
+                None,
             );
             (status, resp_headers, resp_body).into_response()
         }
@@ -5522,6 +5610,8 @@ async fn observe_passthrough_openai_path(
                 session_header,
                 tenant,
                 "openai",
+                "openai.chat_completions",
+                None,
             );
             err.into_response()
         }
@@ -5559,6 +5649,8 @@ async fn observe_stream_openai_path(
                 tenant,
                 "openai",
                 status.is_success(),
+                "openai.chat_completions",
+                None,
             );
             let tap = SseTap::new(response.bytes_stream(), on_done);
             let stream_body = Body::from_stream(tap);
@@ -5573,6 +5665,8 @@ async fn observe_stream_openai_path(
                 session_header,
                 tenant,
                 "openai",
+                "openai.chat_completions",
+                None,
             );
             err.into_response()
         }
@@ -5783,6 +5877,524 @@ async fn responses(
 /// client (OpenAI SDK, Codex) treats as terminal. Client-safe message only, as [`sse_error_event`].
 fn responses_sse_error(e: &ProxyError) -> String {
     crate::responses::sse_failed(&format!("resp_{}", Uuid::now_v7()), &e.client_message())
+}
+
+// ─── Gemini inbound (POST /v1beta/models/{model_action}) ──────────────────────
+
+/// `POST /v1beta/models/{model_action}` — Gemini `generateContent` / `streamGenerateContent`
+/// inbound endpoint.
+///
+/// The `{model_action}` path segment captures everything after `/v1beta/models/`, e.g.
+/// `gemini-2.0-flash:generateContent` or `gemini-2.0-flash:streamGenerateContent`.
+/// The Gemini CLI sends `?alt=sse` on streaming; that query param is NOT part of
+/// `model_action` and is ignored by the gate (we always buffer the full candidate).
+///
+/// **Observe mode** — transparent relay to `FIRSTPASS_UPSTREAM_GEMINI`, streaming or buffered.
+/// Split `?key=…` out of a Gemini request query string so the API key never appears in a
+/// URL forwarded upstream (which could surface in server-side error logs via reqwest errors).
+///
+/// Returns `(key_value, scrubbed_query)`:
+/// - `key_value` — the raw `key=` value if present
+/// - `scrubbed_query` — the query string with `key=…` removed; safe to include in upstream
+///   URLs and path strings used for logging because it never contains the API key
+fn parse_gemini_query(raw: Option<&str>) -> (Option<String>, String) {
+    let Some(q) = raw.filter(|s| !s.is_empty()) else {
+        return (None, String::new());
+    };
+    let mut key_val: Option<String> = None;
+    let scrubbed: Vec<&str> = q
+        .split('&')
+        .filter(|pair| {
+            if let Some(v) = pair.strip_prefix("key=") {
+                if !v.is_empty() {
+                    // Percent-decode the key value so `%3D` (padding `=`) and similar survive
+                    // the round-trip from URL → header. No new dep: `%XX` is 20 bytes of logic.
+                    key_val = Some(percent_decode_ascii(v));
+                }
+                false // exclude from scrubbed query
+            } else {
+                !pair.is_empty()
+            }
+        })
+        .collect();
+    (key_val, scrubbed.join("&"))
+}
+
+/// Minimal percent-decoder for URL query parameter values. Handles `%HH` sequences; `+` is NOT
+/// decoded as a space (query param values, not form data). Non-UTF-8 sequences are replaced with
+/// the replacement character via `String::from_utf8_lossy`.
+fn percent_decode_ascii(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// The `x-goog-api-key` header (or `?key=` query parameter) is forwarded to the Gemini upstream
+/// only; never sent to Anthropic/OpenAI upstreams. A `?key=` value is moved to the
+/// `x-goog-api-key` header before the upstream URL is built so the key never appears in a URL
+/// that could surface in server-side logs. The key is NOT stored in receipts or traces.
+///
+/// **Enforce mode** — translate Gemini → Chat, run the ladder/gate/escalation, translate back.
+/// Anything not representable in Chat (binary data, executableCode, thoughtSignature on tool
+/// calls, …) falls through to observe passthrough.
+///
+/// `countTokens` is always observe-passthrough (no gate, just relay).
+async fn gemini_generate_content(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant)): Extension<TenantId>,
+    axum::extract::Path(model_action): axum::extract::Path<String>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Strip ?key= from the forwarded URL and inject it as x-goog-api-key header so
+    // the key never appears in an upstream URL that could surface in server-side error logs.
+    let (key_from_query, scrubbed_query) = parse_gemini_query(raw_query.as_deref());
+    let headers: HeaderMap = if let (Some(k), None) = (
+        &key_from_query,
+        headers.get("x-goog-api-key").filter(|v| !v.is_empty()),
+    ) {
+        match axum::http::HeaderValue::from_str(k) {
+            Ok(v) => {
+                let mut h = headers;
+                h.insert("x-goog-api-key", v);
+                h
+            }
+            Err(_) => headers,
+        }
+    } else {
+        headers
+    };
+
+    // Split "gemini-2.0-flash:generateContent" → ("gemini-2.0-flash", "generateContent")
+    // Last colon: the action never contains one, a model name might.
+    let (model, action) = model_action
+        .rsplit_once(':')
+        .unwrap_or((model_action.as_str(), ""));
+    // Owned copy before any possible move of `model_action`; used as model_hint in observe traces.
+    let model_owned = model.to_owned();
+
+    // Only the two generate actions (exact match) are traced or gated. countTokens and any
+    // other or missing action relay transparently and write NO receipt (same as
+    // `/v1/messages/count_tokens`): exact Gemini endpoint semantics, no proxy-specific guess.
+    if !matches!(action, "generateContent" | "streamGenerateContent") {
+        let path = if scrubbed_query.is_empty() {
+            format!("/v1beta/models/{model_action}")
+        } else {
+            format!("/v1beta/models/{model_action}?{scrubbed_query}")
+        };
+        let result = crate::upstream::forward_gemini_path(
+            &state.http,
+            &state.config.upstream_gemini,
+            &path,
+            &headers,
+            body,
+        )
+        .await;
+        return match result {
+            Ok((status, resp_headers, resp_body)) => {
+                (status, resp_headers, resp_body).into_response()
+            }
+            Err(err) => err.into_response(),
+        };
+    }
+
+    let is_streaming = action == "streamGenerateContent";
+
+    let mut session_header = header_session(&headers, &state.config.prompt_salt);
+
+    let Ok(parsed) = serde_json::from_slice::<Value>(&body) else {
+        return observe_passthrough_gemini(
+            state,
+            headers,
+            body,
+            session_header,
+            tenant,
+            model_action,
+            is_streaming,
+            scrubbed_query,
+            Some(model_owned),
+        )
+        .await;
+    };
+
+    // Content the translation cannot faithfully represent → observe passthrough (allow-list).
+    // body_session is NOT called here — consistent with the `responses` handler which only
+    // computes body_session on enforce routes where the body is already being parsed.
+    if crate::gemini::has_untranslatable_content(&parsed) {
+        return observe_passthrough_gemini(
+            state,
+            headers,
+            body,
+            session_header,
+            tenant,
+            model_action,
+            is_streaming,
+            scrubbed_query,
+            Some(model_owned),
+        )
+        .await;
+    }
+
+    // Convert to Chat body for routing/features/gating.
+    let chat_body = Bytes::from(crate::gemini::request_to_chat(&parsed, model).to_string());
+
+    if let Some(routing) = state.config.routing.as_ref() {
+        let features = extract_openai_features(&headers, &chat_body);
+        if let Some(route) = routing
+            .route_for(&features)
+            .filter(|r| r.mode == Mode::Enforce && !r.ladder.is_empty())
+        {
+            // body_session only on enforce routes — consistent with `responses` handler.
+            // Use the translated Chat body so the hash is over Chat-format messages/tools,
+            // not raw Gemini `contents`. Without this, every tool-bearing Gemini body hashes
+            // to the same `conv:` prefix (Gemini bodies have no `messages` key), causing
+            // cross-tenant session collision.
+            session_header = session_header
+                .take()
+                .or_else(|| body_session_bytes(&chat_body, &state.config.prompt_salt));
+            let route_ix = routing
+                .routes
+                .iter()
+                .position(|r| std::ptr::eq(r, route))
+                .unwrap_or(0);
+            let route = route.clone();
+            let routing_mode = resolve_mode(&headers, &route, &state.config);
+            // Observe mode forces the observe passthrough path — no gating, no escalation.
+            if routing_mode == RoutingMode::Observe {
+                return observe_passthrough_gemini(
+                    state,
+                    headers,
+                    body,
+                    session_header,
+                    tenant,
+                    model_action,
+                    is_streaming,
+                    scrubbed_query,
+                    Some(model_owned.clone()),
+                )
+                .await;
+            }
+            // Guardrail demotion (ADR 0009 D3). A route whose served-failure bound has
+            // breached serves exactly as it would without Firstpass until cooldown lapses.
+            if state
+                .guardrails
+                .is_demoted(&tenant, route_ix, jiff::Timestamp::now().as_second())
+            {
+                return observe_passthrough_gemini(
+                    state,
+                    headers,
+                    body,
+                    session_header,
+                    tenant,
+                    model_action,
+                    is_streaming,
+                    scrubbed_query,
+                    Some(model_owned.clone()),
+                )
+                .await;
+            }
+            // Percentage rollout (ADR 0009 D1).
+            if let Some(rollout) = route.rollout.as_ref() {
+                let key_value = match rollout.key {
+                    firstpass_core::RolloutKey::Session => session_header
+                        .clone()
+                        .unwrap_or_else(|| firstpass_core::rollout::request_identity(&body)),
+                    firstpass_core::RolloutKey::Request => {
+                        firstpass_core::rollout::request_identity(&body)
+                    }
+                    firstpass_core::RolloutKey::Tenant => tenant.to_string(),
+                };
+                let decision =
+                    firstpass_core::rollout::decide(&state.config.prompt_salt, rollout, &key_value);
+                if !decision.enforced {
+                    // Control arm: observe passthrough. No shadow: `evaluate_shadow` reads an
+                    // Anthropic Messages body (the only handler that shadows), same as
+                    // `responses` and `chat_completions`.
+                    return observe_passthrough_gemini(
+                        state,
+                        headers,
+                        body,
+                        session_header,
+                        tenant,
+                        model_action,
+                        is_streaming,
+                        scrubbed_query,
+                        Some(model_owned.clone()),
+                    )
+                    .await;
+                }
+            }
+            if enforce_can_handle_route(
+                &features,
+                &chat_body,
+                routing.escalation.enforce_structured,
+                &route,
+                &state.providers,
+                Dialect::Openai,
+            ) {
+                if is_streaming {
+                    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
+                    tokio::spawn(async move {
+                        let out = enforce_pipeline_gemini_as(
+                            &state,
+                            &headers,
+                            &chat_body,
+                            &body,
+                            "gemini.generate_content",
+                            features,
+                            &route,
+                            route_ix,
+                            session_header,
+                            tenant,
+                            routing_mode,
+                        )
+                        .await;
+                        let _ = tx.send(out);
+                    });
+                    return sse_keepalive_response(
+                        rx,
+                        Box::new(|chat| {
+                            crate::gemini::sse_from_response(&crate::gemini::response_from_chat(
+                                chat,
+                            ))
+                        }),
+                        gemini_sse_error,
+                    );
+                }
+                return match enforce_pipeline_gemini_as(
+                    &state,
+                    &headers,
+                    &chat_body,
+                    &body,
+                    "gemini.generate_content",
+                    features,
+                    &route,
+                    route_ix,
+                    session_header,
+                    tenant,
+                    routing_mode,
+                )
+                .await
+                {
+                    Ok(chat) => Json(crate::gemini::response_from_chat(&chat)).into_response(),
+                    Err(e) => e.into_response(),
+                };
+            }
+        }
+    }
+
+    observe_passthrough_gemini(
+        state,
+        headers,
+        body,
+        session_header,
+        tenant,
+        model_action,
+        is_streaming,
+        scrubbed_query,
+        Some(model_owned),
+    )
+    .await
+}
+
+/// Observe passthrough for Gemini `generateContent` / `streamGenerateContent`.
+/// Preserves the exact upstream path (`:generateContent` or `:streamGenerateContent`) so the
+/// upstream receives the right verb. The `scrubbed_query` is the request query string with any
+/// `key=` parameter removed; it is safe to forward and will never contain the API key.
+///
+/// `model_hint` is the model name extracted from the URL path (e.g. `"gemini-2.0-flash"`),
+/// used in the trace because Gemini response bodies carry no top-level `model` field.
+#[allow(clippy::too_many_arguments)]
+async fn observe_passthrough_gemini(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    session_header: Option<String>,
+    tenant: String,
+    model_action: String,
+    is_streaming: bool,
+    scrubbed_query: String,
+    model_hint: Option<String>,
+) -> Response {
+    let path = if scrubbed_query.is_empty() {
+        format!("/v1beta/models/{model_action}")
+    } else {
+        format!("/v1beta/models/{model_action}?{scrubbed_query}")
+    };
+    if is_streaming {
+        let start = Instant::now();
+        let result = crate::upstream::forward_gemini_streaming_path(
+            &state.http,
+            &state.config.upstream_gemini,
+            &path,
+            &headers,
+            body.clone(),
+        )
+        .await;
+        let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match result {
+            Ok((status, resp_headers, response)) => {
+                let on_done = stream_trace_callback(
+                    &state,
+                    body,
+                    latency_ms,
+                    session_header,
+                    tenant,
+                    "google", // price-table prefix (google/gemini-*)
+                    status.is_success(),
+                    "gemini.generate_content",
+                    model_hint,
+                );
+                let tap = SseTap::new(response.bytes_stream(), on_done);
+                let stream_body = Body::from_stream(tap);
+                return (status, resp_headers, stream_body).into_response();
+            }
+            Err(err) => {
+                spawn_trace(
+                    &state,
+                    body,
+                    None,
+                    latency_ms,
+                    session_header,
+                    tenant,
+                    "google", // price-table prefix (google/gemini-*)
+                    "gemini.generate_content",
+                    model_hint,
+                );
+                return err.into_response();
+            }
+        }
+    }
+    let start = Instant::now();
+    let result = crate::upstream::forward_gemini_path(
+        &state.http,
+        &state.config.upstream_gemini,
+        &path,
+        &headers,
+        body.clone(),
+    )
+    .await;
+    let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok((status, resp_headers, resp_body)) => {
+            let for_trace = status.is_success().then_some(resp_body.clone());
+            spawn_trace(
+                &state,
+                body,
+                for_trace,
+                latency_ms,
+                session_header,
+                tenant,
+                "google", // price-table prefix (google/gemini-*)
+                "gemini.generate_content",
+                model_hint,
+            );
+            (status, resp_headers, resp_body).into_response()
+        }
+        Err(err) => {
+            spawn_trace(
+                &state,
+                body,
+                None,
+                latency_ms,
+                session_header,
+                tenant,
+                "google", // price-table prefix (google/gemini-*)
+                "gemini.generate_content",
+                model_hint,
+            );
+            err.into_response()
+        }
+    }
+}
+
+/// Enforce pipeline for Gemini inbound requests. Translates the Gemini body to Chat Completions,
+/// runs the ladder/gate/escalation with `Dialect::Gemini` auth scoping, and returns the Chat
+/// `Value` for the caller to translate back to Gemini shape.
+///
+/// Parallel to [`enforce_pipeline_openai_as`] but uses `Dialect::Gemini` for auth extraction so
+/// the inbound `x-goog-api-key` goes into `Auth::gemini_key` and never leaks to non-Gemini rungs.
+#[allow(clippy::too_many_arguments)]
+async fn enforce_pipeline_gemini_as(
+    state: &AppState,
+    headers: &HeaderMap,
+    chat_body: &Bytes,
+    receipt_body: &Bytes,
+    api: &str,
+    features: Features,
+    route: &Route,
+    route_ix: usize,
+    session_header: Option<String>,
+    tenant: String,
+    routing_mode: RoutingMode,
+) -> Result<Value, ProxyError> {
+    let providers = &state.providers;
+    let all_openai_of = |ladder: &[String]| {
+        ladder.iter().all(|rung| {
+            let pid = rung.split('/').next().unwrap_or_default();
+            providers
+                .get(pid)
+                .is_some_and(|p| p.carries_structured_verbatim(Dialect::Openai))
+        })
+    };
+    let all_openai = all_openai_of(&route.ladder);
+    let allow_challenger = route
+        .challenger
+        .as_ref()
+        .is_none_or(|c| all_openai_of(&c.ladder) == all_openai);
+    let Some(base_request) = parse_openai_request(chat_body, all_openai) else {
+        return Err(ProxyError::BadRequest(
+            "Gemini request could not be translated to a valid Chat Completions request".to_owned(),
+        ));
+    };
+    // Gemini-scoped auth: x-goog-api-key → Auth::gemini_key only; never populates openai_key
+    // from the inbound Gemini header, never sends the Google key to Anthropic/OpenAI rungs.
+    let auth = Auth::from_headers(headers, Dialect::Gemini);
+    let resp = enforce_pipeline_inner(
+        state,
+        receipt_body,
+        base_request,
+        auth,
+        features,
+        route,
+        session_header,
+        tenant,
+        api,
+        routing_mode,
+        route_ix,
+        allow_challenger,
+    )
+    .await?;
+    Ok(openai_response_json(&resp))
+}
+
+/// A ladder failure on a streaming Gemini request: a single SSE data frame containing an error
+/// JSON object that the `@google/genai` SDK surfaces as a thrown `Error`.
+fn gemini_sse_error(e: &ProxyError) -> String {
+    crate::gemini::sse_error_response(&e.client_message())
 }
 
 #[cfg(test)]
@@ -6452,7 +7064,16 @@ mod tests {
                 "usage":{"prompt_tokens":1000,"completion_tokens":200,
                          "prompt_tokens_details":{"cached_tokens":400}}}"#,
         );
-        let trace = build_trace(&config, &req, &resp, 7, None, "openai");
+        let trace = build_trace(
+            &config,
+            &req,
+            &resp,
+            7,
+            None,
+            "openai",
+            "openai.chat_completions",
+            None,
+        );
         let a = &trace.attempts[0];
         assert_eq!(a.provider, "openai");
         assert_eq!(a.in_tokens, 600, "uncached prompt tokens");
@@ -6495,7 +7116,16 @@ mod tests {
             br#"{"model":"claude-haiku-4-5","usage":{"input_tokens":1200,"output_tokens":300}}"#,
         );
 
-        let trace = build_trace(&config, &req, &resp, 42, Some("sess-1"), "anthropic");
+        let trace = build_trace(
+            &config,
+            &req,
+            &resp,
+            42,
+            Some("sess-1"),
+            "anthropic",
+            "anthropic.messages",
+            None,
+        );
 
         assert_eq!(trace.request.api, "anthropic.messages");
         assert_eq!(trace.session_id, "sess-1");
@@ -6517,7 +7147,16 @@ mod tests {
         let req = Bytes::from_static(b"{}");
         let resp = Bytes::from_static(b"{}");
 
-        let trace = build_trace(&config, &req, &resp, 1, None, "anthropic");
+        let trace = build_trace(
+            &config,
+            &req,
+            &resp,
+            1,
+            None,
+            "anthropic",
+            "anthropic.messages",
+            None,
+        );
 
         assert_eq!(trace.session_id, trace.trace_id.to_string());
     }
@@ -6527,7 +7166,7 @@ mod tests {
         let config = test_config();
         let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5"}"#);
 
-        let trace = build_error_trace(&config, &req, 7, None, "anthropic");
+        let trace = build_error_trace(&config, &req, 7, None, "anthropic", "anthropic.messages");
 
         assert!(trace.attempts.is_empty());
         assert_eq!(trace.final_.served_from, ServedFrom::Error);
@@ -7571,6 +8210,7 @@ mod tests {
             5,
             Some("sess-fb"),
             "anthropic",
+            "anthropic.messages",
         );
         trace.attempts.push(Attempt {
             rung: 0,
@@ -11247,6 +11887,8 @@ mod tests {
             usage,
             "anthropic",
             StreamOutcome::Served,
+            "anthropic.messages",
+            None,
         );
         assert!(
             trace.attempts[0].truncated,
@@ -11577,7 +12219,16 @@ mod tests {
         let resp = Bytes::from_static(
             br#"{"model":"claude-haiku-4-5-20251001","usage":{"input_tokens":500,"output_tokens":100}}"#,
         );
-        let trace = build_trace(&config, &req, &resp, 10, None, "anthropic");
+        let trace = build_trace(
+            &config,
+            &req,
+            &resp,
+            10,
+            None,
+            "anthropic",
+            "anthropic.messages",
+            None,
+        );
         let attempt = &trace.attempts[0];
 
         // Cost must be non-zero (priced via the canonical request model).
@@ -11615,6 +12266,8 @@ mod tests {
             usage,
             "anthropic",
             StreamOutcome::Served,
+            "anthropic.messages",
+            None,
         );
         let attempt = &trace.attempts[0];
 
@@ -11626,6 +12279,33 @@ mod tests {
             attempt.model, "claude-haiku-4-5-20251001",
             "attempt model must be the dated snapshot name, not the canonical request model"
         );
+    }
+
+    /// A Gemini stream cut off at the output cap reports `finishReason: "MAX_TOKENS"`; it must be
+    /// recorded as truncated like Anthropic's `max_tokens` and OpenAI's `length`.
+    #[test]
+    fn gemini_stream_max_tokens_is_truncated() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"contents":[]}"#);
+        let usage = SseUsage {
+            in_tokens: 10,
+            out_tokens: 64,
+            stop_reason: Some("MAX_TOKENS".to_owned()),
+            completed: true,
+            ..Default::default()
+        };
+        let trace = build_stream_trace_from_usage(
+            &config,
+            &req,
+            10,
+            None,
+            usage,
+            "google",
+            StreamOutcome::Served,
+            "gemini.generate_content",
+            Some("gemini-2.5-pro"),
+        );
+        assert!(trace.attempts[0].truncated);
     }
 
     // ── Snapshot-fallback edge cases ────────────────────────────────────────────
@@ -11643,7 +12323,16 @@ mod tests {
         let resp = Bytes::from_static(
             br#"{"model":"gpt-99-turbo","usage":{"input_tokens":500,"output_tokens":100}}"#,
         );
-        let trace = build_trace(&config, &req, &resp, 10, None, "anthropic");
+        let trace = build_trace(
+            &config,
+            &req,
+            &resp,
+            10,
+            None,
+            "anthropic",
+            "anthropic.messages",
+            None,
+        );
         let attempt = &trace.attempts[0];
         assert_eq!(
             attempt.cost_usd, 0.0,
@@ -11681,6 +12370,8 @@ mod tests {
             usage,
             "openai",
             StreamOutcome::Served,
+            "openai.chat_completions",
+            None,
         );
         let attempt = &trace.attempts[0];
         // Should fall back to `openai/gpt-4.1-mini`, not `openai/openai/gpt-4.1-mini`.
@@ -11748,6 +12439,8 @@ mod tests {
             "default".to_owned(),
             "anthropic",
             true,
+            "anthropic.messages",
+            None,
         );
         cb(usage, SseEndReason::UpstreamError);
 
@@ -11786,6 +12479,8 @@ mod tests {
             "default".to_owned(),
             "anthropic",
             true,
+            "anthropic.messages",
+            None,
         );
         cb(usage, SseEndReason::Dropped);
         tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -11839,7 +12534,16 @@ mod tests {
         let config = test_config();
         let req = Bytes::from_static(br#"{"model":"openai/gpt-4.1-mini","messages":[]}"#);
         let resp = Bytes::from_static(br#"{"usage":{"prompt_tokens":100,"completion_tokens":10}}"#);
-        let trace = build_trace(&config, &req, &resp, 1, None, "openai");
+        let trace = build_trace(
+            &config,
+            &req,
+            &resp,
+            1,
+            None,
+            "openai",
+            "openai.chat_completions",
+            None,
+        );
         assert!(trace.attempts[0].cost_usd > 0.0, "{:?}", trace.attempts[0]);
     }
 
@@ -11858,6 +12562,8 @@ mod tests {
                 "default".to_owned(),
                 "anthropic",
                 true,
+                "anthropic.messages",
+                None,
             );
             cb(
                 SseUsage {
@@ -11948,7 +12654,7 @@ mod tests {
     fn error_trace_carries_upstream_provider() {
         let config = test_config();
         let req = Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#);
-        let trace = build_error_trace(&config, &req, 10, None, "anthropic");
+        let trace = build_error_trace(&config, &req, 10, None, "anthropic", "anthropic.messages");
         assert_eq!(
             trace.upstream_provider, "anthropic",
             "error trace must record the provider for metrics even without an attempt"
@@ -12732,5 +13438,126 @@ mod tests {
             rx.try_recv().is_err(),
             "count_tokens must not enqueue a trace"
         );
+    }
+
+    // ── Gemini: percent-decode, SSE parsing, response_usage ─────────────────
+
+    #[test]
+    fn percent_decode_ascii_handles_common_cases() {
+        assert_eq!(percent_decode_ascii("AIza-key"), "AIza-key");
+        assert_eq!(percent_decode_ascii("AIza%3Dkey"), "AIza=key"); // = is %3D
+        assert_eq!(percent_decode_ascii("key%2Bplus"), "key+plus"); // + is %2B
+        assert_eq!(percent_decode_ascii("%41%42%43"), "ABC"); // A=41, B=42, C=43
+        assert_eq!(percent_decode_ascii("%"), "%"); // incomplete → pass-through
+        assert_eq!(percent_decode_ascii("%XY"), "%XY"); // non-hex → pass-through
+        // mutant: remove hex_val branches → %3D stays as-is → assert_eq!(…, "AIza=key") fails
+    }
+
+    #[test]
+    fn parse_gemini_query_decodes_key() {
+        let (key, scrubbed) = parse_gemini_query(Some("key=AIza%3Dsecret&alt=sse"));
+        assert_eq!(key.as_deref(), Some("AIza=secret"), "key must be decoded");
+        assert_eq!(scrubbed, "alt=sse", "key must be scrubbed from query");
+        // mutant: remove percent_decode_ascii call → key is "AIza%3Dsecret" not "AIza=secret"
+    }
+
+    #[test]
+    fn gemini_sse_tokens_and_finish_reason_parsed() {
+        let mut u = SseUsage::default();
+        let (mut buf, mut over) = (Vec::new(), false);
+        // Final Gemini SSE chunk with usageMetadata and finishReason.
+        // Note: parse_sse_chunk_into only fires process_sse_line on '\n', so we append one.
+        parse_sse_chunk_into(
+            b"data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"thoughtsTokenCount\":2}}\n",
+            &mut buf,
+            &mut over,
+            &mut u,
+        );
+        assert_eq!(u.in_tokens, 10, "promptTokenCount");
+        assert_eq!(u.out_tokens, 7, "candidatesTokenCount + thoughtsTokenCount");
+        assert!(u.completed, "STOP sets completed");
+        // mutant: remove usageMetadata branch → in_tokens stays 0
+    }
+
+    #[test]
+    fn gemini_sse_finish_reason_and_usage_in_separate_chunks_still_complete() {
+        // Google may send finishReason and the final usageMetadata in different chunks; a
+        // successful stream must not be recorded as partial (Abstain).
+        let mut u = SseUsage::default();
+        let (mut buf, mut over) = (Vec::new(), false);
+        parse_sse_chunk_into(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}\n",
+            &mut buf,
+            &mut over,
+            &mut u,
+        );
+        parse_sse_chunk_into(
+            b"data: {\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":60,\"candidatesTokenCount\":5}}\n",
+            &mut buf,
+            &mut over,
+            &mut u,
+        );
+        assert!(
+            u.completed,
+            "finishReason in its own chunk completes the stream"
+        );
+        assert_eq!(u.stop_reason.as_deref(), Some("STOP"));
+        assert_eq!(
+            u.in_tokens, 40,
+            "cached content is split out of promptTokenCount"
+        );
+        assert_eq!(u.cache_read_tokens, 60);
+        assert_eq!(u.out_tokens, 5);
+    }
+
+    #[test]
+    fn gemini_buffered_usage_splits_cached_content() {
+        let body = br#"{"candidates":[],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":60,"candidatesTokenCount":5,"thoughtsTokenCount":2}}"#;
+        let u = response_usage(body);
+        assert_eq!(
+            (u.in_tokens, u.cache_read_tokens, u.out_tokens),
+            (40, 60, 7)
+        );
+    }
+
+    #[test]
+    fn gemini_sse_intermediate_chunk_updates_tokens_without_completing() {
+        // Intermediate chunks carry usageMetadata but no finishReason.
+        let mut u = SseUsage::default();
+        let (mut buf, mut over) = (Vec::new(), false);
+        parse_sse_chunk_into(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}],\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":3}}\n",
+            &mut buf,
+            &mut over,
+            &mut u,
+        );
+        assert_eq!(u.in_tokens, 8);
+        assert_eq!(u.out_tokens, 3);
+        assert!(!u.completed, "no finishReason → not completed");
+        // mutant: set completed=true always → assert!(!u.completed) fails
+    }
+
+    #[test]
+    fn response_usage_parses_gemini_usage_metadata() {
+        let body = serde_json::json!({
+            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "hi" }] } }],
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "candidatesTokenCount": 5,
+                "thoughtsTokenCount": 3,
+                "totalTokenCount": 28,
+            },
+        });
+        let usage = response_usage(body.to_string().as_bytes());
+        assert_eq!(usage.in_tokens, 20, "promptTokenCount");
+        assert_eq!(
+            usage.out_tokens, 8,
+            "candidatesTokenCount + thoughtsTokenCount"
+        );
+        assert_eq!(
+            usage.model, None,
+            "Gemini response has no top-level model field"
+        );
+        // mutant: remove usageMetadata branch → in_tokens stays 0
     }
 }

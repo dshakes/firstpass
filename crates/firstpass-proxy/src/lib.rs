@@ -35,6 +35,7 @@ pub mod demo;
 pub mod error;
 pub mod experiment;
 pub mod gate;
+pub mod gemini;
 pub mod guard;
 pub mod judge;
 pub mod key_custody;

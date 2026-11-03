@@ -129,6 +129,99 @@ pub async fn forward_anthropic_path(
     Ok((status, out_headers, body))
 }
 
+/// Request headers forwarded verbatim to the upstream Gemini API. The Gemini-specific key header
+/// is forwarded only on the Gemini path — never on Anthropic or OpenAI paths.
+const FORWARDED_GEMINI_REQUEST_HEADERS: &[&str] = &["x-goog-api-key", "content-type"];
+
+/// Response headers relayed on the Gemini observe path (rate-limit / retry signalling).
+const RELAYED_GEMINI_RESPONSE_HEADERS: &[&str] = &["retry-after", "x-request-id"];
+const RELAYED_GEMINI_RESPONSE_HEADER_PREFIXES: &[&str] = &["x-ratelimit-", "x-goog-"];
+
+fn relayed_gemini(name: &str) -> bool {
+    RELAYED_GEMINI_RESPONSE_HEADERS.contains(&name)
+        || RELAYED_GEMINI_RESPONSE_HEADER_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// Build an upstream POST request to `{base}{path}` using the Gemini-specific header allow-list
+/// (`x-goog-api-key` instead of `authorization`/`x-api-key`). If the API key was supplied as a
+/// `?key=` query parameter the caller should strip it and forward it as `x-goog-api-key` before
+/// calling this function.
+fn build_gemini_request(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> reqwest::RequestBuilder {
+    let url = format!("{}{path}", base.trim_end_matches('/'));
+    let mut req = client.post(url);
+    for name in FORWARDED_GEMINI_REQUEST_HEADERS {
+        if let Some(value) = headers.get(*name) {
+            req = req.header(*name, value.clone());
+        }
+    }
+    req.body(body)
+}
+
+/// Copy the response headers observe mode relays on the Gemini path.
+fn passthrough_headers_gemini(response: &reqwest::Response) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    if let Some(content_type) = response.headers().get(header::CONTENT_TYPE) {
+        out.insert(header::CONTENT_TYPE, content_type.clone());
+    }
+    for (name, value) in response.headers() {
+        if relayed_gemini(name.as_str()) {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out
+}
+
+/// Forward one Gemini `generateContent` request to an explicit upstream path and return its
+/// response **buffered**. Observe-mode passthrough — a byte-identical relay.
+///
+/// The path must be the full Gemini path (e.g. `/v1beta/models/gemini-2.0-flash:generateContent`).
+///
+/// # Errors
+/// Returns [`ProxyError::Upstream`] on a transport-level failure.
+pub async fn forward_gemini_path(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
+    let response = build_gemini_request(client, base, path, headers, body)
+        .send()
+        .await?;
+    let status = response.status();
+    let out_headers = passthrough_headers_gemini(&response);
+    let body = response.bytes().await?;
+    Ok((status, out_headers, body))
+}
+
+/// Forward one Gemini `streamGenerateContent` request and return the raw response for streaming
+/// relay. Observe-mode passthrough — SSE chunks forwarded without buffering.
+///
+/// # Errors
+/// Returns [`ProxyError::Upstream`] on a transport-level failure.
+pub async fn forward_gemini_streaming_path(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, reqwest::Response), ProxyError> {
+    let response = build_gemini_request(client, base, path, headers, body)
+        .send()
+        .await?;
+    let status = response.status();
+    let out_headers = passthrough_headers_gemini(&response);
+    Ok((status, out_headers, response))
+}
+
 /// The OpenAI-compatible inbound paths this proxy relays for.
 pub const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 /// The Responses API path. A Responses-shaped body relayed to [`OPENAI_CHAT_PATH`] is rejected by

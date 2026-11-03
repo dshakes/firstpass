@@ -198,6 +198,13 @@ pub struct Auth {
     pub anthropic_beta: Option<String>,
     /// `anthropic-version` header value. When set, overrides the default `2023-06-01`.
     pub anthropic_version: Option<String>,
+    /// Google Gemini API key from the inbound request's `x-goog-api-key` header, **only on
+    /// Gemini-dialect requests** (`/v1beta/models/{model}:generateContent`).
+    /// Never populated from env. A Gemini rung that must work for non-Gemini callers (a mixed
+    /// ladder) needs `api_key_env` on its `[[provider]]` block; there is no ambient fallback.
+    /// Never set on Anthropic/OpenAI paths — scoping prevents the Google key from reaching
+    /// other providers.
+    pub gemini_key: Option<String>,
 }
 
 impl std::fmt::Debug for Auth {
@@ -211,6 +218,7 @@ impl std::fmt::Debug for Auth {
             )
             .field("anthropic_beta", &self.anthropic_beta)
             .field("anthropic_version", &self.anthropic_version)
+            .field("gemini_key", &self.gemini_key.as_ref().map(|_| "***"))
             .finish()
     }
 }
@@ -236,8 +244,11 @@ impl Auth {
     pub fn from_headers(headers: &HeaderMap, dialect: firstpass_core::Dialect) -> Self {
         // Only the request header; env fallback is the provider's responsibility so that
         // a request-supplied Bearer is not shadowed by the server's ANTHROPIC_API_KEY.
+        // Not on the Gemini path: a Gemini client's headers are for Google, and a mixed ladder's
+        // Anthropic rung must not forward a stray inbound `x-api-key` from one.
         let anthropic_key = headers
             .get("x-api-key")
+            .filter(|_| !matches!(dialect, firstpass_core::Dialect::Gemini))
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
 
@@ -259,11 +270,23 @@ impl Auth {
                 (openai_key, None)
             }
             firstpass_core::Dialect::Gemini => {
-                // Bearer on this path is a Google API key — neither OpenAI nor Anthropic.
-                // Fall back to env for escalation paths.
+                // Bearer on this path is a Google token — neither OpenAI nor Anthropic.
+                // `openai_key` is still populated from env for mixed-ladder rungs; it is NOT
+                // sourced from the inbound `x-goog-api-key` (that goes into `gemini_key`).
                 let openai_env = std::env::var("OPENAI_API_KEY").ok();
                 (openai_env, None)
             }
+        };
+
+        // Gemini API key from the inbound `x-goog-api-key` header.
+        // Only trusted on the Gemini path; on other paths the header is ignored.
+        let gemini_key = if matches!(dialect, firstpass_core::Dialect::Gemini) {
+            headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        } else {
+            None
         };
 
         // Multiple `anthropic-beta` values (e.g. "extended-thinking-2025-02-19" + another flag)
@@ -292,6 +315,7 @@ impl Auth {
             anthropic_bearer,
             anthropic_beta,
             anthropic_version,
+            gemini_key,
         }
     }
 }
@@ -1074,10 +1098,12 @@ fn gemini_parse_response(json: &Value) -> Result<(String, u64, u64), ProviderErr
         .pointer("/usageMetadata/promptTokenCount")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let out_tokens = json
-        .pointer("/usageMetadata/candidatesTokenCount")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    // Thinking tokens (Gemini 2.5+/3) are billed as output; leaving them out under-bills.
+    // ponytail: cachedContentTokenCount is not split out here, so implicit cache hits are
+    // priced at the full input rate (over-, never under-billing); split it if that matters.
+    let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
+    let out_tokens =
+        u("/usageMetadata/candidatesTokenCount") + u("/usageMetadata/thoughtsTokenCount");
     Ok((text, in_tokens, out_tokens))
 }
 
@@ -1111,7 +1137,9 @@ impl Provider for GeminiProvider {
         req: &ModelRequest,
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
-        let key = resolve_api_key(self.api_key_env.as_deref(), auth.openai_key.as_deref());
+        // A configured api_key_env wins and never falls through (it is *this* provider's key);
+        // otherwise the inbound x-goog-api-key, Gemini dialect only. Never auth.openai_key.
+        let key = resolve_api_key(self.api_key_env.as_deref(), auth.gemini_key.as_deref());
         let body = gemini_request_body(req);
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
@@ -2093,6 +2121,12 @@ mod tests {
         assert_eq!(out_tok, 4);
         // A response with no candidates is a decode error, not a fabricated empty answer.
         assert!(gemini_parse_response(&serde_json::json!({ "candidates": [] })).is_err());
+        let thinking = serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }],
+            "usageMetadata": { "promptTokenCount": 7, "candidatesTokenCount": 3, "thoughtsTokenCount": 40 }
+        });
+        let (_, _, out) = gemini_parse_response(&thinking).unwrap();
+        assert_eq!(out, 43, "thinking tokens are billed output");
     }
 
     #[test]
@@ -2410,6 +2444,7 @@ mod tests {
             anthropic_bearer: Some("oauth-super-secret".to_owned()),
             anthropic_beta: None,
             anthropic_version: None,
+            gemini_key: None,
         };
         let debug = format!("{auth:?}");
         assert!(!debug.contains("super-secret"));
@@ -2597,6 +2632,26 @@ mod tests {
     }
 
     #[test]
+    fn gemini_dialect_never_populates_anthropic_or_inbound_openai_credentials() {
+        use firstpass_core::Dialect;
+        let mut h = HeaderMap::new();
+        h.insert("x-goog-api-key", "goog-key".parse().unwrap());
+        h.insert("x-api-key", "stray-anthropic-key".parse().unwrap());
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer stray-bearer".parse().unwrap(),
+        );
+        let auth = Auth::from_headers(&h, Dialect::Gemini);
+        assert_eq!(auth.gemini_key.as_deref(), Some("goog-key"));
+        assert!(
+            auth.anthropic_key.is_none(),
+            "x-api-key must not cross to Anthropic"
+        );
+        assert!(auth.anthropic_bearer.is_none());
+        assert_ne!(auth.openai_key.as_deref(), Some("stray-bearer"));
+    }
+
+    #[test]
     fn auth_from_headers_captures_beta_and_version() {
         use firstpass_core::Dialect;
         let mut h = HeaderMap::new();
@@ -2713,6 +2768,7 @@ mod tests {
             anthropic_bearer: Some("oauth-bearer-token".to_owned()),
             anthropic_beta: Some("interleaved-thinking-2025-05-14".to_owned()),
             anthropic_version: Some("2024-01-01".to_owned()),
+            gemini_key: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 
@@ -2844,6 +2900,7 @@ mod tests {
             anthropic_bearer: None,
             anthropic_beta: None,
             anthropic_version: None,
+            gemini_key: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 
@@ -2907,6 +2964,7 @@ mod tests {
             anthropic_bearer: Some("client-oauth-token".to_owned()),
             anthropic_beta: None,
             anthropic_version: None,
+            gemini_key: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 
@@ -2935,6 +2993,7 @@ mod tests {
             anthropic_bearer: bearer.map(str::to_owned),
             anthropic_beta: None,
             anthropic_version: None,
+            gemini_key: None,
         };
         // configured = Option<Option<String>>
         //   None           → api_key_env not set → use client creds + ambient
@@ -3033,6 +3092,7 @@ mod tests {
             anthropic_bearer: Some("oauth-bearer-ignored".to_owned()),
             anthropic_beta: None,
             anthropic_version: None,
+            gemini_key: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 

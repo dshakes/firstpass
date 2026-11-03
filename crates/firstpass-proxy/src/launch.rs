@@ -46,6 +46,14 @@ const AGENTS: &[Agent] = &[
         bin: "",
         vars: &["OPENAI_BASE_URL"],
     },
+    // Gemini CLI (`gemini` binary from `google-gemini/gemini-cli`).
+    // Uses `GOOGLE_GEMINI_BASE_URL` with no path suffix — the SDK appends
+    // `/v1beta/models/{model}:generateContent` directly.
+    Agent {
+        name: "gemini",
+        bin: "gemini",
+        vars: &["GOOGLE_GEMINI_BASE_URL"],
+    },
 ];
 
 /// Print a multi-line diagnostic and exit non-zero.
@@ -297,5 +305,14 @@ mod tests {
             env_for(codex, "http://127.0.0.1:8080").get("OPENAI_BASE_URL"),
             Some(&"http://127.0.0.1:8080/v1".to_owned())
         );
+        // Gemini CLI: GOOGLE_GEMINI_BASE_URL must NOT have /v1 appended — the SDK constructs
+        // `/v1beta/models/{model}:generateContent` from the base itself.
+        let gemini = AGENTS.iter().find(|a| a.name == "gemini").expect("gemini");
+        assert_eq!(
+            env_for(gemini, "http://127.0.0.1:8080").get("GOOGLE_GEMINI_BASE_URL"),
+            Some(&"http://127.0.0.1:8080".to_owned()),
+            "GOOGLE_GEMINI_BASE_URL must point at the proxy root, not /v1"
+        );
+        // mutant: if we add /v1 to GOOGLE vars, this assertion fails
     }
 }

@@ -90,6 +90,7 @@ echo "==> starting proxy on $PROXY_PORT..."
 PROXY_STDERR_LOG="$WORK_DIR/fp-compat-stderr.log"
 FIRSTPASS_UPSTREAM_ANTHROPIC="http://127.0.0.1:$UPSTREAM_PORT" \
 FIRSTPASS_UPSTREAM_OPENAI="http://127.0.0.1:$UPSTREAM_PORT" \
+FIRSTPASS_UPSTREAM_GEMINI="http://127.0.0.1:$UPSTREAM_PORT" \
 FIRSTPASS_MODE=observe \
 FIRSTPASS_DB="$DB_PATH" \
 FIRSTPASS_BIND="127.0.0.1:$PROXY_PORT" \
@@ -188,8 +189,7 @@ PYEOF
 # ---------------------------------------------------------------------------
 RESULT_CLAUDE=skip; NOTES_CLAUDE="not run"; EPATHS_CLAUDE="N/A"
 RESULT_AIDER=skip;  NOTES_AIDER="not run";  EPATHS_AIDER="N/A"
-RESULT_GEMINI=skip; NOTES_GEMINI="Google Gemini protocol (/v1beta/models/{m}:generateContent) is incompatible; proxy 404s"
-EPATHS_GEMINI="N/A"
+RESULT_GEMINI=skip; NOTES_GEMINI="not run"; EPATHS_GEMINI="N/A"
 RESULT_CLINE=skip;  NOTES_CLINE="Requires interactive auth setup; protocol /v1/chat/completions is served"
 EPATHS_CLINE="N/A"
 RESULT_CURSOR=skip; NOTES_CURSOR="Requires Cursor cloud OAuth; no workaround with dummy key"
@@ -366,8 +366,87 @@ run_aider() {
   fi
 }
 
+# ── gemini (Gemini CLI) — fixture only ───────────────────────────────────────
+# The real `gemini` binary requires an interactive session and a real GOOGLE_API_KEY.
+# We exercise the proxy's /v1beta/models/* route with a direct HTTP fixture.
+run_gemini() {
+  echo "==> Gemini fixture (non-streaming + streaming)..."
+  local bef; bef=$(count_log)
+
+  # non-streaming generateContent (needs x-goog-api-key, not x-api-key)
+  local gns_raw; gns_raw=$(python3 - "http://127.0.0.1:$PROXY_PORT/v1beta/models/gemini-2.0-flash:generateContent" \
+    '{"contents":[{"role":"user","parts":[{"text":"say hi"}]}]}' <<'PYEOF'
+import urllib.request, sys
+url, body = sys.argv[1], sys.argv[2].encode()
+req = urllib.request.Request(url, data=body, headers={
+    "Content-Type": "application/json",
+    "x-goog-api-key": "dummy",
+})
+try:
+    r = urllib.request.urlopen(req, timeout=10)
+    print(r.status, r.read().decode()[:400])
+except urllib.error.HTTPError as e:
+    print(e.code, e.read().decode()[:200])
+except Exception as ex:
+    print(0, str(ex))
+PYEOF
+)
+  local gns_code; gns_code=$(echo "$gns_raw" | cut -d' ' -f1)
+  local gns_body; gns_body=$(echo "$gns_raw" | cut -d' ' -f2-)
+
+  # streaming streamGenerateContent
+  local gss_raw; gss_raw=$(python3 - "http://127.0.0.1:$PROXY_PORT/v1beta/models/gemini-2.0-flash:streamGenerateContent" \
+    '{"contents":[{"role":"user","parts":[{"text":"say hi"}]}]}' <<'PYEOF'
+import urllib.request, sys
+url, body = sys.argv[1], sys.argv[2].encode()
+req = urllib.request.Request(url, data=body, headers={
+    "Content-Type": "application/json",
+    "x-goog-api-key": "dummy",
+})
+try:
+    r = urllib.request.urlopen(req, timeout=10)
+    print(r.status, r.read().decode()[:200])
+except urllib.error.HTTPError as e:
+    print(e.code, e.read().decode()[:200])
+except Exception as ex:
+    print(0, str(ex))
+PYEOF
+)
+  local gss_code; gss_code=$(echo "$gss_raw" | cut -d' ' -f1)
+
+  EPATHS_GEMINI=$(endpoints_since "$bef")
+  echo "    generateContent:       HTTP $gns_code | upstream: $EPATHS_GEMINI"
+  echo "    streamGenerateContent: HTTP $gss_code"
+
+  if [ "$gns_code" = "200" ] && [ "$gss_code" = "200" ]; then
+    # confirm response has Gemini shape: candidates field
+    local has_candidates; has_candidates=$(python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    print('yes' if 'candidates' in d else 'no')
+except:
+    print('no')
+" "$gns_body" 2>/dev/null || echo "no")
+    if [ "$has_candidates" = "yes" ]; then
+      RESULT_GEMINI=pass; GEMINI_EP_STATUS="**PASS**"
+      NOTES_GEMINI="fixture only (real CLI needs real GOOGLE_API_KEY); Gemini-shaped response with candidates"
+    else
+      RESULT_GEMINI=fail; GEMINI_EP_STATUS="**FAIL**"
+      NOTES_GEMINI="200 but response missing candidates field: $(echo "$gns_body" | cut -c1-100)"
+      HARNESS_FAILED=1
+    fi
+  else
+    RESULT_GEMINI=fail; GEMINI_EP_STATUS="**FAIL**"
+    NOTES_GEMINI="generateContent=$gns_code streamGenerateContent=$gss_code"
+    HARNESS_FAILED=1
+  fi
+}
+GEMINI_EP_STATUS="**SKIP**"
+
 run_claude
 run_aider
+run_gemini
 
 # ---------------------------------------------------------------------------
 # Upstream summary
@@ -459,7 +538,7 @@ logic applies: token counting is not a routable request.
 |-----|---------|----------------------|----------|---------------|-------|
 | **claude** (Claude Code) | 2.1.x | \`${EPATHS_CLAUDE:-—}\` | yes | ${RESULT_CLAUDE} | ${NOTES_CLAUDE:-—} |
 | **aider** | latest | \`${EPATHS_AIDER:-—}\` | yes | ${RESULT_AIDER} | ${NOTES_AIDER:-—} |
-| **gemini** | 0.26.0 | N/A | no | skip | ${NOTES_GEMINI} |
+| **gemini** | 0.26.0 | \`${EPATHS_GEMINI:-—}\` | yes | ${RESULT_GEMINI} | ${NOTES_GEMINI} |
 | **cline** | installed | N/A | — | skip | ${NOTES_CLINE} |
 | **cursor-agent** | installed | N/A | — | skip | ${NOTES_CURSOR} |
 | **codex** | alias only | \`${EPATHS_CODEX:-—}\` | yes | ${RESULT_CODEX} | ${NOTES_CODEX} |
@@ -472,9 +551,10 @@ logic applies: token counting is not a routable request.
 | \`POST /v1/messages/count_tokens\` | \`count_tokens_passthrough\` | $CT_STATUS | No receipt; see above |
 | \`POST /v1/chat/completions\` | \`chat_completions\` | PASS | OpenAI Chat; aider, cline, cursor |
 | \`POST /v1/responses\` | \`responses\` | PASS | OpenAI Responses API (Codex) |
+| \`POST /v1beta/models/{m}:generateContent\` | \`gemini_generate_content\` | ${GEMINI_EP_STATUS} | Gemini CLI; observe+enforce; countTokens always passthrough |
+| \`POST /v1beta/models/{m}:streamGenerateContent\` | \`gemini_generate_content\` | ${GEMINI_EP_STATUS} | SSE \`data: {json}\` frames |
 | \`GET /v1/models\` | \`models\` | PASS | Served from ladder config |
 | \`GET /healthz\` | \`healthz\` | PASS | Liveness |
-| Gemini \`POST /v1beta/models/*\` | none | **UNSUPPORTED** | See gaps |
 
 ## Header forwarding
 
@@ -492,7 +572,7 @@ Forwarded verbatim on all proxy paths:
 
 | Gap | Status | Upgrade path |
 |-----|--------|-------------|
-| Gemini inbound protocol | Unsupported | Add \`/v1beta/models/*\` routes translating generateContent ↔ OpenAI Chat; non-trivial. |
+| Gemini CLI real run | fixture only | Real \`gemini\` CLI requires GOOGLE_API_KEY; inbound protocol supported; untranslatable parts (inlineData, executableCode) fall through. On Gemini 2.5+/3 with tool use, turns carrying \`thoughtSignature\` are observe passthrough — gemini-cli replays it in history, so most agentic turns after the first tool call on those models are not gated. |
 | cline headless auth | Env workaround needed | cline needs \`CLINE_BASE_URL\`/\`CLINE_API_KEY\` env vars; currently requires interactive setup. |
 | cursor-agent | Cursor-cloud bound | No workaround without real Cursor OAuth. |
 | codex standalone binary | Missing | Shell alias only; covered by Responses API fixture tests. |
@@ -518,6 +598,15 @@ curl -X POST http://127.0.0.1:PORT/v1/responses \\
   -H "Authorization: Bearer dummy" \\
   -H "Content-Type: application/json" \\
   -d '{"model":"gpt-4o","input":[{"type":"message","role":"user","content":"say hi"}]}'
+
+# Gemini CLI (real binary, needs GOOGLE_API_KEY):
+GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:PORT gemini "say hi"
+
+# Gemini fixture (no real key):
+curl -X POST http://127.0.0.1:PORT/v1beta/models/gemini-2.0-flash:generateContent \\
+  -H "x-goog-api-key: dummy" \\
+  -H "Content-Type: application/json" \\
+  -d '{"contents":[{"role":"user","parts":[{"text":"say hi"}]}]}'
 \`\`\`
 MDEOF
 echo ""

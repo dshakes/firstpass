@@ -7,6 +7,9 @@ minus secrets, body shape), and returns protocol-correct responses for:
   - POST /v1/messages/count_tokens   Anthropic count-tokens
   - POST /v1/chat/completions   OpenAI Chat Completions (non-streaming + streaming)
   - POST /v1/responses          OpenAI Responses API (non-streaming + streaming)
+  - POST /v1beta/models/*:generateContent   Gemini generateContent (non-streaming)
+  - POST /v1beta/models/*:streamGenerateContent  Gemini streaming SSE
+  - POST /v1beta/models/*:countTokens   Gemini count-tokens passthrough
   - GET  /v1/models             OpenAI model list
 
 Usage (invoked by run_compat.sh):
@@ -432,11 +435,56 @@ def scripted_openai(parsed, kind, name, args, stream):
 # Request handler
 # ---------------------------------------------------------------------------
 
+GEMINI_NON_STREAM = json.dumps(
+    {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "I am the fake upstream (Gemini)."}],
+                }
+            }
+        ],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 7,
+            "totalTokenCount": 17,
+        },
+    }
+)
+
+# Gemini SSE: single data frame (the SDK accumulates chunks).
+GEMINI_SSE = (
+    "data: "
+    + json.dumps(
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "Fake Gemini stream."}],
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 4,
+                "totalTokenCount": 14,
+            },
+        }
+    )
+    + "\n\n"
+)
+
+GEMINI_COUNT_TOKENS = json.dumps({"totalTokens": 42})
+
 SKIP_HEADERS = frozenset(
     [
         "x-api-key",
         "authorization",
         "x-firstpass-key",
+        "x-goog-api-key",
         "cookie",
         "set-cookie",
     ]
@@ -568,6 +616,17 @@ class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
                 self.send_sse(200, RESPONSES_SSE)
             else:
                 self.send_json(200, RESPONSES_NON_STREAM)
+
+        elif path.startswith("/v1beta/models/"):
+            # Gemini: /v1beta/models/{model}:{action}
+            bare = path.split("?", 1)[0]
+            action = bare.rsplit(":", 1)[-1] if ":" in bare else "generateContent"
+            if action == "countTokens":
+                self.send_json(200, GEMINI_COUNT_TOKENS)
+            elif action.startswith("streamGenerateContent"):
+                self.send_sse(200, GEMINI_SSE)
+            else:
+                self.send_json(200, GEMINI_NON_STREAM)
 
         else:
             self.send_json(404, json.dumps({"error": f"unknown path {path}"}))
