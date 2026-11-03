@@ -234,6 +234,7 @@ fn fd_to_chat(fd: &Value) -> Option<Value> {
     // `parameters`; dropping it would serve every tool schema-less.
     if let Some(p) = fd
         .get("parameters")
+        .filter(|p| !p.is_null())
         .or_else(|| fd.get("parametersJsonSchema"))
     {
         f.insert("parameters".to_owned(), p.clone());
@@ -876,6 +877,14 @@ mod tests {
             "p"
         );
         // mutant (done): without the `parametersJsonSchema` fallback, parameters is null.
+    }
+
+    #[test]
+    fn null_parameters_fall_back_to_parameters_json_schema() {
+        let schema = serde_json::json!({"type": "object"});
+        let fd =
+            serde_json::json!({"name": "f", "parameters": null, "parametersJsonSchema": schema});
+        assert_eq!(fd_to_chat(&fd).unwrap()["function"]["parameters"], schema);
     }
 
     #[test]

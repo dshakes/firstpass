@@ -1331,12 +1331,22 @@ fn gemini_raw_with_choices(mut json: Value, parsed: &GeminiParsed) -> Value {
         } else {
             Value::String(parsed.text.clone())
         };
+        // A call cut off at the output cap must still read as truncated in this view.
+        let finish_reason = if map
+            .get("candidates")
+            .and_then(|c| c.pointer("/0/finishReason"))
+            == Some(&Value::String("MAX_TOKENS".to_owned()))
+        {
+            "length"
+        } else {
+            "tool_calls"
+        };
         map.insert(
             "choices".to_owned(),
             serde_json::json!([{
                 "index": 0,
                 "message": { "role": "assistant", "content": content, "tool_calls": parsed.tool_calls },
-                "finish_reason": "tool_calls",
+                "finish_reason": finish_reason,
             }]),
         );
     }
@@ -2520,6 +2530,20 @@ mod tests {
                 .contains("SIG_A")
         );
         // mutant (done): removing any one `strip_extra_content` call fails its label.
+    }
+
+    #[test]
+    fn gemini_tool_call_cut_off_at_max_tokens_still_reads_truncated() {
+        let json = serde_json::json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                { "functionCall": { "name": "write", "args": { "body": "partial" } } }
+            ] }, "finishReason": "MAX_TOKENS" }],
+            "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 2 }
+        });
+        let parsed = gemini_parse_response(&json).unwrap();
+        let raw = gemini_raw_with_choices(json, &parsed);
+        assert_eq!(raw["choices"][0]["finish_reason"], "length");
+        assert!(hit_output_limit(&raw));
     }
 
     #[test]
