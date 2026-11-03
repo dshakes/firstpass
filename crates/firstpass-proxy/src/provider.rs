@@ -355,6 +355,38 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     fn carries_structured_verbatim(&self, _inbound: firstpass_core::Dialect) -> bool {
         false
     }
+
+    /// Whether this provider rebuilds tool and image content from the normalized
+    /// (Anthropic-shaped) `messages`/`tools` of a translated request — the enforce translation
+    /// path, alongside the Anthropic-dialect providers. `false` unless the provider's wire
+    /// builder translates `tool_use` / `tool_result` / `image` blocks faithfully.
+    fn translates_structured(&self) -> bool {
+        false
+    }
+}
+
+/// Remove Google's OpenAI-compat `extra_content` (Gemini thought signatures, see
+/// [`crate::gemini`]) from every message, tool call, and content block of a wire body's
+/// `messages`. Only a Gemini rung can use a signature; OpenAI rejects unknown message fields and
+/// Anthropic rejects unknown block fields, so no other provider may ever send it.
+///
+/// ponytail: unconditional, so an OpenAI-dialect caller deliberately sending `extra_content` to a
+/// custom OpenAI-compatible provider that is really Google's compat endpoint loses it. Gate on the
+/// provider's host if anyone does that.
+fn strip_extra_content(messages: Option<&mut Value>) {
+    let Some(Value::Array(messages)) = messages else {
+        return;
+    };
+    for m in messages.iter_mut().filter_map(Value::as_object_mut) {
+        m.remove("extra_content");
+        for key in ["tool_calls", "content"] {
+            if let Some(Value::Array(items)) = m.get_mut(key) {
+                for item in items.iter_mut().filter_map(Value::as_object_mut) {
+                    item.remove("extra_content");
+                }
+            }
+        }
+    }
 }
 
 /// Strip the `provider/` prefix from a ladder model id for the provider's wire API — Anthropic and
@@ -439,6 +471,7 @@ pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
             Value::String(wire_model(&req.model).to_owned()),
         );
         body.remove("stream");
+        strip_extra_content(body.get_mut("messages"));
         normalize_reasoning(&mut body, Wire::Anthropic);
         if req.cache_prefix {
             add_cache_breakpoints(&mut body);
@@ -455,6 +488,7 @@ pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
         "max_tokens": req.max_tokens,
         "messages": messages,
     });
+    strip_extra_content(body.get_mut("messages"));
     if let Some(system) = req.system.as_deref() {
         body["system"] = serde_json::json!(system);
     }
@@ -636,6 +670,7 @@ fn anthropic_messages_body(req: &ModelRequest, anthropic_version: &str) -> Value
         let mut body = raw.clone();
         body.remove("model");
         body.remove("stream");
+        strip_extra_content(body.get_mut("messages"));
         body.insert(
             "anthropic_version".to_owned(),
             Value::String(anthropic_version.to_owned()),
@@ -652,6 +687,7 @@ fn anthropic_messages_body(req: &ModelRequest, anthropic_version: &str) -> Value
         "max_tokens": req.max_tokens,
         "messages": messages,
     });
+    strip_extra_content(body.get_mut("messages"));
     if let Some(system) = req.system.as_deref() {
         body["system"] = serde_json::json!(system);
     }
@@ -675,6 +711,7 @@ pub fn openai_wire_body(req: &ModelRequest) -> Value {
             Value::String(wire_model(&req.model).to_owned()),
         );
         body.remove("stream");
+        strip_extra_content(body.get_mut("messages"));
         normalize_reasoning(&mut body, Wire::OpenAi);
         return Value::Object(body);
     }
@@ -693,6 +730,7 @@ pub fn openai_wire_body(req: &ModelRequest) -> Value {
         "max_tokens": req.max_tokens,
         "messages": messages,
     });
+    strip_extra_content(body.get_mut("messages"));
     if !req.tools.is_null() {
         body["tools"] = req.tools.clone();
     }
@@ -1035,31 +1073,136 @@ impl Provider for OpenAiProvider {
     }
 }
 
+/// gemini-cli's placeholder signature for a function call that has no real one.
+///
+/// Verified against `google-gemini/gemini-cli` @ `203fbc528d83982a7866da43e989b69dd089de83`:
+/// `packages/core/src/utils/historyHardening.ts:12` and `packages/core/src/core/geminiChat.ts:112`
+/// define `SYNTHETIC_THOUGHT_SIGNATURE = 'skip_thought_signature_validator'`;
+/// `geminiChat.ts:1424-1470` (`ensureActiveLoopHasThoughtSignatures`, called on every request at
+/// `geminiChat.ts:984`) puts it on the **first** `functionCall` of each `model` turn that lacks a
+/// `thoughtSignature`, "If we do not do this, the API rejects the request with a 400"
+/// (`historyHardening.ts:140-152` applies the same rule). [`gemini_request_body`] follows that
+/// rule for calls a non-Gemini rung (or a non-Gemini caller) produced.
+const SYNTHETIC_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
 /// Build the Gemini `generateContent` request body from a normalized [`ModelRequest`]. Split out
 /// (pure, no I/O) so the translation is unit-tested offline. Gemini uses `contents` with roles
-/// `user` / `model` (not `assistant`) and a separate `systemInstruction`; the system prompt and the
-/// per-message text projection ([`ChatMessage::text_view`]) are what we send. Tool/multimodal blocks
-/// for Gemini (its `functionCall` / `functionResponse` / `inlineData` shapes) are a follow-on — this
-/// adapter routes text, matching the OpenAI adapter's current scope.
+/// `user` / `model` (not `assistant`) and a separate `systemInstruction`.
+///
+/// Message content is either a string or the Anthropic-shaped blocks the translation path
+/// produces: `text` → text part, `tool_use` → `functionCall` (its
+/// `extra_content.google.thought_signature` restored as `thoughtSignature`), `tool_result` →
+/// `functionResponse` (named by the matching `tool_use`), base64 `image` → `inlineData`. Other
+/// blocks (e.g. `thinking`) contribute nothing, as before. Consecutive same-role messages merge
+/// into one turn: Gemini requires every parallel `functionResponse` in a single turn, and the
+/// translation path emits one message per tool result. `tools` (Anthropic or OpenAI shape) →
+/// one `functionDeclarations` entry; `tool_choice` is not carried (the translation path drops it).
 fn gemini_request_body(req: &ModelRequest) -> Value {
-    let contents: Vec<Value> = req
-        .messages
-        .iter()
-        .map(|m| {
-            let role = if m.role == "assistant" {
-                "model"
-            } else {
-                "user"
-            };
-            serde_json::json!({ "role": role, "parts": [{ "text": m.text_view() }] })
-        })
-        .collect();
+    let str_at = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    // tool_use id → name: a tool_result carries only the id, a functionResponse needs the name.
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    let mut contents: Vec<Value> = Vec::with_capacity(req.messages.len());
+    for m in &req.messages {
+        let role = if m.role == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
+        let mut parts: Vec<Value> = Vec::new();
+        if let Value::Array(blocks) = &m.content {
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        parts.push(serde_json::json!({ "text": str_at(b, "text") }));
+                    }
+                    Some("tool_use") => {
+                        let name = str_at(b, "name");
+                        call_names.insert(str_at(b, "id"), name.clone());
+                        let args = b
+                            .get("input")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        let mut part =
+                            serde_json::json!({ "functionCall": { "name": name, "args": args } });
+                        if let Some(sig) = b
+                            .pointer("/extra_content/google/thought_signature")
+                            .and_then(Value::as_str)
+                        {
+                            part["thoughtSignature"] = Value::String(sig.to_owned());
+                        }
+                        parts.push(part);
+                    }
+                    Some("tool_result") => {
+                        let name = call_names
+                            .get(&str_at(b, "tool_use_id"))
+                            .cloned()
+                            .unwrap_or_default();
+                        parts.push(serde_json::json!({ "functionResponse": {
+                            "name": name,
+                            "response": gemini_function_response(b.get("content")),
+                        } }));
+                    }
+                    Some("image") if b.pointer("/source/type") == Some(&Value::from("base64")) => {
+                        parts.push(serde_json::json!({ "inlineData": {
+                            "mimeType": b.pointer("/source/media_type").cloned().unwrap_or(Value::Null),
+                            "data": b.pointer("/source/data").cloned().unwrap_or(Value::Null),
+                        } }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if parts.is_empty() {
+            parts.push(serde_json::json!({ "text": m.text_view() }));
+        }
+        match contents.last_mut() {
+            Some(prev) if prev["role"] == role => {
+                if let Some(prev_parts) = prev["parts"].as_array_mut() {
+                    prev_parts.extend(parts);
+                }
+            }
+            _ => contents.push(serde_json::json!({ "role": role, "parts": parts })),
+        }
+    }
+    // gemini-cli's rule (see SYNTHETIC_THOUGHT_SIGNATURE): the first call of every model turn
+    // must be signed, or Gemini 2.5+/3 400s the request.
+    for c in contents.iter_mut().filter(|c| c["role"] == "model") {
+        if let Some(first_call) = c["parts"]
+            .as_array_mut()
+            .and_then(|ps| ps.iter_mut().find(|p| p.get("functionCall").is_some()))
+            && first_call.get("thoughtSignature").is_none()
+        {
+            first_call["thoughtSignature"] = Value::from(SYNTHETIC_THOUGHT_SIGNATURE);
+        }
+    }
     let mut body = serde_json::json!({
         "contents": contents,
         "generationConfig": { "maxOutputTokens": req.max_tokens },
     });
     if let Some(system) = req.system.as_deref() {
         body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": system }] });
+    }
+    if let Some(tools) = req.tools.as_array() {
+        let decls: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                let f = t.get("function").unwrap_or(t); // OpenAI wraps, Anthropic does not
+                let mut d =
+                    serde_json::json!({ "name": f.get("name").cloned().unwrap_or(Value::Null) });
+                if let Some(desc) = f.get("description") {
+                    d["description"] = desc.clone();
+                }
+                // JSON Schema from Anthropic/OpenAI, so the JSON Schema field — `parameters` is
+                // Gemini's OpenAPI subset and rejects keywords like `additionalProperties`.
+                if let Some(schema) = f.get("input_schema").or_else(|| f.get("parameters")) {
+                    d["parametersJsonSchema"] = schema.clone();
+                }
+                d
+            })
+            .collect();
+        if !decls.is_empty() {
+            body["tools"] = serde_json::json!([{ "functionDeclarations": decls }]);
+        }
     }
     // This builder reconstructs from normalized fields, so the caller's reasoning request is only
     // in `raw` — carry it across rather than dropping it on the Gemini rung.
@@ -1082,9 +1225,43 @@ fn gemini_request_body(req: &ModelRequest) -> Value {
     body
 }
 
-/// Extract `(text, in_tokens, out_tokens)` from a Gemini `generateContent` response. `text` is the
-/// concatenation of the first candidate's text parts; token counts come from `usageMetadata`.
-fn gemini_parse_response(json: &Value) -> Result<(String, u64, u64), ProviderError> {
+/// A `tool_result` block's content as a Gemini `functionResponse.response`, which must be an
+/// object. A Gemini caller's response was serialized to a JSON object string on the way in
+/// ([`crate::gemini`]), so it round-trips exactly; any other result is wrapped as `{"output": …}`,
+/// the key gemini-cli itself uses for tool output.
+fn gemini_function_response(content: Option<&Value>) -> Value {
+    let text = match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(Value::Object(o)) => return Value::Object(o.clone()),
+        _ => String::new(),
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(obj @ Value::Object(_)) => obj,
+        _ => serde_json::json!({ "output": text }),
+    }
+}
+
+/// What [`gemini_parse_response`] reads off a Gemini response.
+#[derive(Debug, PartialEq)]
+struct GeminiParsed {
+    text: String,
+    /// Uncached input only — `promptTokenCount` includes `cachedContentTokenCount`.
+    in_tokens: u64,
+    cache_read_tokens: u64,
+    out_tokens: u64,
+    /// The first candidate's `functionCall` parts as Chat tool calls, each carrying its
+    /// `thoughtSignature` as `extra_content.google.thought_signature`.
+    tool_calls: Vec<Value>,
+}
+
+/// Parse a Gemini `generateContent` response: the first candidate's text and function calls, and
+/// the token split from `usageMetadata`.
+fn gemini_parse_response(json: &Value) -> Result<GeminiParsed, ProviderError> {
     let parts = json
         .pointer("/candidates/0/content/parts")
         .and_then(Value::as_array)
@@ -1094,17 +1271,76 @@ fn gemini_parse_response(json: &Value) -> Result<(String, u64, u64), ProviderErr
         .filter_map(|p| p.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("");
-    let in_tokens = json
-        .pointer("/usageMetadata/promptTokenCount")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    // Thinking tokens (Gemini 2.5+/3) are billed as output; leaving them out under-bills.
-    // ponytail: cachedContentTokenCount is not split out here, so implicit cache hits are
-    // priced at the full input rate (over-, never under-billing); split it if that matters.
+    let tool_calls = parts
+        .iter()
+        .filter_map(|p| Some((p.get("functionCall")?, p)))
+        .map(|(fc, p)| {
+            // Gemini's call id is optional; a fresh one keeps ids unique across a conversation
+            // (Anthropic rejects a repeated tool_use id if a later turn escalates there).
+            let id = fc.get("id").and_then(Value::as_str).map_or_else(
+                || format!("call_{}", uuid::Uuid::now_v7().simple()),
+                str::to_owned,
+            );
+            let args = fc
+                .get("args")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let mut call = serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": fc.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments": args.to_string(),
+                },
+            });
+            if let Some(sig) = p.get("thoughtSignature").and_then(Value::as_str) {
+                call["extra_content"] =
+                    serde_json::json!({ "google": { "thought_signature": sig } });
+            }
+            call
+        })
+        .collect();
     let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
+    // promptTokenCount includes the implicit/explicit cache hits; price those as cache reads,
+    // the same split the observe path makes (`proxy::response_usage`).
+    let cache_read_tokens = u("/usageMetadata/cachedContentTokenCount");
+    let in_tokens = u("/usageMetadata/promptTokenCount").saturating_sub(cache_read_tokens);
+    // Thinking tokens (Gemini 2.5+/3) are billed as output; leaving them out under-bills.
     let out_tokens =
         u("/usageMetadata/candidatesTokenCount") + u("/usageMetadata/thoughtsTokenCount");
-    Ok((text, in_tokens, out_tokens))
+    Ok(GeminiParsed {
+        text,
+        in_tokens,
+        cache_read_tokens,
+        out_tokens,
+        tool_calls,
+    })
+}
+
+/// The Gemini wire response plus, when it called tools, an OpenAI-shaped `choices[0].message`
+/// beside `candidates`. Gates ([`crate::gate`]), [`ModelResponse::has_tool_calls`], and the
+/// response renderers read tool calls from Anthropic or OpenAI shape only; adding the OpenAI view
+/// lets all of them see Gemini calls (with their signatures) without a third reader each, while
+/// `candidates` stays intact for [`hit_output_limit`] and audit.
+fn gemini_raw_with_choices(mut json: Value, parsed: &GeminiParsed) -> Value {
+    if !parsed.tool_calls.is_empty()
+        && let Some(map) = json.as_object_mut()
+    {
+        let content = if parsed.text.is_empty() {
+            Value::Null
+        } else {
+            Value::String(parsed.text.clone())
+        };
+        map.insert(
+            "choices".to_owned(),
+            serde_json::json!([{
+                "index": 0,
+                "message": { "role": "assistant", "content": content, "tool_calls": parsed.tool_calls },
+                "finish_reason": "tool_calls",
+            }]),
+        );
+    }
+    json
 }
 
 /// Speaks `POST {base}/v1beta/models/{model}:generateContent` (Google Gemini Generative Language
@@ -1130,6 +1366,10 @@ pub struct GeminiProvider {
 impl Provider for GeminiProvider {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn translates_structured(&self) -> bool {
+        true
     }
 
     async fn complete(
@@ -1169,16 +1409,16 @@ impl Provider for GeminiProvider {
 
         let json: Value =
             serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
-        let (text, in_tokens, out_tokens) = gemini_parse_response(&json)?;
+        let parsed = gemini_parse_response(&json)?;
         Ok(ModelResponse {
-            // This provider reports no prompt-cache split.
+            // Gemini bills no cache write on the generateContent call.
             cache_write_tokens: 0,
-            cache_read_tokens: 0,
+            cache_read_tokens: parsed.cache_read_tokens,
             model: req.model.clone(),
-            text,
-            in_tokens,
-            out_tokens,
-            raw: json,
+            text: parsed.text.clone(),
+            in_tokens: parsed.in_tokens,
+            out_tokens: parsed.out_tokens,
+            raw: gemini_raw_with_choices(json, &parsed),
         })
     }
 }
@@ -2115,18 +2355,210 @@ mod tests {
             ] } }],
             "usageMetadata": { "promptTokenCount": 11, "candidatesTokenCount": 4 }
         });
-        let (text, in_tok, out_tok) = gemini_parse_response(&json).unwrap();
-        assert_eq!(text, "the answer is 42");
-        assert_eq!(in_tok, 11);
-        assert_eq!(out_tok, 4);
+        let p = gemini_parse_response(&json).unwrap();
+        assert_eq!(p.text, "the answer is 42");
+        assert_eq!(p.in_tokens, 11);
+        assert_eq!(p.out_tokens, 4);
         // A response with no candidates is a decode error, not a fabricated empty answer.
         assert!(gemini_parse_response(&serde_json::json!({ "candidates": [] })).is_err());
         let thinking = serde_json::json!({
             "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }],
             "usageMetadata": { "promptTokenCount": 7, "candidatesTokenCount": 3, "thoughtsTokenCount": 40 }
         });
-        let (_, _, out) = gemini_parse_response(&thinking).unwrap();
-        assert_eq!(out, 43, "thinking tokens are billed output");
+        let p = gemini_parse_response(&thinking).unwrap();
+        assert_eq!(p.out_tokens, 43, "thinking tokens are billed output");
+    }
+
+    #[test]
+    fn gemini_cached_prompt_tokens_are_split_out_as_cache_reads() {
+        let json = serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }],
+            "usageMetadata": { "promptTokenCount": 1000, "cachedContentTokenCount": 800, "candidatesTokenCount": 5 }
+        });
+        let p = gemini_parse_response(&json).unwrap();
+        assert_eq!(
+            p.in_tokens, 200,
+            "promptTokenCount includes the cached part"
+        );
+        assert_eq!(p.cache_read_tokens, 800);
+        // mutant (done): reverting to `in_tokens = promptTokenCount` / `cache_read = 0` fails both.
+        // A malformed count larger than the prompt saturates rather than wrapping.
+        let odd = serde_json::json!({
+            "candidates": [{ "content": { "parts": [] } }],
+            "usageMetadata": { "promptTokenCount": 10, "cachedContentTokenCount": 50 }
+        });
+        assert_eq!(gemini_parse_response(&odd).unwrap().in_tokens, 0);
+    }
+
+    /// A Gemini-inbound tool turn as `crate::gemini::request_to_chat` emits it, through the real
+    /// translation path (`parse_openai_request(_, false)`), into each provider's wire body.
+    fn signed_gemini_tool_turn() -> ModelRequest {
+        let gemini = serde_json::json!({ "contents": [
+            { "role": "user", "parts": [{ "text": "list src" }] },
+            { "role": "model", "parts": [
+                { "functionCall": { "name": "ls", "args": { "p": "src" } }, "thoughtSignature": "SIG_A" },
+                { "functionCall": { "name": "cat", "args": { "f": "x" } } }
+            ] },
+            { "role": "user", "parts": [
+                { "functionResponse": { "name": "ls", "response": { "out": "a.rs" } } },
+                { "functionResponse": { "name": "cat", "response": { "out": "fn" } } }
+            ] }
+        ], "tools": [{ "functionDeclarations": [
+            { "name": "ls", "parametersJsonSchema": { "type": "object" } },
+            { "name": "cat", "parametersJsonSchema": { "type": "object" } }
+        ] }] });
+        assert!(!crate::gemini::has_untranslatable_content(&gemini));
+        let chat = crate::gemini::request_to_chat(&gemini, "gemini-3-flash");
+        let mut req = crate::proxy::parse_openai_request(chat.to_string().as_bytes(), false)
+            .expect("translatable");
+        req.model = "google/gemini-3-flash".to_owned();
+        req
+    }
+
+    #[test]
+    fn gemini_body_replays_the_inbound_thought_signature() {
+        let body = gemini_request_body(&signed_gemini_tool_turn());
+        let c = body["contents"].as_array().unwrap();
+        assert_eq!(
+            c.len(),
+            3,
+            "the two tool results merge into one user turn: {body}"
+        );
+        let model_parts = c[1]["parts"].as_array().unwrap();
+        assert_eq!(c[1]["role"], "model");
+        assert_eq!(model_parts[0]["functionCall"]["name"], "ls");
+        assert_eq!(model_parts[0]["functionCall"]["args"]["p"], "src");
+        assert_eq!(model_parts[0]["thoughtSignature"], "SIG_A");
+        // Only the first call of a turn needs one (gemini-cli's rule); the second stays unsigned.
+        assert!(model_parts[1].get("thoughtSignature").is_none());
+        let resp = c[2]["parts"].as_array().unwrap();
+        assert_eq!(resp[0]["functionResponse"]["name"], "ls");
+        assert_eq!(resp[0]["functionResponse"]["response"]["out"], "a.rs");
+        assert_eq!(resp[1]["functionResponse"]["name"], "cat");
+        let decls = body["tools"][0]["functionDeclarations"].as_array().unwrap();
+        assert_eq!(decls[0]["name"], "ls");
+        assert_eq!(decls[0]["parametersJsonSchema"]["type"], "object");
+        // mutant (done): dropping the `extra_content` copy in `parse_openai_request` or the
+        // `thoughtSignature` restore here makes SIG_A the synthetic value and fails line 3.
+    }
+
+    #[test]
+    fn gemini_body_signs_an_unsigned_first_call_like_gemini_cli() {
+        // A call a non-Gemini rung (or an OpenAI caller) produced carries no signature.
+        let req = ModelRequest {
+            model: "google/gemini-3-flash".to_owned(),
+            system: None,
+            messages: vec![
+                ChatMessage::text("user", "go"),
+                ChatMessage {
+                    role: "assistant".to_owned(),
+                    content: serde_json::json!([
+                        { "type": "tool_use", "id": "t1", "name": "ls", "input": {} },
+                        { "type": "tool_use", "id": "t2", "name": "ls", "input": {} }
+                    ]),
+                },
+                ChatMessage {
+                    role: "user".to_owned(),
+                    content: serde_json::json!([
+                        { "type": "tool_result", "tool_use_id": "t1", "content": "plain text" },
+                        { "type": "tool_result", "tool_use_id": "t2", "content": "x" }
+                    ]),
+                },
+            ],
+            max_tokens: 64,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let body = gemini_request_body(&req);
+        let parts = body["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["thoughtSignature"], SYNTHETIC_THOUGHT_SIGNATURE);
+        assert!(parts[1].get("thoughtSignature").is_none());
+        // A non-JSON tool result is wrapped, because functionResponse.response must be an object.
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"],
+            "plain text"
+        );
+        // mutant (done): deleting the synthetic-signature loop fails the first assert.
+    }
+
+    #[test]
+    fn non_gemini_bodies_never_carry_extra_content() {
+        let req = signed_gemini_tool_turn();
+        // Translation path (raw = Null): Anthropic, Bedrock/Vertex, and OpenAI rebuild bodies.
+        let mut raw_carry = req.clone();
+        raw_carry.raw = serde_json::json!({
+            "model": "x",
+            "messages": [{ "role": "assistant", "content": "hi",
+                "extra_content": { "google": { "thought_signature": "m" } },
+                "tool_calls": [{ "id": "c", "type": "function",
+                    "function": { "name": "ls", "arguments": "{}" },
+                    "extra_content": { "google": { "thought_signature": "SIG_A" } } }] }],
+        });
+        for (label, body) in [
+            ("anthropic", anthropic_wire_body(&req)),
+            ("anthropic raw", anthropic_wire_body(&raw_carry)),
+            (
+                "bedrock",
+                anthropic_messages_body(&req, "bedrock-2023-05-31"),
+            ),
+            (
+                "bedrock raw",
+                anthropic_messages_body(&raw_carry, "bedrock-2023-05-31"),
+            ),
+            ("openai", openai_wire_body(&req)),
+            ("openai raw", openai_wire_body(&raw_carry)),
+        ] {
+            let s = body.to_string();
+            assert!(!s.contains("extra_content"), "{label} leaked: {s}");
+            assert!(!s.contains("SIG_A"), "{label} leaked the signature: {s}");
+        }
+        // The normalized request really did carry it (else the asserts above prove nothing).
+        assert!(
+            serde_json::to_string(&req.messages)
+                .unwrap()
+                .contains("SIG_A")
+        );
+        // mutant (done): removing any one `strip_extra_content` call fails its label.
+    }
+
+    #[test]
+    fn gemini_response_function_calls_surface_with_their_signature() {
+        let json = serde_json::json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                { "text": "Checking." },
+                { "functionCall": { "name": "ls", "args": { "p": "." } }, "thoughtSignature": "OUT_SIG" }
+            ] }, "finishReason": "STOP" }],
+            "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 2 }
+        });
+        let parsed = gemini_parse_response(&json).unwrap();
+        let resp = ModelResponse {
+            model: "google/gemini-3-flash".to_owned(),
+            text: parsed.text.clone(),
+            in_tokens: parsed.in_tokens,
+            cache_write_tokens: 0,
+            cache_read_tokens: parsed.cache_read_tokens,
+            out_tokens: parsed.out_tokens,
+            raw: gemini_raw_with_choices(json, &parsed),
+        };
+        assert!(resp.has_tool_calls(), "gates must see the Gemini call");
+        let call = &resp.raw["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "ls");
+        assert_eq!(call["function"]["arguments"], r#"{"p":"."}"#);
+        assert_eq!(
+            call["extra_content"]["google"]["thought_signature"],
+            "OUT_SIG"
+        );
+        assert!(
+            resp.raw["candidates"].is_array(),
+            "wire response kept for audit"
+        );
+        // And back out to a Gemini caller with the signature on the functionCall part.
+        let out = crate::gemini::response_from_chat(&crate::proxy::openai_response_json(&resp));
+        let parts = out["candidates"][0]["content"]["parts"].as_array().unwrap();
+        assert_eq!(parts[1]["thoughtSignature"], "OUT_SIG");
+        // mutant (done): dropping the `extra_content` insert in `gemini_parse_response` fails
+        // the signature asserts; skipping `gemini_raw_with_choices` fails `has_tool_calls`.
     }
 
     #[test]

@@ -19,17 +19,27 @@
 //! | `contents[].role = "user"/"model"` | `messages[].role = "user"/"assistant"` |
 //! | `contents[].parts[].text` | message content string |
 //! | `contents[].parts[].functionCall` | `tool_calls` in assistant message |
+//! | `parts[].thoughtSignature` on a `functionCall` part | that tool call's `extra_content.google.thought_signature` |
+//! | `parts[].thoughtSignature` on a `text` part | the message's `extra_content.google.thought_signature` (last one wins) |
 //! | `contents[].parts[].functionResponse` | `{role:"tool", tool_call_id, content}` |
-//! | `tools[].functionDeclarations[]` | `tools[{type:"function", function:{...}}]` |
+//! | `tools[].functionDeclarations[]` (`parameters` or `parametersJsonSchema`) | `tools[{type:"function", function:{...}}]` |
 //! | `generationConfig.maxOutputTokens` | `max_tokens` |
 //! | `usageMetadata.promptTokenCount` | `usage.prompt_tokens` |
 //! | `usageMetadata.candidatesTokenCount` | `usage.completion_tokens` |
 //! | `finishReason: "STOP"/"MAX_TOKENS"` | `finish_reason: "stop"/"length"` |
+//! | (outbound) `tool_calls[].extra_content.google.thought_signature` | `functionCall` part's `thoughtSignature` |
+//!
+//! `extra_content: {google: {thought_signature}}` is Google's own OpenAI-compatibility spelling.
+//! It exists so a Gemini rung can replay the signature (`GeminiProvider` restores it); the
+//! OpenAI/Anthropic wire builders strip it, so it never reaches a non-Gemini upstream.
+//! Function-call signatures are the load-bearing ones (Gemini 400s without them); text-part
+//! signatures are optional and only survive as far as the Chat body — no provider replays them.
 //!
 //! ## Not translated → passthrough
 //!
 //! `inlineData` (binary), `executableCode` / `codeExecutionResult`, `fileData`, `videoMetadata`,
-//! `thoughtSignature`, `cachedContent`, and any part type not in the allow-list above.
+//! `thought: true` parts, a `thoughtSignature` on a part with neither `text` nor `functionCall`
+//! (or a non-string one), `cachedContent`, and any part key not in the allow-list above.
 
 use serde_json::{Map, Value};
 
@@ -125,21 +135,35 @@ fn content_to_messages(content: &Value, turn: usize) -> Vec<Value> {
     // history where that pairing is not exact.
     let calls: Vec<Value> = parts
         .iter()
-        .filter_map(|p| p.as_object()?.get("functionCall")?.as_object())
+        .filter_map(|p| {
+            let p = p.as_object()?;
+            Some((p.get("functionCall")?.as_object()?, p))
+        })
         .enumerate()
-        .filter_map(|(idx, fc)| {
+        .filter_map(|(idx, (fc, part))| {
             let name = fc.get("name")?.clone();
             let args = fc
                 .get("args")
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new()));
-            Some(serde_json::json!({
+            let mut call = serde_json::json!({
                 "id": format!("call_{turn}_{idx}"),
                 "type": "function",
                 "function": { "name": name, "arguments": args.to_string() },
-            }))
+            });
+            if let Some(extra) = signature_extra(part) {
+                call["extra_content"] = extra;
+            }
+            Some(call)
         })
         .collect();
+    // Optional text-part signature (Gemini puts it on the last part of a non-call answer).
+    let text_sig = parts
+        .iter()
+        .rev()
+        .filter_map(Value::as_object)
+        .filter(|p| p.contains_key("text"))
+        .find_map(signature_extra);
     if !calls.is_empty() {
         let text = text_from_parts(parts);
         let content_val = if text.is_empty() {
@@ -147,11 +171,15 @@ fn content_to_messages(content: &Value, turn: usize) -> Vec<Value> {
         } else {
             Value::String(text)
         };
-        return vec![serde_json::json!({
+        let mut msg = serde_json::json!({
             "role": "assistant",
             "content": content_val,
             "tool_calls": calls,
-        })];
+        });
+        if let Some(extra) = text_sig {
+            msg["extra_content"] = extra;
+        }
+        return vec![msg];
     }
 
     // functionResponse parts → one tool message per part (parallel tool results).
@@ -180,7 +208,17 @@ fn content_to_messages(content: &Value, turn: usize) -> Vec<Value> {
 
     // Plain text message
     let text = text_from_parts(parts);
-    vec![serde_json::json!({ "role": chat_role, "content": text })]
+    let mut msg = serde_json::json!({ "role": chat_role, "content": text });
+    if let Some(extra) = text_sig {
+        msg["extra_content"] = extra;
+    }
+    vec![msg]
+}
+
+/// A part's `thoughtSignature` in Google's OpenAI-compat `extra_content` shape.
+fn signature_extra(part: &Map<String, Value>) -> Option<Value> {
+    let sig = part.get("thoughtSignature")?.as_str()?;
+    Some(serde_json::json!({ "google": { "thought_signature": sig } }))
 }
 
 /// Concatenate text parts from a `parts` array.
@@ -204,7 +242,12 @@ fn fd_to_chat(fd: &Value) -> Option<Value> {
     if let Some(d) = fd.get("description") {
         f.insert("description".to_owned(), d.clone());
     }
-    if let Some(p) = fd.get("parameters") {
+    // gemini-cli (via `@google/genai`) declares its tools with `parametersJsonSchema`, not
+    // `parameters`; dropping it would serve every tool schema-less.
+    if let Some(p) = fd
+        .get("parameters")
+        .or_else(|| fd.get("parametersJsonSchema"))
+    {
         f.insert("parameters".to_owned(), p.clone());
     }
     Some(serde_json::json!({"type": "function", "function": Value::Object(f)}))
@@ -256,9 +299,11 @@ fn function_pairing_is_exact(contents: Option<&Value>) -> bool {
 /// tool entries (e.g. `googleSearch`, `codeExecution`), `systemInstruction` with non-text parts,
 /// and unmapped `generationConfig` fields trigger passthrough.
 ///
-/// **Part-level**: plain text, `functionCall`, `functionResponse` are translatable. Anything
-/// else — `inlineData`, `executableCode`, `codeExecutionResult`, `fileData`, `videoMetadata`,
-/// `thoughtSignature`, or any unknown part key — is not.
+/// **Part-level**: plain text, `functionCall`, `functionResponse` are translatable, and so is a
+/// string `thoughtSignature` on a `text` or `functionCall` part (carried as `extra_content`).
+/// Anything else — `inlineData`, `executableCode`, `codeExecutionResult`, `fileData`,
+/// `videoMetadata`, `thought: true`, a bare or non-string `thoughtSignature`, or any unknown
+/// part key — is not.
 #[must_use]
 pub fn has_untranslatable_content(body: &Value) -> bool {
     let Some(obj) = body.as_object() else {
@@ -355,14 +400,21 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
                 return true;
             };
             // Strict allow-list: every field on the part must translate faithfully. Anything
-            // else (inlineData, `thought: true`, and `thoughtSignature`, an opaque signed
-            // token Gemini 2.5+/3 needs replayed) would be silently dropped. gemini-cli
-            // replays thoughtSignature in history after the first tool call, so for those
-            // models most agentic tool turns take the observe passthrough.
+            // else (inlineData, `thought: true`, …) would be silently dropped. A
+            // `thoughtSignature` (opaque token Gemini 2.5+/3 needs replayed) is carried as
+            // `extra_content`, but only where it has an anchor: a text or functionCall part.
+            let sig_unanchored = part_obj.get("thoughtSignature").is_some_and(|s| {
+                !s.is_string()
+                    || !(part_obj.contains_key("text") || part_obj.contains_key("functionCall"))
+            });
             part_obj.is_empty()
-                || part_obj
-                    .keys()
-                    .any(|k| !matches!(k.as_str(), "text" | "functionCall" | "functionResponse"))
+                || sig_unanchored
+                || part_obj.keys().any(|k| {
+                    !matches!(
+                        k.as_str(),
+                        "text" | "functionCall" | "functionResponse" | "thoughtSignature"
+                    )
+                })
         })
     })
 }
@@ -408,9 +460,19 @@ pub fn response_from_chat(chat: &Value) -> Value {
                 .unwrap_or("{}");
             let args: Value =
                 serde_json::from_str(args_str).unwrap_or_else(|_| Value::Object(Map::new()));
-            parts.push(serde_json::json!({
+            let mut part = serde_json::json!({
                 "functionCall": { "name": name, "args": args }
-            }));
+            });
+            // Replayed by gemini-cli in its next request's history; Gemini 2.5+/3 400s a
+            // function call in history without one (gemini-cli injects a synthetic one when
+            // a non-Gemini rung served the call, so absence is fine).
+            if let Some(sig) = tc
+                .pointer("/extra_content/google/thought_signature")
+                .and_then(Value::as_str)
+            {
+                part["thoughtSignature"] = Value::String(sig.to_owned());
+            }
+            parts.push(part);
         }
     }
 
@@ -679,6 +741,29 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_signature_is_emitted_as_thought_signature() {
+        let chat = serde_json::json!({
+            "choices": [{ "finish_reason": "tool_calls", "message": {
+                "content": null,
+                "tool_calls": [
+                    { "id": "a", "type": "function",
+                      "function": { "name": "ls", "arguments": "{}" },
+                      "extra_content": { "google": { "thought_signature": "SIG1" } } },
+                    { "id": "b", "type": "function",
+                      "function": { "name": "ls", "arguments": "{}" } }
+                ],
+            }}],
+        });
+        let out = response_from_chat(&chat);
+        let parts = out["candidates"][0]["content"]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["thoughtSignature"], "SIG1");
+        assert!(parts[1].get("thoughtSignature").is_none());
+        // The streaming path re-emits the same response, so it carries it too.
+        assert!(sse_from_response(&out).contains("\"thoughtSignature\":\"SIG1\""));
+        // mutant (done): deleting the `thoughtSignature` insert fails the first assert.
+    }
+
+    #[test]
     fn empty_response_still_has_a_parts_array() {
         // An empty content response must still have a well-formed candidates shape.
         let chat = serde_json::json!({
@@ -730,23 +815,79 @@ mod tests {
     }
 
     #[test]
-    fn function_call_with_thought_signature_is_untranslatable() {
-        // Gemini 2.5+/3 returns `thoughtSignature` on functionCall parts. gemini-cli
-        // replays it in every subsequent history turn, so after the first tool call
-        // on those models most agentic turns will have untranslatable content and fall
-        // through to observe passthrough.
-        assert!(has_untranslatable_content(&serde_json::json!({
-            "contents": [{
-                "role": "model",
-                "parts": [{
-                    "functionCall": { "name": "f", "args": {} },
-                    "thoughtSignature": "Aef8xyz=="
-                }],
-            }],
-        })));
-        // mutant: if we remove `obj.contains_key("thoughtSignature")` from the guard,
-        // has_untranslatable_content returns false (the functionCall makes it "translatable")
-        // and this assertion fails — the thoughtSignature would be silently dropped.
+    fn signed_function_call_translates_and_keeps_its_signature() {
+        // gemini-cli replays `thoughtSignature` on every functionCall part in history after
+        // the first tool call (Gemini 2.5+/3). It must translate, and the signature must land
+        // on the Chat tool call in Google's OpenAI-compat `extra_content` shape.
+        let body = serde_json::json!({ "contents": [
+            { "role": "user", "parts": [{ "text": "ls" }] },
+            { "role": "model", "parts": [
+                { "text": "Looking.", "thoughtSignature": "txtSig" },
+                { "functionCall": { "name": "ls", "args": {} }, "thoughtSignature": "Aef8xyz==" },
+                { "functionCall": { "name": "ls", "args": { "p": "src" } } }
+            ] },
+            { "role": "user", "parts": [
+                { "functionResponse": { "name": "ls", "response": {} } },
+                { "functionResponse": { "name": "ls", "response": {} } }
+            ] }
+        ] });
+        assert!(!has_untranslatable_content(&body));
+        let chat = request_to_chat(&body, "gemini-3-flash");
+        let msg = &chat["messages"][1];
+        let calls = msg["tool_calls"].as_array().unwrap();
+        assert_eq!(
+            calls[0]["extra_content"]["google"]["thought_signature"],
+            "Aef8xyz=="
+        );
+        assert!(
+            calls[1].get("extra_content").is_none(),
+            "an unsigned call stays unsigned"
+        );
+        assert_eq!(
+            msg["extra_content"]["google"]["thought_signature"],
+            "txtSig"
+        );
+        // mutant (done): `signature_extra` -> None makes both signature asserts fail;
+        // dropping "thoughtSignature" from the part allow-list fails the translatable assert.
+    }
+
+    #[test]
+    fn unanchored_or_thought_parts_stay_untranslatable() {
+        for part in [
+            // a thought summary: not part of the answer, no Chat equivalent
+            serde_json::json!({ "text": "pondering", "thought": true, "thoughtSignature": "s" }),
+            // a bare signature part with nothing to carry it on
+            serde_json::json!({ "thoughtSignature": "s" }),
+            // a non-string signature
+            serde_json::json!({ "functionCall": { "name": "f", "args": {} }, "thoughtSignature": 7 }),
+            // a signature on a functionResponse (Gemini never emits one; nothing replays it)
+            serde_json::json!({ "functionResponse": { "name": "f", "response": {} }, "thoughtSignature": "s" }),
+        ] {
+            assert!(
+                has_untranslatable_content(&serde_json::json!({
+                    "contents": [{ "role": "model", "parts": [part.clone()] }]
+                })),
+                "must not translate {part}"
+            );
+        }
+        // mutant (done): removing `sig_unanchored` from the guard fails the last three cases.
+    }
+
+    #[test]
+    fn parameters_json_schema_is_carried() {
+        // `@google/genai` (what gemini-cli uses) sends `parametersJsonSchema`.
+        let body = serde_json::json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "tools": [{ "functionDeclarations": [{
+                "name": "ls", "parametersJsonSchema": { "type": "object", "required": ["p"] }
+            }] }],
+        });
+        let out = request_to_chat(&body, "m");
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"]["required"][0],
+            "p"
+        );
+        // mutant (done): without the `parametersJsonSchema` fallback, parameters is null.
     }
 
     #[test]
@@ -755,7 +896,6 @@ mod tests {
         for part in [
             serde_json::json!({ "text": "hi", "inlineData": { "mimeType": "image/png", "data": "AA==" } }),
             serde_json::json!({ "text": "pondering", "thought": true }),
-            serde_json::json!({ "text": "ok", "thoughtSignature": "sig" }),
             serde_json::json!({}),
         ] {
             assert!(
