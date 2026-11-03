@@ -244,7 +244,8 @@ fn function_pairing_is_exact(contents: Option<&Value>) -> bool {
         }
         pending = names(c, "functionCall");
     }
-    true
+    // A trailing unanswered call would end the Chat history on an assistant tool_calls turn.
+    pending.is_empty()
 }
 
 /// Whether this `generateContent` body contains anything the translation cannot faithfully
@@ -838,6 +839,10 @@ mod tests {
                 vec![resp("a"), serde_json::json!({ "text": "also" })],
             ),
             turns(vec![serde_json::json!({ "text": "hi" })], vec![resp("a")]),
+            serde_json::json!({ "contents": [
+                { "role": "user", "parts": [{ "text": "go" }] },
+                { "role": "model", "parts": [call("a")] }
+            ] }),
             serde_json::json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }], "labels": { "a": "b" } }),
         ] {
             assert!(

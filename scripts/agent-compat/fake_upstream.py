@@ -619,7 +619,8 @@ class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
 
         elif path.startswith("/v1beta/models/"):
             # Gemini: /v1beta/models/{model}:{action}
-            action = path.rsplit(":", 1)[-1] if ":" in path else "generateContent"
+            bare = path.split("?", 1)[0]
+            action = bare.rsplit(":", 1)[-1] if ":" in bare else "generateContent"
             if action == "countTokens":
                 self.send_json(200, GEMINI_COUNT_TOKENS)
             elif action.startswith("streamGenerateContent"):

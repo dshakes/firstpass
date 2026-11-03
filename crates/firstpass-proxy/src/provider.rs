@@ -200,8 +200,8 @@ pub struct Auth {
     pub anthropic_version: Option<String>,
     /// Google Gemini API key from the inbound request's `x-goog-api-key` header, **only on
     /// Gemini-dialect requests** (`/v1beta/models/{model}:generateContent`).
-    /// Never populated from env on the Gemini inbound path — callers that need a server-side
-    /// fallback key can set `GOOGLE_API_KEY` and let `GeminiProvider::complete` resolve it.
+    /// Never populated from env. A Gemini rung that must work for non-Gemini callers (a mixed
+    /// ladder) needs `api_key_env` on its `[[provider]]` block; there is no ambient fallback.
     /// Never set on Anthropic/OpenAI paths — scoping prevents the Google key from reaching
     /// other providers.
     pub gemini_key: Option<String>,
@@ -1132,8 +1132,8 @@ impl Provider for GeminiProvider {
         req: &ModelRequest,
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
-        // Priority (BYOK-first): inbound x-goog-api-key (BYOK) > configured api_key_env >
-        // ambient GOOGLE_API_KEY / GEMINI_API_KEY. Never use auth.openai_key.
+        // A configured api_key_env wins and never falls through (it is *this* provider's key);
+        // otherwise the inbound x-goog-api-key, Gemini dialect only. Never auth.openai_key.
         let key = resolve_api_key(self.api_key_env.as_deref(), auth.gemini_key.as_deref());
         let body = gemini_request_body(req);
         let url = format!(
