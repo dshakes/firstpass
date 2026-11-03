@@ -181,7 +181,7 @@ A route for an agent (validated with `firstpass doctor`):
 
 ```toml
 [[route]]
-match  = {}                                    # every request; match = { agent = "…" } needs the client to send x-firstpass-agent
+match  = {}                                    # every request; agent = "claude-code"/"codex"/"gemini-cli" is detected from User-Agent, others send x-firstpass-agent
 mode   = "enforce"
 ladder = ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-5"]
 gates  = ["non-empty", "json-valid", "tool-args-valid"]

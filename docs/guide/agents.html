@@ -106,7 +106,7 @@
 
 <h2 id="config">4. A route for an agent<a class="anchor" href="#config" aria-label="Link to this section">#</a></h2>
 <div class="codeblock"><div class="cb-head"><span>toml</span><button class="copy-btn" type="button" aria-label="Copy code"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><span class="lbl">Copy</span></button></div><pre><code>[[route]]
-match  = {}                                    # every request; match = { agent = &quot;…&quot; } needs the client to send x-firstpass-agent
+match  = {}                                    # every request; agent = &quot;claude-code&quot;/&quot;codex&quot;/&quot;gemini-cli&quot; is detected from User-Agent, others send x-firstpass-agent
 mode   = &quot;enforce&quot;
 ladder = [&quot;anthropic/claude-haiku-4-5&quot;, &quot;anthropic/claude-sonnet-5&quot;]
 gates  = [&quot;non-empty&quot;, &quot;json-valid&quot;, &quot;tool-args-valid&quot;]
