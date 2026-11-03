@@ -148,7 +148,12 @@ pub fn request_to_chat(body: &Value) -> Value {
         out.remove(k);
     }
     // Meaningful (false forbids parallel calls), but OpenAI 400s it on a request with no tools.
-    if !out.contains_key("tools") {
+    // `tools: []` / `null` counts as none.
+    if out
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+    {
         out.remove("parallel_tool_calls");
     }
     Value::Object(out)
@@ -264,6 +269,10 @@ fn tool_to_chat(tool: &Value) -> Option<Value> {
 /// The single string argument a `custom` (freeform) tool's input rides in on the Chat side.
 const CUSTOM_INPUT_ARG: &str = "input";
 
+/// Envelope of a Codex patch (`apply_patch` lark grammar: `start: begin_patch hunk+ end_patch`):
+/// the begin marker, at least one file operation, the end marker.
+pub(crate) const PATCH_ENVELOPE_PATTERN: &str = r"^\s*\*\*\* Begin Patch\r?\n(?s:.*?)\*\*\* (Add|Delete|Update) File: (?s:.*)\*\*\* End Patch\s*$";
+
 /// A Responses `custom` (freeform) tool → a Chat function tool taking one string, `input`.
 ///
 /// Codex declares `apply_patch` this way: `{type: "custom", name, description, format: {type:
@@ -277,6 +286,7 @@ const CUSTOM_INPUT_ARG: &str = "input";
 /// one, so the appended note says which wins.
 fn custom_tool_to_chat(obj: &Map<String, Value>) -> Option<Value> {
     let name = obj.get("name")?.clone();
+    let mut input_pattern: Option<&str> = None;
     let mut description = obj
         .get("description")
         .and_then(Value::as_str)
@@ -295,10 +305,18 @@ fn custom_tool_to_chat(obj: &Map<String, Value>) -> Option<Value> {
         Some(f) if f.get("type").and_then(Value::as_str) == Some("grammar") => {
             let syntax = f.get("syntax").and_then(Value::as_str)?;
             let definition = f.get("definition").and_then(Value::as_str)?;
-            // ponytail: the grammar is carried, not checked — `tool-args-valid` sees only the
-            // `{input: string}` wrapper, so a malformed patch from a cheap rung is served and
-            // Codex's own apply step rejects it. Real lark validation (or a patch-envelope check)
-            // would let the gate escalate instead.
+            // The gate cannot run a lark grammar, and a grammar is a contract: serving an input
+            // that breaks it would fail-open. Only the patch grammar (Codex `apply_patch`) is
+            // translated, with its envelope as a JSON Schema `pattern` that `tool-args-valid`
+            // checks, so a cheap rung's malformed patch fails the gate and escalates. Any other
+            // grammar returns None → the request takes passthrough.
+            // ponytail: envelope only (begin/end markers + a file op), not every hunk line.
+            if !(definition.contains("\"*** Begin Patch\"")
+                && definition.contains("\"*** End Patch\""))
+            {
+                return None;
+            }
+            input_pattern = Some(PATCH_ENVELOPE_PATTERN);
             description.push_str("\n\nThe `input` text must match this ");
             description.push_str(syntax);
             description.push_str(" grammar:\n");
@@ -307,12 +325,16 @@ fn custom_tool_to_chat(obj: &Map<String, Value>) -> Option<Value> {
         // A format this code does not know is a contract it would silently drop.
         Some(_) => return None,
     }
+    let mut input_schema = serde_json::json!({ "type": "string" });
+    if let Some(pat) = input_pattern {
+        input_schema["pattern"] = Value::String(pat.to_owned());
+    }
     Some(serde_json::json!({ "type": "function", "function": {
         "name": name,
         "description": description,
         "parameters": {
             "type": "object",
-            "properties": { CUSTOM_INPUT_ARG: { "type": "string" } },
+            "properties": { CUSTOM_INPUT_ARG: input_schema },
             "required": [CUSTOM_INPUT_ARG],
             "additionalProperties": false,
         },
@@ -1498,6 +1520,35 @@ mod tests {
     }
 
     #[test]
+    fn patch_grammar_is_gated_by_its_envelope_and_other_grammars_pass_through() {
+        let tool = |definition: &str| {
+            serde_json::json!({"model": "m", "input": "hi", "store": false, "tools": [{
+                "type": "custom", "name": "apply_patch", "description": "d",
+                "format": {"type": "grammar", "syntax": "lark", "definition": definition}
+            }]})
+        };
+        let patch = r#"start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?"#;
+        assert!(has_untranslatable_content(&tool(r#"start: "SELECT" /.+/"#)));
+        assert!(!has_untranslatable_content(&tool(patch)));
+        // The gate's half (pattern enforced by tool-args-valid) is tested in gate.rs.
+        let chat = request_to_chat(&tool(patch));
+        assert_eq!(
+            chat["tools"][0]["function"]["parameters"]["properties"][CUSTOM_INPUT_ARG]["pattern"],
+            PATCH_ENVELOPE_PATTERN
+        );
+    }
+
+    #[test]
+    fn empty_tools_still_drop_parallel_tool_calls() {
+        let chat = request_to_chat(&serde_json::json!({
+            "model": "m", "input": "hi", "tools": [], "parallel_tool_calls": true
+        }));
+        assert!(chat.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
     fn a_name_declared_as_both_custom_and_function_is_not_translated() {
         let body = |fname: &str| {
             serde_json::json!({"model": "m", "input": "hi", "store": false, "tools": [
@@ -1664,7 +1715,7 @@ mod tests {
             "type": "custom", "name": "apply_patch",
             "description": "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
             "format": { "type": "grammar", "syntax": "lark",
-                "definition": "start: begin_patch hunk+ end_patch" },
+                "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?" },
         })
     }
 
