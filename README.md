@@ -344,7 +344,7 @@ Multi-tenant deployments add per-tenant auth (Argon2id), rate limits, gate-healt
 
 ## Status
 
-**Version 0.9.2, pre-1.0, developed in the open.** Published on crates.io (`firstpass-proxy`, `firstpass-core`), PyPI, Homebrew, GHCR and GitHub Releases. Shipped: both wire dialects, all gate kinds, start-rung bandit, conformal and Learn-then-Test bounds, OPE, receipts with export and verify, certified model selection. Research or unfinished: elastic verification is not default-on, four provider dialects await live wire verification, and the hosted multi-tenant plane, a soak period and an external security audit are still open. GA is a checklist we publish ([ADR 0003](docs/adr/0003-production-ga-readiness.md), [GA handoff](docs/ga-handoff.md)), not an adjective.
+**Version 0.10.0, pre-1.0, developed in the open.** Published on crates.io (`firstpass-proxy`, `firstpass-core`), PyPI, Homebrew, GHCR and GitHub Releases. Shipped: both wire dialects, all gate kinds, start-rung bandit, conformal and Learn-then-Test bounds, OPE, receipts with export and verify, certified model selection. Research or unfinished: elastic verification is not default-on, four provider dialects await live wire verification, and the hosted multi-tenant plane, a soak period and an external security audit are still open. GA is a checklist we publish ([ADR 0003](docs/adr/0003-production-ga-readiness.md), [GA handoff](docs/ga-handoff.md)), not an adjective.
 
 ## Links
 
