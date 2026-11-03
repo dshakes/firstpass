@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-03
+
+Coding agents. Claude Code, Codex, Gemini CLI and aider can be pointed at Firstpass and gated
+per turn, with sessions grouped without a session header. A pre-registered granularity study
+(#259) says where routing pays for agents and where it does not.
+
+### Breaking
+- An inline `gates` or `escalation.elastic.expensive_gates` id that is neither built in nor
+  defined in a `[[gate]]` block is rejected at parse instead of silently skipped (#266).
+  `deferred_gates` are exempt.
+
+### Added
+- **Gemini CLI inbound protocol** (#269): `/v1beta/models/{model}:generateContent`,
+  `:streamGenerateContent` and `:countTokens`. Observe relays to Google, preserving the query
+  string and SSE. Enforce translates, gates and re-streams requests that translate exactly;
+  anything else (inline data, `thoughtSignature`, cached content, built-in Google tools,
+  ambiguous tool pairing) is relayed ungated. With Gemini 2.5+/3, most tool turns after the
+  first call carry `thoughtSignature` and are relayed, not gated. `firstpass launch gemini`
+  sets `GOOGLE_GEMINI_BASE_URL`.
+- **Streaming Responses API (Codex) is gated** on enforce routes and re-streamed as Responses
+  SSE (#267). Requests with `previous_response_id`, `conversation`, reasoning items or
+  hosted/custom tools are relayed, as before.
+- Coding-agent sessions without a session header, from agent headers or the request body (#263).
+- Built-in `tool-args-valid` gate; tool turns pass `non-empty`, `json-valid` and `schema` only
+  when the request declared tools (#260).
+- `count_tokens` passthrough and a real-CLI compatibility harness (#261); an enforce-mode
+  harness that drives `claude -p` and aider against a fake upstream at $0 (#268).
+- Observe relays `retry-after`, rate-limit and request-id headers so agents back off (#262).
+- Paired challenger health persists across restarts; cluster-wide paired spend cap (#257).
+
+### Fixed
+- **`firstpass verify` reported freshly written chains as TAMPERED**: serde_json's default
+  float parser read some stored costs one ulp off. `float_roundtrip` is on; hashes unchanged,
+  chains written before the fix now verify (#268).
+- Enforce for agents: tool steps, reply fidelity, `anthropic-beta`/OAuth headers, and a
+  configured `api_key_env` always wins over client credentials (#260).
+- `firstpass launch` points OpenAI-style agents at `<proxy>/v1` (#265).
+- Observe receipts record real usage and cost for streamed and OpenAI traffic, and upstream
+  errors, non-2xx replies and dated model names no longer produce false receipts (#256, #258).
+- A challenger ladder accepts the built-in OpenAI-compatible providers (#254).
+
+### Docs
+- Coding-agent guide, README and site (#253, #255, #264). Granularity results: mid-session
+  escalate-and-pin costs more than always-top at equal quality; per-session cheap/top loses
+  quality; workload-level pool selection is far cheaper but not shown non-inferior (#259).
+
 ## [0.9.2] - 2026-11-01
 
 Completes the 0.9.1 release on every channel. The 0.9.1 GitHub Release, Homebrew formula and npm
