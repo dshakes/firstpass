@@ -643,6 +643,10 @@ pub fn run(
     live_percent: f64,
     p: &PreRegistered,
 ) -> Result<ReplayReport, String> {
+    // Every replay average divides by this; zero would print NaN as if it were a result.
+    if p.replays == 0 {
+        return Err("--replays must be at least 1".to_owned());
+    }
     let sessions = check(sessions.to_vec())?;
     let models: Vec<String> = sessions[0].runs.keys().cloned().collect();
     let col = |m: &str| -> (Vec<f64>, Vec<f64>) {
@@ -970,6 +974,15 @@ mod tests {
             bootstrap: 300,
             ..PreRegistered::default()
         }
+    }
+
+    #[test]
+    fn zero_replays_is_an_error_not_a_nan_report() {
+        let p = PreRegistered {
+            replays: 0,
+            ..fast()
+        };
+        assert!(run(&synthetic(50), "synthetic", None, 50.0, &p).is_err());
     }
 
     #[test]
