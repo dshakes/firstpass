@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+- Agent routes match Claude Code, Codex and Gemini CLI with no client header: the agent is
+  inferred from the User-Agent when `x-firstpass-agent` is absent or blank (#271).
+- Gemini tool turns are gated. `thoughtSignature` on function calls is carried through enforce
+  and replayed to Gemini rungs (an unsigned first call gets gemini-cli's synthetic signature);
+  Gemini rungs now serve tool turns and `parametersJsonSchema` declarations are kept (#272).
+- More real Codex turns are gated: reasoning items are dropped (no Chat rung can read
+  `encrypted_content`), freeform `apply_patch` round-trips as a `custom_tool_call`, and
+  Responses-only controls are stripped. Hosted `web_search` (on by default in Codex),
+  MCP namespaces, compaction and explicit `store: true` still take passthrough (#273).
+- `tool-args-valid` enforces JSON Schema `pattern`; Codex patches are checked against the
+  patch envelope, so a malformed patch escalates (#273).
+- `firstpass-bench --paired-replay`: $0 replay of ADR 0014 certified selection over recorded
+  agent sessions. Verdict on all three recorded datasets: STOP (#274,
+  `docs/benchmarks/agent-paired-replay.txt`).
+
+### Fixed
+- OpenAI→Anthropic translation kept only the last `system` message and dropped `developer`
+  ones, so gated Codex turns lost their base prompt; `max_tokens` default 1024 → 4096 and
+  `max_completion_tokens` honoured (#275).
+- Gemini rung receipts split cached prompt tokens out as cache reads (#272).
+
 ## [0.10.0] - 2026-11-03
 
 Coding agents. Claude Code, Codex, Gemini CLI and aider can be pointed at Firstpass and gated
