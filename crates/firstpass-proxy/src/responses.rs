@@ -295,6 +295,10 @@ fn custom_tool_to_chat(obj: &Map<String, Value>) -> Option<Value> {
         Some(f) if f.get("type").and_then(Value::as_str) == Some("grammar") => {
             let syntax = f.get("syntax").and_then(Value::as_str)?;
             let definition = f.get("definition").and_then(Value::as_str)?;
+            // ponytail: the grammar is carried, not checked — `tool-args-valid` sees only the
+            // `{input: string}` wrapper, so a malformed patch from a cheap rung is served and
+            // Codex's own apply step rejects it. Real lark validation (or a patch-envelope check)
+            // would let the gate escalate instead.
             description.push_str("\n\nThe `input` text must match this ");
             description.push_str(syntax);
             description.push_str(" grammar:\n");
