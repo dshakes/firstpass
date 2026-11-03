@@ -271,7 +271,9 @@ const CUSTOM_INPUT_ARG: &str = "input";
 
 /// Envelope of a Codex patch (`apply_patch` lark grammar: `start: begin_patch hunk+ end_patch`):
 /// the begin marker, at least one file operation, the end marker.
-pub(crate) const PATCH_ENVELOPE_PATTERN: &str = r"^\s*\*\*\* Begin Patch\r?\n(?s:.*?)\*\*\* (Add|Delete|Update) File: (?s:.*)\*\*\* End Patch\s*$";
+/// ECMA-262 syntax (`[\s\S]`, no inline flags): providers validate tool schemas, and JSON Schema
+/// `pattern` is ECMA-262, so a Rust-only construct would 400 upstream.
+pub(crate) const PATCH_ENVELOPE_PATTERN: &str = r"^\s*\*\*\* Begin Patch\r?\n[\s\S]*?\*\*\* (Add|Delete|Update) File: [\s\S]*\*\*\* End Patch\s*$";
 
 /// A Responses `custom` (freeform) tool → a Chat function tool taking one string, `input`.
 ///
@@ -441,7 +443,10 @@ fn function_output_to_chat(item: &serde_json::Map<String, Value>) -> Option<Valu
         Value::Array(parts) => {
             let mut text = String::new();
             for p in parts {
-                if p.get("type").and_then(Value::as_str) != Some("input_text") {
+                if !matches!(
+                    p.get("type").and_then(Value::as_str),
+                    Some("input_text" | "output_text" | "text")
+                ) {
                     return None;
                 }
                 text.push_str(p.get("text").and_then(Value::as_str)?);
@@ -561,6 +566,10 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
     let Some(Value::Array(turns)) = body.get("input") else {
         return false;
     };
+    // Nothing left once reasoning items are dropped: an empty Chat request would 400.
+    if !turns.is_empty() && turns.iter().all(is_dropped_item) {
+        return true;
+    }
     turns.iter().any(|turn| {
         if is_dropped_item(turn) {
             return false;
@@ -1538,6 +1547,20 @@ end_patch: "*** End Patch" LF?"#;
             chat["tools"][0]["function"]["parameters"]["properties"][CUSTOM_INPUT_ARG]["pattern"],
             PATCH_ENVELOPE_PATTERN
         );
+    }
+
+    #[test]
+    fn reasoning_only_input_is_not_translated() {
+        let body = serde_json::json!({"model": "m", "store": false, "input": [
+            {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "x"}
+        ]});
+        assert!(has_untranslatable_content(&body));
+    }
+
+    #[test]
+    fn patch_envelope_pattern_is_ecma_262_compatible() {
+        // No Rust-only inline flags: providers validate `pattern` as ECMA-262.
+        assert!(!PATCH_ENVELOPE_PATTERN.contains("(?"));
     }
 
     #[test]
