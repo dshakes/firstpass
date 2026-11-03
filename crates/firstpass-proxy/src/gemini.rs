@@ -116,11 +116,14 @@ fn content_to_messages(content: &Value) -> Vec<Value> {
 
     // functionCall parts → single assistant message with tool_calls list.
     // Positional IDs: call_{name}_{idx} so parallel calls to the same function differ.
+    // The index counts functionCall parts only (not text), so it matches the ordinal of the
+    // paired functionResponse in the next turn; `has_untranslatable_content` rejects any
+    // history where that pairing is not exact.
     let calls: Vec<Value> = parts
         .iter()
+        .filter_map(|p| p.as_object()?.get("functionCall")?.as_object())
         .enumerate()
-        .filter_map(|(idx, p)| {
-            let fc = p.as_object()?.get("functionCall")?.as_object()?;
+        .filter_map(|(idx, fc)| {
             let name = fc.get("name")?.clone();
             let args = fc
                 .get("args")
@@ -151,9 +154,9 @@ fn content_to_messages(content: &Value) -> Vec<Value> {
     // Each part contributes its own {role:"tool"} message with a positional call ID.
     let tool_msgs: Vec<Value> = parts
         .iter()
+        .filter_map(|p| p.as_object()?.get("functionResponse")?.as_object())
         .enumerate()
-        .filter_map(|(idx, p)| {
-            let fr = p.as_object()?.get("functionResponse")?.as_object()?;
+        .filter_map(|(idx, fr)| {
             let name = fr.get("name").and_then(Value::as_str)?;
             let output = fr
                 .get("response")
@@ -203,6 +206,43 @@ fn fd_to_chat(fd: &Value) -> Option<Value> {
     Some(serde_json::json!({"type": "function", "function": Value::Object(f)}))
 }
 
+/// Chat pairs a tool result to its call by id; Gemini pairs them by order. The positional ids
+/// `content_to_messages` assigns are only right when every turn of functionResponses answers the
+/// functionCalls of the model turn right before it, same names in the same order, and does not
+/// mix in other parts. Anything else is ambiguous → the caller sends it to passthrough.
+fn function_pairing_is_exact(contents: Option<&Value>) -> bool {
+    let Some(Value::Array(contents)) = contents else {
+        return true;
+    };
+    let names = |c: &Value, key: &str| -> Vec<String> {
+        c.get("parts")
+            .and_then(Value::as_array)
+            .map(|ps| {
+                ps.iter()
+                    .filter_map(|p| p.get(key)?.get("name")?.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut pending: Vec<String> = Vec::new();
+    for c in contents {
+        let responses = names(c, "functionResponse");
+        if !responses.is_empty() {
+            let all_parts = c.get("parts").and_then(Value::as_array).map_or(0, Vec::len);
+            if responses != pending || all_parts != responses.len() {
+                return false;
+            }
+            pending.clear();
+            continue;
+        }
+        if !pending.is_empty() {
+            return false; // calls left unanswered before the next turn
+        }
+        pending = names(c, "functionCall");
+    }
+    true
+}
+
 /// Whether this `generateContent` body contains anything the translation cannot faithfully
 /// represent. Allow-list, not deny-list: only known-good content is gated; anything outside
 /// takes the passthrough path un-gated.
@@ -221,7 +261,19 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
     };
 
     // ── request-level allow-list ──────────────────────────────────────────────
-    // cachedContent, toolConfig, safetySettings: no Chat equivalent → passthrough.
+    // Only the fields `request_to_chat` maps; any other (cachedContent, toolConfig,
+    // safetySettings, labels, a future field) would be silently dropped → passthrough.
+    if obj.keys().any(|k| {
+        !matches!(
+            k.as_str(),
+            "contents" | "systemInstruction" | "generationConfig" | "tools"
+        )
+    }) {
+        return true;
+    }
+    if !function_pairing_is_exact(obj.get("contents")) {
+        return true;
+    }
     if obj.contains_key("cachedContent")
         || obj.contains_key("toolConfig")
         || obj.contains_key("safetySettings")
@@ -695,6 +747,74 @@ mod tests {
         assert!(!has_untranslatable_content(&serde_json::json!({
             "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
         })));
+    }
+
+    #[test]
+    fn tool_call_ids_pair_across_turns_when_text_precedes_the_call() {
+        // The normal Gemini shape: the model says something, then calls. The call id and the
+        // result id must still match, or the tool result is orphaned upstream.
+        let body = serde_json::json!({ "contents": [
+            { "role": "user", "parts": [{ "text": "list files" }] },
+            { "role": "model", "parts": [
+                { "text": "Let me look." },
+                { "functionCall": { "name": "ls", "args": {} } },
+                { "functionCall": { "name": "ls", "args": { "path": "src" } } }
+            ] },
+            { "role": "user", "parts": [
+                { "functionResponse": { "name": "ls", "response": { "out": "a" } } },
+                { "functionResponse": { "name": "ls", "response": { "out": "b" } } }
+            ] }
+        ] });
+        assert!(!has_untranslatable_content(&body));
+        let chat = request_to_chat(&body, "gemini-2.5-flash");
+        let msgs = chat["messages"].as_array().unwrap();
+        let call_ids: Vec<&str> = msgs
+            .iter()
+            .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        let result_ids: Vec<&str> = msgs
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(call_ids.len(), 2);
+        assert_eq!(call_ids, result_ids);
+        assert_ne!(call_ids[0], call_ids[1]);
+    }
+
+    #[test]
+    fn ambiguous_function_pairing_and_unknown_fields_are_untranslatable() {
+        let call = |n: &str| serde_json::json!({ "functionCall": { "name": n, "args": {} } });
+        let resp =
+            |n: &str| serde_json::json!({ "functionResponse": { "name": n, "response": {} } });
+        let turns = |model: Vec<Value>, user: Vec<Value>| {
+            serde_json::json!({ "contents": [
+            { "role": "user", "parts": [{ "text": "go" }] },
+            { "role": "model", "parts": model },
+            { "role": "user", "parts": user }
+        ] })
+        };
+        // Out of order, missing one, extra text alongside results, response with no call.
+        for body in [
+            turns(vec![call("a"), call("b")], vec![resp("b"), resp("a")]),
+            turns(vec![call("a"), call("b")], vec![resp("a")]),
+            turns(
+                vec![call("a")],
+                vec![resp("a"), serde_json::json!({ "text": "also" })],
+            ),
+            turns(vec![serde_json::json!({ "text": "hi" })], vec![resp("a")]),
+            serde_json::json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }], "labels": { "a": "b" } }),
+        ] {
+            assert!(
+                has_untranslatable_content(&body),
+                "must not translate {body}"
+            );
+        }
+        assert!(!has_untranslatable_content(&turns(
+            vec![call("a")],
+            vec![resp("a")]
+        )));
     }
 
     #[test]

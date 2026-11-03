@@ -1079,32 +1079,6 @@ fn gemini_request_body(req: &ModelRequest) -> Value {
     body
 }
 
-/// Resolve the API key for a Gemini upstream call.
-///
-/// Priority (BYOK-first):
-/// 1. Inbound `x-goog-api-key` BYOK header (`gemini_key`)
-/// 2. Configured `api_key_env` env var
-/// 3. Ambient `GOOGLE_API_KEY`
-/// 4. Ambient `GEMINI_API_KEY`
-/// 5. Empty string (keyless / mTLS endpoint)
-fn resolve_gemini_key(gemini_key: Option<&str>, api_key_env: Option<&str>) -> String {
-    gemini_key
-        .filter(|k| !k.is_empty())
-        .map(str::to_owned)
-        .or_else(|| api_key_env.and_then(|env| std::env::var(env).ok().filter(|s| !s.is_empty())))
-        .or_else(|| {
-            std::env::var("GOOGLE_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            std::env::var("GEMINI_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_default()
-}
-
 /// Extract `(text, in_tokens, out_tokens)` from a Gemini `generateContent` response. `text` is the
 /// concatenation of the first candidate's text parts; token counts come from `usageMetadata`.
 fn gemini_parse_response(json: &Value) -> Result<(String, u64, u64), ProviderError> {
@@ -1160,7 +1134,7 @@ impl Provider for GeminiProvider {
     ) -> Result<ModelResponse, ProviderError> {
         // Priority (BYOK-first): inbound x-goog-api-key (BYOK) > configured api_key_env >
         // ambient GOOGLE_API_KEY / GEMINI_API_KEY. Never use auth.openai_key.
-        let key = resolve_gemini_key(auth.gemini_key.as_deref(), self.api_key_env.as_deref());
+        let key = resolve_api_key(self.api_key_env.as_deref(), auth.gemini_key.as_deref());
         let body = gemini_request_body(req);
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
@@ -2369,39 +2343,6 @@ mod tests {
         assert_eq!(resolve_api_key(None, Some("byok")), "byok");
         // Neither → empty (keyless local endpoint).
         assert_eq!(resolve_api_key(None, None), "");
-    }
-
-    #[test]
-    fn gemini_provider_key_resolution_byok_first() {
-        // BYOK (inbound x-goog-api-key) must win over configured api_key_env.
-        // Calls the production `resolve_gemini_key` function directly so a mutation of that
-        // function's priority order is caught here.
-
-        // BYOK wins over configured env var.
-        assert_eq!(
-            super::resolve_gemini_key(Some("byok-key"), Some("PATH")),
-            "byok-key",
-            "BYOK must win over configured env var"
-        );
-        // Configured env var wins when no BYOK.
-        let path = std::env::var("PATH").expect("PATH is set");
-        assert_eq!(
-            super::resolve_gemini_key(None, Some("PATH")),
-            path,
-            "configured env var wins when no BYOK"
-        );
-        // Empty BYOK falls through to configured env.
-        assert_eq!(
-            super::resolve_gemini_key(Some(""), Some("PATH")),
-            path,
-            "empty BYOK must fall through to configured env"
-        );
-        // Neither BYOK nor configured env → empty (no key, rely on ambient or unauthenticated).
-        assert_eq!(
-            super::resolve_gemini_key(None, Some("FIRSTPASS_DEFINITELY_UNSET_KEY")),
-            "", // GOOGLE_API_KEY / GEMINI_API_KEY may be set in CI but not in unit test env
-        );
-        // mutant: swap BYOK and api_key_env priority → "byok-key" test fails
     }
 
     #[test]
