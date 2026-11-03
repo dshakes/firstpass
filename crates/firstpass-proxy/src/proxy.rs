@@ -5864,6 +5864,8 @@ async fn responses(
                     Dialect::Openai,
                 )
             {
+                // A served call to a `custom` tool must go back as a `custom_tool_call`.
+                let custom_tools = crate::responses::custom_tool_names(&parsed);
                 if is_stream_request(&body) {
                     let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
                     tokio::spawn(async move {
@@ -5885,9 +5887,9 @@ async fn responses(
                     });
                     return sse_keepalive_response(
                         rx,
-                        Box::new(|chat| {
+                        Box::new(move |chat| {
                             crate::responses::sse_from_response(
-                                &crate::responses::response_from_chat(chat),
+                                &crate::responses::response_from_chat(chat, &custom_tools),
                             )
                         }),
                         responses_sse_error,
@@ -5908,7 +5910,8 @@ async fn responses(
                 )
                 .await
                 {
-                    Ok(chat) => Json(crate::responses::response_from_chat(&chat)).into_response(),
+                    Ok(chat) => Json(crate::responses::response_from_chat(&chat, &custom_tools))
+                        .into_response(),
                     Err(e) => e.into_response(),
                 };
             }

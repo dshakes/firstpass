@@ -26,6 +26,7 @@ aes-gcm = "0.11"
 jiff = { version = "0.2", features = ["serde"] }
 # Errors
 thiserror = "2"
+regex-lite = "0.1"
 async-trait = "0.1"
 # Optional L2 for the verified cache (ADR: multi-instance state). Feature-gated — the default
 # build has no Redis dependency, and a single-instance deployment never needs one.

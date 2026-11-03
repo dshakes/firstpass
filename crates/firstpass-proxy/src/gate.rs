@@ -137,6 +137,15 @@ fn schema_violation(
     }
 
     // `enum` keyword — value must be one of the listed literals.
+    // JSON Schema `pattern` (string values only). A pattern this engine cannot compile (ECMA
+    // lookaround, say) is skipped like any unknown keyword rather than failing every call.
+    // ponytail: recompiled per call; cache by pattern string if it ever shows in a profile.
+    if let (Some(Value::String(pat)), Value::String(text)) = (schema.get("pattern"), value)
+        && let Ok(re) = regex_lite::Regex::new(pat)
+        && !re.is_match(text)
+    {
+        return Some(format!("{path}: does not match pattern {pat}"));
+    }
     if let Some(Value::Array(variants)) = schema.get("enum")
         && !variants.contains(value)
     {
@@ -1547,6 +1556,60 @@ mod tests {
             .evaluate(&req, &resp(r#"{"city":"Paris"}"#))
             .await;
         assert_eq!(good.verdict, Verdict::Pass, "{:?}", good.reason);
+    }
+
+    /// A Responses `custom` (freeform) tool — Codex's `apply_patch` — is gated as the one-string
+    /// function it translates to: a call missing the `input` wrapper Fails (and escalates) rather
+    /// than being served as a malformed custom call.
+    #[tokio::test]
+    async fn tool_args_valid_checks_responses_custom_tool_input() {
+        let responses_req = serde_json::json!({
+            "model": "gpt-5.5", "input": "fix it",
+            "tools": [{ "type": "custom", "name": "apply_patch", "description": "edit files",
+                "format": { "type": "grammar", "syntax": "lark", "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?" } }],
+        });
+        let chat = crate::responses::request_to_chat(&responses_req).to_string();
+        let req = crate::proxy::parse_openai_request(chat.as_bytes(), true).unwrap();
+        let resp = |args: &str| ModelResponse {
+            raw: serde_json::json!({ "choices": [{ "message": { "role": "assistant",
+                "content": null, "tool_calls": [{ "id": "call_1", "type": "function",
+                "function": { "name": "apply_patch", "arguments": args } }] } }] }),
+            ..tool_use_resp()
+        };
+        let bad = ToolArgsValidGate.evaluate(&req, &resp("{}")).await;
+        assert_eq!(bad.verdict, Verdict::Fail, "{:?}", bad.reason);
+        let good = ToolArgsValidGate
+            .evaluate(
+                &req,
+                &resp(r#"{"input":"*** Begin Patch\n*** Delete File: a.rs\n*** End Patch"}"#),
+            )
+            .await;
+        assert_eq!(good.verdict, Verdict::Pass, "{:?}", good.reason);
+    }
+
+    #[test]
+    fn pattern_keyword_is_enforced_and_the_patch_envelope_holds() {
+        let schema = serde_json::json!({ "type": "string",
+            "pattern": crate::responses::PATCH_ENVELOPE_PATTERN });
+        let ok = |v: &str| schema_violation(&serde_json::json!(v), &schema, "input").is_none();
+        assert!(ok(
+            "*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n*** End Patch\n"
+        ));
+        assert!(ok(
+            "*** Begin Patch\n*** Add File: b.txt\n+hi\n*** End Patch"
+        ));
+        assert!(
+            !ok("--- a/a.rs\n+++ b/a.rs\n@@\n-x\n+y\n"),
+            "unified diff is not a patch"
+        );
+        assert!(!ok("*** Begin Patch\n*** End Patch"), "no file operation");
+        assert!(
+            !ok("*** Begin Patch\n*** Update File: a.rs\n+y\n"),
+            "no end marker"
+        );
+        // An uncompilable pattern is skipped, not a universal failure.
+        let bad = serde_json::json!({ "type": "string", "pattern": "(?<=x)y" });
+        assert!(schema_violation(&serde_json::json!("y"), &bad, "input").is_none());
     }
 
     /// A tool declared in the flat Responses shape (`{type, name, parameters}`) is schema-checked,
