@@ -1098,10 +1098,12 @@ fn gemini_parse_response(json: &Value) -> Result<(String, u64, u64), ProviderErr
         .pointer("/usageMetadata/promptTokenCount")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let out_tokens = json
-        .pointer("/usageMetadata/candidatesTokenCount")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    // Thinking tokens (Gemini 2.5+/3) are billed as output; leaving them out under-bills.
+    // ponytail: cachedContentTokenCount is not split out here, so implicit cache hits are
+    // priced at the full input rate (over-, never under-billing); split it if that matters.
+    let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
+    let out_tokens =
+        u("/usageMetadata/candidatesTokenCount") + u("/usageMetadata/thoughtsTokenCount");
     Ok((text, in_tokens, out_tokens))
 }
 
@@ -2119,6 +2121,12 @@ mod tests {
         assert_eq!(out_tok, 4);
         // A response with no candidates is a decode error, not a fabricated empty answer.
         assert!(gemini_parse_response(&serde_json::json!({ "candidates": [] })).is_err());
+        let thinking = serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }],
+            "usageMetadata": { "promptTokenCount": 7, "candidatesTokenCount": 3, "thoughtsTokenCount": 40 }
+        });
+        let (_, _, out) = gemini_parse_response(&thinking).unwrap();
+        assert_eq!(out, 43, "thinking tokens are billed output");
     }
 
     #[test]

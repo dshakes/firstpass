@@ -5972,19 +5972,21 @@ async fn gemini_generate_content(
     // Strip ?key= from the forwarded URL and inject it as x-goog-api-key header so
     // the key never appears in an upstream URL that could surface in server-side error logs.
     let (key_from_query, scrubbed_query) = parse_gemini_query(raw_query.as_deref());
-    let headers: HeaderMap =
-        if let (Some(k), None) = (&key_from_query, headers.get("x-goog-api-key")) {
-            match axum::http::HeaderValue::from_str(k) {
-                Ok(v) => {
-                    let mut h = headers;
-                    h.insert("x-goog-api-key", v);
-                    h
-                }
-                Err(_) => headers,
+    let headers: HeaderMap = if let (Some(k), None) = (
+        &key_from_query,
+        headers.get("x-goog-api-key").filter(|v| !v.is_empty()),
+    ) {
+        match axum::http::HeaderValue::from_str(k) {
+            Ok(v) => {
+                let mut h = headers;
+                h.insert("x-goog-api-key", v);
+                h
             }
-        } else {
-            headers
-        };
+            Err(_) => headers,
+        }
+    } else {
+        headers
+    };
 
     // Split "gemini-2.0-flash:generateContent" → ("gemini-2.0-flash", "generateContent")
     let (model, action) = model_action
