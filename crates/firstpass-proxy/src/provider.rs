@@ -1037,7 +1037,7 @@ impl Provider for OpenAiProvider {
 
 /// Build the Gemini `generateContent` request body from a normalized [`ModelRequest`]. Split out
 /// (pure, no I/O) so the translation is unit-tested offline. Gemini uses `contents` with roles
-/// `user` / `model` (not `assistant`) and a separate `system_instruction`; the system prompt and the
+/// `user` / `model` (not `assistant`) and a separate `systemInstruction`; the system prompt and the
 /// per-message text projection ([`ChatMessage::text_view`]) are what we send. Tool/multimodal blocks
 /// for Gemini (its `functionCall` / `functionResponse` / `inlineData` shapes) are a follow-on — this
 /// adapter routes text, matching the OpenAI adapter's current scope.
@@ -1059,7 +1059,7 @@ fn gemini_request_body(req: &ModelRequest) -> Value {
         "generationConfig": { "maxOutputTokens": req.max_tokens },
     });
     if let Some(system) = req.system.as_deref() {
-        body["system_instruction"] = serde_json::json!({ "parts": [{ "text": system }] });
+        body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": system }] });
     }
     // This builder reconstructs from normalized fields, so the caller's reasoning request is only
     // in `raw` — carry it across rather than dropping it on the Gemini rung.
@@ -2097,8 +2097,8 @@ mod tests {
             cache_prefix: false,
         };
         let body = gemini_request_body(&req);
-        // System prompt goes in system_instruction, not contents.
-        assert_eq!(body["system_instruction"]["parts"][0]["text"], "be terse");
+        // System prompt goes in systemInstruction (canonical REST field name), not contents.
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be terse");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 256);
         // Anthropic's "assistant" role becomes Gemini's "model"; "user" stays "user".
         assert_eq!(body["contents"][0]["role"], "user");
