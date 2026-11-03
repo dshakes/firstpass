@@ -2215,7 +2215,7 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 /// `GeminiCLI-{client}` (gemini-cli packages/core/src/core/contentGenerator.ts).
 // ponytail: aider/Cline/Cursor use generic SDK User-Agents; they still need the header.
 fn agent_label(headers: &HeaderMap) -> Option<String> {
-    if let Some(a) = header_str(headers, AGENT_HEADER) {
+    if let Some(a) = header_str(headers, AGENT_HEADER).filter(|a| !a.trim().is_empty()) {
         return Some(a);
     }
     let ua = headers.get("user-agent")?.to_str().ok()?;
@@ -6462,6 +6462,16 @@ mod tests {
         // Both feature extractors use it, so a header-less Claude Code turn matches agent routes.
         let mut headers = HeaderMap::new();
         headers.insert("user-agent", cc.parse().unwrap());
+        assert_eq!(
+            extract_features(&headers, b"{}").agent.as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            extract_openai_features(&headers, b"{}").agent.as_deref(),
+            Some("claude-code")
+        );
+        // A blank header (an unset env var forwarded as "") must not mask inference.
+        headers.insert("x-firstpass-agent", " ".parse().unwrap());
         assert_eq!(
             extract_features(&headers, b"{}").agent.as_deref(),
             Some("claude-code")
