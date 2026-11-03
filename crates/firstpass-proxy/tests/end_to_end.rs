@@ -1720,7 +1720,7 @@ async fn gemini_observe_receipt_has_correct_api_model_tokens() {
     // The recording upstream returns usageMetadata: promptTokenCount=5, candidatesTokenCount=3.
     let resp = reqwest::Client::new()
         .post(format!(
-            "{proxy}/v1beta/models/gemini-2.0-flash:generateContent"
+            "{proxy}/v1beta/models/gemini-2.5-pro:generateContent"
         ))
         .header("x-goog-api-key", "AIza-test")
         .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
@@ -1739,7 +1739,7 @@ async fn gemini_observe_receipt_has_correct_api_model_tokens() {
         t.request.api
     );
     assert_eq!(
-        t.attempts[0].model, "gemini-2.0-flash",
+        t.attempts[0].model, "gemini-2.5-pro",
         "model must come from URL path, got {:?}",
         t.attempts[0].model
     );
@@ -1750,6 +1750,13 @@ async fn gemini_observe_receipt_has_correct_api_model_tokens() {
     assert_eq!(
         t.attempts[0].out_tokens, 3,
         "out_tokens from usageMetadata.candidatesTokenCount"
+    );
+
+    // Priced from the built-in `google/` table, not a silent $0 receipt.
+    assert!(
+        t.attempts[0].cost_usd > 0.0,
+        "a priced Gemini model must not record $0, got {}",
+        t.attempts[0].cost_usd
     );
 
     let _ = std::fs::remove_file(&db_path);

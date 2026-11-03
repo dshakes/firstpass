@@ -244,8 +244,11 @@ impl Auth {
     pub fn from_headers(headers: &HeaderMap, dialect: firstpass_core::Dialect) -> Self {
         // Only the request header; env fallback is the provider's responsibility so that
         // a request-supplied Bearer is not shadowed by the server's ANTHROPIC_API_KEY.
+        // Not on the Gemini path: a Gemini client's headers are for Google, and a mixed ladder's
+        // Anthropic rung must not forward a stray inbound `x-api-key` from one.
         let anthropic_key = headers
             .get("x-api-key")
+            .filter(|_| !matches!(dialect, firstpass_core::Dialect::Gemini))
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
 
@@ -2618,6 +2621,26 @@ mod tests {
         assert_eq!(wire["messages"][0]["content"], "be terse");
         assert_eq!(wire["messages"][1]["role"], "user");
         assert_eq!(wire["messages"][2]["role"], "assistant");
+    }
+
+    #[test]
+    fn gemini_dialect_never_populates_anthropic_or_inbound_openai_credentials() {
+        use firstpass_core::Dialect;
+        let mut h = HeaderMap::new();
+        h.insert("x-goog-api-key", "goog-key".parse().unwrap());
+        h.insert("x-api-key", "stray-anthropic-key".parse().unwrap());
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer stray-bearer".parse().unwrap(),
+        );
+        let auth = Auth::from_headers(&h, Dialect::Gemini);
+        assert_eq!(auth.gemini_key.as_deref(), Some("goog-key"));
+        assert!(
+            auth.anthropic_key.is_none(),
+            "x-api-key must not cross to Anthropic"
+        );
+        assert!(auth.anthropic_bearer.is_none());
+        assert_ne!(auth.openai_key.as_deref(), Some("stray-bearer"));
     }
 
     #[test]

@@ -1013,11 +1013,11 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
         "feature_version": FEATURE_VERSION,
         "modes": ["observe", "enforce"],
         "routing_modes": routing_modes,
-        "wire_apis": ["anthropic.messages", "openai.chat_completions", "openai.responses"],
+        "wire_apis": ["anthropic.messages", "openai.chat_completions", "openai.responses", "gemini.generate_content"],
         "ladder": ladder,
         "gates": gates,
         "feedback_api": "POST /v1/feedback",
-        "offboarding": "unset ANTHROPIC_BASE_URL (or OPENAI_BASE_URL for OpenAI clients)",
+        "offboarding": "unset ANTHROPIC_BASE_URL (or OPENAI_BASE_URL for OpenAI clients, GOOGLE_GEMINI_BASE_URL for Gemini CLI)",
     }))
 }
 
@@ -4336,20 +4336,27 @@ fn process_sse_line(line: &[u8], usage: &mut SseUsage) {
             // Gemini: each SSE chunk carries the cumulative `usageMetadata`. The last chunk
             // also sets `candidates[0].finishReason`. Model is in the URL path, not in the
             // response body, so `usage.model` stays `None` — the caller supplies a `model_hint`.
+            // finishReason and usageMetadata may arrive in different chunks: track each alone.
+            let is_gemini = json.get("candidates").is_some() || json.get("usageMetadata").is_some();
+            if let Some(fr) = json
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str)
+                .filter(|fr| !fr.is_empty() && *fr != "FINISH_REASON_UNSPECIFIED")
+            {
+                usage.stop_reason = Some(fr.to_owned());
+                usage.completed = true;
+            }
             if json.pointer("/usageMetadata/promptTokenCount").is_some() {
                 let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
-                usage.in_tokens = u("/usageMetadata/promptTokenCount");
+                // promptTokenCount includes cached content; price that part as a cache read.
+                let cached = u("/usageMetadata/cachedContentTokenCount");
+                usage.in_tokens = u("/usageMetadata/promptTokenCount").saturating_sub(cached);
+                usage.cache_read_tokens = cached;
                 // thoughtsTokenCount: extended-thinking tokens on Gemini 2.5+/3.
                 usage.out_tokens = u("/usageMetadata/candidatesTokenCount")
                     + u("/usageMetadata/thoughtsTokenCount");
-                if let Some(fr) = json
-                    .pointer("/candidates/0/finishReason")
-                    .and_then(Value::as_str)
-                    .filter(|fr| !fr.is_empty() && *fr != "FINISH_REASON_UNSPECIFIED")
-                {
-                    usage.stop_reason = Some(fr.to_owned());
-                    usage.completed = true;
-                }
+            }
+            if is_gemini {
                 return;
             }
             // OpenAI-compatible: final usage chunk (only populated when
@@ -4501,11 +4508,13 @@ fn response_usage(body: &[u8]) -> ResponseUsage {
     // Gemini `usageMetadata` format: promptTokenCount / candidatesTokenCount / thoughtsTokenCount.
     // thoughtsTokenCount counts extended-thinking tokens (Gemini 2.5+/3) as output.
     if json.pointer("/usageMetadata/promptTokenCount").is_some() {
+        // promptTokenCount includes cachedContentTokenCount; price the cached part as a read.
+        let cached = u("/usageMetadata/cachedContentTokenCount");
         return ResponseUsage {
             model, // Gemini responses don't carry a top-level model field; caller supplies hint
-            in_tokens: u("/usageMetadata/promptTokenCount"),
+            in_tokens: u("/usageMetadata/promptTokenCount").saturating_sub(cached),
             cache_write_tokens: 0,
-            cache_read_tokens: 0,
+            cache_read_tokens: cached,
             out_tokens: u("/usageMetadata/candidatesTokenCount")
                 + u("/usageMetadata/thoughtsTokenCount"),
         };
@@ -6250,7 +6259,7 @@ async fn observe_passthrough_gemini(
                     latency_ms,
                     session_header,
                     tenant,
-                    "gemini",
+                    "google", // price-table prefix (google/gemini-*)
                     status.is_success(),
                     "gemini.generate_content",
                     model_hint,
@@ -6267,7 +6276,7 @@ async fn observe_passthrough_gemini(
                     latency_ms,
                     session_header,
                     tenant,
-                    "gemini",
+                    "google", // price-table prefix (google/gemini-*)
                     "gemini.generate_content",
                     model_hint,
                 );
@@ -6295,7 +6304,7 @@ async fn observe_passthrough_gemini(
                 latency_ms,
                 session_header,
                 tenant,
-                "gemini",
+                "google", // price-table prefix (google/gemini-*)
                 "gemini.generate_content",
                 model_hint,
             );
@@ -6309,7 +6318,7 @@ async fn observe_passthrough_gemini(
                 latency_ms,
                 session_header,
                 tenant,
-                "gemini",
+                "google", // price-table prefix (google/gemini-*)
                 "gemini.generate_content",
                 model_hint,
             );
@@ -13437,6 +13446,47 @@ mod tests {
         assert_eq!(u.out_tokens, 7, "candidatesTokenCount + thoughtsTokenCount");
         assert!(u.completed, "STOP sets completed");
         // mutant: remove usageMetadata branch → in_tokens stays 0
+    }
+
+    #[test]
+    fn gemini_sse_finish_reason_and_usage_in_separate_chunks_still_complete() {
+        // Google may send finishReason and the final usageMetadata in different chunks; a
+        // successful stream must not be recorded as partial (Abstain).
+        let mut u = SseUsage::default();
+        let (mut buf, mut over) = (Vec::new(), false);
+        parse_sse_chunk_into(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}\n",
+            &mut buf,
+            &mut over,
+            &mut u,
+        );
+        parse_sse_chunk_into(
+            b"data: {\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":60,\"candidatesTokenCount\":5}}\n",
+            &mut buf,
+            &mut over,
+            &mut u,
+        );
+        assert!(
+            u.completed,
+            "finishReason in its own chunk completes the stream"
+        );
+        assert_eq!(u.stop_reason.as_deref(), Some("STOP"));
+        assert_eq!(
+            u.in_tokens, 40,
+            "cached content is split out of promptTokenCount"
+        );
+        assert_eq!(u.cache_read_tokens, 60);
+        assert_eq!(u.out_tokens, 5);
+    }
+
+    #[test]
+    fn gemini_buffered_usage_splits_cached_content() {
+        let body = br#"{"candidates":[],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":60,"candidatesTokenCount":5,"thoughtsTokenCount":2}}"#;
+        let u = response_usage(body);
+        assert_eq!(
+            (u.in_tokens, u.cache_read_tokens, u.out_tokens),
+            (40, 60, 7)
+        );
     }
 
     #[test]
