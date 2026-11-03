@@ -5989,8 +5989,9 @@ async fn gemini_generate_content(
     };
 
     // Split "gemini-2.0-flash:generateContent" → ("gemini-2.0-flash", "generateContent")
+    // Last colon: the action never contains one, a model name might.
     let (model, action) = model_action
-        .split_once(':')
+        .rsplit_once(':')
         .unwrap_or((model_action.as_str(), ""));
     // Owned copy before any possible move of `model_action`; used as model_hint in observe traces.
     let model_owned = model.to_owned();

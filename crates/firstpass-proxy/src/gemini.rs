@@ -276,6 +276,22 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
     }) {
         return true;
     }
+    // Shape guards: a field the translator would skip because it is malformed is dropped
+    // silently, so any unexpected shape takes passthrough and upstream judges it.
+    let parts_array = |v: &Value| v.get("parts").is_some_and(Value::is_array);
+    if obj.get("contents").is_some_and(|c| !c.is_array())
+        || obj
+            .get("systemInstruction")
+            .is_some_and(|si| !parts_array(si))
+        || obj.get("tools").is_some_and(|t| {
+            !t.as_array().is_some_and(|ts| {
+                ts.iter()
+                    .all(|t| t.get("functionDeclarations").is_some_and(Value::is_array))
+            })
+        })
+    {
+        return true;
+    }
     if !function_pairing_is_exact(obj.get("contents")) {
         return true;
     }
@@ -816,6 +832,29 @@ mod tests {
         assert_eq!(call_ids.len(), 2);
         assert_ne!(call_ids[0], call_ids[1]);
         assert_eq!(call_ids, result_ids);
+    }
+
+    #[test]
+    fn malformed_fields_take_passthrough_instead_of_being_dropped() {
+        let user = serde_json::json!([{ "role": "user", "parts": [{ "text": "hi" }] }]);
+        for body in [
+            serde_json::json!({ "contents": user, "systemInstruction": "be terse" }),
+            serde_json::json!({ "contents": user, "systemInstruction": { "text": "be terse" } }),
+            serde_json::json!({ "contents": user, "systemInstruction": { "parts": "be terse" } }),
+            serde_json::json!({ "contents": { "role": "user" } }),
+            serde_json::json!({ "contents": user, "tools": { "functionDeclarations": [] } }),
+            serde_json::json!({ "contents": user, "tools": [{ "functionDeclarations": {} }] }),
+        ] {
+            assert!(
+                has_untranslatable_content(&body),
+                "must not translate {body}"
+            );
+        }
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "contents": user,
+            "systemInstruction": { "parts": [{ "text": "be terse" }] },
+            "tools": [{ "functionDeclarations": [{ "name": "ls", "parameters": { "type": "object" } }] }]
+        })));
     }
 
     #[test]
