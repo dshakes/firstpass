@@ -1289,7 +1289,11 @@ fn paired_replay(args: &[String], i: usize, json: bool) {
         from_swebench_experiments(&files)
     } else {
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| fail(format!("{src}: {e}")));
-        if text.lines().next().is_some_and(|l| l.contains("\"turns\"")) {
+        if text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(|l| l.contains("\"turns\""))
+        {
             from_checkpoint(&text)
         } else {
             parse_jsonl(&text)

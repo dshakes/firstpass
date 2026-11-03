@@ -1,6 +1,6 @@
 # Certified selection (ADR 0014) — REPLAY of recorded outcomes, NOT a live run
 
-data source: /Users/shakes/.cache/firstpass-swebench-experiments  ·  sessions: 500  ·  spend: $0
+data source: ~/.cache/firstpass-swebench-experiments  ·  sessions: 500  ·  spend: $0
 
 ## Pre-registered
 

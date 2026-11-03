@@ -606,7 +606,11 @@ fn cascade(sessions: &[Session], cheap: &str, top: &str) -> Option<(Vec<f64>, Ve
             .filter(|(i, _)| i % 2 != fold)
             .collect();
         let target: f64 = train.iter().map(|(_, r)| r.3).sum();
-        let mut taus: Vec<f64> = train.iter().map(|(_, r)| r.0).collect();
+        // +inf first: "accept every cheap answer" must stay that on the test fold, where a
+        // signal above the train max would otherwise escalate. `min_by` keeps the first of
+        // equal scores, so +inf wins the tie against max(train).
+        let mut taus: Vec<f64> = vec![f64::INFINITY];
+        taus.extend(train.iter().map(|(_, r)| r.0));
         taus.push(f64::NEG_INFINITY);
         let score = |tau: f64| {
             train.iter().fold((0.0, 0.0), |(s, c), (_, r)| {
@@ -974,6 +978,31 @@ mod tests {
             bootstrap: 300,
             ..PreRegistered::default()
         }
+    }
+
+    #[test]
+    fn cascade_that_should_accept_everything_does_so_on_unseen_high_signals() {
+        // Cheap always succeeds, so the best train threshold is "accept all". Signals rise with
+        // the index, so each test fold has values above its train max; without +inf in the grid
+        // those escalate to top and pay for it.
+        let sessions: Vec<Session> = (0..10)
+            .map(|i| {
+                let run = |cost: f64, sig: Option<f64>| ModelRun {
+                    success: true,
+                    cost_usd: cost,
+                    gate_signal: sig,
+                };
+                Session {
+                    id: format!("t{i}"),
+                    runs: BTreeMap::from([
+                        ("cheap".to_owned(), run(0.1, Some(f64::from(i)))),
+                        ("top".to_owned(), run(1.0, None)),
+                    ]),
+                }
+            })
+            .collect();
+        let (_, cost) = cascade(&sessions, "cheap", "top").unwrap();
+        assert!(cost.iter().all(|&c| (c - 0.1).abs() < 1e-9), "{cost:?}");
     }
 
     #[test]
