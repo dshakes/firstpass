@@ -498,7 +498,15 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
     // Stateful threading: the upstream holds history we do not have, so a translated request is
     // not the conversation the client is actually continuing. `conversation` is the newer,
     // mutually exclusive form of the same server-side state.
-    if body.get("previous_response_id").is_some() || body.get("conversation").is_some() {
+    // An explicit `store: true` asks the upstream to persist this response for a later
+    // `previous_response_id` turn; a synthetic reply built from Chat has nothing stored, so that
+    // continuation would fail or thread onto the wrong state. Codex sends `store: false`.
+    // ponytail: an absent `store` (API default true) stays translated, as before this change;
+    // a client that omits it and then threads by id gets passthrough on that next turn anyway.
+    if body.get("previous_response_id").is_some()
+        || body.get("conversation").is_some()
+        || body.get("store").and_then(Value::as_bool) == Some(true)
+    {
         return true;
     }
     // A structured-output contract (`codex exec --output-schema` sends `text.format:
@@ -1468,6 +1476,13 @@ mod tests {
                 "must not translate {item}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_store_true_is_not_translated_but_store_false_is() {
+        let body = |store: bool| serde_json::json!({"model": "m", "input": "hi", "store": store});
+        assert!(has_untranslatable_content(&body(true)));
+        assert!(!has_untranslatable_content(&body(false)));
     }
 
     #[test]
