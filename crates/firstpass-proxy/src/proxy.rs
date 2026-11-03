@@ -4753,7 +4753,7 @@ fn build_stream_trace_from_usage(
     // the same condition.
     let truncated = matches!(
         usage.stop_reason.as_deref(),
-        Some("max_tokens") | Some("length")
+        Some("max_tokens") | Some("length") | Some("MAX_TOKENS")
     );
 
     let (verdict, served_from, served_rung) = match outcome {
@@ -5989,13 +5989,14 @@ async fn gemini_generate_content(
     // Split "gemini-2.0-flash:generateContent" → ("gemini-2.0-flash", "generateContent")
     let (model, action) = model_action
         .split_once(':')
-        .unwrap_or((model_action.as_str(), "generateContent"));
+        .unwrap_or((model_action.as_str(), ""));
     // Owned copy before any possible move of `model_action`; used as model_hint in observe traces.
     let model_owned = model.to_owned();
 
-    // countTokens: metadata endpoint — relay transparently, write NO receipt (same as
-    // `/v1/messages/count_tokens`). Only the actual generate call costs tokens and gets billed.
-    if action.starts_with("countTokens") {
+    // Only the two generate actions (exact match) are traced or gated. countTokens and any
+    // other or missing action relay transparently and write NO receipt (same as
+    // `/v1/messages/count_tokens`): exact Gemini endpoint semantics, no proxy-specific guess.
+    if !matches!(action, "generateContent" | "streamGenerateContent") {
         let path = if scrubbed_query.is_empty() {
             format!("/v1beta/models/{model_action}")
         } else {
@@ -6017,7 +6018,7 @@ async fn gemini_generate_content(
         };
     }
 
-    let is_streaming = action.starts_with("streamGenerateContent");
+    let is_streaming = action == "streamGenerateContent";
 
     let mut session_header = header_session(&headers, &state.config.prompt_salt);
 
@@ -12275,6 +12276,33 @@ mod tests {
             attempt.model, "claude-haiku-4-5-20251001",
             "attempt model must be the dated snapshot name, not the canonical request model"
         );
+    }
+
+    /// A Gemini stream cut off at the output cap reports `finishReason: "MAX_TOKENS"`; it must be
+    /// recorded as truncated like Anthropic's `max_tokens` and OpenAI's `length`.
+    #[test]
+    fn gemini_stream_max_tokens_is_truncated() {
+        let config = test_config();
+        let req = Bytes::from_static(br#"{"contents":[]}"#);
+        let usage = SseUsage {
+            in_tokens: 10,
+            out_tokens: 64,
+            stop_reason: Some("MAX_TOKENS".to_owned()),
+            completed: true,
+            ..Default::default()
+        };
+        let trace = build_stream_trace_from_usage(
+            &config,
+            &req,
+            10,
+            None,
+            usage,
+            "google",
+            StreamOutcome::Served,
+            "gemini.generate_content",
+            Some("gemini-2.5-pro"),
+        );
+        assert!(trace.attempts[0].truncated);
     }
 
     // ── Snapshot-fallback edge cases ────────────────────────────────────────────

@@ -1652,6 +1652,21 @@ async fn gemini_count_tokens_writes_no_receipt() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "countTokens must relay 200");
+    // Only exact `generateContent` / `streamGenerateContent` are traced: a look-alike or a
+    // missing action is relayed as-is, never treated as a generate call.
+    for path in [
+        "gemini-2.0-flash:countTokensX",
+        "gemini-2.0-flash:generateContentX",
+        "gemini-2.0-flash",
+    ] {
+        let _ = reqwest::Client::new()
+            .post(format!("{proxy}/v1beta/models/{path}"))
+            .header("x-goog-api-key", "AIza-test")
+            .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
+            .send()
+            .await
+            .unwrap();
+    }
 
     // Wait briefly; any spawned trace would land within this window.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
