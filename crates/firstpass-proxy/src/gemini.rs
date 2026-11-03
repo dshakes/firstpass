@@ -20,7 +20,7 @@
 //! | `contents[].parts[].text` | message content string |
 //! | `contents[].parts[].functionCall` | `tool_calls` in assistant message |
 //! | `parts[].thoughtSignature` on a `functionCall` part | that tool call's `extra_content.google.thought_signature` |
-//! | `parts[].thoughtSignature` on a `text` part | the message's `extra_content.google.thought_signature` (last one wins) |
+//! | `parts[].thoughtSignature` on a `text` part | dropped (see below) |
 //! | `contents[].parts[].functionResponse` | `{role:"tool", tool_call_id, content}` |
 //! | `tools[].functionDeclarations[]` (`parameters` or `parametersJsonSchema`) | `tools[{type:"function", function:{...}}]` |
 //! | `generationConfig.maxOutputTokens` | `max_tokens` |
@@ -32,8 +32,11 @@
 //! `extra_content: {google: {thought_signature}}` is Google's own OpenAI-compatibility spelling.
 //! It exists so a Gemini rung can replay the signature (`GeminiProvider` restores it); the
 //! OpenAI/Anthropic wire builders strip it, so it never reaches a non-Gemini upstream.
-//! Function-call signatures are the load-bearing ones (Gemini 400s without them); text-part
-//! signatures are optional and only survive as far as the Chat body — no provider replays them.
+//! Function-call signatures are the load-bearing ones (Gemini 400s without them). Text-part
+//! signatures are dropped: the API does not validate them, which is why gemini-cli's own history
+//! hardening (`ensureActiveLoopHasThoughtSignatures`, geminiChat.ts) only ever repairs
+//! functionCall parts. The cost is the model's prior reasoning context on that turn — the same
+//! thing any non-Gemini rung lives with.
 //!
 //! ## Not translated → passthrough
 //!
@@ -157,13 +160,6 @@ fn content_to_messages(content: &Value, turn: usize) -> Vec<Value> {
             Some(call)
         })
         .collect();
-    // Optional text-part signature (Gemini puts it on the last part of a non-call answer).
-    let text_sig = parts
-        .iter()
-        .rev()
-        .filter_map(Value::as_object)
-        .filter(|p| p.contains_key("text"))
-        .find_map(signature_extra);
     if !calls.is_empty() {
         let text = text_from_parts(parts);
         let content_val = if text.is_empty() {
@@ -171,15 +167,11 @@ fn content_to_messages(content: &Value, turn: usize) -> Vec<Value> {
         } else {
             Value::String(text)
         };
-        let mut msg = serde_json::json!({
+        return vec![serde_json::json!({
             "role": "assistant",
             "content": content_val,
             "tool_calls": calls,
-        });
-        if let Some(extra) = text_sig {
-            msg["extra_content"] = extra;
-        }
-        return vec![msg];
+        })];
     }
 
     // functionResponse parts → one tool message per part (parallel tool results).
@@ -208,11 +200,7 @@ fn content_to_messages(content: &Value, turn: usize) -> Vec<Value> {
 
     // Plain text message
     let text = text_from_parts(parts);
-    let mut msg = serde_json::json!({ "role": chat_role, "content": text });
-    if let Some(extra) = text_sig {
-        msg["extra_content"] = extra;
-    }
-    vec![msg]
+    vec![serde_json::json!({ "role": chat_role, "content": text })]
 }
 
 /// A part's `thoughtSignature` in Google's OpenAI-compat `extra_content` shape.
@@ -843,11 +831,11 @@ mod tests {
             calls[1].get("extra_content").is_none(),
             "an unsigned call stays unsigned"
         );
-        assert_eq!(
-            msg["extra_content"]["google"]["thought_signature"],
-            "txtSig"
+        assert!(
+            msg.get("extra_content").is_none(),
+            "text-part signatures are dropped, not stored where nothing replays them"
         );
-        // mutant (done): `signature_extra` -> None makes both signature asserts fail;
+        // mutant (done): `signature_extra` -> None makes the call signature assert fail;
         // dropping "thoughtSignature" from the part allow-list fails the translatable assert.
     }
 

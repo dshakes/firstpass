@@ -5312,7 +5312,11 @@ fn extract_openai_content_and_tools(raw: &Value, text: &str) -> (Value, Option<V
         return (content_text, tc);
     }
 
-    // OpenAI-format raw (all-OpenAI-ladder path): extract from choices
+    // OpenAI-format raw (all-OpenAI-ladder path, or a Gemini rung's `choices` view): extract
+    // from choices. A Gemini rung's tool calls keep `extra_content.google.thought_signature`
+    // on purpose: it is Google's own OpenAI-compat response field, clients ignore it, and one
+    // that replays its history hands the signature back for the next Gemini turn (the wire
+    // builders strip it before any non-Gemini upstream).
     if let Some(msg) = raw.pointer("/choices/0/message") {
         let content = msg
             .get("content")
