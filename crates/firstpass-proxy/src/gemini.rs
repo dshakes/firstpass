@@ -60,9 +60,7 @@ pub fn request_to_chat(body: &Value, model: &str) -> Value {
     // contents → messages
     if let Some(Value::Array(contents)) = obj.get("contents") {
         for c in contents {
-            if let Some(msg) = content_to_message(c) {
-                messages.push(msg);
-            }
+            messages.extend(content_to_messages(c));
         }
     }
     out.insert("messages".to_owned(), Value::Array(messages));
@@ -98,17 +96,30 @@ pub fn request_to_chat(body: &Value, model: &str) -> Value {
     Value::Object(out)
 }
 
-/// One Gemini `content` object → one Chat message, or `None` for unrepresentable content.
-fn content_to_message(content: &Value) -> Option<Value> {
-    let obj = content.as_object()?;
+/// One Gemini `content` object → zero or more Chat messages.
+///
+/// A `functionResponse` content (the user/tool side returning results) may have multiple parts
+/// when the model issued parallel calls. Each response is emitted as its own `{role:"tool"}`
+/// message so downstream providers see one message per call ID, matching the OpenAI wire format.
+///
+/// Tool call IDs use a positional suffix (`call_{name}_{idx}`) so two parallel calls to the
+/// same function get distinct IDs and neither clobbers the other's result.
+fn content_to_messages(content: &Value) -> Vec<Value> {
+    let Some(obj) = content.as_object() else {
+        return vec![];
+    };
     let role = obj.get("role").and_then(Value::as_str).unwrap_or("user");
     let chat_role = if role == "model" { "assistant" } else { role };
-    let parts = obj.get("parts").and_then(Value::as_array)?;
+    let Some(parts) = obj.get("parts").and_then(Value::as_array) else {
+        return vec![];
+    };
 
-    // functionCall parts → assistant message with tool_calls
+    // functionCall parts → single assistant message with tool_calls list.
+    // Positional IDs: call_{name}_{idx} so parallel calls to the same function differ.
     let calls: Vec<Value> = parts
         .iter()
-        .filter_map(|p| {
+        .enumerate()
+        .filter_map(|(idx, p)| {
             let fc = p.as_object()?.get("functionCall")?.as_object()?;
             let name = fc.get("name")?.clone();
             let args = fc
@@ -116,7 +127,7 @@ fn content_to_message(content: &Value) -> Option<Value> {
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new()));
             Some(serde_json::json!({
-                "id": format!("call_{}", name.as_str().unwrap_or("fn")),
+                "id": format!("call_{}_{idx}", name.as_str().unwrap_or("fn")),
                 "type": "function",
                 "function": { "name": name, "arguments": args.to_string() },
             }))
@@ -129,34 +140,40 @@ fn content_to_message(content: &Value) -> Option<Value> {
         } else {
             Value::String(text)
         };
-        return Some(serde_json::json!({
+        return vec![serde_json::json!({
             "role": "assistant",
             "content": content_val,
             "tool_calls": calls,
-        }));
+        })];
     }
 
-    // functionResponse parts → tool message (one per response; multi-result is rare)
-    for p in parts {
-        if let Some(fr) = p.as_object().and_then(|m| m.get("functionResponse")) {
-            let fr = fr.as_object()?;
+    // functionResponse parts → one tool message per part (parallel tool results).
+    // Each part contributes its own {role:"tool"} message with a positional call ID.
+    let tool_msgs: Vec<Value> = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, p)| {
+            let fr = p.as_object()?.get("functionResponse")?.as_object()?;
             let name = fr.get("name").and_then(Value::as_str)?;
             let output = fr
                 .get("response")
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new()))
                 .to_string();
-            return Some(serde_json::json!({
+            Some(serde_json::json!({
                 "role": "tool",
-                "tool_call_id": format!("call_{name}"),
+                "tool_call_id": format!("call_{name}_{idx}"),
                 "content": output,
-            }));
-        }
+            }))
+        })
+        .collect();
+    if !tool_msgs.is_empty() {
+        return tool_msgs;
     }
 
     // Plain text message
     let text = text_from_parts(parts);
-    Some(serde_json::json!({ "role": chat_role, "content": text }))
+    vec![serde_json::json!({ "role": chat_role, "content": text })]
 }
 
 /// Concatenate text parts from a `parts` array.
@@ -190,26 +207,78 @@ fn fd_to_chat(fd: &Value) -> Option<Value> {
 /// represent. Allow-list, not deny-list: only known-good content is gated; anything outside
 /// takes the passthrough path un-gated.
 ///
-/// Translatable: plain text, `functionCall`, `functionResponse`, function-declaration tools,
-/// `systemInstruction` with text parts.
+/// **Request-level**: `cachedContent`, `toolConfig`, `safetySettings`, non-`functionDeclarations`
+/// tool entries (e.g. `googleSearch`, `codeExecution`), `systemInstruction` with non-text parts,
+/// and unmapped `generationConfig` fields trigger passthrough.
 ///
-/// Not translatable (→ passthrough): `inlineData`, `executableCode`, `codeExecutionResult`,
-/// `fileData`, `videoMetadata`, `thoughtSignature`, and any part type not in the allow-list.
+/// **Part-level**: plain text, `functionCall`, `functionResponse` are translatable. Anything
+/// else — `inlineData`, `executableCode`, `codeExecutionResult`, `fileData`, `videoMetadata`,
+/// `thoughtSignature`, or any unknown part key — is not.
 #[must_use]
 pub fn has_untranslatable_content(body: &Value) -> bool {
-    let Some(Value::Array(contents)) = body.get("contents") else {
+    let Some(obj) = body.as_object() else {
+        return false;
+    };
+
+    // ── request-level allow-list ──────────────────────────────────────────────
+    // cachedContent, toolConfig, safetySettings: no Chat equivalent → passthrough.
+    if obj.contains_key("cachedContent")
+        || obj.contains_key("toolConfig")
+        || obj.contains_key("safetySettings")
+    {
+        return true;
+    }
+
+    // tools: each entry must only carry functionDeclarations; googleSearch, codeExecution,
+    // retrieval, etc. have no Chat equivalent and would be silently dropped.
+    if let Some(Value::Array(tools)) = obj.get("tools") {
+        for tool in tools {
+            let is_only_fn_decls = tool
+                .as_object()
+                .is_some_and(|m| m.keys().all(|k| k == "functionDeclarations"));
+            if !is_only_fn_decls {
+                return true;
+            }
+        }
+    }
+
+    // systemInstruction: only pure-text parts are translatable.
+    if let Some(si) = obj.get("systemInstruction")
+        && let Some(Value::Array(parts)) = si.get("parts")
+    {
+        for p in parts {
+            let has_only_text = p
+                .as_object()
+                .is_some_and(|m| m.len() == 1 && m.contains_key("text"));
+            if !has_only_text {
+                return true;
+            }
+        }
+    }
+
+    // generationConfig: only the mapped subset (maxOutputTokens, temperature, topP).
+    if let Some(Value::Object(gen_cfg)) = obj.get("generationConfig") {
+        for k in gen_cfg.keys() {
+            if !matches!(k.as_str(), "maxOutputTokens" | "temperature" | "topP") {
+                return true;
+            }
+        }
+    }
+
+    // ── part-level allow-list ─────────────────────────────────────────────────
+    let Some(Value::Array(contents)) = obj.get("contents") else {
         // No contents at all is fine — caller decides whether to reject that.
         return false;
     };
     contents.iter().any(|content| {
-        let Some(obj) = content.as_object() else {
+        let Some(content_obj) = content.as_object() else {
             return true;
         };
-        let Some(Value::Array(parts)) = obj.get("parts") else {
+        let Some(Value::Array(parts)) = content_obj.get("parts") else {
             return true;
         };
         parts.iter().any(|part| {
-            let Some(obj) = part.as_object() else {
+            let Some(part_obj) = part.as_object() else {
                 return true;
             };
             // Strict allow-list: every field on the part must translate faithfully. Anything
@@ -217,8 +286,8 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
             // token Gemini 2.5+/3 needs replayed) would be silently dropped. gemini-cli
             // replays thoughtSignature in history after the first tool call, so for those
             // models most agentic tool turns take the observe passthrough.
-            obj.is_empty()
-                || obj
+            part_obj.is_empty()
+                || part_obj
                     .keys()
                     .any(|k| !matches!(k.as_str(), "text" | "functionCall" | "functionResponse"))
         })
@@ -423,9 +492,64 @@ mod tests {
         let out = request_to_chat(&body, "m");
         let msgs = out["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "tool");
-        assert_eq!(msgs[0]["tool_call_id"], "call_get_weather");
+        // positional ID: the functionResponse is at index 0
+        assert_eq!(msgs[0]["tool_call_id"], "call_get_weather_0");
         assert!(msgs[0]["content"].as_str().is_some());
         // mutant: if we emit role "user" instead of "tool", assertion fails
+    }
+
+    #[test]
+    fn parallel_function_responses_each_become_own_tool_message() {
+        // Two functionResponse parts in one content → two separate tool messages with
+        // positional call IDs. Dropping the second part would lose a tool result.
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    { "functionResponse": { "name": "lookup", "response": { "a": 1 } } },
+                    { "functionResponse": { "name": "lookup", "response": { "b": 2 } } },
+                ],
+            }],
+        });
+        let out = request_to_chat(&body, "m");
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "must emit one message per functionResponse part"
+        );
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["tool_call_id"], "call_lookup_0");
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "call_lookup_1");
+        // mutant: revert to old `return Some(...)` on first match → msgs.len() == 1
+    }
+
+    #[test]
+    fn parallel_function_calls_get_positional_ids() {
+        // Two functionCall parts for the same function name must get distinct IDs so neither
+        // result overwrites the other when the model returns its tool responses.
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "model",
+                "parts": [
+                    { "functionCall": { "name": "search", "args": { "q": "foo" } } },
+                    { "functionCall": { "name": "search", "args": { "q": "bar" } } },
+                ],
+            }],
+        });
+        let out = request_to_chat(&body, "m");
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let calls = msgs[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(
+            calls[0]["id"], calls[1]["id"],
+            "parallel calls must have distinct IDs"
+        );
+        assert_eq!(calls[0]["id"], "call_search_0");
+        assert_eq!(calls[1]["id"], "call_search_1");
+        // mutant: use name-only ID → both get "call_search" → ids are equal → assertion fails
     }
 
     // ── response_from_chat ──────────────────────────────────────────────────
@@ -580,6 +704,87 @@ mod tests {
         assert!(!has_untranslatable_content(&serde_json::json!({
             "generationConfig": { "maxOutputTokens": 128 },
         })));
+    }
+
+    #[test]
+    fn cached_content_is_not_translatable() {
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "cachedContent": "projects/p/cachedContents/c",
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // mutant: remove `cachedContent` check → returns false
+    }
+
+    #[test]
+    fn tool_config_is_not_translatable() {
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "toolConfig": { "functionCallingConfig": { "mode": "ANY" } },
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // mutant: remove `toolConfig` check → returns false
+    }
+
+    #[test]
+    fn safety_settings_are_not_translatable() {
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "safetySettings": [{ "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE" }],
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // mutant: remove `safetySettings` check → returns false
+    }
+
+    #[test]
+    fn non_function_declaration_tool_is_not_translatable() {
+        // googleSearch has no Chat equivalent — it must be passed through unmodified.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "tools": [{ "googleSearch": {} }],
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // A mix of functionDeclarations and googleSearch is also not translatable.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "tools": [{ "functionDeclarations": [{ "name": "f" }], "googleSearch": {} }],
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // Pure functionDeclarations is translatable.
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "tools": [{ "functionDeclarations": [{ "name": "f" }] }],
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // mutant: remove the tools check → first assert returns false
+    }
+
+    #[test]
+    fn system_instruction_with_non_text_part_is_not_translatable() {
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "systemInstruction": { "parts": [{ "inlineData": { "mimeType": "image/png", "data": "AA==" } }] },
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // Text-only systemInstruction is fine.
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "systemInstruction": { "parts": [{ "text": "be helpful" }] },
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // mutant: remove the systemInstruction part check → first assert returns false
+    }
+
+    #[test]
+    fn unmapped_generation_config_field_is_not_translatable() {
+        // responseMimeType has no direct Chat equivalent.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "generationConfig": { "responseMimeType": "application/json" },
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // topK is not in the mapped set.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "generationConfig": { "maxOutputTokens": 512, "topK": 40 },
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // All mapped fields together are fine.
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "generationConfig": { "maxOutputTokens": 512, "temperature": 0.7, "topP": 0.9 },
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        })));
+        // mutant: remove the generationConfig check → first assert returns false
     }
 
     // ── SSE format ───────────────────────────────────────────────────────────

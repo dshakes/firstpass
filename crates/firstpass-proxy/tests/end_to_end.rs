@@ -1590,3 +1590,353 @@ async fn gemini_query_key_not_in_receipt() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+/// `countTokens` is a metadata endpoint: the proxy relays it transparently but writes NO receipt.
+///
+/// Mutation check: restore `spawn_trace` in the countTokens branch → a trace is written and
+/// the `is_empty()` assertion fails.
+#[tokio::test]
+async fn gemini_count_tokens_writes_no_receipt() {
+    let (upstream, log) = spawn_recording_gemini_upstream().await;
+    drop(log); // not needed here
+    let db_path = std::env::temp_dir().join(format!("firstpass-e2e-{}.db", uuid::Uuid::now_v7()));
+    let db_str = db_path.to_string_lossy().into_owned();
+    let upstream_c = upstream.clone();
+    let config = ProxyConfig::from_lookup(move |key| match key {
+        "FIRSTPASS_UPSTREAM_GEMINI" => Some(upstream_c.clone()),
+        "FIRSTPASS_DB" => Some(db_str.clone()),
+        _ => None,
+    })
+    .unwrap();
+    let (traces_store, _writer) = store::open(&db_path).unwrap();
+    let promoter = firstpass_proxy::proxy::build_promoter_async(&config)
+        .await
+        .unwrap();
+    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config)
+        .await
+        .unwrap();
+    let state = AppState {
+        config: Arc::new(config),
+        http: reqwest::Client::new(),
+        providers: ProviderRegistry::from_config(&[], &upstream, &upstream),
+        gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
+        shadow_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        paired_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        experiments: std::sync::Arc::default(),
+        guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
+        traces: traces_store,
+        adaptive: None,
+        eprocess: None,
+        bandit: None,
+        promoter,
+        verified_cache,
+        predictor: None,
+        prior: None,
+        tenant_rate_limiter: None,
+        spill: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state).unwrap()).await.unwrap();
+    });
+    let proxy = format!("http://{addr}");
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{proxy}/v1beta/models/gemini-2.0-flash:countTokens"
+        ))
+        .header("x-goog-api-key", "AIza-test")
+        .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "countTokens must relay 200");
+
+    // Wait briefly; any spawned trace would land within this window.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let traces = store::load_all_traces(&db_path).unwrap_or_default();
+    assert!(
+        traces.is_empty(),
+        "countTokens must not write a receipt; got {} traces",
+        traces.len()
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// A Gemini observe-mode trace records `api = "gemini.generate_content"`, the model from the
+/// URL path, and token counts from `usageMetadata` (not `usage.prompt_tokens`).
+///
+/// Mutation check: revert `response_usage` Gemini branch → in_tokens/out_tokens stay at 0.
+/// Mutation check: revert `base_trace` api param → api stays `"anthropic.messages"`.
+/// Mutation check: remove `model_hint` → model stays `"unknown"`.
+#[tokio::test]
+async fn gemini_observe_receipt_has_correct_api_model_tokens() {
+    let (upstream, _log) = spawn_recording_gemini_upstream().await;
+    let db_path = std::env::temp_dir().join(format!("firstpass-e2e-{}.db", uuid::Uuid::now_v7()));
+    let db_str = db_path.to_string_lossy().into_owned();
+    let upstream_c = upstream.clone();
+    let config = ProxyConfig::from_lookup(move |key| match key {
+        "FIRSTPASS_UPSTREAM_GEMINI" => Some(upstream_c.clone()),
+        "FIRSTPASS_DB" => Some(db_str.clone()),
+        _ => None,
+    })
+    .unwrap();
+    let (traces_store, _writer) = store::open(&db_path).unwrap();
+    let promoter = firstpass_proxy::proxy::build_promoter_async(&config)
+        .await
+        .unwrap();
+    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config)
+        .await
+        .unwrap();
+    let state = AppState {
+        config: Arc::new(config),
+        http: reqwest::Client::new(),
+        providers: ProviderRegistry::from_config(&[], &upstream, &upstream),
+        gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
+        shadow_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        paired_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        experiments: std::sync::Arc::default(),
+        guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
+        traces: traces_store,
+        adaptive: None,
+        eprocess: None,
+        bandit: None,
+        promoter,
+        verified_cache,
+        predictor: None,
+        prior: None,
+        tenant_rate_limiter: None,
+        spill: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state).unwrap()).await.unwrap();
+    });
+    let proxy = format!("http://{addr}");
+
+    // The recording upstream returns usageMetadata: promptTokenCount=5, candidatesTokenCount=3.
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{proxy}/v1beta/models/gemini-2.0-flash:generateContent"
+        ))
+        .header("x-goog-api-key", "AIza-test")
+        .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let traces = wait_for_traces(&db_path, 1).await;
+    assert!(!traces.is_empty(), "a trace must be written");
+    let t = &traces[0];
+
+    assert_eq!(
+        t.request.api, "gemini.generate_content",
+        "api must be gemini.generate_content, got {:?}",
+        t.request.api
+    );
+    assert_eq!(
+        t.attempts[0].model, "gemini-2.0-flash",
+        "model must come from URL path, got {:?}",
+        t.attempts[0].model
+    );
+    assert_eq!(
+        t.attempts[0].in_tokens, 5,
+        "in_tokens from usageMetadata.promptTokenCount"
+    );
+    assert_eq!(
+        t.attempts[0].out_tokens, 3,
+        "out_tokens from usageMetadata.candidatesTokenCount"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// A `?key=` value containing percent-encoded characters (e.g. `%3D` for `=`) must be decoded
+/// before it is forwarded as the `x-goog-api-key` header.
+///
+/// Mutation check: remove `percent_decode_ascii` call → header carries `"AIza%3Dkey"` (raw) →
+/// assert_eq fails.
+#[tokio::test]
+async fn gemini_query_key_percent_decoded() {
+    let (upstream, log) = spawn_recording_gemini_upstream().await;
+    let db_path = std::env::temp_dir().join(format!("firstpass-e2e-{}.db", uuid::Uuid::now_v7()));
+    let db_str = db_path.to_string_lossy().into_owned();
+    let upstream_c = upstream.clone();
+    let config = ProxyConfig::from_lookup(move |key| match key {
+        "FIRSTPASS_UPSTREAM_GEMINI" => Some(upstream_c.clone()),
+        "FIRSTPASS_DB" => Some(db_str.clone()),
+        _ => None,
+    })
+    .unwrap();
+    let (traces_store, _writer) = store::open(&db_path).unwrap();
+    let promoter = firstpass_proxy::proxy::build_promoter_async(&config)
+        .await
+        .unwrap();
+    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config)
+        .await
+        .unwrap();
+    let state = AppState {
+        config: Arc::new(config),
+        http: reqwest::Client::new(),
+        providers: ProviderRegistry::from_config(&[], &upstream, &upstream),
+        gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
+        shadow_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        paired_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        experiments: std::sync::Arc::default(),
+        guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
+        traces: traces_store,
+        adaptive: None,
+        eprocess: None,
+        bandit: None,
+        promoter,
+        verified_cache,
+        predictor: None,
+        prior: None,
+        tenant_rate_limiter: None,
+        spill: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state).unwrap()).await.unwrap();
+    });
+    let proxy = format!("http://{addr}");
+
+    // `AIza%3Dkey` encodes `=`; the upstream header must receive the decoded `AIza=key`.
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{proxy}/v1beta/models/gemini-2.0-flash:generateContent?key=AIza%3Dkey"
+        ))
+        .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let recorded = log.0.lock().unwrap().clone();
+    assert!(
+        !recorded.is_empty(),
+        "upstream must have received a request"
+    );
+    let (_, api_key_header) = &recorded[0];
+    assert_eq!(
+        api_key_header.as_deref(),
+        Some("AIza=key"),
+        "percent-encoded key must be decoded; got {:?}",
+        api_key_header
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Different Gemini tool-bearing requests get different session IDs (session collision fix).
+/// When `body_session` was called with the raw Gemini body, all tool requests hashed to the
+/// same `conv:` prefix because Gemini bodies have no `messages` field — only `contents`.
+///
+/// Mutation check: revert to `body_session(&parsed, ...)` → both sessions are identical →
+/// `assert_ne!` fails.
+#[tokio::test]
+async fn gemini_enforce_different_tool_requests_get_different_sessions() {
+    // We need an enforce route with a Gemini ladder. Use the recording upstream as both Gemini
+    // and the ladder upstream (it just echoes back a valid Gemini response).
+    let (upstream, _log) = spawn_recording_gemini_upstream().await;
+    let db_path = std::env::temp_dir().join(format!("firstpass-e2e-{}.db", uuid::Uuid::now_v7()));
+    let db_str = db_path.to_string_lossy().into_owned();
+    let upstream_c = upstream.clone();
+
+    // Minimal Gemini provider config so `gemini/gemini-2.0-flash` resolves.
+    let providers_toml =
+        format!("[[provider]]\nid = \"gemini\"\ndialect = \"gemini\"\nbase_url = \"{upstream}\"\n");
+    let price_toml = "[[price]]\nmodel = \"gemini/gemini-2.0-flash\"\ninput_per_mtok = 0.1\noutput_per_mtok = 0.4\n";
+    let routing_toml = format!(
+        "{providers_toml}{price_toml}\n[[route]]\nmatch = {{}}\nmode = \"enforce\"\nladder = [\"gemini/gemini-2.0-flash\"]\ngates = [\"non-empty\"]\n"
+    );
+    let config = ProxyConfig::from_lookup(move |key| match key {
+        "FIRSTPASS_UPSTREAM_GEMINI" => Some(upstream_c.clone()),
+        "FIRSTPASS_DB" => Some(db_str.clone()),
+        "FIRSTPASS_CONFIG_TOML" => Some(routing_toml.clone()),
+        _ => None,
+    })
+    .unwrap();
+    let provider_defs = config
+        .routing
+        .as_ref()
+        .map(|r| r.providers.as_slice())
+        .unwrap_or_default();
+    let providers = ProviderRegistry::from_config(provider_defs, &upstream, &upstream);
+    let (traces_store, _writer) = store::open(&db_path).unwrap();
+    let promoter = firstpass_proxy::proxy::build_promoter_async(&config)
+        .await
+        .unwrap();
+    let verified_cache = firstpass_proxy::proxy::build_verified_cache(&config)
+        .await
+        .unwrap();
+    let state = AppState {
+        config: Arc::new(config),
+        http: reqwest::Client::new(),
+        providers,
+        gate_health: Arc::new(firstpass_proxy::gate::GateHealthRegistry::new()),
+        shadow_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        paired_ledger: std::sync::Arc::new(firstpass_proxy::shadow::ShadowLedger::new()),
+        experiments: std::sync::Arc::default(),
+        guardrails: std::sync::Arc::new(firstpass_proxy::guard::GuardrailRegistry::new()),
+        traces: traces_store,
+        adaptive: None,
+        eprocess: None,
+        bandit: None,
+        promoter,
+        verified_cache,
+        predictor: None,
+        prior: None,
+        tenant_rate_limiter: None,
+        spill: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state).unwrap()).await.unwrap();
+    });
+    let proxy = format!("http://{addr}");
+
+    // Two different tool-bearing requests: different system prompts + different tool names.
+    let req_a = json!({
+        "systemInstruction": { "parts": [{ "text": "You are agent A" }] },
+        "contents": [{ "role": "user", "parts": [{ "text": "query A" }] }],
+        "tools": [{ "functionDeclarations": [{ "name": "tool_a", "description": "a" }] }],
+    });
+    let req_b = json!({
+        "systemInstruction": { "parts": [{ "text": "You are agent B" }] },
+        "contents": [{ "role": "user", "parts": [{ "text": "query B" }] }],
+        "tools": [{ "functionDeclarations": [{ "name": "tool_b", "description": "b" }] }],
+    });
+
+    let client = reqwest::Client::new();
+    let url = format!("{proxy}/v1beta/models/gemini-2.0-flash:generateContent");
+
+    for body in [&req_a, &req_b] {
+        client
+            .post(&url)
+            .header("x-goog-api-key", "AIza-test")
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let traces = wait_for_traces(&db_path, 2).await;
+    assert_eq!(traces.len(), 2, "expected 2 traces, got {}", traces.len());
+
+    let sess_a = &traces[0].session_id;
+    let sess_b = &traces[1].session_id;
+    assert_ne!(
+        sess_a, sess_b,
+        "different tool-bearing requests must get different session IDs (session collision fix)"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
