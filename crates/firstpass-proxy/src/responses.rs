@@ -20,11 +20,20 @@
 //! then re-emits that answer as a Responses event stream: one delta per text part / argument
 //! string, not token-by-token.
 //!
+//! ## Reasoning items are dropped, not carried
+//!
+//! A `reasoning` input item is the model's hidden chain of thought from a prior turn, usually
+//! `encrypted_content` only the issuing OpenAI deployment can read. Chat Completions has no field
+//! for it, so the translation drops it — the same history every Chat client already sends — and
+//! the gate judges the new answer on its own. The served answer has no reasoning item; Codex treats
+//! reasoning output as optional (`codex-api/src/sse/responses.rs` parses each
+//! `output_item.done` independently; nothing waits for a reasoning item).
+//!
 //! ## What it does not do yet
 //!
-//! Reasoning items and stateful `previous_response_id` threading. A request carrying either takes
-//! the passthrough (see [`has_untranslatable_content`]); the enforce path runs over Chat
-//! Completions, which has no reasoning items, so a served answer never contains one.
+//! Stateful `previous_response_id` threading, hosted / namespaced tools, compaction items, and
+//! structured `text.format` output. A request carrying any takes the passthrough (see
+//! [`has_untranslatable_content`]).
 
 use serde_json::{Map, Value};
 
@@ -55,9 +64,9 @@ pub fn request_to_chat(body: &Value) -> Value {
             messages.push(serde_json::json!({ "role": "user", "content": s }));
         }
         Some(Value::Array(turns)) => {
-            for turn in turns {
+            for turn in turns.iter().filter(|t| !is_dropped_item(t)) {
                 if let Some(m) = turn_to_message(turn) {
-                    messages.push(m);
+                    push_message(&mut messages, m);
                 }
             }
         }
@@ -108,7 +117,39 @@ pub fn request_to_chat(body: &Value) -> Value {
             "reasoning_effort".to_owned(),
             Value::String(effort.to_owned()),
         );
-        out.remove("reasoning");
+    }
+    // Responses-only request controls. Raw bodies are carried verbatim to OpenAI-dialect rungs
+    // (`provider::openai_wire_body`), where Chat Completions rejects each of these as an unknown
+    // or mistyped argument — a 400 on every rung for a turn that was perfectly answerable. None of
+    // them changes what a correct answer is:
+    // - `reasoning` (beyond `effort`, flattened above): `summary`/`context` shape reasoning
+    //   *output*, and the Chat path returns no reasoning items. Codex sends `reasoning: null` for
+    //   models without reasoning, which would otherwise ride along.
+    // - `include`: asks for encrypted reasoning/output items Chat never produces.
+    // - `store`: server-side retention for `previous_response_id`, which already routes to
+    //   passthrough. Chat's own default is not to store.
+    // - `prompt_cache_key`, `service_tier`, `client_metadata`, `stream_options`: cache routing,
+    //   billing tier, telemetry, and stream framing — cost/latency knobs, not answer content.
+    // - `text`: only reaches here as `verbosity` (or the no-op `format: text`); a structured
+    //   `format` is routed to passthrough by `has_untranslatable_content`. Verbosity is a length
+    //   hint that non-GPT-5 Chat models reject outright.
+    // ponytail: stripping `prompt_cache_key` costs OpenAI rungs some prefix-cache hits; carry it
+    // per-provider if a measured cache-hit drop shows up.
+    for k in [
+        "reasoning",
+        "include",
+        "store",
+        "prompt_cache_key",
+        "service_tier",
+        "client_metadata",
+        "stream_options",
+        "text",
+    ] {
+        out.remove(k);
+    }
+    // Meaningful (false forbids parallel calls), but OpenAI 400s it on a request with no tools.
+    if !out.contains_key("tools") {
+        out.remove("parallel_tool_calls");
     }
     Value::Object(out)
 }
@@ -119,8 +160,16 @@ fn turn_to_message(turn: &Value) -> Option<Value> {
     // Typed items carry no role/content pair — they are the tool round trip.
     match obj.get("type").and_then(Value::as_str) {
         Some("function_call") => return function_call_to_chat(obj),
-        Some("function_call_output") => return function_output_to_chat(obj),
-        _ => {}
+        Some("custom_tool_call") => return custom_call_to_chat(obj),
+        // Both outputs share one wire encoding (codex `protocol/src/models.rs`,
+        // `CustomToolCallOutput`), and Chat has one `tool` message for either.
+        Some("function_call_output" | "custom_tool_call_output") => {
+            return function_output_to_chat(obj);
+        }
+        None | Some("message") => {}
+        // Any other typed item is not a chat turn, even when it has a `content` key (Codex's
+        // `agent_message` does). Falling through would translate it as a blank user message.
+        Some(_) => return None,
     }
     let role = obj.get("role").and_then(Value::as_str).unwrap_or("user");
     let content = match obj.get("content") {
@@ -151,6 +200,36 @@ fn turn_to_message(turn: &Value) -> Option<Value> {
     Some(serde_json::json!({ "role": role, "content": content }))
 }
 
+/// Input items the translation drops on purpose, as opposed to failing to translate.
+///
+/// Only `reasoning`: prior hidden reasoning that Chat Completions cannot carry and that no Chat
+/// client sends either (see the module docs). Everything else either translates or routes the
+/// request to passthrough.
+fn is_dropped_item(turn: &Value) -> bool {
+    turn.get("type").and_then(Value::as_str) == Some("reasoning")
+}
+
+/// Append `m`, folding a tool-call assistant message into the assistant message before it.
+///
+/// Responses spells parallel calls (and text-then-call) as separate items; translated one-to-one
+/// that is `assistant(call A), assistant(call B), tool(A), tool(B)`, which Chat rejects — every
+/// assistant message with `tool_calls` must be followed directly by its tool results.
+fn push_message(messages: &mut Vec<Value>, mut m: Value) {
+    if let Some(prev) = messages.last_mut()
+        && prev.get("role").and_then(Value::as_str) == Some("assistant")
+        && let Some(Value::Array(calls)) = m.get_mut("tool_calls").map(Value::take)
+    {
+        match prev.get_mut("tool_calls") {
+            Some(Value::Array(prev_calls)) => prev_calls.extend(calls),
+            _ => {
+                prev["tool_calls"] = Value::Array(calls);
+            }
+        }
+        return;
+    }
+    messages.push(m);
+}
+
 /// One Responses tool definition → its Chat Completions spelling.
 ///
 /// `{type: function, name, parameters}` → `{type: function, function: {name, parameters}}`.
@@ -163,8 +242,10 @@ fn tool_to_chat(tool: &Value) -> Option<Value> {
     if obj.contains_key("function") {
         return Some(tool.clone());
     }
-    if obj.get("type").and_then(Value::as_str) != Some("function") {
-        return None;
+    match obj.get("type").and_then(Value::as_str) {
+        Some("function") => {}
+        Some("custom") => return custom_tool_to_chat(obj),
+        _ => return None,
     }
     let mut f = serde_json::Map::new();
     f.insert("name".to_owned(), obj.get("name")?.clone());
@@ -180,6 +261,74 @@ fn tool_to_chat(tool: &Value) -> Option<Value> {
     Some(serde_json::json!({ "type": "function", "function": Value::Object(f) }))
 }
 
+/// The single string argument a `custom` (freeform) tool's input rides in on the Chat side.
+const CUSTOM_INPUT_ARG: &str = "input";
+
+/// A Responses `custom` (freeform) tool → a Chat function tool taking one string, `input`.
+///
+/// Codex declares `apply_patch` this way: `{type: "custom", name, description, format: {type:
+/// "grammar", syntax: "lark", definition}}` (codex `core/src/tools/handlers/apply_patch_spec.rs`).
+/// Chat function tools are JSON-only, so the freeform text becomes the `input` argument and
+/// [`response_from_chat`] unwraps it back into a `custom_tool_call`.
+///
+/// The grammar cannot be enforced as constrained decoding on the Chat side, so it travels in the
+/// description instead — dropping it would hide the input contract from the model. The tool's own
+/// description may say "do not wrap in JSON", which is true of the caller's API and false of this
+/// one, so the appended note says which wins.
+fn custom_tool_to_chat(obj: &Map<String, Value>) -> Option<Value> {
+    let name = obj.get("name")?.clone();
+    let mut description = obj
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if !description.is_empty() {
+        description.push_str("\n\n");
+    }
+    description.push_str(
+        "Pass the raw freeform text as the `input` string argument; it is delivered unchanged.",
+    );
+    match obj.get("format") {
+        // Absent or `text`: unconstrained freeform text, nothing more to carry.
+        None => {}
+        Some(f) if f.get("type").and_then(Value::as_str) == Some("text") => {}
+        Some(f) if f.get("type").and_then(Value::as_str) == Some("grammar") => {
+            let syntax = f.get("syntax").and_then(Value::as_str)?;
+            let definition = f.get("definition").and_then(Value::as_str)?;
+            description.push_str("\n\nThe `input` text must match this ");
+            description.push_str(syntax);
+            description.push_str(" grammar:\n");
+            description.push_str(definition);
+        }
+        // A format this code does not know is a contract it would silently drop.
+        Some(_) => return None,
+    }
+    Some(serde_json::json!({ "type": "function", "function": {
+        "name": name,
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": { CUSTOM_INPUT_ARG: { "type": "string" } },
+            "required": [CUSTOM_INPUT_ARG],
+            "additionalProperties": false,
+        },
+    }}))
+}
+
+/// Names of the request's `custom` (freeform) tools: a served call to one of these must go back
+/// as a `custom_tool_call`, not a `function_call` — Codex dispatches `apply_patch` only on the
+/// custom payload. Empty (no allocation) for a request without custom tools.
+#[must_use]
+pub fn custom_tool_names(body: &Value) -> Vec<String> {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("custom"))
+        .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
 /// A Responses `tool_choice` → its Chat spelling.
 ///
 /// The string forms (`auto` / `none` / `required`) are identical. Naming a specific function is
@@ -192,7 +341,11 @@ fn tool_choice_to_chat(tc: &Value) -> Option<Value> {
             if o.contains_key("function") {
                 return Some(tc.clone()); // already Chat-shaped
             }
-            if o.get("type").and_then(Value::as_str) != Some("function") {
+            // A custom tool is a function on the Chat side (`custom_tool_to_chat`).
+            if !matches!(
+                o.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) {
                 return None; // hosted-tool choice — no Chat equivalent
             }
             Some(serde_json::json!({
@@ -205,6 +358,12 @@ fn tool_choice_to_chat(tc: &Value) -> Option<Value> {
 
 /// A Responses tool-call item → the Chat `assistant` message that carries it.
 fn function_call_to_chat(item: &serde_json::Map<String, Value>) -> Option<Value> {
+    // A namespaced call (`namespace` + `name`, codex `ResponseItem::FunctionCall`) names a tool
+    // inside a `namespace` tool, which has no Chat spelling; the bare name alone could resolve to
+    // a different tool.
+    if item.get("namespace").is_some_and(|n| !n.is_null()) {
+        return None;
+    }
     Some(serde_json::json!({
         "role": "assistant",
         "content": Value::Null,
@@ -221,12 +380,49 @@ fn function_call_to_chat(item: &serde_json::Map<String, Value>) -> Option<Value>
     }))
 }
 
-/// A Responses tool-result item → the Chat `tool` message that carries it.
+/// A Responses `custom_tool_call` (freeform input, e.g. Codex's `apply_patch`) → the Chat
+/// `assistant` tool call that [`custom_tool_to_chat`]'s function spelling would have produced.
+fn custom_call_to_chat(item: &serde_json::Map<String, Value>) -> Option<Value> {
+    if item.get("namespace").is_some_and(|n| !n.is_null()) {
+        return None;
+    }
+    let input = item.get("input")?.as_str()?;
+    Some(serde_json::json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": [{
+            "id": item.get("call_id")?.clone(),
+            "type": "function",
+            "function": {
+                "name": item.get("name")?.clone(),
+                "arguments": serde_json::json!({ CUSTOM_INPUT_ARG: input }).to_string(),
+            },
+        }],
+    }))
+}
+
+/// A Responses tool-result item (`function_call_output` or `custom_tool_call_output`) → the Chat
+/// `tool` message that carries it.
+///
+/// `output` is a string, or a list of content items (codex `FunctionCallOutputPayload`). An
+/// all-text list joins to its text. Anything else in the list — an image from Codex's
+/// `view_image`, audio, an `encrypted_content` item — has no place in a Chat `tool` message, so it
+/// translates to nothing and the request takes passthrough; stringifying it would hand the model a
+/// base64 blob as "text".
 fn function_output_to_chat(item: &serde_json::Map<String, Value>) -> Option<Value> {
-    let output = match item.get("output") {
-        Some(Value::String(s)) => s.clone(),
-        Some(other) => other.to_string(),
-        None => return None,
+    let output = match item.get("output")? {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => {
+            let mut text = String::new();
+            for p in parts {
+                if p.get("type").and_then(Value::as_str) != Some("input_text") {
+                    return None;
+                }
+                text.push_str(p.get("text").and_then(Value::as_str)?);
+            }
+            text
+        }
+        other => other.to_string(),
     };
     Some(serde_json::json!({
         "role": "tool",
@@ -267,14 +463,18 @@ fn part_to_chat(part: &Value) -> Option<Value> {
 /// answer, and between the two this proxy takes the limitation.
 ///
 /// Currently translatable: plain `user`/`assistant`/`system`/`developer` turns whose content is
-/// text or text-and-image parts, function tool definitions, and the `function_call` /
-/// `function_call_output` round trip — in both directions, so a tool call in the reply comes back
-/// as a `function_call` item rather than vanishing.
+/// text or text-and-image parts, function and `custom` (freeform) tool definitions, the
+/// `function_call` / `function_call_output` and `custom_tool_call` / `custom_tool_call_output`
+/// round trips — in both directions, so a tool call in the reply comes back as the item type its
+/// tool was declared as rather than vanishing — and `reasoning` items, which are dropped on purpose
+/// (see the module docs).
 ///
 /// Still excluded: **hosted** tools (`web_search`, `file_search`, `computer_use`), which run inside
-/// the provider and have no Chat equivalent; reasoning items; and `previous_response_id` threading,
-/// where the upstream holds history we do not have, so a translated request is not the conversation
-/// the client is continuing.
+/// the provider and have no Chat equivalent; `namespace` / `tool_search` tools; `compaction` and
+/// other typed items (a compaction item IS the compressed history — dropping it would answer a
+/// conversation with its past erased); tool outputs carrying images; a structured `text.format`;
+/// and `previous_response_id` threading, where the upstream holds history we do not have, so a
+/// translated request is not the conversation the client is continuing.
 #[must_use]
 pub fn has_untranslatable_content(body: &Value) -> bool {
     // Hosted tools (web_search, file_search, computer_use) run inside the provider and have no
@@ -297,10 +497,21 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
     if body.get("previous_response_id").is_some() || body.get("conversation").is_some() {
         return true;
     }
+    // A structured-output contract (`codex exec --output-schema` sends `text.format:
+    // {type: json_schema, ...}`). Chat spells it `response_format`, which the Anthropic
+    // translation path does not carry — dropped, the schema the caller demanded silently vanishes.
+    if let Some(f) = body.pointer("/text/format")
+        && f.get("type").and_then(Value::as_str) != Some("text")
+    {
+        return true;
+    }
     let Some(Value::Array(turns)) = body.get("input") else {
         return false;
     };
     turns.iter().any(|turn| {
+        if is_dropped_item(turn) {
+            return false;
+        }
         let Some(obj) = turn.as_object() else {
             return true;
         };
@@ -308,7 +519,10 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
         // `function_call` missing its `call_id` translates to nothing, and a check that only
         // looked at `type` would wave it through and let the turn vanish — the exact silent drop
         // this allow-list exists to prevent. One source of truth cannot drift from itself.
-        if obj.contains_key("type") && !obj.contains_key("role") {
+        if obj
+            .get("type")
+            .is_some_and(|t| t.as_str() != Some("message"))
+        {
             return turn_to_message(turn).is_none();
         }
         if !matches!(
@@ -320,10 +534,12 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
         match obj.get("content") {
             Some(Value::String(_)) => false,
             Some(Value::Array(parts)) => parts.iter().any(|p| {
-                !matches!(
-                    p.get("type").and_then(Value::as_str),
-                    Some("input_text" | "output_text" | "text" | "input_image")
-                )
+                match p.get("type").and_then(Value::as_str) {
+                    Some("input_text" | "output_text" | "text") => false,
+                    // Ask the translator: an image by `file_id` has no URL and would be dropped.
+                    Some("input_image") => part_to_chat(p).is_none(),
+                    _ => true,
+                }
             }),
             _ => true,
         }
@@ -335,8 +551,12 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
 /// Reports `usage` with Responses' own field names (`input_tokens` / `output_tokens`), which is
 /// what a client reads to display cost — leaving Chat's `prompt_tokens` spelling would make a
 /// served request look like it consumed nothing.
+///
+/// `custom_tools` ([`custom_tool_names`] of the original request) are the tools declared
+/// `custom`: a call to one comes back as a `custom_tool_call` with the freeform `input`, the only
+/// shape the caller's tool accepts.
 #[must_use]
-pub fn response_from_chat(chat: &Value) -> Value {
+pub fn response_from_chat(chat: &Value, custom_tools: &[String]) -> Value {
     let text = chat
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -383,6 +603,22 @@ pub fn response_from_chat(chat: &Value) -> Value {
         .and_then(Value::as_array);
     if let Some(calls) = tool_calls {
         for (i, call) in calls.iter().enumerate() {
+            let name = call.pointer("/function/name").and_then(Value::as_str);
+            if let Some(name) = name.filter(|n| custom_tools.iter().any(|c| c == n)) {
+                let args = call
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                output.push(serde_json::json!({
+                    "type": "custom_tool_call",
+                    "id": format!("ctc_{id}_{i}"),
+                    "status": "completed",
+                    "call_id": call.get("id").cloned().unwrap_or(Value::Null),
+                    "name": name,
+                    "input": custom_input(args),
+                }));
+                continue;
+            }
             output.push(serde_json::json!({
                 "type": "function_call",
                 "id": format!("fc_{id}_{i}"),
@@ -442,6 +678,23 @@ pub fn response_from_chat(chat: &Value) -> Value {
     Value::Object(resp)
 }
 
+/// The freeform `input` of a served custom-tool call: the `input` string out of the Chat
+/// arguments `{"input": "..."}`.
+///
+/// Arguments that are not that shape (a model that ignored the wrapper and emitted the patch
+/// itself) are delivered as-is rather than invented around. A `tool-args-valid` gate fails these
+/// before they are served; without one, the caller's tool sees the raw text and reports its own
+/// parse error to the agent loop — visible, not silent.
+fn custom_input(args: &str) -> String {
+    match serde_json::from_str::<Value>(args) {
+        Ok(Value::Object(mut m)) => match m.remove(CUSTOM_INPUT_ARG) {
+            Some(Value::String(s)) => s,
+            _ => args.to_owned(),
+        },
+        _ => args.to_owned(),
+    }
+}
+
 /// Append one `event: <type>` SSE frame: `data` (a JSON object) stamped with `type` and the next
 /// `sequence_number`.
 fn push_event(out: &mut String, seq: &mut u64, kind: &str, data: Value) {
@@ -480,7 +733,8 @@ fn in_progress_snapshot(resp: &Value) -> Value {
 /// `response.created` → `response.in_progress` → per output item: `response.output_item.added`;
 /// for a `message`, per content part `response.content_part.added` → `response.output_text.delta`
 /// → `response.output_text.done` → `response.content_part.done`; for a `function_call`,
-/// `response.function_call_arguments.delta` → `.done`; then `response.output_item.done` → finally
+/// `response.function_call_arguments.delta` → `.done` (for a `custom_tool_call`,
+/// `response.custom_tool_call_input.delta` → `.done`); then `response.output_item.done` → finally
 /// `response.completed` (`response.incomplete` for a truncated answer) carrying the full object
 /// with `usage`. Event item ids are the final object's ids: the SDK raises if an item's identity
 /// changes between `added`, `done`, and `completed`.
@@ -512,6 +766,11 @@ pub fn sse_from_response(resp: &Value) -> String {
                 }
                 "function_call" => {
                     m.insert("arguments".to_owned(), "".into());
+                }
+                // Codex parses the `added` item as a `ResponseItem`, whose `input` is required;
+                // an item that fails to parse is dropped with only a debug log.
+                "custom_tool_call" => {
+                    m.insert("input".to_owned(), "".into());
                 }
                 _ => {}
             }
@@ -566,20 +825,27 @@ pub fn sse_from_response(resp: &Value) -> String {
                     }
                 }
             }
-            "function_call" => {
-                let args = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                for (k, data) in [
+            "function_call" | "custom_tool_call" => {
+                // Same framing, different names: a custom call streams its freeform `input`
+                // (`response.custom_tool_call_input.*`, which Codex's `process_responses_event`
+                // turns into `ToolCallInputDelta`) where a function call streams `arguments`.
+                let (field, delta_kind, done_kind) = if kind == "custom_tool_call" {
                     (
+                        "input",
+                        "response.custom_tool_call_input.delta",
+                        "response.custom_tool_call_input.done",
+                    )
+                } else {
+                    (
+                        "arguments",
                         "response.function_call_arguments.delta",
-                        json!({ "delta": args }),
-                    ),
-                    (
                         "response.function_call_arguments.done",
-                        json!({ "arguments": args }),
-                    ),
+                    )
+                };
+                let args = item.get(field).and_then(Value::as_str).unwrap_or_default();
+                for (k, data) in [
+                    (delta_kind, json!({ "delta": args })),
+                    (done_kind, json!({ field: args })),
                 ] {
                     let mut data = data;
                     if let Some(m) = data.as_object_mut() {
@@ -707,7 +973,7 @@ mod tests {
 
     #[test]
     fn text_response_streams_the_exact_event_sequence() {
-        let resp = response_from_chat(&chat(Value::from("hello world"), None));
+        let resp = response_from_chat(&chat(Value::from("hello world"), None), &[]);
         let ev = frames(&sse_from_response(&resp));
         assert_eq!(types(&ev), expected(&[&TEXT_EVENTS]));
         // Lifecycle events share the final response id; created/in_progress carry no output yet.
@@ -740,7 +1006,7 @@ mod tests {
 
     #[test]
     fn function_call_response_streams_its_arguments() {
-        let resp = response_from_chat(&chat(Value::Null, Some(call())));
+        let resp = response_from_chat(&chat(Value::Null, Some(call())), &[]);
         let ev = frames(&sse_from_response(&resp));
         assert_eq!(types(&ev), expected(&[&CALL_EVENTS]));
         let added = &ev[2]["item"];
@@ -760,7 +1026,7 @@ mod tests {
 
     #[test]
     fn text_then_function_call_use_consecutive_output_indexes() {
-        let resp = response_from_chat(&chat(Value::from("checking"), Some(call())));
+        let resp = response_from_chat(&chat(Value::from("checking"), Some(call())), &[]);
         let ev = frames(&sse_from_response(&resp));
         assert_eq!(types(&ev), expected(&[&TEXT_EVENTS, &CALL_EVENTS]));
         assert_eq!(ev[2]["output_index"], 0);
@@ -776,7 +1042,7 @@ mod tests {
     fn truncated_response_ends_with_incomplete_not_completed() {
         let mut c = chat(Value::from("cut"), None);
         c["choices"][0]["finish_reason"] = "length".into();
-        let ev = frames(&sse_from_response(&response_from_chat(&c)));
+        let ev = frames(&sse_from_response(&response_from_chat(&c, &[])));
         assert_eq!(ev.last().unwrap()["type"], "response.incomplete");
     }
 
@@ -931,7 +1197,7 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 },
         });
 
-        let out = response_from_chat(&chat);
+        let out = response_from_chat(&chat, &[]);
 
         let item = &out["output"][0];
         assert_eq!(item["type"], "function_call");
@@ -954,7 +1220,7 @@ mod tests {
             }}],
         });
 
-        let out = response_from_chat(&chat);
+        let out = response_from_chat(&chat, &[]);
 
         assert_eq!(out["output"][0]["type"], "message");
         assert_eq!(out["output"][0]["content"][0]["text"], "let me check");
@@ -970,7 +1236,7 @@ mod tests {
             "choices": [{ "finish_reason": "length", "message": { "content": "cut off mid-" } }],
         });
 
-        let out = response_from_chat(&chat);
+        let out = response_from_chat(&chat, &[]);
 
         assert_eq!(out["status"], "incomplete");
         assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
@@ -1070,12 +1336,17 @@ mod tests {
     fn every_allowed_turn_actually_produces_a_message() {
         // The invariant behind the fix, stated directly: anything the gate allows must translate
         // to something. If these two ever disagree again, a turn goes missing with no error.
+        // Text-then-call is folded into one assistant message (`push_message`), so the
+        // turns are kept apart here by a user message; the folded case is tested on its own.
         let body = serde_json::json!({
             "input": [
                 { "role": "user", "content": "hi" },
                 { "role": "assistant", "content": [{ "type": "output_text", "text": "yes" }] },
+                { "role": "user", "content": "go" },
                 { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
                 { "type": "function_call_output", "call_id": "c1", "output": "42" },
+                { "type": "custom_tool_call", "call_id": "c2", "name": "p", "input": "x" },
+                { "type": "custom_tool_call_output", "call_id": "c2", "output": "ok" },
             ],
         });
         assert!(!has_untranslatable_content(&body));
@@ -1090,10 +1361,53 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_items_still_take_passthrough() {
+    fn reasoning_items_are_dropped_and_nothing_else_is() {
+        // Prior encrypted reasoning: Chat cannot carry it and no Chat client sends it, so it is
+        // dropped and the turn is gated. Before this, any Codex turn after the first reasoning
+        // model reply took un-gated passthrough.
+        let body = serde_json::json!({
+            "input": [
+                { "role": "user", "content": "hi" },
+                { "type": "reasoning", "id": "rs_1", "summary": [],
+                  "encrypted_content": "gAAAAB..." },
+                { "role": "assistant", "content": "hello" },
+            ],
+        });
+        assert!(!has_untranslatable_content(&body));
+        let msgs = request_to_chat(&body)["messages"].clone();
+        assert_eq!(msgs.as_array().expect("messages").len(), 2, "{msgs}");
+        assert_eq!(msgs[0]["content"], "hi");
+        assert_eq!(msgs[1]["content"], "hello");
+        assert!(!msgs.to_string().contains("gAAAAB"), "{msgs}");
+
+        // Only reasoning: a compaction item IS the compressed history and must not be dropped.
         assert!(has_untranslatable_content(&serde_json::json!({
-            "input": [{ "type": "reasoning", "summary": [] }],
+            "input": [{ "type": "compaction", "encrypted_content": "gAAAAB..." }],
         })));
+    }
+
+    #[test]
+    fn parallel_calls_and_text_then_call_fold_into_one_assistant_message() {
+        // Chat requires an assistant message with `tool_calls` to be followed directly by its
+        // tool results; one-to-one translation of Responses' parallel calls breaks that.
+        let out = request_to_chat(&serde_json::json!({
+            "input": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "content": "checking both" },
+                { "type": "function_call", "call_id": "a", "name": "f", "arguments": "{}" },
+                { "type": "custom_tool_call", "call_id": "b", "name": "p", "input": "x" },
+                { "type": "function_call_output", "call_id": "a", "output": "1" },
+                { "type": "custom_tool_call_output", "call_id": "b", "output": "2" },
+            ],
+        }));
+        let msgs = out["messages"].as_array().expect("messages");
+        assert_eq!(msgs.len(), 4, "{msgs:?}");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"], "checking both");
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], "a");
+        assert_eq!(msgs[1]["tool_calls"][1]["id"], "b");
+        assert_eq!(msgs[2]["tool_call_id"], "a");
+        assert_eq!(msgs[3]["tool_call_id"], "b");
     }
 
     #[test]
@@ -1114,10 +1428,36 @@ mod tests {
     fn typed_item_turns_are_not_translated() {
         // function_call / function_call_output / reasoning items carry no role+content pair.
         // The earlier deny-list version returned None for these and dropped the turn entirely.
+        // function_call(_output), custom_tool_call(_output) translate and reasoning is dropped;
+        // every other Codex `ResponseItem` type (codex `protocol/src/models.rs`) still routes to
+        // passthrough, as do the malformed / lossy forms of the translatable ones.
         for item in [
-            // function_call / function_call_output now translate; only these remain.
-            serde_json::json!({ "type": "reasoning", "summary": [] }),
             serde_json::json!({ "type": "web_search_call", "id": "ws_1" }),
+            serde_json::json!({ "type": "local_shell_call", "call_id": "c", "status": "completed",
+                "action": { "type": "exec", "command": ["ls"] } }),
+            serde_json::json!({ "type": "tool_search_call", "call_id": "c", "execution": "x",
+                "arguments": {} }),
+            serde_json::json!({ "type": "image_generation_call", "status": "completed",
+                "result": "..." }),
+            serde_json::json!({ "type": "compaction", "encrypted_content": "e" }),
+            serde_json::json!({ "type": "context_compaction", "encrypted_content": "e" }),
+            serde_json::json!({ "type": "agent_message", "author": "a", "recipient": "b",
+                "content": [] }),
+            // Typed, with a role and content, but not a `message`: still not a chat turn.
+            serde_json::json!({ "type": "future_item", "role": "user", "content": "x" }),
+            // Codex Responses-Lite tool declarations ride in the input as a developer item.
+            serde_json::json!({ "type": "additional_tools", "role": "developer", "tools": [] }),
+            // A namespaced call: the bare name could resolve to a different tool.
+            serde_json::json!({ "type": "function_call", "call_id": "c", "name": "f",
+                "namespace": "mcp__srv", "arguments": "{}" }),
+            // A custom call whose input is not a string, or is missing.
+            serde_json::json!({ "type": "custom_tool_call", "call_id": "c", "name": "p" }),
+            serde_json::json!({ "type": "custom_tool_call", "call_id": "c", "name": "p",
+                "input": { "x": 1 } }),
+            // Tool output carrying an image (Codex `view_image`): no place in a Chat tool message.
+            serde_json::json!({ "type": "function_call_output", "call_id": "c", "output": [
+                { "type": "input_text", "text": "see" },
+                { "type": "input_image", "image_url": "data:image/png;base64,AAAA" } ] }),
         ] {
             assert!(
                 has_untranslatable_content(&serde_json::json!({ "input": [item.clone()] })),
@@ -1192,10 +1532,342 @@ mod tests {
     fn unknown_fields_survive_the_crossing() {
         // A field this code does not know is likelier to be newer than this code than to be wrong.
         let out = request_to_chat(&serde_json::json!({
-            "model": "gpt-5.5", "input": "hi", "metadata": { "run": "abc" }, "store": false,
+            "model": "gpt-5.5", "input": "hi", "metadata": { "run": "abc" },
         }));
         assert_eq!(out["metadata"]["run"], "abc");
-        assert_eq!(out["store"], false);
+    }
+
+    #[test]
+    fn responses_only_controls_do_not_reach_a_chat_provider() {
+        // Raw bodies are carried verbatim to OpenAI-dialect rungs; Chat Completions 400s on each
+        // of these. Values are what Codex sends (codex `core/src/client.rs`
+        // `build_responses_request`).
+        let out = request_to_chat(&serde_json::json!({
+            "model": "gpt-5.5", "input": "hi", "stream": true,
+            "reasoning": { "effort": "medium", "summary": "auto" },
+            "store": false, "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "019a-thread", "service_tier": "priority",
+            "text": { "verbosity": "low" }, "client_metadata": { "x": "y" },
+            "stream_options": { "reasoning_summary_delivery": "sequential_cutoff" },
+            "parallel_tool_calls": true,
+        }));
+        for k in [
+            "reasoning",
+            "store",
+            "include",
+            "prompt_cache_key",
+            "service_tier",
+            "text",
+            "client_metadata",
+            "stream_options",
+            // No tools: OpenAI rejects `parallel_tool_calls` without them.
+            "parallel_tool_calls",
+        ] {
+            assert!(out.get(k).is_none(), "{k} leaked: {out}");
+        }
+        assert_eq!(out["reasoning_effort"], "medium");
+
+        // Codex's `reasoning: null` (a model without reasoning) must not ride along either.
+        let out = request_to_chat(&serde_json::json!({ "input": "hi", "reasoning": null }));
+        assert!(out.get("reasoning").is_none(), "{out}");
+
+        // With tools, parallel_tool_calls is meaningful (false forbids parallel calls) and stays.
+        let out = request_to_chat(&serde_json::json!({
+            "input": "hi", "tools": [{ "type": "function", "name": "f" }],
+            "parallel_tool_calls": false,
+        }));
+        assert_eq!(out["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn a_structured_text_format_takes_passthrough_but_verbosity_does_not() {
+        // `codex exec --output-schema`: a schema contract the Anthropic path would drop.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "input": "hi",
+            "text": { "format": { "type": "json_schema", "name": "out", "strict": true,
+                "schema": { "type": "object" } } },
+        })));
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "input": "hi", "text": { "verbosity": "low" },
+        })));
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "input": "hi", "text": { "format": { "type": "text" } },
+        })));
+    }
+
+    #[test]
+    fn an_image_without_a_url_takes_passthrough_instead_of_vanishing() {
+        // `part_to_chat` has no Chat spelling for a `file_id` image and returned None, so the
+        // allow-list waved the part through and the translation dropped it.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "input": [{ "role": "user", "content": [
+                { "type": "input_text", "text": "what is this?" },
+                { "type": "input_image", "file_id": "file_123" },
+            ]}],
+        })));
+    }
+
+    /// Codex's `apply_patch` declaration, verbatim shape from codex
+    /// `core/src/tools/handlers/apply_patch_spec.rs` (grammar shortened).
+    fn apply_patch_tool() -> Value {
+        serde_json::json!({
+            "type": "custom", "name": "apply_patch",
+            "description": "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+            "format": { "type": "grammar", "syntax": "lark",
+                "definition": "start: begin_patch hunk+ end_patch" },
+        })
+    }
+
+    #[test]
+    fn a_custom_tool_becomes_a_one_string_function_carrying_its_grammar() {
+        let out = request_to_chat(&serde_json::json!({
+            "input": "edit it", "tools": [apply_patch_tool()],
+            "tool_choice": { "type": "custom", "name": "apply_patch" },
+        }));
+        let f = &out["tools"][0];
+        assert_eq!(f["type"], "function");
+        assert_eq!(f["function"]["name"], "apply_patch");
+        assert_eq!(f["function"]["parameters"]["required"][0], "input");
+        assert_eq!(
+            f["function"]["parameters"]["properties"]["input"]["type"],
+            "string"
+        );
+        let desc = f["function"]["description"].as_str().expect("description");
+        assert!(desc.contains("FREEFORM tool"), "{desc}");
+        assert!(desc.contains("lark grammar"), "{desc}");
+        assert!(
+            desc.contains("start: begin_patch hunk+ end_patch"),
+            "the grammar is the input contract: {desc}"
+        );
+        // A custom tool_choice is a function choice on the Chat side.
+        assert_eq!(out["tool_choice"]["function"]["name"], "apply_patch");
+
+        // An unknown format is a contract this code would drop: passthrough.
+        assert!(has_untranslatable_content(&serde_json::json!({
+            "input": "x",
+            "tools": [{ "type": "custom", "name": "q", "format": { "type": "regex" } }],
+        })));
+        // An unconstrained (`text`) custom tool translates.
+        assert!(!has_untranslatable_content(&serde_json::json!({
+            "input": "x",
+            "tools": [{ "type": "custom", "name": "q", "format": { "type": "text" } }],
+        })));
+    }
+
+    #[test]
+    fn custom_tool_history_becomes_a_chat_tool_round_trip() {
+        let out = request_to_chat(&serde_json::json!({
+            "input": [
+                { "role": "user", "content": "fix it" },
+                { "type": "custom_tool_call", "status": "completed", "call_id": "call_p",
+                  "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch\n" },
+                { "type": "custom_tool_call_output", "call_id": "call_p",
+                  "output": [{ "type": "input_text", "text": "Success. " },
+                             { "type": "input_text", "text": "Updated a.txt" }] },
+            ],
+        }));
+        let msgs = out["messages"].as_array().expect("messages");
+        assert_eq!(msgs.len(), 3);
+        let tc = &msgs[1]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_p");
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "apply_patch");
+        let args: Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().expect("string args"))
+                .expect("json args");
+        assert_eq!(args["input"], "*** Begin Patch\n*** End Patch\n");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "call_p");
+        // An all-text content-item output joins to its text, not a JSON dump of the list.
+        assert_eq!(msgs[2]["content"], "Success. Updated a.txt");
+    }
+
+    fn custom_chat_call(args: &str) -> Value {
+        chat(
+            Value::Null,
+            Some(serde_json::json!([{ "id": "call_p", "type": "function",
+                "function": { "name": "apply_patch", "arguments": args } }])),
+        )
+    }
+
+    #[test]
+    fn a_served_call_to_a_custom_tool_comes_back_as_a_custom_tool_call() {
+        let patch = "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n";
+        let args = serde_json::json!({ "input": patch }).to_string();
+        let custom = vec!["apply_patch".to_owned()];
+        let out = response_from_chat(&custom_chat_call(&args), &custom);
+        let item = &out["output"][0];
+        // The exact shape codex `ResponseItem::CustomToolCall` deserializes.
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["call_id"], "call_p");
+        assert_eq!(item["name"], "apply_patch");
+        assert_eq!(item["input"], patch);
+        assert!(item.get("arguments").is_none(), "{item}");
+
+        // Not declared custom: stays a function_call.
+        let out = response_from_chat(&custom_chat_call(&args), &[]);
+        assert_eq!(out["output"][0]["type"], "function_call");
+
+        // Arguments not in the wrapper shape are delivered as-is, not invented around.
+        let out = response_from_chat(&custom_chat_call(patch), &custom);
+        assert_eq!(out["output"][0]["input"], patch);
+    }
+
+    #[test]
+    fn a_custom_tool_call_streams_its_input() {
+        let patch = "*** Begin Patch\n*** End Patch\n";
+        let args = serde_json::json!({ "input": patch }).to_string();
+        let resp = response_from_chat(&custom_chat_call(&args), &["apply_patch".to_owned()]);
+        let ev = frames(&sse_from_response(&resp));
+        assert_eq!(
+            types(&ev),
+            expected(&[&[
+                "response.output_item.added",
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "response.output_item.done",
+            ]])
+        );
+        let added = &ev[2]["item"];
+        assert_eq!(added["type"], "custom_tool_call");
+        // Codex parses the shell as a ResponseItem; `input` is required.
+        assert_eq!(added["input"], "");
+        assert_eq!(added["status"], "in_progress");
+        for e in &ev[3..5] {
+            assert_eq!(e["item_id"], added["id"]);
+            assert_eq!(e["output_index"], 0);
+        }
+        assert_eq!(ev[3]["delta"], patch);
+        assert_eq!(ev[4]["input"], patch);
+        assert!(ev[4].get("arguments").is_none());
+        assert_eq!(ev[5]["item"]["input"], patch);
+        assert_eq!(ev[6]["response"]["output"][0]["type"], "custom_tool_call");
+    }
+
+    /// A request in the shape current Codex sends (codex 0ddee3e, `core/src/client.rs`
+    /// `build_responses_request` + `protocol/src/models.rs` `ResponseItem`): base instructions as
+    /// a leading `developer` message rather than `instructions`, encrypted reasoning from prior
+    /// turns, an `exec_command` function round trip, an `apply_patch` custom round trip, and the
+    /// Responses-only controls. `web_search` is absent — Codex sends it unless the user sets
+    /// `web_search = "disabled"`, and with it the turn still (correctly) takes passthrough.
+    fn codex_turn() -> Value {
+        serde_json::json!({
+            "model": "gpt-5.5", "stream": true,
+            "input": [
+                { "type": "message", "id": "msg_base", "role": "developer",
+                  "content": [{ "type": "input_text", "text": "You are Codex, a coding agent." }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text",
+                  "text": "<environment_context><cwd>/repo</cwd></environment_context>" }] },
+                { "type": "message", "role": "user",
+                  "content": [{ "type": "input_text", "text": "fix the typo in README" }] },
+                { "type": "reasoning", "id": "rs_1",
+                  "summary": [{ "type": "summary_text", "text": "Read the file first." }],
+                  "encrypted_content": "gAAAAB-enc-1" },
+                { "type": "function_call", "name": "exec_command",
+                  "arguments": "{\"cmd\":\"cat README.md\"}", "call_id": "call_a" },
+                { "type": "function_call_output", "call_id": "call_a", "output": "Helo world" },
+                { "type": "reasoning", "id": "rs_2", "summary": [],
+                  "encrypted_content": "gAAAAB-enc-2" },
+                { "type": "custom_tool_call", "status": "completed", "call_id": "call_b",
+                  "name": "apply_patch",
+                  "input": "*** Begin Patch\n*** Update File: README.md\n-Helo world\n+Hello world\n*** End Patch\n" },
+                { "type": "custom_tool_call_output", "call_id": "call_b",
+                  "output": "Success. Updated the following files:\nM README.md\n" },
+                { "type": "message", "role": "assistant", "phase": "final_answer",
+                  "content": [{ "type": "output_text", "text": "Fixed the typo." }] },
+                { "type": "message", "role": "user",
+                  "content": [{ "type": "input_text", "text": "also add a trailing newline" }] },
+            ],
+            "tools": [
+                { "type": "function", "name": "exec_command", "description": "Run a command.",
+                  "strict": false, "parameters": { "type": "object",
+                    "properties": { "cmd": { "type": "string" } }, "required": ["cmd"],
+                    "additionalProperties": false } },
+                apply_patch_tool(),
+            ],
+            "tool_choice": "auto", "parallel_tool_calls": true,
+            "reasoning": { "effort": "medium", "summary": "auto" },
+            "store": false, "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "019a5f3e-thread", "text": { "verbosity": "low" },
+            "client_metadata": { "x-codex-installation-id": "i" },
+        })
+    }
+
+    #[test]
+    fn a_realistic_codex_turn_is_gated_and_round_trips() {
+        let body = codex_turn();
+        assert!(
+            !has_untranslatable_content(&body),
+            "a default-shaped Codex turn must be gated"
+        );
+
+        let out = request_to_chat(&body);
+        let msgs = out["messages"].as_array().expect("messages");
+        let roles: Vec<&str> = msgs.iter().filter_map(|m| m["role"].as_str()).collect();
+        assert_eq!(
+            roles,
+            [
+                "developer",
+                "user",
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "assistant",
+                "user"
+            ],
+            "9 = 11 input items - 2 reasoning"
+        );
+        assert_eq!(msgs[0]["content"], "You are Codex, a coding agent.");
+        assert_eq!(msgs[3]["tool_calls"][0]["function"]["name"], "exec_command");
+        assert_eq!(msgs[5]["tool_calls"][0]["function"]["name"], "apply_patch");
+        assert_eq!(msgs[6]["tool_call_id"], "call_b");
+        assert_eq!(msgs[7]["content"], "Fixed the typo.");
+        assert_eq!(msgs[8]["content"], "also add a trailing newline");
+        assert!(!out.to_string().contains("gAAAAB"), "reasoning dropped");
+        assert_eq!(out["tools"][1]["function"]["name"], "apply_patch");
+        assert_eq!(out["reasoning_effort"], "medium");
+        for k in [
+            "input",
+            "include",
+            "store",
+            "text",
+            "prompt_cache_key",
+            "client_metadata",
+        ] {
+            assert!(out.get(k).is_none(), "{k} leaked");
+        }
+
+        // The gated answer is an apply_patch call: it goes back as a custom_tool_call.
+        let args = serde_json::json!({ "input": "*** Begin Patch\n*** End Patch\n" });
+        let resp = response_from_chat(
+            &custom_chat_call(&args.to_string()),
+            &custom_tool_names(&body),
+        );
+        assert_eq!(resp["output"][0]["type"], "custom_tool_call");
+        assert_eq!(
+            resp["output"][0]["input"],
+            "*** Begin Patch\n*** End Patch\n"
+        );
+        assert_eq!(resp["status"], "completed");
+
+        // Codex's default tool list also carries hosted web_search: still passthrough.
+        let mut with_search = body;
+        with_search["tools"]
+            .as_array_mut()
+            .expect("tools")
+            .push(serde_json::json!({ "type": "web_search", "external_web_access": false }));
+        assert!(has_untranslatable_content(&with_search));
+    }
+
+    #[test]
+    fn custom_tool_names_lists_only_custom_tools() {
+        assert_eq!(
+            custom_tool_names(&codex_turn()),
+            vec!["apply_patch".to_owned()]
+        );
+        assert!(custom_tool_names(&serde_json::json!({ "input": "hi" })).is_empty());
     }
 
     #[test]
@@ -1206,7 +1878,7 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 3 },
         });
 
-        let out = response_from_chat(&chat);
+        let out = response_from_chat(&chat, &[]);
 
         assert_eq!(out["object"], "response");
         assert_eq!(out["status"], "completed");
@@ -1226,7 +1898,7 @@ mod tests {
             "usage": { "prompt_tokens": 1200, "completion_tokens": 300 },
         });
 
-        let out = response_from_chat(&chat);
+        let out = response_from_chat(&chat, &[]);
 
         assert_eq!(out["usage"]["input_tokens"], 1200);
         assert_eq!(out["usage"]["output_tokens"], 300);

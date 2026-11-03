@@ -1549,6 +1549,32 @@ mod tests {
         assert_eq!(good.verdict, Verdict::Pass, "{:?}", good.reason);
     }
 
+    /// A Responses `custom` (freeform) tool — Codex's `apply_patch` — is gated as the one-string
+    /// function it translates to: a call missing the `input` wrapper Fails (and escalates) rather
+    /// than being served as a malformed custom call.
+    #[tokio::test]
+    async fn tool_args_valid_checks_responses_custom_tool_input() {
+        let responses_req = serde_json::json!({
+            "model": "gpt-5.5", "input": "fix it",
+            "tools": [{ "type": "custom", "name": "apply_patch", "description": "edit files",
+                "format": { "type": "grammar", "syntax": "lark", "definition": "start: x" } }],
+        });
+        let chat = crate::responses::request_to_chat(&responses_req).to_string();
+        let req = crate::proxy::parse_openai_request(chat.as_bytes(), true).unwrap();
+        let resp = |args: &str| ModelResponse {
+            raw: serde_json::json!({ "choices": [{ "message": { "role": "assistant",
+                "content": null, "tool_calls": [{ "id": "call_1", "type": "function",
+                "function": { "name": "apply_patch", "arguments": args } }] } }] }),
+            ..tool_use_resp()
+        };
+        let bad = ToolArgsValidGate.evaluate(&req, &resp("{}")).await;
+        assert_eq!(bad.verdict, Verdict::Fail, "{:?}", bad.reason);
+        let good = ToolArgsValidGate
+            .evaluate(&req, &resp(r#"{"input":"*** Begin Patch\n*** End Patch"}"#))
+            .await;
+        assert_eq!(good.verdict, Verdict::Pass, "{:?}", good.reason);
+    }
+
     /// A tool declared in the flat Responses shape (`{type, name, parameters}`) is schema-checked,
     /// not waved through: `tool_name_is_known` accepts it by name, so skipping the schema would be
     /// fail-open.
