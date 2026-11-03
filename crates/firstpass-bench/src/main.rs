@@ -13,6 +13,7 @@
 //!   firstpass-bench --replay-blend <mbpp.jsonl> <matrix1> <priors1> [<matrix2> <priors2> ...]  # Study A: prior+learned blend, offline
 //!   firstpass-bench --decision-study <candidates.jsonl> <mbpp.jsonl> <base_url> <labels.jsonl> <scores.jsonl>  # Study B: decision gate error rates (sandbox + live OpenJev)
 //!   firstpass-bench --verifier-bakeoff <candidates.jsonl> <mbpp.jsonl> <scratch_dir>  # V0-V3 held-out bake-off (specs/verifier-bakeoff.md; sandbox + live OpenJev + live local judge/test-writer)
+//!   firstpass-bench --paired-replay <dir|checkpoint.jsonl|sessions.jsonl>  # ADR 0014 selection replayed on recorded paired outcomes, $0
 //!   firstpass-bench --multiturn-selfcheck  # prove the multi-turn harness + pre-registered bar work, no spend
 
 use firstpass_bench::coding::{
@@ -51,6 +52,11 @@ fn main() {
 
     if args.iter().any(|a| a == "--agentic-multiturn") {
         agentic_multiturn(json);
+        return;
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--paired-replay") {
+        paired_replay(&args, i, json);
         return;
     }
 
@@ -1237,6 +1243,85 @@ fn agentic_multiturn(json: bool) {
 /// is reachable and the trajectory signal has something to be a signal about.
 ///
 /// SPENDS REAL MONEY and needs multi-GB eval images pulled in advance (no network at eval time).
+/// `--paired-replay <source>`: ADR 0014 selection replayed on recorded paired outcomes. $0, no key.
+/// `<source>` is a directory of SWE-bench `per_instance_details.json` files (named `<system>.json`,
+/// filtered by `--systems <substring>`, default `mini-v2.0.0` so the scaffold is held constant), a
+/// Firstpass multi-turn checkpoint (`*.checkpoint.jsonl`, turn 1), or the generic JSONL in
+/// `paired_replay`'s module doc.
+fn paired_replay(args: &[String], i: usize, json: bool) {
+    use firstpass_bench::paired_replay::{
+        PreRegistered, from_checkpoint, from_swebench_experiments, parse_jsonl, run,
+    };
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|j| args.get(j + 1))
+            .cloned()
+    };
+    let fail = |msg: String| -> ! {
+        eprintln!("--paired-replay: {msg}");
+        std::process::exit(2);
+    };
+    let Some(src) = args.get(i + 1).filter(|a| !a.starts_with("--")) else {
+        fail("usage: --paired-replay <dir|checkpoint.jsonl|sessions.jsonl> [--incumbent M] [--percent P] [--replays N] [--systems S] [--json]".into());
+    };
+    let path = std::path::Path::new(src);
+    let loaded = if path.is_dir() {
+        let filter = flag("--systems").unwrap_or_else(|| "mini-v2.0.0".to_owned());
+        let mut files = Vec::new();
+        let mut entries: Vec<_> = std::fs::read_dir(path)
+            .unwrap_or_else(|e| fail(format!("{src}: {e}")))
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let Some(system) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if system.contains(".ctx.") || !system.contains(&filter) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap_or_else(|e| fail(format!("{name}: {e}")));
+            files.push((system.to_owned(), text));
+        }
+        from_swebench_experiments(&files)
+    } else {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| fail(format!("{src}: {e}")));
+        if text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(|l| l.contains("\"turns\""))
+        {
+            from_checkpoint(&text)
+        } else {
+            parse_jsonl(&text)
+        }
+    };
+    let sessions = loaded.unwrap_or_else(|e| fail(format!("{src}: {e}")));
+    let mut p = PreRegistered::default();
+    if let Some(n) = flag("--replays") {
+        p.replays = n
+            .parse()
+            .unwrap_or_else(|_| fail(format!("bad --replays {n}")));
+    }
+    let percent = flag("--percent").map_or(50.0, |v| {
+        v.parse()
+            .unwrap_or_else(|_| fail(format!("bad --percent {v}")))
+    });
+    let report = run(&sessions, src, flag("--incumbent").as_deref(), percent, &p)
+        .unwrap_or_else(|e| fail(e));
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => println!("{s}"),
+            Err(e) => fail(e.to_string()),
+        }
+    } else {
+        print!("{}", report.to_markdown());
+    }
+}
+
 fn swe_agentic(json: bool) {
     use firstpass_bench::agentic::RecordedTask;
     use firstpass_bench::multiturn::{PreRegistered, evaluate};
