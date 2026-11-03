@@ -2146,15 +2146,17 @@ fn enforce_can_handle(
     if all_verbatim {
         return true;
     }
-    // Path 2: translation — OpenAI inbound → all-Anthropic ladder, when content is translatable.
-    // text/tools/tool_calls/tool_results are covered; http(s) image_url is not (can't relay to
-    // Anthropic's vision API without fetching). Conservative: any http(s) image → observe.
+    // Path 2: translation — OpenAI inbound → a ladder whose every rung rebuilds structured
+    // content from the normalized (Anthropic-shaped) fields: Anthropic-dialect providers, and
+    // Gemini (`Provider::translates_structured`). text/tools/tool_calls/tool_results are covered;
+    // http(s) image_url is not (can't relay to a vision API without fetching). Conservative: any
+    // http(s) image → observe.
     if inbound == Dialect::Openai && !openai_has_http_images(body) {
         let all_anthropic = ladder.iter().all(|rung| {
             let pid = rung.split('/').next().unwrap_or_default();
-            providers
-                .get(pid)
-                .is_some_and(|p| p.carries_structured_verbatim(Dialect::Anthropic))
+            providers.get(pid).is_some_and(|p| {
+                p.carries_structured_verbatim(Dialect::Anthropic) || p.translates_structured()
+            })
         });
         if all_anthropic {
             return true;
@@ -5201,12 +5203,18 @@ pub fn parse_openai_request(body: &[u8], carry_raw: bool) -> Option<ModelRequest
                             .unwrap_or("{}");
                         let input: Value = serde_json::from_str(args_str)
                             .unwrap_or_else(|_| serde_json::json!({}));
-                        blocks.push(serde_json::json!({
+                        let mut block = serde_json::json!({
                             "type": "tool_use",
                             "id": id,
                             "name": name,
                             "input": input,
-                        }));
+                        });
+                        // A Gemini thought signature rides along for a Gemini rung to replay;
+                        // the Anthropic wire builders strip it (`provider::strip_extra_content`).
+                        if let Some(extra) = tc.get("extra_content") {
+                            block["extra_content"] = extra.clone();
+                        }
+                        blocks.push(block);
                     }
                     messages.push(ChatMessage {
                         role: "assistant".to_owned(),
@@ -5344,7 +5352,11 @@ fn extract_openai_content_and_tools(raw: &Value, text: &str) -> (Value, Option<V
         return (content_text, tc);
     }
 
-    // OpenAI-format raw (all-OpenAI-ladder path): extract from choices
+    // OpenAI-format raw (all-OpenAI-ladder path, or a Gemini rung's `choices` view): extract
+    // from choices. A Gemini rung's tool calls keep `extra_content.google.thought_signature`
+    // on purpose: it is Google's own OpenAI-compat response field, clients ignore it, and one
+    // that replays its history hands the signature back for the next Gemini turn (the wire
+    // builders strip it before any non-Gemini upstream).
     if let Some(msg) = raw.pointer("/choices/0/message") {
         let content = msg
             .get("content")
@@ -5360,7 +5372,7 @@ fn extract_openai_content_and_tools(raw: &Value, text: &str) -> (Value, Option<V
 
 /// Render a served [`ModelResponse`] back as an OpenAI `chat.completion` JSON envelope,
 /// so an OpenAI-client caller sees the standard wire shape regardless of which rung answered.
-fn openai_response_json(resp: &ModelResponse) -> Value {
+pub(crate) fn openai_response_json(resp: &ModelResponse) -> Value {
     let (content_text, tool_calls) = extract_openai_content_and_tools(&resp.raw, &resp.text);
     let finish_reason = if resp.truncated() {
         "length"
@@ -7977,6 +7989,56 @@ mod tests {
             &providers,
             Dialect::Anthropic,
         ));
+    }
+
+    #[test]
+    fn translation_path_admits_gemini_rungs_but_not_openai_mixes() {
+        // A Gemini rung rebuilds tool turns from the normalized fields (functionCall /
+        // functionResponse with thought signatures), so an OpenAI-shaped (incl. translated
+        // Gemini-inbound) tool request may enforce on a Gemini or Gemini+Anthropic ladder.
+        let defs = vec![firstpass_core::ProviderDef {
+            id: "google".to_owned(),
+            dialect: Dialect::Gemini,
+            base_url: "http://localhost".to_owned(),
+            api_key_env: Some("GEMINI_API_KEY".to_owned()),
+            auth: firstpass_core::AuthScheme::ApiKey,
+            region: None,
+            project: None,
+        }];
+        let providers = crate::provider::ProviderRegistry::from_config(
+            &defs,
+            "http://localhost",
+            "http://localhost",
+        );
+        let tools = Bytes::from_static(
+            br#"{"model":"m","tools":[{"type":"function","function":{"name":"t"}}],"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let f = extract_openai_features(&HeaderMap::new(), &tools);
+        let ladder = |rungs: &[&str]| rungs.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>();
+        let can = |rungs: &[&str]| {
+            enforce_can_handle(
+                &f,
+                &tools,
+                true,
+                &ladder(rungs),
+                &providers,
+                Dialect::Openai,
+            )
+        };
+        assert!(can(&["google/gemini-3-flash"]));
+        assert!(can(&["google/gemini-3-flash", "anthropic/claude-sonnet-5"]));
+        // OpenAI rungs need the raw OpenAI body; a mix with a rebuilding rung stays observe.
+        assert!(!can(&["google/gemini-3-flash", "openai/gpt-4.1-mini"]));
+        // Anthropic inbound is unchanged: only verbatim Anthropic carriers.
+        assert!(!enforce_can_handle(
+            &f,
+            &tools,
+            true,
+            &ladder(&["google/gemini-3-flash"]),
+            &providers,
+            Dialect::Anthropic,
+        ));
+        // mutant (done): dropping `|| p.translates_structured()` fails the first assert.
     }
 
     #[test]
