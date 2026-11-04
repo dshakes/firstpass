@@ -33,7 +33,32 @@
 //!
 //! Stateful `previous_response_id` threading, hosted / namespaced tools, compaction items, and
 //! structured `text.format` output. A request carrying any takes the passthrough (see
-//! [`has_untranslatable_content`]).
+//! [`has_untranslatable_content`]) — unless the native path below applies.
+//!
+//! ## Native path (no translation)
+//!
+//! When every rung of the route (and its challenger) is a provider that serves `/v1/responses`
+//! itself ([`crate::provider::Provider::serves_responses`]), there is nothing to translate: each
+//! rung gets the client's Responses body with only `model` swapped ([`native_wire_body`]), so
+//! hosted tools (`web_search`), encrypted `reasoning` items, `include`, `store`, compaction items,
+//! and `text.format` all reach the model exactly as Codex sent them. The gates read the rung's
+//! `output[]` (`message` text via [`output_text`]; `function_call` / `custom_tool_call` via the
+//! gate layer's tool-call extraction; hosted `*_call` items are provider-side and need no
+//! argument check), and the winning rung's Responses object is returned verbatim. Eligibility is
+//! [`native_eligible`].
+//!
+//! **`previous_response_id` / `conversation` stay on passthrough.** A native turn returns a real
+//! upstream response id (stored if the client asked for `store`), so a later turn threading onto it
+//! is valid against OpenAI with the same credentials. Enforcing *that* later turn, though, would
+//! replay the server-held thread on every rung: the history is invisible to the gates, it may have
+//! been stored under a different key than the rung's (`api_key_env` on the provider), and whether
+//! a stored thread's reasoning state replays on a different model is not something this proxy has
+//! verified. Unsure, so conservative: those turns are relayed un-gated, as before. Codex sends
+//! `store: false` and the full history every turn, so its default turns are unaffected.
+//!
+//! With `store: true` (or absent — the API default), every rung that was tried stores its
+//! response upstream, including the ones whose answer failed the gate. They are never returned to
+//! the client, so nothing threads onto them; the cost is upstream retention only.
 
 use serde_json::{Map, Value};
 
@@ -267,7 +292,7 @@ fn tool_to_chat(tool: &Value) -> Option<Value> {
 }
 
 /// The single string argument a `custom` (freeform) tool's input rides in on the Chat side.
-const CUSTOM_INPUT_ARG: &str = "input";
+pub(crate) const CUSTOM_INPUT_ARG: &str = "input";
 
 /// Envelope of a Codex patch (`apply_patch` lark grammar: `start: begin_patch hunk+ end_patch`):
 /// the begin marker, at least one file operation, the end marker.
@@ -606,6 +631,176 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
             _ => true,
         }
     })
+}
+
+/// Hosted tools: executed inside the provider, so their `*_call` output items are already-run
+/// provider work, not calls the client must make — the gate has no arguments to validate.
+/// Allow-list (see [`has_untranslatable_content`] for why): `mcp`, `computer_use_preview`,
+/// `local_shell` (client-executed despite the name) and anything newer stay on passthrough.
+const NATIVE_HOSTED_TOOLS: &[&str] = &[
+    "web_search",
+    "web_search_preview",
+    "file_search",
+    "code_interpreter",
+    "image_generation",
+];
+
+/// Whether a Responses request can take the native enforce path (forwarded unchanged to a rung
+/// that serves `/v1/responses`). The ladder half of the decision is the caller's
+/// (`Provider::serves_responses`); this is the request half.
+///
+/// Every tool must be either one the gate can validate ([`tool_to_chat`] translates it) or a
+/// hosted tool from [`NATIVE_HOSTED_TOOLS`]. Excluded: `previous_response_id` / `conversation`
+/// threading (module docs: server-held history the gate cannot see, and cross-model replay is
+/// unverified), and `background: true` (the reply is a queued shell, not an answer to gate).
+#[must_use]
+pub fn native_eligible(body: &Value) -> bool {
+    let Some(obj) = body.as_object() else {
+        return false;
+    };
+    if obj
+        .get("previous_response_id")
+        .is_some_and(|v| !v.is_null())
+        || obj.get("conversation").is_some_and(|v| !v.is_null())
+        || obj.get("background").and_then(Value::as_bool) == Some(true)
+    {
+        return false;
+    }
+    obj.get("tools")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .all(|t| {
+            tool_to_chat(t).is_some()
+                || t.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ty| NATIVE_HOSTED_TOOLS.contains(&ty))
+        })
+}
+
+/// The tool list the gates validate a native turn against: the request's function and custom tools
+/// in Chat spelling (a `custom` patch tool carries its envelope `pattern`, as on the translated
+/// path), hosted tools left out — they have no client-side arguments.
+#[must_use]
+pub fn native_gate_tools(body: &Value) -> Value {
+    match body.get("tools").and_then(Value::as_array) {
+        Some(tools) => Value::Array(tools.iter().filter_map(tool_to_chat).collect()),
+        None => Value::Null,
+    }
+}
+
+/// Whether a raw request body is Responses-shaped (`input`, no `messages`). Only the native path
+/// puts one on `ModelRequest::raw`; the Chat path's raw body always has `messages` (it fails to
+/// parse without them), so the two cannot be confused.
+#[must_use]
+pub fn is_responses_body(raw: &Value) -> bool {
+    raw.get("input").is_some() && raw.get("messages").is_none()
+}
+
+/// The wire body for one native rung: the client's Responses body byte-for-byte except `model`
+/// (the rung's bare id) and the stream controls — the enforce path buffers, so the upstream call is
+/// non-streaming and `stream_options` without `stream` would be rejected. `reasoning` items,
+/// hosted tools, `include`, `store`, `text`, and every unknown field are untouched.
+#[must_use]
+pub fn native_wire_body(raw: &Map<String, Value>, wire_model: &str) -> Value {
+    let mut body = raw.clone();
+    body.insert("model".to_owned(), Value::String(wire_model.to_owned()));
+    body.remove("stream");
+    body.remove("stream_options");
+    Value::Object(body)
+}
+
+/// The text a Responses object answered with: every `output_text` part of every `message` item,
+/// joined. (`output_text` at the top level is an SDK convenience the wire does not send.)
+#[must_use]
+pub fn output_text(resp: &Value) -> String {
+    let mut text = String::new();
+    for item in resp
+        .get("output")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter(|i| i.get("type").and_then(Value::as_str) == Some("message"))
+    {
+        for part in item
+            .get("content")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+        {
+            if part.get("type").and_then(Value::as_str) == Some("output_text")
+                && let Some(t) = part.get("text").and_then(Value::as_str)
+            {
+                text.push_str(t);
+            }
+        }
+    }
+    text
+}
+
+/// The client-executed tool calls in a Responses object's `output`, as the gate layer's
+/// `(name, json_args)` pairs: a `function_call`'s `arguments` string, or a `custom_tool_call`'s
+/// freeform `input` wrapped as `{"input": ...}` — the shape [`native_gate_tools`] declares for it.
+/// Hosted `*_call` items are not included (provider-side, nothing to validate). `None` when `raw`
+/// is not a Responses object, so callers can fall through to the other dialects.
+#[must_use]
+pub fn output_tool_calls(raw: &Value) -> Option<Vec<(String, String)>> {
+    if raw.get("object").and_then(Value::as_str) != Some("response") {
+        return None;
+    }
+    let items = raw.get("output").and_then(Value::as_array)?;
+    let name = |i: &Value| {
+        i.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Some(
+        items
+            .iter()
+            .filter_map(|i| match i.get("type").and_then(Value::as_str) {
+                // Missing/non-string arguments → "" fails the gate's JSON parse, not a fake `{}`.
+                Some("function_call") => Some((
+                    name(i),
+                    i.get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                )),
+                Some("custom_tool_call") => Some((
+                    name(i),
+                    i.get("input")
+                        .and_then(Value::as_str)
+                        .map(|s| serde_json::json!({ CUSTOM_INPUT_ARG: s }).to_string())
+                        .unwrap_or_default(),
+                )),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// Normalize a native rung's Responses object into the provider-agnostic response the router and
+/// gates consume. `raw` is kept whole — it is what the client is served.
+///
+/// ponytail: `in_tokens` includes cached input tokens (no cache split), matching the Chat-path
+/// `OpenAiProvider`; report `input_tokens_details.cached_tokens` once OpenAI cache pricing is in
+/// the price table, or Codex's heavily cached turns are over-costed on the receipt.
+#[must_use]
+pub fn model_response(model: &str, raw: Value) -> crate::provider::ModelResponse {
+    let usage = |k: &str| {
+        raw.pointer(&format!("/usage/{k}"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    crate::provider::ModelResponse {
+        model: model.to_owned(),
+        text: output_text(&raw),
+        in_tokens: usage("input_tokens"),
+        cache_write_tokens: 0,
+        cache_read_tokens: 0,
+        out_tokens: usage("output_tokens"),
+        raw,
+    }
 }
 
 /// Convert a Chat Completions response into the Responses shape.
@@ -2047,5 +2242,83 @@ end_patch: "*** End Patch" LF?"#;
         assert_eq!(msgs.len(), 4, "system + three turns");
         assert_eq!(msgs[3]["content"], "second");
         assert_eq!(msgs[2]["role"], "assistant");
+    }
+
+    /// Native eligibility: hosted tools the gate can treat as provider-side are fine; server-held
+    /// threading, background mode, and tools with no known semantics are not.
+    #[test]
+    fn native_eligible_allows_hosted_web_search_but_not_threading() {
+        let base = serde_json::json!({
+            "model": "gpt-5", "input": "hi", "store": false,
+            "tools": [{ "type": "web_search" },
+                      { "type": "function", "name": "shell", "parameters": {} }],
+        });
+        assert!(native_eligible(&base));
+        assert!(
+            has_untranslatable_content(&base),
+            "translation path cannot carry it"
+        );
+        for (k, v) in [
+            ("previous_response_id", serde_json::json!("resp_1")),
+            ("conversation", serde_json::json!("conv_1")),
+            ("background", serde_json::json!(true)),
+            (
+                "tools",
+                serde_json::json!([{ "type": "mcp", "server_label": "x" }]),
+            ),
+        ] {
+            let mut b = base.clone();
+            b[k] = v;
+            assert!(!native_eligible(&b), "{k} must not be native");
+        }
+    }
+
+    /// The native wire body is the client's body with only `model` and the stream controls changed.
+    #[test]
+    fn native_wire_body_changes_only_model_and_stream() {
+        let raw = serde_json::json!({
+            "model": "gpt-5-codex", "stream": true, "stream_options": {},
+            "store": true, "include": ["reasoning.encrypted_content"],
+            "tools": [{ "type": "web_search" }],
+            "input": [{ "type": "reasoning", "id": "rs", "summary": [],
+                        "encrypted_content": "opaque==" }],
+            "some_future_field": 1,
+        });
+        let out = native_wire_body(raw.as_object().unwrap(), "gpt-5-mini");
+        let mut expected = raw.clone();
+        expected["model"] = "gpt-5-mini".into();
+        expected.as_object_mut().unwrap().remove("stream");
+        expected.as_object_mut().unwrap().remove("stream_options");
+        assert_eq!(out, expected);
+        assert!(is_responses_body(&raw));
+        assert!(!is_responses_body(
+            &serde_json::json!({ "messages": [], "input": 1 })
+        ));
+    }
+
+    /// Output extraction: text from `message` parts only; client tool calls (function and custom)
+    /// in gate shape; reasoning and hosted calls ignored; a non-Responses object is `None`.
+    #[test]
+    fn native_output_extraction() {
+        let raw = serde_json::json!({ "object": "response", "output": [
+            { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "hidden" }] },
+            { "type": "web_search_call", "id": "ws" },
+            { "type": "message", "content": [
+                { "type": "output_text", "text": "a" }, { "type": "output_text", "text": "b" }] },
+            { "type": "function_call", "name": "f", "arguments": "{\"x\":1}" },
+            { "type": "custom_tool_call", "name": "apply_patch", "input": "*** Begin Patch" },
+        ]});
+        assert_eq!(output_text(&raw), "ab");
+        assert_eq!(
+            output_tool_calls(&raw).unwrap(),
+            [
+                ("f".to_owned(), "{\"x\":1}".to_owned()),
+                (
+                    "apply_patch".to_owned(),
+                    r#"{"input":"*** Begin Patch"}"#.to_owned()
+                ),
+            ]
+        );
+        assert!(output_tool_calls(&serde_json::json!({ "choices": [] })).is_none());
     }
 }

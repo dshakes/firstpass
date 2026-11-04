@@ -123,6 +123,11 @@ impl ModelResponse {
                 .iter()
                 .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"));
         }
+        // OpenAI Responses (native path): a client-executed call in `output`; hosted `*_call`
+        // items are provider-side work, not calls.
+        if let Some(calls) = crate::responses::output_tool_calls(&self.raw) {
+            return !calls.is_empty();
+        }
         // OpenAI: choices[0].message.tool_calls is a non-empty array.
         self.raw
             .pointer("/choices/0/message/tool_calls")
@@ -361,6 +366,14 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// path, alongside the Anthropic-dialect providers. `false` unless the provider's wire
     /// builder translates `tool_use` / `tool_result` / `image` blocks faithfully.
     fn translates_structured(&self) -> bool {
+        false
+    }
+
+    /// Whether this provider serves the OpenAI Responses API (`POST /v1/responses`) itself, so a
+    /// Responses request can be forwarded to it unchanged but for `model` (the native path in
+    /// [`crate::responses`]). A [`ModelRequest`] whose `raw` is Responses-shaped
+    /// ([`crate::responses::is_responses_body`]) is only ever sent to a provider returning `true`.
+    fn serves_responses(&self) -> bool {
         false
     }
 }
@@ -1007,18 +1020,34 @@ impl Provider for OpenAiProvider {
         inbound == firstpass_core::Dialect::Openai
     }
 
+    // ponytail: only the `openai` id (built-in, or a `[[provider]]` overriding it). The compatible
+    // hosts' Responses support varies (missing, beta, or a subset without hosted tools), and a
+    // wrong `true` turns every Codex turn into a 404 on that rung. Add a `[[provider]]` flag when
+    // one is verified.
+    fn serves_responses(&self) -> bool {
+        self.id == "openai"
+    }
+
     async fn complete(
         &self,
         req: &ModelRequest,
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
         let key = resolve_api_key(self.api_key_env.as_deref(), auth.openai_key.as_deref());
-        let body = openai_wire_body(req);
+        // Native Responses turn: the client's body, `model` swapped, to `/v1/responses`.
+        let responses_raw = req
+            .raw
+            .as_object()
+            .filter(|_| crate::responses::is_responses_body(&req.raw));
+        let (body, path) = match responses_raw {
+            Some(raw) => (
+                crate::responses::native_wire_body(raw, wire_model(&req.model)),
+                "/v1/responses",
+            ),
+            None => (openai_wire_body(req), "/v1/chat/completions"),
+        };
 
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}{path}", self.base_url.trim_end_matches('/'));
         let resp = self
             .http
             .post(url)
@@ -1043,6 +1072,9 @@ impl Provider for OpenAiProvider {
 
         let json: Value =
             serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
+        if responses_raw.is_some() {
+            return Ok(crate::responses::model_response(&req.model, json));
+        }
 
         // `content` is null for tool-call-only responses; treat as empty text rather than an error.
         let text = json
@@ -1878,6 +1910,8 @@ pub struct MockProvider {
     /// Simulated per-call latency (0 = respond instantly). Lets a test measure the wall-clock win
     /// speculation buys by overlapping rung calls that would otherwise run serially.
     delay_ms: u64,
+    /// What [`Provider::serves_responses`] reports (default `false`).
+    serves_responses: bool,
 }
 
 #[cfg(test)]
@@ -1893,7 +1927,15 @@ impl MockProvider {
             outcomes,
             calls: Arc::default(),
             delay_ms: 0,
+            serves_responses: false,
         }
+    }
+
+    /// Report [`Provider::serves_responses`] as `true` (the native Responses enforce path).
+    #[must_use]
+    pub fn serving_responses(mut self) -> Self {
+        self.serves_responses = true;
+        self
     }
 
     /// Make `complete()` sleep `ms` before responding, to simulate real per-call latency.
@@ -1922,6 +1964,10 @@ impl Provider for MockProvider {
     // for both Anthropic and OpenAI inbound tests without a real dialect-split implementation.
     fn carries_structured_verbatim(&self, _inbound: firstpass_core::Dialect) -> bool {
         true
+    }
+
+    fn serves_responses(&self) -> bool {
+        self.serves_responses
     }
 
     async fn complete(
