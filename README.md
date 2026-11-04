@@ -169,6 +169,7 @@ Point the agent at the proxy; nothing else about the agent changes.
 | **Codex** | `firstpass launch codex` (sets `OPENAI_BASE_URL`) | `POST /v1/responses` |
 | **Gemini CLI** | `firstpass launch gemini` (sets `GOOGLE_GEMINI_BASE_URL`) | `POST /v1beta/models/{m}:generateContent` |
 | **aider** | `aider --openai-api-base=http://127.0.0.1:8080/v1 …` | `POST /v1/chat/completions` |
+| **Cursor IDE** | Override OpenAI Base URL to a public tunnel; Cursor's servers call it, so `FIRSTPASS_REQUIRE_AUTH=true` is mandatory ([steps and limits](https://dshakes.github.io/firstpass/guide/agents.html#cursor)). cursor-agent CLI cannot be redirected. | `POST /v1/chat/completions` |
 
 **Observe** (the default) forwards byte-identical, writes receipts, and relays the upstream's `retry-after`, `request-id`, `anthropic-ratelimit-*` and `x-ratelimit-*` headers so an agent backs off correctly on a 429. `POST /v1/messages/count_tokens` is passed through and writes no receipt (it is not a routing decision). **Enforce** adds gates, escalation and sessions:
 
