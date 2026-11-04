@@ -3624,6 +3624,7 @@ fn parse_model_request(body: &[u8]) -> Option<ModelRequest> {
         tools,
         raw,
         cache_prefix: false,
+        reasoning_effort: crate::provider::effort_of(&json),
     })
 }
 
@@ -5303,6 +5304,7 @@ pub fn parse_openai_request(body: &[u8], carry_raw: bool) -> Option<ModelRequest
         tools,
         raw,
         cache_prefix: false,
+        reasoning_effort: crate::provider::effort_of(&json),
     })
 }
 

@@ -251,6 +251,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         };
         assert_eq!(query_text(&req), "be terse\nfix the bug\non it");
     }
@@ -265,6 +266,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         };
         assert_eq!(query_text(&req), "hi");
     }

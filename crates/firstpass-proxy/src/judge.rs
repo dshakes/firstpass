@@ -143,6 +143,7 @@ pub fn build_judge_request(judge_model: &str, rubric: &str, candidate: &str) -> 
         // A judge prompt is synthesized here, not routed from a caller; caching it is a separate
         // decision from the operator's `[escalation] prompt_cache` for their own traffic.
         cache_prefix: false,
+        reasoning_effort: None,
     }
 }
 

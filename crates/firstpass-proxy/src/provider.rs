@@ -83,6 +83,19 @@ pub struct ModelRequest {
     /// including synthesized judge/consistency requests, so nothing changes unless asked.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cache_prefix: bool,
+    /// The caller's reasoning request, read off the inbound body at parse time. Needed because the
+    /// translated path clears `raw`, and the wire builders that reconstruct from normalized fields
+    /// would otherwise drop it. Use [`ModelRequest::effort`] to read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<Effort>,
+}
+
+impl ModelRequest {
+    /// The caller's reasoning request: the parsed field, else whatever `raw` carries.
+    #[must_use]
+    pub fn effort(&self) -> Option<Effort> {
+        self.reasoning_effort.or_else(|| effort_of(&self.raw))
+    }
 }
 
 /// A provider-agnostic model response.
@@ -495,6 +508,7 @@ pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
     if !req.tools.is_null() {
         body["tools"] = req.tools.clone();
     }
+    apply_effort(&mut body, req, Wire::Anthropic);
     // This branch is not a rare fallback: it is the path every translated request takes, and
     // every CONDENSED one — condensing clears `raw` precisely so the smaller message list is what
     // gets sent. Applying breakpoints only in the raw branch above would mean `prompt_cache`
@@ -734,7 +748,20 @@ pub fn openai_wire_body(req: &ModelRequest) -> Value {
     if !req.tools.is_null() {
         body["tools"] = req.tools.clone();
     }
+    apply_effort(&mut body, req, Wire::OpenAi);
     body
+}
+
+/// Re-spell the request's reasoning effort for `wire` on a body rebuilt from normalized fields
+/// (no `raw` to normalize in place).
+fn apply_effort(body: &mut Value, req: &ModelRequest, wire: Wire) {
+    if let (Some(effort), Some(map)) = (req.effort(), body.as_object_mut()) {
+        map.insert(
+            "reasoning_effort".to_owned(),
+            Value::String(effort.as_str().to_owned()),
+        );
+        normalize_reasoning(map, wire);
+    }
 }
 
 /// How hard the caller asked the model to think, independent of how any one provider spells it.
@@ -744,7 +771,8 @@ pub fn openai_wire_body(req: &ModelRequest) -> Value {
 /// that sets `reasoning_effort` gets a **400** the moment the router escalates it onto an
 /// Anthropic rung, because raw bodies pass through verbatim and Anthropic rejects the unknown
 /// field. The caller did nothing wrong; the ladder moved under it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Effort {
     Low,
     Medium,
@@ -1232,7 +1260,7 @@ fn gemini_request_body(req: &ModelRequest) -> Value {
     }
     // This builder reconstructs from normalized fields, so the caller's reasoning request is only
     // in `raw` — carry it across rather than dropping it on the Gemini rung.
-    if let (Some(effort), Some(map)) = (effort_of(&req.raw), body.as_object_mut()) {
+    if let (Some(effort), Some(map)) = (req.effort(), body.as_object_mut()) {
         let mut carry = serde_json::Map::new();
         carry.insert(
             "reasoning_effort".to_owned(),
@@ -2261,6 +2289,7 @@ mod tests {
             tools: Value::Null,
             raw: raw.clone(),
             cache_prefix: false,
+            reasoning_effort: None,
         };
 
         let body = anthropic_wire_body(&req);
@@ -2268,6 +2297,7 @@ mod tests {
 
         let opted = ModelRequest {
             cache_prefix: true,
+            reasoning_effort: None,
             ..req
         };
         let body = anthropic_wire_body(&opted);
@@ -2288,6 +2318,7 @@ mod tests {
             tools: serde_json::json!([{ "name": "a" }]),
             raw: Value::Null, // no raw body → normalized build path
             cache_prefix: true,
+            reasoning_effort: None,
         };
 
         let body = anthropic_wire_body(&req);
@@ -2371,6 +2402,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let body = gemini_request_body(&req);
         // System prompt goes in systemInstruction (canonical REST field name), not contents.
@@ -2505,6 +2537,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let body = gemini_request_body(&req);
         let parts = body["contents"][1]["parts"].as_array().unwrap();
@@ -2681,6 +2714,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let body = anthropic_messages_body(&req, "bedrock-2023-05-31");
         // Model goes in the URL for Bedrock/Vertex, never the body.
@@ -2727,6 +2761,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let err = provider.complete(&req, &Auth::default()).await.unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
@@ -2784,6 +2819,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let err = provider.complete(&req, &Auth::default()).await.unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
@@ -2867,6 +2903,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         });
         assert_eq!(wire["messages"][0]["content"], serde_json::json!("hi"));
         assert_eq!(
@@ -2948,6 +2985,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let out = provider.complete(&req, &Auth::default()).await.unwrap();
         assert_eq!(out.text, "hello");
@@ -2976,6 +3014,7 @@ mod tests {
             tools: raw["tools"].clone(),
             raw: raw.clone(),
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let wire = anthropic_wire_body(&req);
         assert_eq!(wire["model"], "claude-haiku-4-5", "rung model swapped in");
@@ -3012,6 +3051,7 @@ mod tests {
             tools: raw["tools"].clone(),
             raw: raw.clone(),
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let body = anthropic_messages_body(&req, "bedrock-2023-05-31");
         assert!(body.get("model").is_none(), "model lives in the URL");
@@ -3070,6 +3110,7 @@ mod tests {
             tools: Value::Null,
             raw: raw.clone(),
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let wire = openai_wire_body(&req);
         assert_eq!(wire["model"], "gpt-4.1-mini", "rung model swapped in");
@@ -3103,6 +3144,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let wire = openai_wire_body(&req);
         assert_eq!(wire["model"], "gpt-4.1-mini");
@@ -3243,6 +3285,7 @@ mod tests {
             tools: Value::Null,
             raw: serde_json::json!({"messages": [{"role":"user","content":"hi"}], "max_tokens": 16}),
             cache_prefix: false,
+            reasoning_effort: None,
         };
         let auth = Auth {
             anthropic_key: None, // no API key — use Bearer fallback
@@ -3373,6 +3416,7 @@ mod tests {
             tools: Value::Null,
             raw: serde_json::json!({"messages": [{"role":"user","content":"hi"}], "max_tokens": 16}),
             cache_prefix: false,
+            reasoning_effort: None,
         };
 
         // Auth with an openai_key set (e.g., from OPENAI_API_KEY env) but no anthropic creds.
@@ -3438,6 +3482,7 @@ mod tests {
             tools: Value::Null,
             raw: serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":16}),
             cache_prefix: false,
+            reasoning_effort: None,
         };
         // Client sends Bearer only — no x-api-key.  Bearer must win over the server env key.
         let auth = Auth {
@@ -3566,6 +3611,7 @@ mod tests {
             tools: Value::Null,
             raw: serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":16}),
             cache_prefix: false,
+            reasoning_effort: None,
         };
         // Both x-api-key and Bearer present: x-api-key must win.
         let auth = Auth {

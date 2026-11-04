@@ -372,10 +372,20 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
         }
     }
 
-    // generationConfig: only the mapped subset (maxOutputTokens, temperature, topP).
+    // generationConfig: only the mapped subset (maxOutputTokens, temperature, topP, thinkingConfig{thinkingBudget,thinkingLevel}).
     if let Some(Value::Object(gen_cfg)) = obj.get("generationConfig") {
         for k in gen_cfg.keys() {
-            if !matches!(k.as_str(), "maxOutputTokens" | "temperature" | "topP") {
+            let ok = match k.as_str() {
+                "maxOutputTokens" | "temperature" | "topP" => true,
+                // Mapped to `reasoning_effort`. Any other thinkingConfig key (e.g.
+                // `includeThoughts`) has no Chat equivalent and would be dropped silently.
+                "thinkingConfig" => gen_cfg[k].as_object().is_some_and(|c| {
+                    c.keys()
+                        .all(|k| matches!(k.as_str(), "thinkingBudget" | "thinkingLevel"))
+                }),
+                _ => false,
+            };
+            if !ok {
                 return true;
             }
         }
@@ -1193,5 +1203,25 @@ mod tests {
             "Gemini key must not be set on OpenAI path"
         );
         // mutant: if from_headers sets gemini_key on Anthropic/OpenAI, assertion fails
+    }
+
+    #[test]
+    fn thinking_config_is_translatable_only_with_mapped_keys() {
+        let body = |tc: Value| {
+            serde_json::json!({
+                "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+                "generationConfig": { "thinkingConfig": tc }
+            })
+        };
+        assert!(!has_untranslatable_content(&body(
+            serde_json::json!({ "thinkingBudget": 1024 })
+        )));
+        assert!(!has_untranslatable_content(&body(
+            serde_json::json!({ "thinkingLevel": "HIGH" })
+        )));
+        assert!(has_untranslatable_content(&body(
+            serde_json::json!({ "includeThoughts": true })
+        )));
+        assert!(has_untranslatable_content(&body(serde_json::json!("high"))));
     }
 }

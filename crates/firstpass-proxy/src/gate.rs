@@ -793,6 +793,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         }
     }
 
@@ -1299,6 +1300,7 @@ mod tests {
             }]),
             raw: serde_json::Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         }
     }
 
