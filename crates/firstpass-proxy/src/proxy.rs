@@ -14109,22 +14109,43 @@ mod tests {
         }
     }
 
-    /// `previous_response_id` stays on passthrough even on an all-OpenAI ladder (see the
-    /// `responses` module docs for why).
+    /// Even on an all-OpenAI ladder, these stay on passthrough (see the `responses` module docs):
+    /// `previous_response_id` threading, and any `store` other than an explicit `false` — omitted
+    /// means `true` upstream, and a failed cheap rung would then be retained there unseen. Exactly
+    /// one upstream call, carrying the client's body unchanged, proves no rung was tried.
     #[tokio::test]
-    async fn responses_native_path_not_taken_for_previous_response_id() {
-        let (upstream, log) = spawn_recording_responses_upstream().await;
-        let (state, _traces) = native_state(r#"["openai/cheap", "openai/strong"]"#, &upstream);
-        let mut turn = codex_turn(false);
-        turn["previous_response_id"] = "resp_strong".into();
-        let resp = responses(
-            State(state),
-            Extension(TenantId("default".to_owned())),
-            HeaderMap::new(),
-            Bytes::from(turn.to_string()),
-        )
-        .await;
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        assert_eq!(log.lock().unwrap().clone(), [turn]);
+    async fn responses_native_path_not_taken_for_threading_or_stored_turns() {
+        let threaded = {
+            let mut t = codex_turn(false);
+            t["previous_response_id"] = "resp_strong".into();
+            t
+        };
+        let stored = {
+            let mut t = codex_turn(false);
+            t["store"] = true.into();
+            t
+        };
+        let store_omitted = {
+            let mut t = codex_turn(false);
+            t.as_object_mut().unwrap().remove("store");
+            t
+        };
+        for (case, turn) in [
+            ("previous_response_id", threaded),
+            ("store: true", stored),
+            ("store omitted", store_omitted),
+        ] {
+            let (upstream, log) = spawn_recording_responses_upstream().await;
+            let (state, _traces) = native_state(r#"["openai/cheap", "openai/strong"]"#, &upstream);
+            let resp = responses(
+                State(state),
+                Extension(TenantId("default".to_owned())),
+                HeaderMap::new(),
+                Bytes::from(turn.to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{case}");
+            assert_eq!(log.lock().unwrap().clone(), [turn], "{case}");
+        }
     }
 }

@@ -56,9 +56,19 @@
 //! verified. Unsure, so conservative: those turns are relayed un-gated, as before. Codex sends
 //! `store: false` and the full history every turn, so its default turns are unaffected.
 //!
-//! With `store: true` (or absent — the API default), every rung that was tried stores its
-//! response upstream, including the ones whose answer failed the gate. They are never returned to
-//! the client, so nothing threads onto them; the cost is upstream retention only.
+//! **Only an explicit `store: false` is native.** Every tried rung receives the body, so with
+//! `store: true` — or `store` omitted, which the Responses API treats as `true` — a cheap rung
+//! whose answer failed the gate would persist a response upstream that the client never sees: a
+//! retention side effect the client did not ask for. Forcing `store: false` on the rungs instead
+//! would hand back an id the client asked to be retrievable and is not. So any other `store` keeps
+//! the prior behaviour (translation when possible, else passthrough). Codex sends `store: false`
+//! on every turn (`codex-rs/core/src/client.rs`, `ResponsesApiRequest { store: false, .. }`,
+//! openai/codex @ 49f2fc2), so its default turns stay covered.
+//!
+//! **Every rung must accept the client's parameters.** The body is forwarded as-is, so a rung
+//! that rejects a field the client sent (`reasoning` on a non-reasoning model, say) answers 400,
+//! and a 4xx is a hard error that ends the ladder rather than escalating — the same rule as the
+//! Chat raw-carry path. Ladder native routes with models that share a parameter surface.
 
 use serde_json::{Map, Value};
 
@@ -652,12 +662,16 @@ const NATIVE_HOSTED_TOOLS: &[&str] = &[
 /// Every tool must be either one the gate can validate ([`tool_to_chat`] translates it) or a
 /// hosted tool from [`NATIVE_HOSTED_TOOLS`]. Excluded: `previous_response_id` / `conversation`
 /// threading (module docs: server-held history the gate cannot see, and cross-model replay is
-/// unverified), and `background: true` (the reply is a queued shell, not an answer to gate).
+/// unverified), `background: true` (the reply is a queued shell, not an answer to gate), and any
+/// `store` other than an explicit `false` (module docs: a failed rung would be retained upstream).
 #[must_use]
 pub fn native_eligible(body: &Value) -> bool {
     let Some(obj) = body.as_object() else {
         return false;
     };
+    if obj.get("store").and_then(Value::as_bool) != Some(false) {
+        return false;
+    }
     if obj
         .get("previous_response_id")
         .is_some_and(|v| !v.is_null())
@@ -2262,6 +2276,8 @@ end_patch: "*** End Patch" LF?"#;
             ("previous_response_id", serde_json::json!("resp_1")),
             ("conversation", serde_json::json!("conv_1")),
             ("background", serde_json::json!(true)),
+            ("store", serde_json::json!(true)),
+            ("store", Value::Null),
             (
                 "tools",
                 serde_json::json!([{ "type": "mcp", "server_label": "x" }]),
@@ -2271,6 +2287,10 @@ end_patch: "*** End Patch" LF?"#;
             b[k] = v;
             assert!(!native_eligible(&b), "{k} must not be native");
         }
+        // Omitted `store` is the API's `true`: not native either.
+        let mut b = base.clone();
+        b.as_object_mut().unwrap().remove("store");
+        assert!(!native_eligible(&b), "omitted store must not be native");
     }
 
     /// The native wire body is the client's body with only `model` and the stream controls changed.
