@@ -70,6 +70,7 @@
     <tr><td>Codex</td><td><code>firstpass launch codex</code> (sets <code>OPENAI_BASE_URL</code>)</td><td><code>POST /v1/responses</code></td></tr>
     <tr><td>Gemini CLI</td><td><code>firstpass launch gemini</code> (sets <code>GOOGLE_GEMINI_BASE_URL</code>)</td><td><code>POST /v1beta/models/{m}:generateContent</code></td></tr>
     <tr><td>aider</td><td><code>aider --openai-api-base=http://127.0.0.1:8080/v1 …</code></td><td><code>POST /v1/chat/completions</code></td></tr>
+    <tr><td>Cursor IDE</td><td>Override OpenAI Base URL to a <b>public, authenticated</b> tunnel; <a href="#cursor">steps and limits</a></td><td><code>POST /v1/chat/completions</code></td></tr>
   </tbody>
 </table></div>
 <p>Leaving is unsetting the variable. <code>firstpass launch</code> refuses to start the agent if no proxy is listening.</p>
@@ -152,9 +153,24 @@ FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy</code><
     <tr><td>Codex</td><td>pass, fixture only</td><td>A <code>/v1/responses</code> request returned 200. The run had a shell alias, not the Codex binary.</td></tr>
     <tr><td>Gemini CLI 0.26.0</td><td>pass, fixture only</td><td><code>POST /v1beta/models/{m}:generateContent</code> returned 200. Tested via <code>firstpass launch gemini</code> against a fake local upstream. The Gemini binary was not available in CI.</td></tr>
     <tr><td>cline</td><td>skip</td><td>Needs interactive auth setup. Its <code>/v1/chat/completions</code> protocol is served.</td></tr>
-    <tr><td>cursor-agent</td><td>skip</td><td>Bound to Cursor cloud OAuth.</td></tr>
+    <tr><td>cursor-agent</td><td>skip</td><td>Bound to Cursor cloud OAuth. No base-URL override; see <a href="#cursor">Cursor</a>.</td></tr>
   </tbody>
 </table></div>
+
+<h2 id="cursor">7. Cursor<a class="anchor" href="#cursor" aria-label="Link to this section">#</a></h2>
+<p><b>cursor-agent (CLI)</b> has no base-URL override and is bound to Cursor's cloud login, so it cannot be pointed at Firstpass. <b>Cursor IDE</b> has one supported path: <i>Settings &rarr; Models &rarr; OpenAI API Key</i> plus <i>Override OpenAI Base URL</i>. Cursor does not call that URL from your machine. Your prompt goes to Cursor's servers (<code>api2.cursor.sh</code>), and they call the URL, so <code>127.0.0.1</code> and LAN addresses never see a request. The proxy must be reachable from the public internet (sources: <a href="https://ngrok.com/docs/gateway/examples/cursor-local-llm">ngrok</a>, <a href="https://dev.to/orchidfiles/why-localhost-doesnt-work-as-openai-base-url-in-cursor-and-how-to-fix-it-589e">community write-up</a>; third-party, not Cursor-documented).</p>
+<div class="note warn"><span class="nt">A public proxy spends your provider keys</span> An enforce rung with <code>api_key_env</code> uses the <b>server's</b> key for every request it accepts. A tunnel to a proxy without inbound auth lets anyone who finds the URL spend that key. Do not tunnel until <code>FIRSTPASS_REQUIRE_AUTH=true</code> is on. That auth is marked <b>experimental / pre-external-review</b> (ADR 0004 &sect;D7): use a dedicated, spend-capped provider key and a <code>[budget]</code>. <code>/healthz</code>, <code>/metrics</code> and <code>/panel</code> stay unauthenticated; do not route them through the tunnel (for example, restrict the tunnel to <code>/v1/*</code>).</div>
+<p><b>1. Make a tenant key.</b> A key is <code>&lt;tenant&gt;.&lt;secret&gt;</code>; the proxy stores only an Argon2id hash of the secret. Any Argon2id PHC hash works (the tenant id must not contain <code>.</code>):</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span></div><pre><code>SECRET=$(openssl rand -hex 24)
+HASH=$(uvx --from argon2-cffi python -c &quot;import sys;from argon2 import PasswordHasher as P;print(P().hash(sys.argv[1]))&quot; &quot;$SECRET&quot;)
+printf '{&quot;cursor&quot;: &quot;%s&quot;}' &quot;$HASH&quot; &gt; tenant-keys.json
+echo &quot;Cursor API key: cursor.$SECRET&quot;</code></pre></div>
+<p><b>2. Run the proxy with auth and an enforce route</b> whose rungs carry their own server-side keys. Cursor's key field holds the tenant key, and the proxy strips it before going upstream, so with no <code>api_key_env</code> the upstream gets no credential.</p>
+<div class="codeblock"><div class="cb-head"><span>bash</span></div><pre><code>FIRSTPASS_REQUIRE_AUTH=true FIRSTPASS_TENANT_KEYS=./tenant-keys.json \
+FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy        # route mode = &quot;enforce&quot;, rungs with api_key_env
+cloudflared tunnel --url http://127.0.0.1:8080           # or ngrok / tailscale funnel</code></pre></div>
+<p><b>3. In Cursor:</b> set <i>OpenAI API Key</i> to <code>cursor.&lt;secret&gt;</code>, <i>Override OpenAI Base URL</i> to <code>https://&lt;tunnel-host&gt;/v1</code>, add a custom model name your route matches, and pick it in chat. Check that a request appears in <code>GET /v1/receipts</code>. Cursor has been reported to switch the override off after some hours; if receipts stop, re-check the toggle.</p>
+<p><b>Limits.</b> Only chat requests carry the override (Cursor: custom keys &ldquo;only work with chat models&rdquo;; reasoning models are unsupported). <b>Tab completion</b> and Cursor's own hosted models never touch the base URL, and whether Agent mode uses the override is not documented by Cursor. Cursor's servers see the prompt before Firstpass does. Plain <code>http://127.0.0.1</code> and tunnels you cannot authenticate are not options. This path has <b>not been run</b> against a real Cursor install by us.</p>
 
 <h2 id="limits">Limits<a class="anchor" href="#limits" aria-label="Link to this section">#</a></h2>
 <ul>
@@ -170,7 +186,7 @@ FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy</code><
 
 <nav class="pager" aria-label="Pagination"><a class="prev" href="experiments.html"><span class="dir">← Previous</span><span class="t">Choose by proof</span></a></nav>
 </main>
-<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#setup" class="">1. Setup</a><a href="#sessions" class="">2. Sessions</a><a href="#tools" class="">3. Tool turns</a><a href="#config" class="">4. Route config</a><a href="#granularity" class="">5. Granularity</a><a href="#compat" class="">6. Tested</a><a href="#limits" class="">Limits</a></nav>
+<nav class="toc" aria-label="On this page"><p class="toc-t">On this page</p><a href="#setup" class="">1. Setup</a><a href="#sessions" class="">2. Sessions</a><a href="#tools" class="">3. Tool turns</a><a href="#config" class="">4. Route config</a><a href="#granularity" class="">5. Granularity</a><a href="#compat" class="">6. Tested</a><a href="#cursor" class="">7. Cursor</a><a href="#limits" class="">Limits</a></nav>
 </div>
 <footer class="foot"><div class="wrap">
   <div class="cols">
