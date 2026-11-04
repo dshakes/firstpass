@@ -239,6 +239,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         }
     }
 
@@ -422,6 +423,7 @@ mod tests {
             ModelPrice {
                 input_per_mtok: 1.0,
                 output_per_mtok: 5.0,
+                cache_read_multiplier: 0.1,
             },
         );
         let gate = ConsistencyGate::new(

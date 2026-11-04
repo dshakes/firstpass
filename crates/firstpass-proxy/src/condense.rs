@@ -87,6 +87,7 @@ mod tests {
             tools: serde_json::Value::Null,
             raw: serde_json::json!({ "messages": "the full original" }),
             cache_prefix: false,
+            reasoning_effort: None,
         }
     }
 

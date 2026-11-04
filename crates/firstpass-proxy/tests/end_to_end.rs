@@ -1962,3 +1962,128 @@ async fn gemini_enforce_different_tool_requests_get_different_sessions() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+/// Records every request body an upstream receives, answering with a passing candidate.
+#[derive(Clone, Default)]
+struct BodyLog(Arc<std::sync::Mutex<Vec<Value>>>);
+
+async fn spawn_body_recorder() -> (String, BodyLog) {
+    async fn anthropic(State(log): State<BodyLog>, body: Bytes) -> Response {
+        log.0
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&body).unwrap());
+        Json(json!({
+            "id": "msg_rec", "type": "message", "role": "assistant", "model": "m",
+            "content": [{ "type": "text", "text": "fn main() {} // compiles" }],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 10, "output_tokens": 5 },
+        }))
+        .into_response()
+    }
+    async fn gemini(State(log): State<BodyLog>, body: Bytes) -> Response {
+        log.0
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&body).unwrap());
+        Json(json!({
+            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "recorded" }] } }],
+            "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 3 },
+        }))
+        .into_response()
+    }
+    let log = BodyLog::default();
+    let router = Router::new()
+        .route("/v1/messages", post(anthropic))
+        .route("/v1beta/models/{model_action}", post(gemini))
+        .with_state(log.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (format!("http://{addr}"), log)
+}
+
+/// Translated inbound dialects clear `raw`, so the caller's reasoning request has to be carried
+/// some other way to reach the rung. Asserted at the upstream wire, through the real handlers.
+#[tokio::test]
+async fn translated_inbound_effort_reaches_the_anthropic_rung() {
+    let (upstream, log) = spawn_body_recorder().await;
+    let (proxy, _db) = spawn_proxy(&upstream, &["anthropic/claude-sonnet-5"], "").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{proxy}/v1/responses"))
+        .header("x-api-key", "byok-test")
+        .json(&json!({
+            "model": "claude-sonnet-5", "input": "write hello world",
+            "max_output_tokens": 32000, "reasoning": { "effort": "high" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(format!(
+            "{proxy}/v1beta/models/gemini-2.5-pro:generateContent"
+        ))
+        .header("x-goog-api-key", "AIza-test")
+        .json(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "write hello world" }] }],
+            "generationConfig": {
+                "maxOutputTokens": 32000,
+                "thinkingConfig": { "thinkingBudget": 4096 }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let bodies = log.0.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "both must be enforced, not passed through: {bodies:?}"
+    );
+    assert_eq!(
+        bodies[0]["thinking"]["budget_tokens"], 16384,
+        "{}",
+        bodies[0]
+    );
+    assert_eq!(
+        bodies[1]["thinking"]["budget_tokens"], 4096,
+        "{}",
+        bodies[1]
+    );
+    for b in &bodies {
+        assert!(b.get("reasoning_effort").is_none(), "{b}");
+    }
+}
+
+/// Same, for a Gemini rung: effort from a Responses request lands as `thinkingConfig`.
+#[tokio::test]
+async fn translated_inbound_effort_reaches_the_gemini_rung() {
+    let (upstream, log) = spawn_body_recorder().await;
+    let providers =
+        format!("[[provider]]\nid = \"gemini\"\ndialect = \"gemini\"\nbase_url = \"{upstream}\"\n");
+    let (proxy, _db) = spawn_proxy(&upstream, &["gemini/gemini-2.5-pro"], &providers).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/responses"))
+        .header("x-goog-api-key", "AIza-test")
+        .json(&json!({
+            "model": "gemini-2.5-pro", "input": "hi", "reasoning": { "effort": "medium" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let bodies = log.0.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert_eq!(
+        bodies[0]["generationConfig"]["thinkingConfig"]["thinkingBudget"], 4096,
+        "{}",
+        bodies[0]
+    );
+}
