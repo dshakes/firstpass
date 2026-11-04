@@ -59,8 +59,11 @@ for off in range(0, 5000, 100):
             }
         )
 print("eligible", len(rows))
+N = int(sys.argv[2]) if len(sys.argv) > 2 else 300
+if N > len(rows):
+    sys.exit(f"requested {N} but only {len(rows)} eligible")
 random.seed(20261031)
-sample = random.sample(rows, int(sys.argv[2]) if len(sys.argv) > 2 else 300)
+sample = random.sample(rows, N)
 (out / "tests.json").write_text(
     json.dumps(
         {

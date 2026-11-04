@@ -27,7 +27,7 @@ minimax-2.5 and gemini-3-flash tie on quality evidence. Gemini is chosen because
 
 ## Dataset
 
-APPS, interview + competition, hidden stdin/stdout tests, from `scripts/live-paired/fetch_apps.py` with a seeded draw of **800** problems (seed 20261031; the script took a fixed 300 until this branch added an optional `N` argument). APPS rather than MBPP: sonnet's APPS pass rate (65.2%) is close to the SWE-bench rate (0.768) the variance below was measured on, and it is not ceiling-limited (sonnet passes 95.4% of MBPP). Gate = the task's own tests in a network-less container, so gate pass is task success. Caps: `max_tokens = 12000` both arms (the live run showed 4096 truncates sonnet).
+APPS, interview + competition, hidden stdin/stdout tests, from `scripts/live-paired/fetch_apps.py` with a seeded draw of **800** problems (seed 20261031; a fresh draw, not an ordered extension of the earlier 300, because `random.sample` changes with k; the script took a fixed 300 until this branch added an optional `N` argument). APPS rather than MBPP: sonnet's APPS pass rate (65.2%) is close to the SWE-bench rate (0.768) the variance below was measured on, and it is not ceiling-limited (sonnet passes 95.4% of MBPP). Gate = the task's own tests in a network-less container, so gate pass is task success. Caps: `max_tokens = 12000` both arms (the live run showed 4096 truncates sonnet).
 
 ## Power (the math)
 
@@ -65,7 +65,7 @@ Per-pair cost from measured data: sonnet APPS `$0.0668`/request (receipts, 2026-
 | expected, all 800 pairs: `800 x (0.0668 + 0.033)` | 79.8 |
 | smoke test first (20 pairs, abort if per-pair > $0.20) | <= 3 |
 | **hard ceiling** (`FP_CAP_USD`, incumbent + challenger) | **120** |
-| challenger-only daily cap (`max_usd_per_day`) | 50 |
+| challenger-only daily cap (`max_usd_per_day`) | 80 (800 Gemini answers at 12000 tokens could reach about $72; a lower cap would silently stop recording pairs while sonnet keeps spending) |
 
 Expected spend is lower: the median certify time is about 370 pairs (about $37). The ceiling is a stop, not a bound: at `max_tokens` 12000 a single pair could in principle cost $0.28, so a pathological run stops at $120 and is scored STOP.
 
@@ -81,22 +81,22 @@ python3 scripts/live-paired/fetch_apps.py data/apps 800
 #    [[provider]]  id = "google"  base_url = "https://generativelanguage.googleapis.com"  dialect = "gemini"  api_key_env = "GEMINI_API_KEY"
 #    [[gate]]      id = "tests"   cmd = ["python3", "scripts/live-paired/gate_apps.py", "data/apps/tests.json"]  timeout_ms = 180000
 #    [[route]]     mode = "enforce"  ladder = ["anthropic/claude-sonnet-5"]  gates = ["tests"]
-#    [route.challenger]  ladder = ["google/gemini-3.6-flash"]  mode = "paired"  margin = 0.05  alpha = 0.05  sample_rate = 1.0  max_usd_per_day = 50
+#    [route.challenger]  ladder = ["google/gemini-3.6-flash"]  mode = "paired"  margin = 0.05  alpha = 0.05  sample_rate = 1.0  max_usd_per_day = 80
 FIRSTPASS_CONFIG=./firstpass.toml firstpass doctor
 FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy &
 
 # 3. smoke: 20 pairs, check $/pair <= 0.20 in receipts, then continue
 head -20 data/apps/apps300.jsonl > data/apps/smoke.jsonl
-FP_BASE=http://127.0.0.1:8080 FP_CAP_USD=3 FP_MAX_TOKENS=12000 python3 scripts/live-paired/drive.py data/apps/smoke.jsonl smoke.out
+FP_BASE=http://127.0.0.1:8080 FP_CAP_USD=3 FP_MAX_TOKENS=12000 python3 scripts/live-paired/drive.py data/apps/smoke.jsonl apps800.out
 
 # 4. the run
-FP_BASE=http://127.0.0.1:8080 FP_CAP_USD=120 FP_MAX_TOKENS=12000 python3 scripts/live-paired/drive.py data/apps/apps300.jsonl apps800.out
+FP_BASE=http://127.0.0.1:8080 FP_CAP_USD=120 FP_MAX_TOKENS=12000 python3 scripts/live-paired/drive.py data/apps/apps300.jsonl apps800.out   # resumes: drive.py skips task ids already in apps800.out
 
 # 5. read the decision
-firstpass experiment
+FIRSTPASS_CONFIG=./firstpass.toml firstpass experiment   # needs the config, or it prints 'no route configured'
 ```
 
-Needs `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` in the proxy environment, Docker for the gate, and the human's spend approval for the $120 ceiling before step 3. The smoke pairs count toward the 800 (same seeded order); they are not a separate sample.
+Needs `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` in the proxy environment, Docker for the gate, and the human's spend approval for the $120 ceiling before step 3. The smoke pairs count toward the 800: both steps write `apps800.out` and use the same proxy and experiment, so step 4 resumes at task 21 instead of re-sending the first 20 (a repeat would add duplicate pairs to the e-process and break independence). `drive.py` reads spend from the proxy, so smoke spend counts toward the $120. Run the whole procedure against one proxy process; if it is restarted, state is rebuilt from receipts.
 
 ## Known limits (before the data)
 
