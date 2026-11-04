@@ -159,7 +159,7 @@ FIRSTPASS_MODE=enforce FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy</code><
 
 <h2 id="cursor">7. Cursor<a class="anchor" href="#cursor" aria-label="Link to this section">#</a></h2>
 <p><b>cursor-agent (CLI)</b> has no base-URL override and is bound to Cursor's cloud login, so it cannot be pointed at Firstpass. <b>Cursor IDE</b> has one supported path: <i>Settings &rarr; Models &rarr; OpenAI API Key</i> plus <i>Override OpenAI Base URL</i>. Cursor does not call that URL from your machine. Your prompt goes to Cursor's servers (<code>api2.cursor.sh</code>), and they call the URL, so <code>127.0.0.1</code> and LAN addresses never see a request. The proxy must be reachable from the public internet (sources: <a href="https://ngrok.com/docs/gateway/examples/cursor-local-llm">ngrok</a>, <a href="https://dev.to/orchidfiles/why-localhost-doesnt-work-as-openai-base-url-in-cursor-and-how-to-fix-it-589e">community write-up</a>; third-party, not Cursor-documented).</p>
-<div class="note warn"><span class="nt">A public proxy spends your provider keys</span> An enforce rung with <code>api_key_env</code> uses the <b>server's</b> key for every request it accepts. A tunnel to a proxy without inbound auth lets anyone who finds the URL spend that key. Do not tunnel until <code>FIRSTPASS_REQUIRE_AUTH=true</code> is on. That auth is marked <b>experimental / pre-external-review</b> (ADR 0004 &sect;D7): use a dedicated, spend-capped provider key and a <code>[budget]</code>. <code>/healthz</code>, <code>/metrics</code> and <code>/panel</code> stay unauthenticated; do not route them through the tunnel (for example, restrict the tunnel to <code>/v1/*</code>).</div>
+<div class="note warn"><span class="nt">A public proxy spends your provider keys</span> An enforce rung with <code>api_key_env</code> uses the <b>server's</b> key for every request it accepts. A tunnel to a proxy without inbound auth lets anyone who finds the URL spend that key. Do not tunnel until <code>FIRSTPASS_REQUIRE_AUTH=true</code> is on. That auth is marked <b>experimental / pre-external-review</b> (ADR 0004 &sect;D7): use a dedicated, spend-capped provider key and a <code>[budget]</code>. <code>/healthz</code>, <code>/metrics</code> and <code>/panel</code> stay unauthenticated; do not route them through the tunnel: use a path-filtered ingress like the one below, not a bare quick tunnel.</div>
 <p><b>1. Make a tenant key.</b> A key is <code>&lt;tenant&gt;.&lt;secret&gt;</code>; the proxy stores only an Argon2id hash of the secret. Any Argon2id PHC hash works (the tenant id must not contain <code>.</code>):</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span></div><pre><code>SECRET=$(openssl rand -hex 24)
 HASH=$(uvx --from argon2-cffi python -c &quot;import sys;from argon2 import PasswordHasher as P;print(P().hash(sys.argv[1]))&quot; &quot;$SECRET&quot;)
@@ -168,7 +168,18 @@ echo &quot;Cursor API key: cursor.$SECRET&quot;</code></pre></div>
 <p><b>2. Run the proxy with auth and an enforce route</b> whose rungs carry their own server-side keys. Cursor's key field holds the tenant key, and the proxy strips it before going upstream, so with no <code>api_key_env</code> the upstream gets no credential.</p>
 <div class="codeblock"><div class="cb-head"><span>bash</span></div><pre><code>FIRSTPASS_REQUIRE_AUTH=true FIRSTPASS_TENANT_KEYS=./tenant-keys.json \
 FIRSTPASS_CONFIG=./firstpass.toml firstpass-proxy        # route mode = &quot;enforce&quot;, rungs with api_key_env
-cloudflared tunnel --url http://127.0.0.1:8080           # or ngrok / tailscale funnel</code></pre></div>
+# cloudflared ingress: forward /v1/* only, 404 everything else
+# (a bare `cloudflared tunnel --url` quick tunnel forwards every path, /metrics and /panel included)
+cat &gt; cloudflared.yml &lt;&lt;'EOF'
+tunnel: &lt;tunnel-id&gt;
+credentials-file: &lt;path-to-tunnel-credentials.json&gt;
+ingress:
+  - hostname: &lt;tunnel-host&gt;
+    path: ^/v1/
+    service: http://127.0.0.1:8080
+  - service: http_status:404
+EOF
+cloudflared tunnel --config cloudflared.yml run</code></pre></div>
 <p><b>3. In Cursor:</b> set <i>OpenAI API Key</i> to <code>cursor.&lt;secret&gt;</code>, <i>Override OpenAI Base URL</i> to <code>https://&lt;tunnel-host&gt;/v1</code>, add a custom model name your route matches, and pick it in chat. Check that a request appears in <code>GET /v1/receipts</code>. Cursor has been reported to switch the override off after some hours; if receipts stop, re-check the toggle.</p>
 <p><b>Limits.</b> Only chat requests carry the override (Cursor: custom keys &ldquo;only work with chat models&rdquo;; reasoning models are unsupported). <b>Tab completion</b> and Cursor's own hosted models never touch the base URL, and whether Agent mode uses the override is not documented by Cursor. Cursor's servers see the prompt before Firstpass does. Plain <code>http://127.0.0.1</code> and tunnels you cannot authenticate are not options. This path has <b>not been run</b> against a real Cursor install by us.</p>
 
