@@ -254,6 +254,34 @@ mod tests {
         bad(&format!("<<'EOT'\n{body}\nEOT"));
     }
 
+    /// Pins Codex's behaviour on points a reviewer may read the Lark grammar as saying otherwise
+    /// (`streaming_parser.rs` is the executable truth; its tests assert the same outcomes).
+    #[test]
+    fn mirrors_codex_where_the_lark_text_differs() {
+        let wrap = |b: &str| format!("*** Begin Patch\n{b}\n*** End Patch");
+        // Empty filenames (`filename: /(.+)/`): the header is matched on the trimmed line, so
+        // "*** X File: " never carries the prefix and falls through as an invalid header/line.
+        for h in [
+            "Add File: ",
+            "Delete File: ",
+            "Update File: ",
+            "Add File:   ",
+        ] {
+            bad(&wrap(&format!("*** {h}\n+x")));
+        }
+        bad(&wrap("*** Update File: a.rs\n*** Move to: \n@@\n+x"));
+        bad(&wrap("*** Update File: a.rs\n*** Move to:\n@@\n+x"));
+        ok(&wrap("*** Update File: a.rs\n*** Move to: b.rs\n@@\n+x"));
+        // `add_line+` is not enforced by Codex: an empty Add File parses (creates an empty file).
+        ok(&wrap("*** Add File: a.txt"));
+        // Rename-only is rejected by Codex ("Update file hunk ... is empty").
+        bad(&wrap("*** Update File: old.txt\n*** Move to: new.txt"));
+        // Heredoc delimiters are matched exactly, as in Codex lenient mode.
+        let body = "*** Begin Patch\n*** Delete File: a\n*** End Patch";
+        bad(&format!("<<EOF \n{body}\nEOF"));
+        bad(&format!("<<EOF\n{body}\n\nEOF"));
+    }
+
     #[test]
     fn structurally_broken_patches_fail() {
         let wrap = |b: &str| format!("*** Begin Patch\n{b}\n*** End Patch");
