@@ -141,10 +141,20 @@ fn schema_violation(
     // lookaround, say) is skipped like any unknown keyword rather than failing every call.
     // ponytail: recompiled per call; cache by pattern string if it ever shows in a profile.
     if let (Some(Value::String(pat)), Value::String(text)) = (schema.get("pattern"), value)
+        && pat != crate::responses::PATCH_ENVELOPE_PATTERN
         && let Ok(re) = regex_lite::Regex::new(pat)
         && !re.is_match(text)
     {
         return Some(format!("{path}: does not match pattern {pat}"));
+    }
+    // The translator's patch-envelope pattern doubles as the marker for Codex's `apply_patch`
+    // (no extra schema key to strip before upstream). It is checked by the full Codex grammar
+    // instead of the regex above, which would reject Codex's lenient heredoc-wrapped form.
+    if let (Some(Value::String(pat)), Value::String(text)) = (schema.get("pattern"), value)
+        && pat == crate::responses::PATCH_ENVELOPE_PATTERN
+        && let Err(why) = crate::patch_grammar::validate(text)
+    {
+        return Some(format!("{path}: invalid apply_patch grammar: {why}"));
     }
     if let Some(Value::Array(variants)) = schema.get("enum")
         && !variants.contains(value)
@@ -1607,6 +1617,18 @@ mod tests {
             !ok("*** Begin Patch\n*** Update File: a.rs\n+y\n"),
             "no end marker"
         );
+        // Full Codex grammar behind the envelope: a hunk line with no prefix fails; Codex's
+        // lenient heredoc-wrapped form passes.
+        assert!(
+            !ok("*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\nbare\n*** End Patch"),
+            "unprefixed hunk line inside a valid envelope"
+        );
+        assert!(!ok(
+            "*** Begin Patch\n*** Add File: b.txt\nno plus\n*** End Patch"
+        ));
+        assert!(ok(
+            "<<'EOF'\n*** Begin Patch\n*** Add File: b.txt\n+hi\n*** End Patch\nEOF\n"
+        ));
         // An uncompilable pattern is skipped, not a universal failure.
         let bad = serde_json::json!({ "type": "string", "pattern": "(?<=x)y" });
         assert!(schema_violation(&serde_json::json!("y"), &bad, "input").is_none());
