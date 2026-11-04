@@ -16,6 +16,14 @@ pub struct ModelPrice {
     pub input_per_mtok: f64,
     /// USD per 1M output (completion) tokens.
     pub output_per_mtok: f64,
+    /// Fraction of the input rate billed for prompt-cache reads. Provider-specific (Anthropic
+    /// 0.1, Gemini 2.5 0.25); defaults to [`CACHE_READ_MULTIPLIER`].
+    #[serde(default = "default_cache_read_multiplier")]
+    pub cache_read_multiplier: f64,
+}
+
+fn default_cache_read_multiplier() -> f64 {
+    CACHE_READ_MULTIPLIER
 }
 
 impl ModelPrice {
@@ -30,7 +38,7 @@ impl ModelPrice {
     /// Cached prompt tokens are **not** free and **not** priced like ordinary input:
     /// - writing to the cache costs a premium ([`CACHE_WRITE_MULTIPLIER`]), because the provider
     ///   stores the prefix;
-    /// - reading from it is heavily discounted ([`CACHE_READ_MULTIPLIER`]).
+    /// - reading from it is heavily discounted ([`ModelPrice::cache_read_multiplier`]).
     ///
     /// Ignoring both — which is what counting `input_tokens` alone does — understates a cached
     /// request by orders of magnitude. A 190k-token cached prefix reports an `input_tokens` of
@@ -46,7 +54,7 @@ impl ModelPrice {
     ) -> f64 {
         self.cost(input, output)
             + (cache_write as f64 / 1e6) * self.input_per_mtok * CACHE_WRITE_MULTIPLIER
-            + (cache_read as f64 / 1e6) * self.input_per_mtok * CACHE_READ_MULTIPLIER
+            + (cache_read as f64 / 1e6) * self.input_per_mtok * self.cache_read_multiplier
     }
 }
 
@@ -58,7 +66,8 @@ impl ModelPrice {
 /// one of them diverges.
 pub const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
 
-/// Discount on input rate for tokens served from the provider's prompt cache (Anthropic: 0.1×).
+/// Default discount on input rate for tokens served from the provider's prompt cache (Anthropic:
+/// 0.1×). Override per model via [`ModelPrice::cache_read_multiplier`].
 pub const CACHE_READ_MULTIPLIER: f64 = 0.1;
 
 /// A lookup from `provider/model` to [`ModelPrice`].
@@ -89,6 +98,7 @@ impl PriceTable {
                 ModelPrice {
                     input_per_mtok: i,
                     output_per_mtok: o,
+                    cache_read_multiplier: CACHE_READ_MULTIPLIER,
                 },
             );
         };
@@ -108,6 +118,11 @@ impl PriceTable {
         put("google/gemini-3.5-flash-lite", 0.3, 2.5);
         put("google/gemini-3.6-flash", 1.5, 7.5);
         put("google/gemini-2.5-pro", 1.25, 10.0);
+        // Gemini 2.5 family bills cached input at 25% of input (not Anthropic's 10%).
+        // UNVERIFIED against Google's live pricing page.
+        if let Some(p) = prices.get_mut("google/gemini-2.5-pro") {
+            p.cache_read_multiplier = 0.25;
+        }
         Self { prices }
     }
 
@@ -116,6 +131,29 @@ impl PriceTable {
     pub fn with_override(mut self, model: impl Into<String>, price: ModelPrice) -> Self {
         self.prices.insert(model.into(), price);
         self
+    }
+
+    /// Override a model's rates; `cache_read_multiplier: None` keeps the existing entry's
+    /// multiplier (so re-pricing `google/gemini-2.5-pro` stays 0.25x), else the default.
+    #[must_use]
+    pub fn with_rates(
+        self,
+        model: &str,
+        input_per_mtok: f64,
+        output_per_mtok: f64,
+        cache_read_multiplier: Option<f64>,
+    ) -> Self {
+        let cache_read_multiplier = cache_read_multiplier
+            .or_else(|| self.get(model).map(|p| p.cache_read_multiplier))
+            .unwrap_or(CACHE_READ_MULTIPLIER);
+        self.with_override(
+            model,
+            ModelPrice {
+                input_per_mtok,
+                output_per_mtok,
+                cache_read_multiplier,
+            },
+        )
     }
 
     /// Look up a model's price by its `provider/model` key.
@@ -184,6 +222,7 @@ mod tests {
         let p = super::ModelPrice {
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
+            cache_read_multiplier: 0.1,
         };
 
         // What a real cached Claude Code turn looks like: tiny uncached remainder, huge cache write.
@@ -203,6 +242,7 @@ mod tests {
         let p = super::ModelPrice {
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
+            cache_read_multiplier: 0.1,
         };
         // 190k read from cache at 0.1x = $0.057, versus $0.57 had it been uncached input.
         let read = p.cost_with_cache(0, 0, 190_000, 0);
@@ -218,6 +258,7 @@ mod tests {
         let p = super::ModelPrice {
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
+            cache_read_multiplier: 0.1,
         };
         assert!((p.cost_with_cache(1000, 0, 0, 500) - p.cost(1000, 500)).abs() < f64::EPSILON);
     }
@@ -229,6 +270,7 @@ mod tests {
         let p = ModelPrice {
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
+            cache_read_multiplier: 0.1,
         };
         // 1000 in * $3/M + 500 out * $15/M = 0.003 + 0.0075 = 0.0105
         assert!((p.cost(1000, 500) - 0.0105).abs() < 1e-12);
@@ -263,8 +305,41 @@ mod tests {
             ModelPrice {
                 input_per_mtok: 2.0,
                 output_per_mtok: 2.0,
+                cache_read_multiplier: 0.1,
             },
         );
         assert_eq!(t.cost_usd("x/y", 1_000_000, 0).unwrap(), 2.0);
+    }
+
+    #[test]
+    fn cache_read_multiplier_is_per_model() {
+        let t = super::PriceTable::defaults();
+        // 1M cached tokens: Gemini 2.5 Pro at 0.25 x $1.25, Sonnet at 0.1 x $3.
+        let g = t.cost_usd_with_cache("google/gemini-2.5-pro", 0, 0, 1_000_000, 0);
+        assert!((g.unwrap() - 0.3125).abs() < 1e-9);
+        let a = t.cost_usd_with_cache("anthropic/claude-sonnet-5", 0, 0, 1_000_000, 0);
+        assert!((a.unwrap() - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn with_rates_keeps_or_overrides_multiplier() {
+        let t = super::PriceTable::defaults();
+        // Re-pricing without the field keeps the built-in 0.25; unknown model gets 0.1.
+        let kept = t
+            .clone()
+            .with_rates("google/gemini-2.5-pro", 2.0, 10.0, None);
+        assert!(
+            (kept
+                .get("google/gemini-2.5-pro")
+                .unwrap()
+                .cache_read_multiplier
+                - 0.25)
+                .abs()
+                < 1e-12
+        );
+        let new = t.clone().with_rates("x/y", 1.0, 1.0, None);
+        assert!((new.get("x/y").unwrap().cache_read_multiplier - 0.1).abs() < 1e-12);
+        let set = t.with_rates("x/y", 1.0, 1.0, Some(0.5));
+        assert!((set.get("x/y").unwrap().cache_read_multiplier - 0.5).abs() < 1e-12);
     }
 }

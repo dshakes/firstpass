@@ -268,12 +268,11 @@ impl ProxyConfig {
                 let mut prices = PriceTable::defaults();
                 if let Some(cfg) = routing.as_ref() {
                     for p in &cfg.price_defs {
-                        prices = prices.with_override(
-                            p.model.clone(),
-                            firstpass_core::ModelPrice {
-                                input_per_mtok: p.input_per_mtok,
-                                output_per_mtok: p.output_per_mtok,
-                            },
+                        prices = prices.with_rates(
+                            &p.model,
+                            p.input_per_mtok,
+                            p.output_per_mtok,
+                            p.cache_read_multiplier,
                         );
                     }
                 }

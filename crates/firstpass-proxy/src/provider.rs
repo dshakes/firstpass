@@ -821,6 +821,32 @@ fn read_effort(body: &serde_json::Map<String, Value>) -> Option<Effort> {
     None
 }
 
+/// Map a Gemini `generationConfig.thinkingConfig` to Chat's `reasoning_effort` word.
+///
+/// - `thinkingLevel` (Gemini 3, case-insensitive): `minimal`/`low` -> `low`, `medium` -> `medium`,
+///   `high` -> `high`; anything else is ignored.
+/// - `thinkingBudget` (Gemini 2.5): `0` (thinking off) and `-1` (dynamic) carry no explicit
+///   intent, so map to `None`; a positive budget uses the same thresholds as [`Effort::from_budget`]
+///   (< 2048 low, < 8192 medium, else high).
+///
+/// The level wins when both are present, as Google rejects sending both anyway.
+#[must_use]
+pub fn gemini_thinking_effort(cfg: &Value) -> Option<&'static str> {
+    let cfg = cfg.as_object()?;
+    if let Some(l) = cfg.get("thinkingLevel").and_then(Value::as_str) {
+        return match l.to_ascii_lowercase().as_str() {
+            "minimal" | "low" => Some(Effort::Low.as_str()),
+            "medium" => Some(Effort::Medium.as_str()),
+            "high" => Some(Effort::High.as_str()),
+            _ => None,
+        };
+    }
+    match cfg.get("thinkingBudget").and_then(Value::as_u64) {
+        Some(b) if b > 0 => Some(Effort::from_budget(b).as_str()),
+        _ => None,
+    }
+}
+
 /// Which wire dialect a body is being prepared for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wire {
@@ -3604,5 +3630,63 @@ mod tests {
             beta.contains(", "),
             "values must be comma-separated: {beta}"
         );
+    }
+
+    /// Translated (Responses/Gemini) requests go through `parse_openai_request`; the caller's effort
+    /// must survive to the rung in that rung's own dialect.
+    fn rung_bodies(chat: &Value) -> (Value, Value) {
+        let req = crate::proxy::parse_openai_request(chat.to_string().as_bytes(), true)
+            .expect("translated body parses");
+        (anthropic_wire_body(&req), openai_wire_body(&req))
+    }
+
+    #[test]
+    fn responses_effort_reaches_anthropic_and_openai_rungs() {
+        let chat = crate::responses::request_to_chat(&serde_json::json!({
+            "model": "gpt-5.5",
+            "input": "hi",
+            "max_output_tokens": 32000,
+            "reasoning": { "effort": "high" }
+        }));
+        let (anthropic, openai) = rung_bodies(&chat);
+        assert_eq!(anthropic["thinking"]["budget_tokens"], 16384, "{anthropic}");
+        assert!(anthropic.get("reasoning_effort").is_none(), "{anthropic}");
+        assert_eq!(openai["reasoning_effort"], "high", "{openai}");
+    }
+
+    #[test]
+    fn gemini_thinking_config_maps_to_effort_and_reaches_rungs() {
+        let cases = [
+            (serde_json::json!({ "thinkingLevel": "HIGH" }), Some("high")),
+            (
+                serde_json::json!({ "thinkingLevel": "minimal" }),
+                Some("low"),
+            ),
+            (serde_json::json!({ "thinkingBudget": 1024 }), Some("low")),
+            (
+                serde_json::json!({ "thinkingBudget": 4096 }),
+                Some("medium"),
+            ),
+            (serde_json::json!({ "thinkingBudget": 24576 }), Some("high")),
+            (serde_json::json!({ "thinkingBudget": 0 }), None),
+            (serde_json::json!({ "thinkingBudget": -1 }), None),
+            (serde_json::json!({ "thinkingLevel": "bogus" }), None),
+        ];
+        for (cfg, want) in cases {
+            let chat = crate::gemini::request_to_chat(
+                &serde_json::json!({
+                    "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+                    "generationConfig": { "maxOutputTokens": 32000, "thinkingConfig": cfg }
+                }),
+                "gemini-2.5-pro",
+            );
+            let (anthropic, openai) = rung_bodies(&chat);
+            assert_eq!(
+                openai.get("reasoning_effort").and_then(Value::as_str),
+                want,
+                "{cfg}"
+            );
+            assert_eq!(anthropic.get("thinking").is_some(), want.is_some(), "{cfg}");
+        }
     }
 }

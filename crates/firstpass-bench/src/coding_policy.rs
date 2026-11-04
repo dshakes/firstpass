@@ -1116,6 +1116,7 @@ mod tests {
                 firstpass_core::cost::ModelPrice {
                     input_per_mtok: 1.0,
                     output_per_mtok: 0.0,
+                    cache_read_multiplier: 0.1,
                 },
             )
             .with_override(
@@ -1123,6 +1124,7 @@ mod tests {
                 firstpass_core::cost::ModelPrice {
                     input_per_mtok: 10.0,
                     output_per_mtok: 0.0,
+                    cache_read_multiplier: 0.1,
                 },
             );
         let solver = FixedSolver;
@@ -1209,6 +1211,7 @@ mod tests {
             firstpass_core::cost::ModelPrice {
                 input_per_mtok: 1.0,
                 output_per_mtok: 0.0,
+                cache_read_multiplier: 0.1,
             },
         );
         let solver = DollarSolver(std::cell::Cell::new(0));
@@ -1302,6 +1305,7 @@ mod tests {
             firstpass_core::cost::ModelPrice {
                 input_per_mtok: 1.0,
                 output_per_mtok: 0.0,
+                cache_read_multiplier: 0.1,
             },
         );
         let solver = S;

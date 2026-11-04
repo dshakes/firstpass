@@ -24,6 +24,8 @@
 //! | `contents[].parts[].functionResponse` | `{role:"tool", tool_call_id, content}` |
 //! | `tools[].functionDeclarations[]` (`parameters` or `parametersJsonSchema`) | `tools[{type:"function", function:{...}}]` |
 //! | `generationConfig.maxOutputTokens` | `max_tokens` |
+//! | `generationConfig.thinkingConfig.thinkingLevel` | `reasoning_effort` (`minimal`/`low` -> low, `medium`, `high`) |
+//! | `generationConfig.thinkingConfig.thinkingBudget` | `reasoning_effort` (`<2048` low, `<8192` medium, else high; `0`/`-1` -> none) |
 //! | `usageMetadata.promptTokenCount` | `usage.prompt_tokens` |
 //! | `usageMetadata.candidatesTokenCount` | `usage.completion_tokens` |
 //! | `finishReason: "STOP"/"MAX_TOKENS"` | `finish_reason: "stop"/"length"` |
@@ -88,6 +90,13 @@ pub fn request_to_chat(body: &Value, model: &str) -> Value {
         }
         if let Some(v) = gen_cfg.get("topP") {
             out.insert("top_p".to_owned(), v.clone());
+        }
+        // Carry reasoning effort in Chat's spelling so `normalize_reasoning` re-spells it per rung.
+        if let Some(e) = gen_cfg
+            .get("thinkingConfig")
+            .and_then(crate::provider::gemini_thinking_effort)
+        {
+            out.insert("reasoning_effort".to_owned(), Value::String(e.to_owned()));
         }
     }
 
