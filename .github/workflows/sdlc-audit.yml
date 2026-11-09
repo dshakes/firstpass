@@ -1,29 +1,36 @@
-# Auditor (Codex) — independent cross-audit. Runs automatically when a PR opens (an
+# Auditor (Codex) — independent cross-audit. Runs when a PR is marked ready for review (an
 # independent second opinion to the Claude reviewer) and on demand via the `agent:audit`
 # label. Read-only; posts Codex's verdict as a PR comment. Needs secret OPENAI_API_KEY.
-# Not on `synchronize`, so the fix loop's pushes don't re-spend Codex credits each round.
+# COST: no `opened`/`synchronize` triggers — pushes after ready-for-review are NOT
+# re-audited; re-apply the `agent:audit` label before merge for a fresh pass.
 name: "sdlc · audit (Codex)"
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, reopened, ready_for_review, labeled]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'site/**'
+      - '**/*.svg'
+      - '**/*.lock'
 
 permissions:
   contents: read
   pull-requests: write
 
-# Bounded cost: a burst of pushes cancels its own intermediate runs, so only the final
-# commit is audited. Without this, adding `synchronize` above would start one AI audit per
-# push.
+# Bounded cost: a burst of ready/label events cancels its own intermediate runs, so only
+# the latest is audited.
 concurrency:
   group: sdlc-audit-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   audit:
-    # Auto on open/reopen, or on the agent:audit label. (label.name is null on open events.)
+    # Auto on ready-for-review, or on the agent:audit label. (label.name is null on ready_for_review events.)
+    # Drafts never audit — the `labeled` event can fire on a draft.
     # dependabot-actor runs get Dependabot's (empty) secret store — agent can't auth, so skip
-    if: github.actor != 'dependabot[bot]' && (github.event.action != 'labeled' || github.event.label.name == 'agent:audit')
+    if: github.actor != 'dependabot[bot]' && !github.event.pull_request.draft && (github.event.action != 'labeled' || github.event.label.name == 'agent:audit')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
