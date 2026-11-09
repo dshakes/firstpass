@@ -8,7 +8,7 @@ name: "sdlc · audit (Gemini)"
 
 on:
   pull_request:
-    types: [ready_for_review, labeled]
+    types: [opened, reopened, ready_for_review, labeled]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
