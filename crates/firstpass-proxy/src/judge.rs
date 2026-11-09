@@ -143,6 +143,7 @@ pub fn build_judge_request(judge_model: &str, rubric: &str, candidate: &str) -> 
         // A judge prompt is synthesized here, not routed from a caller; caching it is a separate
         // decision from the operator's `[escalation] prompt_cache` for their own traffic.
         cache_prefix: false,
+        reasoning_effort: None,
     }
 }
 
@@ -339,6 +340,7 @@ mod tests {
             ModelPrice {
                 input_per_mtok: 1.0,
                 output_per_mtok: 5.0,
+                cache_read_multiplier: 0.1,
             },
         );
         let g = JudgeGate::new(

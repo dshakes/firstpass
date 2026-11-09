@@ -927,6 +927,7 @@ mod tests {
             tools: Value::Null,
             raw: Value::Null,
             cache_prefix: false,
+            reasoning_effort: None,
         }
     }
 

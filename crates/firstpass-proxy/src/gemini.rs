@@ -24,6 +24,8 @@
 //! | `contents[].parts[].functionResponse` | `{role:"tool", tool_call_id, content}` |
 //! | `tools[].functionDeclarations[]` (`parameters` or `parametersJsonSchema`) | `tools[{type:"function", function:{...}}]` |
 //! | `generationConfig.maxOutputTokens` | `max_tokens` |
+//! | `generationConfig.thinkingConfig.thinkingLevel` | `reasoning_effort` (`minimal`/`low` -> low, `medium`, `high`) |
+//! | `generationConfig.thinkingConfig.thinkingBudget` | `reasoning_effort` (`<2048` low, `<8192` medium, else high; `0`/`-1` -> none) |
 //! | `usageMetadata.promptTokenCount` | `usage.prompt_tokens` |
 //! | `usageMetadata.candidatesTokenCount` | `usage.completion_tokens` |
 //! | `finishReason: "STOP"/"MAX_TOKENS"` | `finish_reason: "stop"/"length"` |
@@ -88,6 +90,13 @@ pub fn request_to_chat(body: &Value, model: &str) -> Value {
         }
         if let Some(v) = gen_cfg.get("topP") {
             out.insert("top_p".to_owned(), v.clone());
+        }
+        // Carry reasoning effort in Chat's spelling so `normalize_reasoning` re-spells it per rung.
+        if let Some(e) = gen_cfg
+            .get("thinkingConfig")
+            .and_then(crate::provider::gemini_thinking_effort)
+        {
+            out.insert("reasoning_effort".to_owned(), Value::String(e.to_owned()));
         }
     }
 
@@ -363,10 +372,20 @@ pub fn has_untranslatable_content(body: &Value) -> bool {
         }
     }
 
-    // generationConfig: only the mapped subset (maxOutputTokens, temperature, topP).
+    // generationConfig: only the mapped subset (maxOutputTokens, temperature, topP, thinkingConfig{thinkingBudget,thinkingLevel}).
     if let Some(Value::Object(gen_cfg)) = obj.get("generationConfig") {
         for k in gen_cfg.keys() {
-            if !matches!(k.as_str(), "maxOutputTokens" | "temperature" | "topP") {
+            let ok = match k.as_str() {
+                "maxOutputTokens" | "temperature" | "topP" => true,
+                // Mapped to `reasoning_effort`. Any other thinkingConfig key (e.g.
+                // `includeThoughts`) has no Chat equivalent and would be dropped silently.
+                "thinkingConfig" => gen_cfg[k].as_object().is_some_and(|c| {
+                    c.keys()
+                        .all(|k| matches!(k.as_str(), "thinkingBudget" | "thinkingLevel"))
+                }),
+                _ => false,
+            };
+            if !ok {
                 return true;
             }
         }
@@ -1184,5 +1203,25 @@ mod tests {
             "Gemini key must not be set on OpenAI path"
         );
         // mutant: if from_headers sets gemini_key on Anthropic/OpenAI, assertion fails
+    }
+
+    #[test]
+    fn thinking_config_is_translatable_only_with_mapped_keys() {
+        let body = |tc: Value| {
+            serde_json::json!({
+                "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+                "generationConfig": { "thinkingConfig": tc }
+            })
+        };
+        assert!(!has_untranslatable_content(&body(
+            serde_json::json!({ "thinkingBudget": 1024 })
+        )));
+        assert!(!has_untranslatable_content(&body(
+            serde_json::json!({ "thinkingLevel": "HIGH" })
+        )));
+        assert!(has_untranslatable_content(&body(
+            serde_json::json!({ "includeThoughts": true })
+        )));
+        assert!(has_untranslatable_content(&body(serde_json::json!("high"))));
     }
 }

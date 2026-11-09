@@ -306,6 +306,10 @@ pub struct PriceDef {
     pub input_per_mtok: f64,
     /// USD per 1M output (completion) tokens.
     pub output_per_mtok: f64,
+    /// Fraction of the input rate billed for prompt-cache reads. Omit to keep the model's
+    /// built-in value (0.1, or 0.25 for Gemini 2.5).
+    #[serde(default)]
+    pub cache_read_multiplier: Option<f64>,
 }
 /// Gate ids the proxy provides without a `[[gate]]` block. Any other id in a route's `gates` or in
 /// `escalation.elastic.expensive_gates` must be defined by a `[[gate]]` block, or
@@ -1362,7 +1366,10 @@ impl Config {
                 ));
             }
             let ok = |v: f64| v.is_finite() && v >= 0.0;
-            if !ok(price.input_per_mtok) || !ok(price.output_per_mtok) {
+            if !ok(price.input_per_mtok)
+                || !ok(price.output_per_mtok)
+                || !price.cache_read_multiplier.is_none_or(ok)
+            {
                 return Err(Error::InvalidConfig(format!(
                     "price for {:?} must be finite and >= 0",
                     price.model
@@ -1553,12 +1560,11 @@ impl Config {
         self.price_defs
             .iter()
             .fold(crate::cost::PriceTable::defaults(), |table, p| {
-                table.with_override(
-                    p.model.clone(),
-                    crate::cost::ModelPrice {
-                        input_per_mtok: p.input_per_mtok,
-                        output_per_mtok: p.output_per_mtok,
-                    },
+                table.with_rates(
+                    &p.model,
+                    p.input_per_mtok,
+                    p.output_per_mtok,
+                    p.cache_read_multiplier,
                 )
             })
     }
@@ -2313,6 +2319,27 @@ id = "verify"
 decision = { provider = "typesafe", timeout_ms = 0 }
 "#;
         assert!(matches!(Config::parse(toml), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn price_cache_read_multiplier_is_optional_and_validated() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "observe"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[[price]]
+model = "anthropic/claude-haiku-4-5"
+input_per_mtok = 1.0
+output_per_mtok = 5.0
+"#;
+        let c = Config::parse(toml).expect("omitted field parses");
+        let m = |c: &Config| c.price_table().get("anthropic/claude-haiku-4-5").unwrap();
+        assert!((m(&c).cache_read_multiplier - 0.1).abs() < 1e-12);
+        let c = Config::parse(&format!("{toml}cache_read_multiplier = 0.25\n")).expect("set");
+        assert!((m(&c).cache_read_multiplier - 0.25).abs() < 1e-12);
+        assert!(Config::parse(&format!("{toml}cache_read_multiplier = -0.1\n")).is_err());
     }
 
     #[test]
