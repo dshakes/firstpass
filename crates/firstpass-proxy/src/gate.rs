@@ -281,6 +281,10 @@ impl Gate for SchemaGate {
 /// with an empty name so `ToolArgsValidGate` fails the hallucinated-tool check rather than
 /// silently skipping the entry and treating the call list as empty.
 fn extract_response_tool_calls(raw: &serde_json::Value) -> Vec<(String, String)> {
+    // OpenAI Responses (native path): `function_call` / `custom_tool_call` output items.
+    if let Some(calls) = crate::responses::output_tool_calls(raw) {
+        return calls;
+    }
     let mut out = Vec::new();
     // Anthropic format
     if let Some(blocks) = raw.get("content").and_then(serde_json::Value::as_array) {
@@ -1585,6 +1589,52 @@ mod tests {
             )
             .await;
         assert_eq!(good.verdict, Verdict::Pass, "{:?}", good.reason);
+    }
+
+    /// Native Responses path: the gate reads the rung's `output[]` directly. A `custom_tool_call`
+    /// patch is checked against the envelope pattern (malformed Fails, well-formed Passes), and a
+    /// hosted `web_search_call` is provider-side — not a call, so nothing to validate.
+    #[tokio::test]
+    async fn tool_args_valid_reads_native_responses_output() {
+        let body = serde_json::json!({
+            "model": "gpt-5.5", "input": "fix it",
+            "tools": [{ "type": "web_search" },
+                { "type": "custom", "name": "apply_patch", "description": "edit files",
+                "format": { "type": "grammar", "syntax": "lark", "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?" } }],
+        });
+        let req = ModelRequest {
+            tools: crate::responses::native_gate_tools(&body),
+            raw: body,
+            ..tool_req_with_schema()
+        };
+        let resp = |item: serde_json::Value| {
+            crate::responses::model_response(
+                "openai/x",
+                serde_json::json!({ "object": "response", "output": [item] }),
+            )
+        };
+        let patch = |input: &str| {
+            resp(
+                serde_json::json!({ "type": "custom_tool_call", "call_id": "c",
+                "name": "apply_patch", "input": input }),
+            )
+        };
+        let bad = ToolArgsValidGate
+            .evaluate(&req, &patch("just edit a.rs"))
+            .await;
+        assert_eq!(bad.verdict, Verdict::Fail, "{:?}", bad.reason);
+        let good = ToolArgsValidGate
+            .evaluate(
+                &req,
+                &patch("*** Begin Patch\n*** Delete File: a.rs\n*** End Patch"),
+            )
+            .await;
+        assert_eq!(good.verdict, Verdict::Pass, "{:?}", good.reason);
+        let hosted = resp(serde_json::json!({ "type": "web_search_call", "id": "ws",
+            "status": "completed" }));
+        assert!(!hosted.has_tool_calls());
+        let r = ToolArgsValidGate.evaluate(&req, &hosted).await;
+        assert_eq!(r.verdict, Verdict::Pass, "{:?}", r.reason);
     }
 
     #[test]

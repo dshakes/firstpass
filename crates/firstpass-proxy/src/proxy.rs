@@ -5799,8 +5799,12 @@ async fn chat_completions(
 /// a Responses event stream ([`crate::responses::sse_from_response`]). Not token-by-token — the
 /// gate has to see the whole candidate before anything reaches the client.
 ///
+/// On a route whose every rung serves `/v1/responses` ([`route_serves_responses`]) the request is
+/// not translated at all: the native path ([`enforce_pipeline_responses_native`]) forwards the
+/// client's body with only `model` swapped, so hosted tools and reasoning items are gated too.
+///
 /// Falls back to the OpenAI observe passthrough for anything it cannot gate faithfully — content
-/// the translation cannot represent, or no matching enforce route. Passthrough relays the ORIGINAL
+/// neither path can carry, or no matching enforce route. Passthrough relays the ORIGINAL
 /// body to the upstream's Responses path, so a streaming client still gets Responses events.
 async fn responses(
     State(state): State<AppState>,
@@ -5823,8 +5827,11 @@ async fn responses(
     };
     // Content this translation cannot represent (files, audio, a part type newer than this code)
     // must not be silently reduced to a smaller request. Being un-gated is a limitation; being
-    // answered about content that was thrown away is a wrong answer.
-    if crate::responses::has_untranslatable_content(&parsed) {
+    // answered about content that was thrown away is a wrong answer. A request the native path
+    // could carry untranslated waits for the route check below.
+    let untranslatable = crate::responses::has_untranslatable_content(&parsed);
+    let native_request = crate::responses::native_eligible(&parsed);
+    if untranslatable && !native_request {
         return observe_passthrough_openai_path(
             state,
             headers,
@@ -5866,6 +5873,59 @@ async fn responses(
             {
                 // A served call to a `custom` tool must go back as a `custom_tool_call`.
                 let custom_tools = crate::responses::custom_tool_names(&parsed);
+                // Native path: every rung serves `/v1/responses`, so the client's body goes out
+                // unchanged but for `model` (hosted tools and reasoning items intact) and the
+                // winning rung's Responses object comes back verbatim. A mixed ladder keeps the
+                // translation (or passthrough, for content it cannot translate).
+                if native_request && route_serves_responses(&route, &state.providers) {
+                    let stream = is_stream_request(&body);
+                    let run = async move {
+                        enforce_pipeline_responses_native(
+                            &state,
+                            &headers,
+                            &chat_body,
+                            &body,
+                            parsed,
+                            &custom_tools,
+                            features,
+                            &route,
+                            route_ix,
+                            session_header,
+                            tenant,
+                            routing_mode,
+                        )
+                        .await
+                    };
+                    if stream {
+                        let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
+                        tokio::spawn(async move {
+                            let _ = tx.send(run.await);
+                        });
+                        return sse_keepalive_response(
+                            rx,
+                            Box::new(crate::responses::sse_from_response),
+                            responses_sse_error,
+                        );
+                    }
+                    return match run.await {
+                        Ok(resp) => Json(resp).into_response(),
+                        Err(e) => e.into_response(),
+                    };
+                }
+                if untranslatable {
+                    tracing::info!(
+                        "enforce route matched but its ladder cannot serve the Responses request natively and it cannot be translated; serving via observe passthrough"
+                    );
+                    return observe_passthrough_openai_path(
+                        state,
+                        headers,
+                        body,
+                        session_header,
+                        tenant,
+                        crate::upstream::OPENAI_RESPONSES_PATH,
+                    )
+                    .await;
+                }
                 if is_stream_request(&body) {
                     let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, ProxyError>>();
                     tokio::spawn(async move {
@@ -5926,6 +5986,82 @@ async fn responses(
         crate::upstream::OPENAI_RESPONSES_PATH,
     )
     .await
+}
+
+/// Whether every rung of the route — and of its challenger, so the choice is arm-independent —
+/// is a provider that serves `/v1/responses` natively.
+fn route_serves_responses(route: &Route, providers: &crate::provider::ProviderRegistry) -> bool {
+    let all = |ladder: &[String]| {
+        !ladder.is_empty()
+            && ladder.iter().all(|rung| {
+                let pid = rung.split('/').next().unwrap_or_default();
+                providers.get(pid).is_some_and(|p| p.serves_responses())
+            })
+    };
+    all(&route.ladder) && route.challenger.as_ref().is_none_or(|c| all(&c.ladder))
+}
+
+/// Native Responses enforce: the same inner pipeline (gates, ladder, budget, receipt) as every
+/// other enforce path, over a [`ModelRequest`] whose `raw` is the client's Responses body — each
+/// rung forwards it with only `model` swapped ([`crate::responses::native_wire_body`]). Returns
+/// the winning rung's Responses object verbatim.
+///
+/// The normalized fields (`messages`, `system`) come from the Chat translation and exist only for
+/// what reads them (judge, prior, condense); they never reach a native rung. `tools` is what the
+/// gates validate calls against ([`crate::responses::native_gate_tools`]).
+#[allow(clippy::too_many_arguments)]
+async fn enforce_pipeline_responses_native(
+    state: &AppState,
+    headers: &HeaderMap,
+    chat_body: &Bytes,
+    body: &Bytes,
+    parsed: Value,
+    custom_tools: &[String],
+    features: Features,
+    route: &Route,
+    route_ix: usize,
+    session_header: Option<String>,
+    tenant: String,
+    routing_mode: RoutingMode,
+) -> Result<Value, ProxyError> {
+    // A history with nothing translatable (compaction items only, say) still runs natively; it
+    // just gives the judge/prior no text to read.
+    let mut base_request = parse_openai_request(chat_body, false).unwrap_or_else(|| ModelRequest {
+        model: String::new(),
+        system: None,
+        messages: Vec::new(),
+        max_tokens: 4096,
+        tools: Value::Null,
+        raw: Value::Null,
+        cache_prefix: false,
+    });
+    base_request.tools = crate::responses::native_gate_tools(&parsed);
+    base_request.raw = parsed;
+    let auth = Auth::from_headers(headers, Dialect::Openai);
+    let resp = enforce_pipeline_inner(
+        state,
+        body,
+        base_request,
+        auth,
+        features,
+        route,
+        session_header,
+        tenant,
+        "openai.responses",
+        routing_mode,
+        route_ix,
+        true,
+    )
+    .await?;
+    // Served from a native rung: its object, untouched. Anything else (a condensed retry rebuilt
+    // from the normalized fields goes out as Chat) is converted like the translated path's answer.
+    Ok(
+        if resp.raw.get("object").and_then(Value::as_str) == Some("response") {
+            resp.raw
+        } else {
+            crate::responses::response_from_chat(&openai_response_json(&resp), custom_tools)
+        },
+    )
 }
 
 /// A ladder failure on a streaming Responses request, as the `response.failed` event a Responses
@@ -13735,5 +13871,281 @@ mod tests {
             "Gemini response has no top-level model field"
         );
         // mutant: remove usageMetadata branch → in_tokens stays 0
+    }
+
+    // ── Native Responses enforce ───────────────────────────────────────────────
+
+    /// Recording stand-in for OpenAI `/v1/responses`. Keyed on the requested model:
+    /// - `cheap`  → a `function_call` to a tool the request never declared (fails `tool-args-valid`)
+    /// - `strong` → reasoning + hosted `web_search_call` + a text message (passes)
+    /// - anything else (the passthrough relay sends the client's own model) → a canned message
+    ///
+    /// Returns the base URL and every request body received, in order.
+    async fn spawn_recording_responses_upstream() -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let log: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let log_c = Arc::clone(&log);
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |body: Bytes| {
+                let log = Arc::clone(&log_c);
+                async move {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    let model = v["model"].as_str().unwrap_or_default().to_owned();
+                    log.lock().unwrap().push(v);
+                    Json(native_upstream_reply(&model))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    fn native_upstream_reply(model: &str) -> Value {
+        let output = match model {
+            "cheap" => serde_json::json!([{
+                "type": "function_call", "id": "fc_1", "status": "completed",
+                "call_id": "call_1", "name": "rm_rf", "arguments": "{}",
+            }]),
+            "strong" => serde_json::json!([
+                { "type": "reasoning", "id": "rs_1", "summary": [],
+                  "encrypted_content": "gAAAA-strong-reasoning" },
+                { "type": "web_search_call", "id": "ws_1", "status": "completed",
+                  "action": { "type": "search", "query": "rust 2024" } },
+                { "type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
+                  "content": [{ "type": "output_text", "text": "found it", "annotations": [] }] },
+            ]),
+            _ => serde_json::json!([{
+                "type": "message", "id": "msg_p", "status": "completed", "role": "assistant",
+                "content": [{ "type": "output_text", "text": "relayed", "annotations": [] }],
+            }]),
+        };
+        serde_json::json!({
+            "id": format!("resp_{model}"), "object": "response", "created_at": 1,
+            "status": "completed", "model": model, "output": output,
+            "usage": { "input_tokens": 100, "output_tokens": 10, "total_tokens": 110 },
+        })
+    }
+
+    /// A Codex-shaped turn: hosted `web_search` beside a function tool, an encrypted reasoning
+    /// item from the previous turn, `store: false`, and an `include` for encrypted reasoning.
+    fn codex_turn(stream: bool) -> Value {
+        let mut v = serde_json::json!({
+            "model": "gpt-5-codex",
+            "instructions": "You are Codex.",
+            "store": false,
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": { "effort": "medium", "summary": "auto" },
+            "parallel_tool_calls": false,
+            "tool_choice": "auto",
+            "tools": [
+                { "type": "function", "name": "shell", "description": "run",
+                  "parameters": { "type": "object",
+                                  "properties": { "command": { "type": "string" } },
+                                  "required": ["command"] } },
+                { "type": "web_search" },
+            ],
+            "input": [
+                { "type": "message", "role": "user",
+                  "content": [{ "type": "input_text", "text": "what's new in rust?" }] },
+                { "type": "reasoning", "id": "rs_prev",
+                  "summary": [{ "type": "summary_text", "text": "s" }],
+                  "encrypted_content": "gAAAA-opaque-prev-turn==" },
+                { "type": "function_call", "call_id": "c0", "name": "shell",
+                  "arguments": "{\"command\":\"ls\"}" },
+                { "type": "function_call_output", "call_id": "c0", "output": "Cargo.toml" },
+            ],
+        });
+        if stream {
+            v["stream"] = true.into();
+            v["stream_options"] = serde_json::json!({ "include_obfuscation": false });
+        }
+        v
+    }
+
+    fn native_state(ladder: &str, upstream: &str) -> (AppState, mpsc::Receiver<Trace>) {
+        let toml = format!(
+            "[[price]]\nmodel = \"openai/cheap\"\ninput_per_mtok = 0.1\noutput_per_mtok = 0.4\n\
+             [[price]]\nmodel = \"openai/strong\"\ninput_per_mtok = 1.0\noutput_per_mtok = 8.0\n\
+             [[price]]\nmodel = \"groq/llama-3.3-70b-versatile\"\ninput_per_mtok = 0.6\noutput_per_mtok = 0.8\n\
+             [[route]]\nmatch = {{}}\nmode = \"enforce\"\nladder = {ladder}\n\
+             gates = [\"non-empty\", \"tool-args-valid\"]\n"
+        );
+        let upstream = upstream.to_owned();
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.clone()),
+            "FIRSTPASS_UPSTREAM_OPENAI" => Some(upstream.clone()),
+            // Unreachable on purpose: a native turn must never touch it.
+            "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some("http://127.0.0.1:1".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let (traces, rx) = mpsc::channel(16);
+        let providers = ProviderRegistry::new("http://127.0.0.1:1", upstream.as_str());
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers,
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+        (state, rx)
+    }
+
+    /// The default Codex turn (hosted `web_search`, encrypted reasoning) on an all-OpenAI ladder
+    /// is GATED, not passed through: each rung receives the client's body unchanged but for
+    /// `model` (reasoning item, hosted tool, store/include intact; stream controls stripped), the
+    /// cheap rung's hallucinated call fails `tool-args-valid` and escalates, and the strong rung's
+    /// Responses object is served verbatim — buffered as JSON, or re-emitted as Responses SSE.
+    #[tokio::test]
+    async fn responses_native_path_gates_codex_turn_and_escalates() {
+        for stream in [false, true] {
+            let (upstream, log) = spawn_recording_responses_upstream().await;
+            let (state, mut traces) =
+                native_state(r#"["openai/cheap", "openai/strong"]"#, &upstream);
+            let turn = codex_turn(stream);
+            let resp = responses(
+                State(state),
+                Extension(TenantId("default".to_owned())),
+                HeaderMap::new(),
+                Bytes::from(turn.to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "stream={stream}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+
+            let sent = log.lock().unwrap().clone();
+            let models: Vec<&str> = sent.iter().filter_map(|b| b["model"].as_str()).collect();
+            assert_eq!(models, ["cheap", "strong"], "escalated cheap -> strong");
+            for (body, model) in sent.iter().zip(["cheap", "strong"]) {
+                let mut expected = turn.clone();
+                expected["model"] = model.into();
+                if let Some(m) = expected.as_object_mut() {
+                    m.remove("stream");
+                    m.remove("stream_options");
+                }
+                assert_eq!(
+                    body, &expected,
+                    "only model/stream differ (stream={stream})"
+                );
+                // The opaque reasoning blob reaches the rung exactly as the client sent it.
+                assert_eq!(body["input"][1].to_string(), turn["input"][1].to_string());
+            }
+
+            let served = if stream {
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                let completed = text
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data: "))
+                    .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+                    .find(|e| e["type"] == "response.completed")
+                    .expect("response.completed event");
+                assert!(
+                    text.contains("gAAAA-strong-reasoning"),
+                    "reasoning item streamed"
+                );
+                completed["response"].clone()
+            } else {
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            };
+            assert_eq!(served, native_upstream_reply("strong"), "served verbatim");
+
+            let trace = tokio::time::timeout(Duration::from_secs(5), traces.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(trace.request.api, "openai.responses");
+            let verdicts: Vec<Verdict> = trace.attempts.iter().map(|a| a.verdict).collect();
+            assert_eq!(verdicts, [Verdict::Fail, Verdict::Pass]);
+            assert_eq!(trace.final_.served_rung, Some(1));
+        }
+    }
+
+    /// A mixed ladder keeps today's behaviour: a hosted-tool turn is relayed un-gated, the
+    /// client's body untouched, one upstream call. Two shapes: an Anthropic rung (already
+    /// excluded by the structured-content guard), and an OpenAI-dialect `groq` rung — Chat
+    /// verbatim-carry passes that guard, so only the Responses-capability check stops it.
+    #[tokio::test]
+    async fn responses_native_path_not_taken_on_mixed_ladder() {
+        for ladder in [
+            r#"["openai/cheap", "anthropic/claude-haiku-4-5"]"#,
+            r#"["openai/cheap", "groq/llama-3.3-70b-versatile"]"#,
+        ] {
+            let (upstream, log) = spawn_recording_responses_upstream().await;
+            let (state, _traces) = native_state(ladder, &upstream);
+            let turn = codex_turn(false);
+            let resp = responses(
+                State(state),
+                Extension(TenantId("default".to_owned())),
+                HeaderMap::new(),
+                Bytes::from(turn.to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{ladder}");
+            let sent = log.lock().unwrap().clone();
+            assert_eq!(
+                sent,
+                [turn],
+                "passthrough relays the original body once: {ladder}"
+            );
+        }
+    }
+
+    /// Even on an all-OpenAI ladder, these stay on passthrough (see the `responses` module docs):
+    /// `previous_response_id` threading, and any `store` other than an explicit `false` — omitted
+    /// means `true` upstream, and a failed cheap rung would then be retained there unseen. Exactly
+    /// one upstream call, carrying the client's body unchanged, proves no rung was tried.
+    #[tokio::test]
+    async fn responses_native_path_not_taken_for_threading_or_stored_turns() {
+        let threaded = {
+            let mut t = codex_turn(false);
+            t["previous_response_id"] = "resp_strong".into();
+            t
+        };
+        let stored = {
+            let mut t = codex_turn(false);
+            t["store"] = true.into();
+            t
+        };
+        let store_omitted = {
+            let mut t = codex_turn(false);
+            t.as_object_mut().unwrap().remove("store");
+            t
+        };
+        for (case, turn) in [
+            ("previous_response_id", threaded),
+            ("store: true", stored),
+            ("store omitted", store_omitted),
+        ] {
+            let (upstream, log) = spawn_recording_responses_upstream().await;
+            let (state, _traces) = native_state(r#"["openai/cheap", "openai/strong"]"#, &upstream);
+            let resp = responses(
+                State(state),
+                Extension(TenantId("default".to_owned())),
+                HeaderMap::new(),
+                Bytes::from(turn.to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{case}");
+            assert_eq!(log.lock().unwrap().clone(), [turn], "{case}");
+        }
     }
 }
