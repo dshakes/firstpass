@@ -1,0 +1,3878 @@
+//! Normalized model access: a provider-agnostic request/response shape, and the wire adapters
+//! (Anthropic Messages, OpenAI Chat Completions, Google Gemini) that speak it. The router
+//! ([`crate::router`]) only ever talks to [`Provider`]; it never knows which wire format is
+//! behind a given rung.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use async_trait::async_trait;
+use axum::http::HeaderMap;
+use firstpass_core::config::BUILTIN_OPENAI_COMPATIBLE;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// One message in a normalized chat conversation. `content` is either a plain string (the common
+/// case — serializes byte-identically to a text message) OR the original array of content blocks
+/// (`text` / `tool_use` / `tool_result` / `image`), forwarded verbatim so tool and multimodal turns
+/// survive the enforce path (ADR 0005). Use [`ChatMessage::text_view`] to read a text projection for
+/// gating.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    /// `"user"`, `"assistant"`, or `"system"`.
+    pub role: String,
+    /// Message content — a string, or an array of content blocks, forwarded as-is to the provider.
+    pub content: Value,
+}
+
+impl ChatMessage {
+    /// A text-only message (the common path).
+    #[must_use]
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Value::String(content.into()),
+        }
+    }
+
+    /// Concatenate the text this message carries, for gating. A string is itself; an array yields the
+    /// joined `text` blocks (tool_use/tool_result/image blocks contribute no gating text).
+    #[must_use]
+    pub fn text_view(&self) -> String {
+        match &self.content {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
+    }
+}
+
+/// A provider-agnostic model request, built once per incoming call and re-used (with
+/// `model` swapped) across every rung of the ladder.
+///
+// Message content is carried verbatim (string or content-block array, ADR 0005); gates read a text
+// projection via `ChatMessage::text_view`. `tools` is opaque passthrough.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRequest {
+    /// `provider/model`, e.g. `"anthropic/claude-haiku-4-5"`.
+    pub model: String,
+    /// System prompt, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    /// Conversation turns.
+    pub messages: Vec<ChatMessage>,
+    /// Max tokens to generate.
+    pub max_tokens: u32,
+    /// Opaque tool/function-calling passthrough, forwarded as-is to the wire provider.
+    #[serde(default)]
+    pub tools: Value,
+    /// The **full original inbound request JSON**, when this request came off the proxy's wire
+    /// (ADR 0005). Anthropic-dialect providers send it verbatim with only `model` swapped (and
+    /// `stream` stripped), so every field — `tools`, `tool_choice`, `temperature`, `thinking`,
+    /// `stop_sequences`, … — survives the rung exactly as the caller wrote it. `Null` for
+    /// synthesized requests (judge / consistency samples), which use the normalized fields.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub raw: Value,
+    /// Whether to insert prompt-cache breakpoints on the stable prefix — see
+    /// [`add_cache_breakpoints`]. Set from `[escalation] prompt_cache`; `false` everywhere else,
+    /// including synthesized judge/consistency requests, so nothing changes unless asked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_prefix: bool,
+}
+
+/// A provider-agnostic model response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelResponse {
+    /// `provider/model` that produced this response.
+    pub model: String,
+    /// Concatenated text output.
+    pub text: String,
+    /// Input tokens billed, **uncached only** — see `cache_write_tokens` for the rest.
+    pub in_tokens: u64,
+    /// Prompt tokens written to the provider's cache (billed at a premium). 0 when the caller did
+    /// not use prompt caching, or the provider does not report it.
+    pub cache_write_tokens: u64,
+    /// Prompt tokens served from the provider's cache (billed at a discount).
+    pub cache_read_tokens: u64,
+    /// Output tokens billed.
+    pub out_tokens: u64,
+    /// The raw wire response, kept for debugging/audit — never logged wholesale.
+    pub raw: Value,
+}
+
+impl ModelResponse {
+    /// Whether the model stopped at the request's output-token limit. See [`hit_output_limit`].
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        hit_output_limit(&self.raw)
+    }
+
+    /// Whether the response contains at least one tool call.
+    /// Handles Anthropic (`content[*].type == "tool_use"`) and
+    /// OpenAI (`choices[0].message.tool_calls` non-empty) formats.
+    #[must_use]
+    pub fn has_tool_calls(&self) -> bool {
+        // Anthropic: a content array that contains at least one tool_use block.
+        if let Some(blocks) = self.raw.get("content").and_then(Value::as_array) {
+            return blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"));
+        }
+        // OpenAI: choices[0].message.tool_calls is a non-empty array.
+        self.raw
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|tc| !tc.is_empty())
+    }
+}
+
+/// Whether a raw provider response says generation stopped at the output-token limit:
+/// Anthropic `stop_reason: "max_tokens"`, OpenAI Chat `finish_reason: "length"`, OpenAI Responses
+/// `incomplete_details.reason: "max_output_tokens"`, Gemini `finishReason: "MAX_TOKENS"`.
+#[must_use]
+pub fn hit_output_limit(raw: &Value) -> bool {
+    let is = |ptr: &str, want: &str| raw.pointer(ptr).and_then(Value::as_str) == Some(want);
+    is("/stop_reason", "max_tokens")
+        || is("/choices/0/finish_reason", "length")
+        || is("/incomplete_details/reason", "max_output_tokens")
+        || is("/candidates/0/finishReason", "MAX_TOKENS")
+}
+
+/// Failure modes of a provider call.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ProviderError {
+    /// The request never got a response (connection failure, timeout).
+    #[error("transport error: {0}")]
+    Transport(String),
+    /// The provider responded with a non-2xx status.
+    #[error("http {status}: {body}")]
+    Http {
+        /// HTTP status code.
+        status: u16,
+        /// Response body (truncated upstream, not by us).
+        body: String,
+    },
+    /// The response body didn't parse into the shape we expected.
+    #[error("decode error: {0}")]
+    Decode(String),
+}
+
+impl ProviderError {
+    /// Whether this failure should trigger cross-rung/cross-provider failover (transport
+    /// errors and 5xx) rather than being treated as a hard, non-retryable error (4xx, decode).
+    #[must_use]
+    pub fn is_failover_eligible(&self) -> bool {
+        match self {
+            ProviderError::Transport(_) => true,
+            ProviderError::Http { status, .. } => *status >= 500,
+            ProviderError::Decode(_) => false,
+        }
+    }
+}
+
+/// BYOK credentials for one request, extracted from headers with env-var fallback.
+///
+/// Never logged or persisted — [`std::fmt::Debug`] redacts all credential fields.
+#[derive(Clone, Default)]
+pub struct Auth {
+    /// Anthropic API key from the request's `x-api-key` header **only**.
+    /// Never populated from env or from a Bearer token — the env fallback is handled by
+    /// [`AnthropicProvider::complete`] at lowest priority after `anthropic_bearer`.
+    pub anthropic_key: Option<String>,
+    /// OpenAI (or OpenAI-compatible) API key from `Authorization: Bearer …` on OpenAI-dialect
+    /// requests, or `OPENAI_API_KEY` env. **Never populated on Anthropic-dialect requests** so
+    /// the server's `OPENAI_API_KEY` cannot accidentally be forwarded to api.anthropic.com, and
+    /// a Claude Code OAuth token arriving on `/v1/messages` cannot be sent to an OpenAI rung.
+    pub openai_key: Option<String>,
+    /// Bearer token from `Authorization: Bearer …` on **Anthropic-dialect requests only** (`/v1/messages`,
+    /// count-tokens). Used by [`AnthropicProvider`] as the OAuth/subscription fallback when
+    /// `anthropic_key` is absent (Claude Code with a Claude account). Never populated from env
+    /// vars — only from the inbound request header on the Anthropic path.
+    pub anthropic_bearer: Option<String>,
+    /// `anthropic-beta` header value, forwarded verbatim to the Anthropic endpoint.
+    pub anthropic_beta: Option<String>,
+    /// `anthropic-version` header value. When set, overrides the default `2023-06-01`.
+    pub anthropic_version: Option<String>,
+    /// Google Gemini API key from the inbound request's `x-goog-api-key` header, **only on
+    /// Gemini-dialect requests** (`/v1beta/models/{model}:generateContent`).
+    /// Never populated from env. A Gemini rung that must work for non-Gemini callers (a mixed
+    /// ladder) needs `api_key_env` on its `[[provider]]` block; there is no ambient fallback.
+    /// Never set on Anthropic/OpenAI paths — scoping prevents the Google key from reaching
+    /// other providers.
+    pub gemini_key: Option<String>,
+    /// How long the caller will wait, from `x-firstpass-latency` (e.g. `24h`). `Some` makes the
+    /// ladder's `@batch` rungs eligible and bounds how long a batch call may poll; `None` (the
+    /// default, header absent or unparsable) skips batch rungs entirely.
+    pub latency: Option<std::time::Duration>,
+}
+
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Auth")
+            .field("anthropic_key", &self.anthropic_key.as_ref().map(|_| "***"))
+            .field("openai_key", &self.openai_key.as_ref().map(|_| "***"))
+            .field(
+                "anthropic_bearer",
+                &self.anthropic_bearer.as_ref().map(|_| "***"),
+            )
+            .field("anthropic_beta", &self.anthropic_beta)
+            .field("anthropic_version", &self.anthropic_version)
+            .field("gemini_key", &self.gemini_key.as_ref().map(|_| "***"))
+            .field("latency", &self.latency)
+            .finish()
+    }
+}
+
+impl Auth {
+    /// Extract BYOK credentials from request headers, scoped to `dialect` so credentials
+    /// cannot leak across provider boundaries.
+    ///
+    /// - On **Anthropic-dialect** requests (`/v1/messages`, count-tokens): an inbound
+    ///   `Authorization: Bearer` token goes into `anthropic_bearer` only — it is the
+    ///   OAuth/subscription credential for Claude accounts and must NOT be forwarded to
+    ///   OpenAI rungs. `openai_key` is populated only from the `OPENAI_API_KEY` env var
+    ///   (no inbound Bearer on this path).
+    ///
+    /// - On **OpenAI-dialect** requests (`/v1/chat/completions`, `/v1/responses`): an inbound
+    ///   `Authorization: Bearer` token goes into `openai_key` only — it is the caller's
+    ///   OpenAI key and must NOT be forwarded to Anthropic rungs. `anthropic_bearer` is
+    ///   always `None` on this path.
+    ///
+    /// This scoping ensures `OPENAI_API_KEY` is never sent to api.anthropic.com and a Claude
+    /// OAuth token is never sent to an OpenAI-compatible endpoint.
+    #[must_use]
+    pub fn from_headers(headers: &HeaderMap, dialect: firstpass_core::Dialect) -> Self {
+        // Only the request header; env fallback is the provider's responsibility so that
+        // a request-supplied Bearer is not shadowed by the server's ANTHROPIC_API_KEY.
+        // Not on the Gemini path: a Gemini client's headers are for Google, and a mixed ladder's
+        // Anthropic rung must not forward a stray inbound `x-api-key` from one.
+        let anthropic_key = headers
+            .get("x-api-key")
+            .filter(|_| !matches!(dialect, firstpass_core::Dialect::Gemini))
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+
+        let bearer = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_owned);
+
+        let (openai_key, anthropic_bearer) = match dialect {
+            firstpass_core::Dialect::Anthropic => {
+                // Bearer on this path is an Anthropic OAuth token — not an OpenAI key.
+                let openai_env = std::env::var("OPENAI_API_KEY").ok();
+                (openai_env, bearer)
+            }
+            firstpass_core::Dialect::Openai => {
+                // Bearer on this path is an OpenAI key — not an Anthropic credential.
+                let openai_key = bearer.or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                (openai_key, None)
+            }
+            firstpass_core::Dialect::Gemini => {
+                // Bearer on this path is a Google token — neither OpenAI nor Anthropic.
+                // `openai_key` is still populated from env for mixed-ladder rungs; it is NOT
+                // sourced from the inbound `x-goog-api-key` (that goes into `gemini_key`).
+                let openai_env = std::env::var("OPENAI_API_KEY").ok();
+                (openai_env, None)
+            }
+        };
+
+        // Gemini API key from the inbound `x-goog-api-key` header.
+        // Only trusted on the Gemini path; on other paths the header is ignored.
+        let gemini_key = if matches!(dialect, firstpass_core::Dialect::Gemini) {
+            headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        } else {
+            None
+        };
+
+        // Multiple `anthropic-beta` values (e.g. "extended-thinking-2025-02-19" + another flag)
+        // are joined into a comma-separated string so the upstream receives all of them.
+        let anthropic_beta = {
+            let vals: Vec<&str> = headers
+                .get_all("anthropic-beta")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.join(", "))
+            }
+        };
+        let anthropic_version = headers
+            .get("anthropic-version")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
+        let latency = headers
+            .get("x-firstpass-latency")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| firstpass_core::config::parse_window(v).ok())
+            .filter(|d| !d.is_zero());
+        Self {
+            anthropic_key,
+            openai_key,
+            anthropic_bearer,
+            anthropic_beta,
+            anthropic_version,
+            gemini_key,
+            latency,
+        }
+    }
+}
+
+/// A normalized model backend. Implementations translate [`ModelRequest`]/[`ModelResponse`]
+/// to/from one wire API.
+#[async_trait]
+pub trait Provider: Send + Sync + std::fmt::Debug {
+    /// Call the model and normalize the result.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError`] on transport failure, a non-2xx response, or a response
+    /// that doesn't decode into the expected shape.
+    async fn complete(
+        &self,
+        req: &ModelRequest,
+        auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError>;
+
+    /// Call the model through the provider's Batch API (an `@batch` rung), waiting at most
+    /// `auth.latency` for the result. Default: unsupported — a failover-eligible error, so the
+    /// rung abstains with nothing billed rather than silently running at full price.
+    ///
+    /// # Errors
+    /// As [`Provider::complete`], plus a transport error when the batch does not end in time.
+    async fn complete_batch(
+        &self,
+        _req: &ModelRequest,
+        _auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        Err(ProviderError::Transport(format!(
+            "provider {} has no batch tier",
+            self.id()
+        )))
+    }
+
+    /// Provider identity, e.g. `"anthropic"`.
+    fn id(&self) -> &str;
+
+    /// Whether this provider carries structured content (tool_use / tool_result / image blocks
+    /// and top-level `tools`) **verbatim** on the wire for the given *inbound* dialect.
+    ///
+    /// - Anthropic-dialect providers (Anthropic / Bedrock / Vertex) return `true` iff
+    ///   `inbound == Dialect::Anthropic`: the raw inbound body is forwarded with only the model
+    ///   swapped, so every caller field — `tools`, `tool_choice`, `thinking`, … — survives
+    ///   intact (ADR 0005 P4).
+    /// - `OpenAiProvider` returns `true` iff `inbound == Dialect::Openai`: same verbatim-carry
+    ///   rule for all-OpenAI-dialect ladders.
+    /// - All other providers (Gemini, unknown) return `false` — no verbatim-carry built yet.
+    ///
+    /// The enforce path's fidelity guard uses this to decide: verbatim-carry path (all rungs
+    /// return `true` for the inbound dialect), translation path (OpenAI → Anthropic when
+    /// content is translatable), or transparent observe passthrough (safe fallback).
+    fn carries_structured_verbatim(&self, _inbound: firstpass_core::Dialect) -> bool {
+        false
+    }
+
+    /// Whether this provider rebuilds tool and image content from the normalized
+    /// (Anthropic-shaped) `messages`/`tools` of a translated request — the enforce translation
+    /// path, alongside the Anthropic-dialect providers. `false` unless the provider's wire
+    /// builder translates `tool_use` / `tool_result` / `image` blocks faithfully.
+    fn translates_structured(&self) -> bool {
+        false
+    }
+}
+
+/// Remove Google's OpenAI-compat `extra_content` (Gemini thought signatures, see
+/// [`crate::gemini`]) from every message, tool call, and content block of a wire body's
+/// `messages`. Only a Gemini rung can use a signature; OpenAI rejects unknown message fields and
+/// Anthropic rejects unknown block fields, so no other provider may ever send it.
+///
+/// ponytail: unconditional, so an OpenAI-dialect caller deliberately sending `extra_content` to a
+/// custom OpenAI-compatible provider that is really Google's compat endpoint loses it. Gate on the
+/// provider's host if anyone does that.
+fn strip_extra_content(messages: Option<&mut Value>) {
+    let Some(Value::Array(messages)) = messages else {
+        return;
+    };
+    for m in messages.iter_mut().filter_map(Value::as_object_mut) {
+        m.remove("extra_content");
+        for key in ["tool_calls", "content"] {
+            if let Some(Value::Array(items)) = m.get_mut(key) {
+                for item in items.iter_mut().filter_map(Value::as_object_mut) {
+                    item.remove("extra_content");
+                }
+            }
+        }
+    }
+}
+
+/// Strip the `provider/` prefix from a ladder model id for the provider's wire API — Anthropic and
+/// OpenAI expect the bare model (`claude-haiku-4-5`), not `anthropic/claude-haiku-4-5`. The full
+/// prefixed id is still what the ladder/trace use; only the wire call is stripped.
+fn wire_model(model: &str) -> &str {
+    let model = firstpass_core::cost::split_rung(model).0;
+    model.split_once('/').map_or(model, |(_, m)| m)
+}
+
+/// The effort an `@low|@medium|@high` ladder rung pins.
+fn rung_effort(model: &str) -> Option<Effort> {
+    match firstpass_core::cost::split_rung(model).1? {
+        "low" => Some(Effort::Low),
+        "medium" => Some(Effort::Medium),
+        _ => Some(Effort::High),
+    }
+}
+
+/// Apply a rung's pinned effort to a wire body, replacing whatever reasoning the caller asked
+/// for and spelling it the way `wire` expects. No-op for a rung without an effort suffix.
+fn pin_effort(body: &mut serde_json::Map<String, Value>, model: &str, wire: Wire) {
+    let Some(effort) = rung_effort(model) else {
+        return;
+    };
+    body.remove("thinking");
+    body.remove("thinkingConfig");
+    body.insert(
+        "reasoning_effort".to_owned(),
+        Value::String(effort.as_str().to_owned()),
+    );
+    normalize_reasoning(body, wire);
+}
+
+/// Resolve the API key for a provider call.
+///
+/// - If `api_key_env` is `Some(env_name)`, the resolved value is **only** the content of that
+///   env var. If the env var is unset or empty the function returns `""` — it never falls through
+///   to the BYOK override. An operator who wires `api_key_env = "GROQ_API_KEY"` for a custom host
+///   must never inadvertently receive the client's own OpenAI key when the Groq var is missing.
+/// - If `api_key_env` is `None`, the BYOK override is used (may itself be empty/`""`).
+fn resolve_api_key(api_key_env: Option<&str>, byok_override: Option<&str>) -> String {
+    match api_key_env {
+        Some(env_name) => std::env::var(env_name)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default(),
+        None => byok_override.unwrap_or("").to_owned(),
+    }
+}
+
+/// The credential an Anthropic-dialect call sends upstream.
+#[derive(Debug, PartialEq, Eq)]
+enum AnthropicCredential {
+    ApiKey(String),
+    Bearer(String),
+}
+
+/// Pick the Anthropic credential, highest priority first:
+///   1. The rung's configured `api_key_env` value (outer `Some`). An operator who declared this
+///      provider's key must never have a client credential forwarded to that host instead.
+///      If the env var is configured but **unset/empty** (`Some(None)` or `Some(Some(""))`), the
+///      function returns `None` — no credential is sent rather than falling through to the client.
+///   2. (only when `configured = None`) The request's `x-api-key`.
+///   3. (only when `configured = None`) The request's `Authorization: Bearer` OAuth token.
+///   4. (only when `configured = None`) The ambient `ANTHROPIC_API_KEY` env fallback.
+///
+/// `configured: Option<Option<String>>`
+///   - `None`           → api_key_env not configured; proceed with client creds + ambient.
+///   - `Some(None)`     → api_key_env configured but the env var is unset.
+///   - `Some(Some(k))`  → api_key_env configured and resolved to `k`.
+///
+/// Never the OpenAI key. Pure so the ordering is unit-testable without touching process env.
+fn anthropic_credential(
+    configured: Option<Option<String>>,
+    auth: &Auth,
+    ambient: Option<String>,
+) -> Option<AnthropicCredential> {
+    match configured {
+        Some(key) => {
+            // api_key_env IS configured. Use its value if non-empty; otherwise no credential
+            // (never fall through to client creds — the operator intended this provider's key).
+            key.filter(|s| !s.is_empty())
+                .map(AnthropicCredential::ApiKey)
+        }
+        None => {
+            // api_key_env NOT configured — use client creds + ambient.
+            let non_empty = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+            non_empty(&auth.anthropic_key)
+                .map(AnthropicCredential::ApiKey)
+                .or_else(|| non_empty(&auth.anthropic_bearer).map(AnthropicCredential::Bearer))
+                .or_else(|| non_empty(&ambient).map(AnthropicCredential::ApiKey))
+        }
+    }
+}
+
+/// Build the Anthropic Messages wire body for `req`: the original inbound JSON **verbatim** with
+/// only `model` swapped to the rung's wire id and `stream` stripped (`complete` is the buffered
+/// call — the gate needs the whole candidate). Falls back to the normalized fields when there is
+/// no raw body (synthesized judge/consistency requests). Pure, so fidelity is unit-testable.
+#[must_use]
+pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
+    if let Value::Object(raw) = &req.raw {
+        let mut body = raw.clone();
+        body.insert(
+            "model".to_owned(),
+            Value::String(wire_model(&req.model).to_owned()),
+        );
+        body.remove("stream");
+        strip_extra_content(body.get_mut("messages"));
+        pin_effort(&mut body, &req.model, Wire::Anthropic);
+        normalize_reasoning(&mut body, Wire::Anthropic);
+        if req.cache_prefix {
+            add_cache_breakpoints(&mut body);
+        }
+        return Value::Object(body);
+    }
+    let messages: Vec<Value> = req
+        .messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+    let mut body = serde_json::json!({
+        "model": wire_model(&req.model),
+        "max_tokens": req.max_tokens,
+        "messages": messages,
+    });
+    strip_extra_content(body.get_mut("messages"));
+    if let Some(system) = req.system.as_deref() {
+        body["system"] = serde_json::json!(system);
+    }
+    if !req.tools.is_null() {
+        body["tools"] = req.tools.clone();
+    }
+    if let Some(map) = body.as_object_mut() {
+        pin_effort(map, &req.model, Wire::Anthropic);
+    }
+    // This branch is not a rare fallback: it is the path every translated request takes, and
+    // every CONDENSED one — condensing clears `raw` precisely so the smaller message list is what
+    // gets sent. Applying breakpoints only in the raw branch above would mean `prompt_cache`
+    // silently did nothing for exactly the long conversations it exists to pay for.
+    if req.cache_prefix
+        && let Some(map) = body.as_object_mut()
+    {
+        add_cache_breakpoints(map);
+    }
+    body
+}
+
+/// Speaks `POST {base}/v1/messages` (Anthropic Messages API).
+///
+// LIVE-VERIFIED (2026-07-10): exercised against real Anthropic through the running proxy's enforce
+// path — a haiku completion served end-to-end. The `anthropic/` prefix must be stripped for the
+// wire call (see `wire_model`); sending it verbatim 404s.
+#[derive(Debug, Clone)]
+pub struct AnthropicProvider {
+    /// Ladder prefix / trace label for this provider (usually `"anthropic"`).
+    pub id: String,
+    /// Base URL, e.g. `https://api.anthropic.com`.
+    pub base_url: String,
+    /// Env var the API key is read from when no per-request BYOK header is present. `None` for the
+    /// built-in provider, which resolves the key via [`Auth`] (`x-api-key` header or env).
+    pub api_key_env: Option<String>,
+    /// Shared, connection-pooled HTTP client.
+    pub http: reqwest::Client,
+}
+
+#[async_trait]
+impl Provider for AnthropicProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn carries_structured_verbatim(&self, inbound: firstpass_core::Dialect) -> bool {
+        inbound == firstpass_core::Dialect::Anthropic
+    }
+
+    async fn complete(
+        &self,
+        req: &ModelRequest,
+        auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        let body = anthropic_wire_body(req);
+        let json = self.send(self.http.post(self.url("")).json(&body), auth).await?;
+        anthropic_response(req, json)
+    }
+
+    /// Message Batches API: submit one request, poll until it ends (or `auth.latency` runs out,
+    /// which cancels it), then read its result.
+    async fn complete_batch(
+        &self,
+        req: &ModelRequest,
+        auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        // ponytail: one request per batch and a fixed poll interval; group concurrent requests
+        // into one batch if submission overhead ever shows up.
+        const POLL: std::time::Duration = std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + auth.latency.unwrap_or_default();
+        let submit = serde_json::json!({
+            "requests": [{ "custom_id": "firstpass", "params": anthropic_wire_body(req) }]
+        });
+        let batch = self
+            .send(self.http.post(self.url("/batches")).json(&submit), auth)
+            .await?;
+        let id = batch
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Decode("batch: missing id".to_owned()))?
+            .to_owned();
+        loop {
+            let status = self
+                .send(self.http.get(self.url(&format!("/batches/{id}"))), auth)
+                .await?;
+            if status.get("processing_status").and_then(Value::as_str) == Some("ended") {
+                break;
+            }
+            if std::time::Instant::now() + POLL > deadline {
+                let cancel = self.http.post(self.url(&format!("/batches/{id}/cancel")));
+                let _ = self.send(cancel, auth).await;
+                return Err(ProviderError::Transport(format!(
+                    "batch {id} did not end within the caller's latency window"
+                )));
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        // The documented results path on our own base URL — never the `results_url` the status
+        // body names, so credentials only ever go to the configured host.
+        let lines = self
+            .send_raw(self.http.get(self.url(&format!("/batches/{id}/results"))), auth)
+            .await?;
+        let line = String::from_utf8_lossy(&lines)
+            .lines()
+            .find_map(|l| serde_json::from_str::<Value>(l).ok())
+            .ok_or_else(|| ProviderError::Decode("batch: empty results".to_owned()))?;
+        match line.pointer("/result/type").and_then(Value::as_str) {
+            Some("succeeded") => anthropic_response(req, line["result"]["message"].clone()),
+            // A per-request error is the request's fault, like a sync 4xx: don't escalate it.
+            Some("errored") => Err(ProviderError::Http {
+                status: 400,
+                body: line["result"].to_string(),
+            }),
+            // expired / canceled: nothing was billed; let the next rung try.
+            _ => Err(ProviderError::Transport(format!(
+                "batch {id} result: {}",
+                line["result"]
+            ))),
+        }
+    }
+}
+
+impl AnthropicProvider {
+    fn url(&self, suffix: &str) -> String {
+        format!("{}/v1/messages{suffix}", self.base_url.trim_end_matches('/'))
+    }
+
+    async fn send(
+        &self,
+        builder: reqwest::RequestBuilder,
+        auth: &Auth,
+    ) -> Result<Value, ProviderError> {
+        let bytes = self.send_raw(builder, auth).await?;
+        serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))
+    }
+
+    /// Attach credentials + version headers, send, and return the body of a 2xx response.
+    async fn send_raw(
+        &self,
+        mut builder: reqwest::RequestBuilder,
+        auth: &Auth,
+    ) -> Result<bytes::Bytes, ProviderError> {
+        match anthropic_credential(
+            self.api_key_env.as_deref().map(|e| std::env::var(e).ok()),
+            auth,
+            std::env::var("ANTHROPIC_API_KEY").ok(),
+        ) {
+            Some(AnthropicCredential::ApiKey(key)) => builder = builder.header("x-api-key", key),
+            Some(AnthropicCredential::Bearer(token)) => {
+                builder =
+                    builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            None => {}
+        }
+
+        // Forward anthropic-version (inbound header wins; default to the published stable version).
+        let version = auth.anthropic_version.as_deref().unwrap_or("2023-06-01");
+        builder = builder.header("anthropic-version", version);
+
+        // Forward anthropic-beta verbatim (extended thinking, interleaved-thinking, …).
+        if let Some(beta) = &auth.anthropic_beta {
+            builder = builder.header("anthropic-beta", beta);
+        }
+
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        if !status.is_success() {
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        Ok(bytes)
+    }
+}
+
+/// Normalize an Anthropic Messages response (sync, or one batch result's `message`).
+fn anthropic_response(req: &ModelRequest, json: Value) -> Result<ModelResponse, ProviderError> {
+    let u = anthropic_parse_response(&json)?;
+    Ok(ModelResponse {
+        cache_write_tokens: u.cache_write_tokens,
+        cache_read_tokens: u.cache_read_tokens,
+        model: req.model.clone(),
+        text: u.text,
+        in_tokens: u.in_tokens,
+        out_tokens: u.out_tokens,
+        raw: json,
+    })
+}
+
+/// Extract `(text, in_tokens, out_tokens)` from an Anthropic Messages API response. Shared by
+/// [`AnthropicProvider`] and every auth scheme that wraps the Anthropic body shape (Bedrock,
+/// Vertex — ADR 0006): they all get the same response back, only the request's auth/URL differ.
+fn anthropic_parse_response(json: &Value) -> Result<AnthropicUsage, ProviderError> {
+    let text = json
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .ok_or_else(|| ProviderError::Decode("missing content[].text".to_owned()))?;
+
+    let in_tokens = json
+        .pointer("/usage/input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let out_tokens = json
+        .pointer("/usage/output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // Prompt caching splits the prompt across three counters. Reading only `input_tokens` — which
+    // this did until now — reports about 20 tokens for a 190k-token cached prefix, so the receipt
+    // records a fraction of a cent for a call that cost most of a dollar, and `[budget]` caps fed
+    // by that total never trip.
+    let cache_write_tokens = json
+        .pointer("/usage/cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_tokens = json
+        .pointer("/usage/cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    Ok(AnthropicUsage {
+        text,
+        in_tokens,
+        cache_write_tokens,
+        cache_read_tokens,
+        out_tokens,
+    })
+}
+
+/// Text plus the full token split from an Anthropic response.
+struct AnthropicUsage {
+    text: String,
+    in_tokens: u64,
+    cache_write_tokens: u64,
+    cache_read_tokens: u64,
+    out_tokens: u64,
+}
+
+/// Build an Anthropic Messages-shaped request body with the model **omitted** — Bedrock and Vertex
+/// both put the model in the URL, not the body (ADR 0006 P2/P3), unlike direct Anthropic API calls
+/// which need `model` in the body ([`AnthropicWireRequest`]). `anthropic_version` is the dialect
+/// version string each host expects (`bedrock-2023-05-31` / `vertex-2023-10-16`).
+fn anthropic_messages_body(req: &ModelRequest, anthropic_version: &str) -> Value {
+    // Same verbatim-carry rule as `anthropic_wire_body`, adapted to hosts that put the model in
+    // the URL: original inbound JSON minus `model`/`stream`, plus the host's version string.
+    if let Value::Object(raw) = &req.raw {
+        let mut body = raw.clone();
+        body.remove("model");
+        body.remove("stream");
+        strip_extra_content(body.get_mut("messages"));
+        body.insert(
+            "anthropic_version".to_owned(),
+            Value::String(anthropic_version.to_owned()),
+        );
+        pin_effort(&mut body, &req.model, Wire::Anthropic);
+        return Value::Object(body);
+    }
+    let messages: Vec<Value> = req
+        .messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+    let mut body = serde_json::json!({
+        "anthropic_version": anthropic_version,
+        "max_tokens": req.max_tokens,
+        "messages": messages,
+    });
+    strip_extra_content(body.get_mut("messages"));
+    if let Some(system) = req.system.as_deref() {
+        body["system"] = serde_json::json!(system);
+    }
+    if !req.tools.is_null() {
+        body["tools"] = req.tools.clone();
+    }
+    if let Some(map) = body.as_object_mut() {
+        pin_effort(map, &req.model, Wire::Anthropic);
+    }
+    body
+}
+
+/// Build the OpenAI Chat Completions wire body for `req`: the original inbound JSON **verbatim**
+/// with only `model` swapped to the rung's wire id and `stream` stripped (analogous to
+/// [`anthropic_wire_body`] for all-OpenAI-dialect ladders). Falls back to the normalized fields
+/// when there is no raw body (synthesized judge/consistency requests, or translation path).
+/// Pure, so fidelity is unit-testable.
+#[must_use]
+pub fn openai_wire_body(req: &ModelRequest) -> Value {
+    if let Value::Object(raw) = &req.raw {
+        let mut body = raw.clone();
+        body.insert(
+            "model".to_owned(),
+            Value::String(wire_model(&req.model).to_owned()),
+        );
+        body.remove("stream");
+        strip_extra_content(body.get_mut("messages"));
+        pin_effort(&mut body, &req.model, Wire::OpenAi);
+        normalize_reasoning(&mut body, Wire::OpenAi);
+        return Value::Object(body);
+    }
+    // Fallback: reconstruct from normalized fields (translation path or synthesized requests).
+    let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
+    if let Some(system) = req.system.as_deref() {
+        messages.push(serde_json::json!({ "role": "system", "content": system }));
+    }
+    messages.extend(
+        req.messages
+            .iter()
+            .map(|m| serde_json::json!({ "role": m.role, "content": m.content })),
+    );
+    let mut body = serde_json::json!({
+        "model": wire_model(&req.model),
+        "max_tokens": req.max_tokens,
+        "messages": messages,
+    });
+    strip_extra_content(body.get_mut("messages"));
+    if !req.tools.is_null() {
+        body["tools"] = req.tools.clone();
+    }
+    if let Some(map) = body.as_object_mut() {
+        pin_effort(map, &req.model, Wire::OpenAi);
+    }
+    body
+}
+
+/// How hard the caller asked the model to think, independent of how any one provider spells it.
+///
+/// A cascade crosses vendors by design — a ladder is routinely `openai/…` under `anthropic/…` —
+/// so the caller's reasoning request has to survive the crossing. Without this, an OpenAI client
+/// that sets `reasoning_effort` gets a **400** the moment the router escalates it onto an
+/// Anthropic rung, because raw bodies pass through verbatim and Anthropic rejects the unknown
+/// field. The caller did nothing wrong; the ladder moved under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    /// Anthropic/Gemini want a token budget rather than a word. These are deliberately modest:
+    /// the budget is billed as output tokens, so a generous default would silently raise the cost
+    /// of every request that merely mentioned reasoning.
+    const fn budget_tokens(self) -> u32 {
+        match self {
+            Self::Low => 1024, // Anthropic's documented floor; below it the field is invalid.
+            Self::Medium => 4096,
+            Self::High => 16384,
+        }
+    }
+
+    /// Read back a budget as a level, so a caller that spelled it in tokens keeps its intent when
+    /// the request lands on a provider that spells it in words.
+    const fn from_budget(tokens: u64) -> Self {
+        if tokens < 2048 {
+            Self::Low
+        } else if tokens < 8192 {
+            Self::Medium
+        } else {
+            Self::High
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Read the caller's reasoning request out of a raw inbound body, in any dialect. Returns `None`
+/// for a body that is not an object or asked for no reasoning.
+#[must_use]
+pub fn effort_of(raw: &Value) -> Option<Effort> {
+    read_effort(raw.as_object()?)
+}
+
+/// Read whichever spelling the caller used, in any dialect.
+fn read_effort(body: &serde_json::Map<String, Value>) -> Option<Effort> {
+    // OpenAI: a word.
+    if let Some(s) = body.get("reasoning_effort").and_then(Value::as_str) {
+        return match s {
+            "low" | "minimal" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            _ => None,
+        };
+    }
+    // Anthropic: a budget, but only when thinking is actually enabled.
+    if let Some(t) = body.get("thinking").and_then(Value::as_object)
+        && t.get("type").and_then(Value::as_str) != Some("disabled")
+        && let Some(b) = t.get("budget_tokens").and_then(Value::as_u64)
+    {
+        return Some(Effort::from_budget(b));
+    }
+    // Gemini: a budget under a camelCase key.
+    if let Some(b) = body
+        .get("thinkingConfig")
+        .and_then(Value::as_object)
+        .and_then(|c| c.get("thinkingBudget"))
+        .and_then(Value::as_u64)
+    {
+        return Some(Effort::from_budget(b));
+    }
+    None
+}
+
+/// Which wire dialect a body is being prepared for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    Anthropic,
+    OpenAi,
+    Gemini,
+}
+
+/// Rewrite `body` so the caller's reasoning request is spelled the way `target` expects, and no
+/// other dialect's spelling is left behind to be rejected.
+///
+/// Pure and total: a body with no reasoning request loses nothing, and a request that *cannot* be
+/// expressed within the target's constraints is dropped rather than sent invalid.
+pub fn normalize_reasoning(body: &mut serde_json::Map<String, Value>, target: Wire) {
+    // If the caller already spelled it the target's way, this is a same-dialect request: leave it
+    // completely alone. ADR 0005 promises a raw body reaches its own provider verbatim, and that
+    // promise covers the caller's mistakes too — a budget the caller's `max_tokens` cannot fit is
+    // theirs to see as a provider error, not ours to silently rewrite into a different request.
+    // Only a request whose spelling is *foreign* to where it landed needs translating, which is
+    // the cross-vendor escalation this exists for.
+    let native = match target {
+        Wire::OpenAi => "reasoning_effort",
+        Wire::Anthropic => "thinking",
+        Wire::Gemini => "thinkingConfig",
+    };
+    if body.contains_key(native) {
+        return;
+    }
+    let effort = read_effort(body);
+    // Strip every dialect first, so nothing foreign survives the crossing.
+    body.remove("reasoning_effort");
+    body.remove("thinking");
+    body.remove("thinkingConfig");
+    let Some(effort) = effort else { return };
+
+    match target {
+        Wire::OpenAi => {
+            body.insert(
+                "reasoning_effort".to_owned(),
+                Value::String(effort.as_str().to_owned()),
+            );
+        }
+        Wire::Anthropic => {
+            // Anthropic requires `max_tokens > budget_tokens`, and a budget of at least 1024.
+            // A caller with a small `max_tokens` cannot satisfy both, and sending it anyway is a
+            // 400 — so serve the request without extended thinking instead of failing it.
+            let max = body.get("max_tokens").and_then(Value::as_u64).unwrap_or(0);
+            let budget = u64::from(effort.budget_tokens()).min(max.saturating_sub(1));
+            if budget >= 1024 {
+                body.insert(
+                    "thinking".to_owned(),
+                    serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
+                );
+                // Extended thinking rejects any temperature but the default; the caller's value
+                // was chosen without knowing the router would enable thinking.
+                body.remove("temperature");
+                body.remove("top_p");
+            }
+        }
+        Wire::Gemini => {
+            // Gemini nests this under `generationConfig`, not at the top level.
+            body.entry("generationConfig")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .map(|c| {
+                    c.insert(
+                        "thinkingConfig".to_owned(),
+                        serde_json::json!({ "thinkingBudget": effort.budget_tokens() }),
+                    )
+                });
+        }
+    }
+}
+
+/// Insert Anthropic prompt-cache breakpoints on the stable prefix of a request.
+///
+/// Marks the end of the system prompt and the end of the tool definitions — the part of an agent's
+/// request that is byte-identical turn after turn. Everything after the last breakpoint (the
+/// conversation itself) is not cached.
+///
+/// **This is opt-in, and it is not free money.** A cache *write* costs
+/// [`CACHE_WRITE_MULTIPLIER`](firstpass_core::cost::CACHE_WRITE_MULTIPLIER) (1.25×) of base input,
+/// and only pays back once the same prefix is read again — [`CACHE_READ_MULTIPLIER`] is 0.1×, so
+/// roughly one reuse covers the premium and everything after is a large saving. On a long agent
+/// session with a fixed system prompt and tool set that is a clear win; on single-shot traffic it
+/// is a 25% surcharge on the prefix for nothing. Which one an operator has is a question about
+/// their traffic, not about this code, so it is configured rather than assumed.
+///
+/// Idempotent: a caller already using `cache_control` keeps their own breakpoints and gets none
+/// added, since they have placed them with knowledge this code does not have.
+/// Smallest serialized prefix worth marking, in characters.
+///
+/// Anthropic's minimum cacheable prefix is 1024 tokens (2048 on Haiku). At roughly 4 characters per
+/// token that is ~4096 characters; this floor sits deliberately below it, so the guard only skips
+/// prefixes that could not possibly qualify rather than second-guessing the tokenizer.
+const MIN_CACHEABLE_PREFIX_CHARS: usize = 3000;
+
+pub fn add_cache_breakpoints(body: &mut serde_json::Map<String, Value>) {
+    if body_has_cache_control(body) {
+        return;
+    }
+    // Anthropic refuses to cache a prefix below a per-model minimum (1024 tokens for Sonnet/Opus,
+    // 2048 for Haiku). Marking a shorter one is not merely wasted — it is a request the API can
+    // reject outright. Estimated from serialized bytes at the usual ~4 chars/token, floored well
+    // under the real minimum so this only skips prefixes that are clearly too small to qualify.
+    let prefix_chars = body.get("system").map_or(0, |v| v.to_string().len())
+        + body.get("tools").map_or(0, |v| v.to_string().len());
+    if prefix_chars < MIN_CACHEABLE_PREFIX_CHARS {
+        return;
+    }
+    let marker = serde_json::json!({ "type": "ephemeral" });
+
+    // `system` may be a bare string; caching requires the block form.
+    match body.get("system") {
+        Some(Value::String(text)) if !text.is_empty() => {
+            body.insert(
+                "system".to_owned(),
+                serde_json::json!([{
+                    "type": "text", "text": text, "cache_control": marker,
+                }]),
+            );
+        }
+        Some(Value::Array(blocks)) if !blocks.is_empty() => {
+            let mut blocks = blocks.clone();
+            if let Some(last) = blocks.last_mut().and_then(Value::as_object_mut) {
+                last.insert("cache_control".to_owned(), marker.clone());
+            }
+            body.insert("system".to_owned(), Value::Array(blocks));
+        }
+        _ => {}
+    }
+
+    // Tool definitions are the other half of the stable prefix, and on an agent request usually
+    // the larger half.
+    if let Some(Value::Array(tools)) = body.get("tools")
+        && !tools.is_empty()
+    {
+        let mut tools = tools.clone();
+        if let Some(last) = tools.last_mut().and_then(Value::as_object_mut) {
+            last.insert("cache_control".to_owned(), marker);
+        }
+        body.insert("tools".to_owned(), Value::Array(tools));
+    }
+}
+
+/// Whether the caller already placed cache breakpoints of their own.
+fn body_has_cache_control(body: &serde_json::Map<String, Value>) -> bool {
+    fn any_in(v: &Value) -> bool {
+        match v {
+            Value::Array(items) => items.iter().any(any_in),
+            Value::Object(o) => o.contains_key("cache_control") || o.values().any(any_in),
+            _ => false,
+        }
+    }
+    body.values().any(any_in)
+}
+
+/// Speaks `POST {base}/v1/chat/completions` (OpenAI Chat Completions API).
+///
+// LIVE-UNVERIFIED: the `wire_model` prefix-strip fix is applied here too, but the OpenAI path has
+// not yet been exercised against a real endpoint (only Anthropic has). Verify against a real key
+// before relying on it in production.
+#[derive(Debug, Clone)]
+pub struct OpenAiProvider {
+    /// Ladder prefix / trace label for this provider (`"openai"`, `"groq"`, `"together"`, …).
+    pub id: String,
+    /// Base URL, e.g. `https://api.openai.com` or `https://api.groq.com/openai`.
+    pub base_url: String,
+    /// Env var the API key is read from, e.g. `"GROQ_API_KEY"`. `None` for the built-in `openai`
+    /// provider (resolves via [`Auth`]: `authorization` header or `OPENAI_API_KEY`) and for keyless
+    /// local endpoints (Ollama / vLLM).
+    pub api_key_env: Option<String>,
+    /// Shared, connection-pooled HTTP client.
+    pub http: reqwest::Client,
+}
+
+#[async_trait]
+impl Provider for OpenAiProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn carries_structured_verbatim(&self, inbound: firstpass_core::Dialect) -> bool {
+        inbound == firstpass_core::Dialect::Openai
+    }
+
+    async fn complete(
+        &self,
+        req: &ModelRequest,
+        auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        let key = resolve_api_key(self.api_key_env.as_deref(), auth.openai_key.as_deref());
+        let body = openai_wire_body(req);
+
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.base_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .post(url)
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {key}"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        if !status.is_success() {
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+
+        let json: Value =
+            serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
+
+        // `content` is null for tool-call-only responses; treat as empty text rather than an error.
+        let text = json
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+
+        let in_tokens = json
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let out_tokens = json
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        Ok(ModelResponse {
+            // This provider reports no prompt-cache split.
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            model: req.model.clone(),
+            text,
+            in_tokens,
+            out_tokens,
+            raw: json,
+        })
+    }
+}
+
+/// gemini-cli's placeholder signature for a function call that has no real one.
+///
+/// Verified against `google-gemini/gemini-cli` @ `203fbc528d83982a7866da43e989b69dd089de83`:
+/// `packages/core/src/utils/historyHardening.ts:12` and `packages/core/src/core/geminiChat.ts:112`
+/// define `SYNTHETIC_THOUGHT_SIGNATURE = 'skip_thought_signature_validator'`;
+/// `geminiChat.ts:1424-1470` (`ensureActiveLoopHasThoughtSignatures`, called on every request at
+/// `geminiChat.ts:984`) puts it on the **first** `functionCall` of each `model` turn that lacks a
+/// `thoughtSignature`, "If we do not do this, the API rejects the request with a 400"
+/// (`historyHardening.ts:140-152` applies the same rule). [`gemini_request_body`] follows that
+/// rule for calls a non-Gemini rung (or a non-Gemini caller) produced.
+const SYNTHETIC_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
+/// Build the Gemini `generateContent` request body from a normalized [`ModelRequest`]. Split out
+/// (pure, no I/O) so the translation is unit-tested offline. Gemini uses `contents` with roles
+/// `user` / `model` (not `assistant`) and a separate `systemInstruction`.
+///
+/// Message content is either a string or the Anthropic-shaped blocks the translation path
+/// produces: `text` → text part, `tool_use` → `functionCall` (its
+/// `extra_content.google.thought_signature` restored as `thoughtSignature`), `tool_result` →
+/// `functionResponse` (named by the matching `tool_use`), base64 `image` → `inlineData`. Other
+/// blocks (e.g. `thinking`) contribute nothing, as before. Consecutive same-role messages merge
+/// into one turn: Gemini requires every parallel `functionResponse` in a single turn, and the
+/// translation path emits one message per tool result. `tools` (Anthropic or OpenAI shape) →
+/// one `functionDeclarations` entry; `tool_choice` is not carried (the translation path drops it).
+fn gemini_request_body(req: &ModelRequest) -> Value {
+    let str_at = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    // tool_use id → name: a tool_result carries only the id, a functionResponse needs the name.
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    let mut contents: Vec<Value> = Vec::with_capacity(req.messages.len());
+    for m in &req.messages {
+        let role = if m.role == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
+        let mut parts: Vec<Value> = Vec::new();
+        if let Value::Array(blocks) = &m.content {
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        parts.push(serde_json::json!({ "text": str_at(b, "text") }));
+                    }
+                    Some("tool_use") => {
+                        let name = str_at(b, "name");
+                        call_names.insert(str_at(b, "id"), name.clone());
+                        let args = b
+                            .get("input")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        let mut part =
+                            serde_json::json!({ "functionCall": { "name": name, "args": args } });
+                        if let Some(sig) = b
+                            .pointer("/extra_content/google/thought_signature")
+                            .and_then(Value::as_str)
+                        {
+                            part["thoughtSignature"] = Value::String(sig.to_owned());
+                        }
+                        parts.push(part);
+                    }
+                    Some("tool_result") => {
+                        let name = call_names
+                            .get(&str_at(b, "tool_use_id"))
+                            .cloned()
+                            .unwrap_or_default();
+                        parts.push(serde_json::json!({ "functionResponse": {
+                            "name": name,
+                            "response": gemini_function_response(b.get("content")),
+                        } }));
+                    }
+                    Some("image") if b.pointer("/source/type") == Some(&Value::from("base64")) => {
+                        parts.push(serde_json::json!({ "inlineData": {
+                            "mimeType": b.pointer("/source/media_type").cloned().unwrap_or(Value::Null),
+                            "data": b.pointer("/source/data").cloned().unwrap_or(Value::Null),
+                        } }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if parts.is_empty() {
+            parts.push(serde_json::json!({ "text": m.text_view() }));
+        }
+        match contents.last_mut() {
+            Some(prev) if prev["role"] == role => {
+                if let Some(prev_parts) = prev["parts"].as_array_mut() {
+                    prev_parts.extend(parts);
+                }
+            }
+            _ => contents.push(serde_json::json!({ "role": role, "parts": parts })),
+        }
+    }
+    // gemini-cli's rule (see SYNTHETIC_THOUGHT_SIGNATURE): the first call of every model turn
+    // must be signed, or Gemini 2.5+/3 400s the request.
+    for c in contents.iter_mut().filter(|c| c["role"] == "model") {
+        if let Some(first_call) = c["parts"]
+            .as_array_mut()
+            .and_then(|ps| ps.iter_mut().find(|p| p.get("functionCall").is_some()))
+            && first_call.get("thoughtSignature").is_none()
+        {
+            first_call["thoughtSignature"] = Value::from(SYNTHETIC_THOUGHT_SIGNATURE);
+        }
+    }
+    let mut body = serde_json::json!({
+        "contents": contents,
+        "generationConfig": { "maxOutputTokens": req.max_tokens },
+    });
+    if let Some(system) = req.system.as_deref() {
+        body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": system }] });
+    }
+    if let Some(tools) = req.tools.as_array() {
+        let decls: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                let f = t.get("function").unwrap_or(t); // OpenAI wraps, Anthropic does not
+                let mut d =
+                    serde_json::json!({ "name": f.get("name").cloned().unwrap_or(Value::Null) });
+                if let Some(desc) = f.get("description") {
+                    d["description"] = desc.clone();
+                }
+                // JSON Schema from Anthropic/OpenAI, so the JSON Schema field — `parameters` is
+                // Gemini's OpenAPI subset and rejects keywords like `additionalProperties`.
+                if let Some(schema) = f.get("input_schema").or_else(|| f.get("parameters")) {
+                    d["parametersJsonSchema"] = schema.clone();
+                }
+                d
+            })
+            .collect();
+        if !decls.is_empty() {
+            body["tools"] = serde_json::json!([{ "functionDeclarations": decls }]);
+        }
+    }
+    // This builder reconstructs from normalized fields, so the caller's reasoning request is only
+    // in `raw` — carry it across rather than dropping it on the Gemini rung.
+    let effort = rung_effort(&req.model).or_else(|| effort_of(&req.raw));
+    if let (Some(effort), Some(map)) = (effort, body.as_object_mut()) {
+        let mut carry = serde_json::Map::new();
+        carry.insert(
+            "reasoning_effort".to_owned(),
+            Value::String(effort.as_str().to_owned()),
+        );
+        carry.insert(
+            "generationConfig".to_owned(),
+            map["generationConfig"].clone(),
+        );
+        normalize_reasoning(&mut carry, Wire::Gemini);
+        map.insert(
+            "generationConfig".to_owned(),
+            carry["generationConfig"].clone(),
+        );
+    }
+    body
+}
+
+/// A `tool_result` block's content as a Gemini `functionResponse.response`, which must be an
+/// object. A Gemini caller's response was serialized to a JSON object string on the way in
+/// ([`crate::gemini`]), so it round-trips exactly; any other result is wrapped as `{"output": …}`,
+/// the key gemini-cli itself uses for tool output.
+fn gemini_function_response(content: Option<&Value>) -> Value {
+    let text = match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(Value::Object(o)) => return Value::Object(o.clone()),
+        _ => String::new(),
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(obj @ Value::Object(_)) => obj,
+        _ => serde_json::json!({ "output": text }),
+    }
+}
+
+/// What [`gemini_parse_response`] reads off a Gemini response.
+#[derive(Debug, PartialEq)]
+struct GeminiParsed {
+    text: String,
+    /// Uncached input only — `promptTokenCount` includes `cachedContentTokenCount`.
+    in_tokens: u64,
+    cache_read_tokens: u64,
+    out_tokens: u64,
+    /// The first candidate's `functionCall` parts as Chat tool calls, each carrying its
+    /// `thoughtSignature` as `extra_content.google.thought_signature`.
+    tool_calls: Vec<Value>,
+}
+
+/// Parse a Gemini `generateContent` response: the first candidate's text and function calls, and
+/// the token split from `usageMetadata`.
+fn gemini_parse_response(json: &Value) -> Result<GeminiParsed, ProviderError> {
+    let parts = json
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderError::Decode("missing candidates[0].content.parts".to_owned()))?;
+    let text = parts
+        .iter()
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    let tool_calls = parts
+        .iter()
+        .filter_map(|p| Some((p.get("functionCall")?, p)))
+        .map(|(fc, p)| {
+            // Gemini's call id is optional; a fresh one keeps ids unique across a conversation
+            // (Anthropic rejects a repeated tool_use id if a later turn escalates there).
+            let id = fc.get("id").and_then(Value::as_str).map_or_else(
+                || format!("call_{}", uuid::Uuid::now_v7().simple()),
+                str::to_owned,
+            );
+            let args = fc
+                .get("args")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let mut call = serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": fc.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments": args.to_string(),
+                },
+            });
+            if let Some(sig) = p.get("thoughtSignature").and_then(Value::as_str) {
+                call["extra_content"] =
+                    serde_json::json!({ "google": { "thought_signature": sig } });
+            }
+            call
+        })
+        .collect();
+    let u = |ptr: &str| json.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
+    // promptTokenCount includes the implicit/explicit cache hits; price those as cache reads,
+    // the same split the observe path makes (`proxy::response_usage`).
+    let cache_read_tokens = u("/usageMetadata/cachedContentTokenCount");
+    let in_tokens = u("/usageMetadata/promptTokenCount").saturating_sub(cache_read_tokens);
+    // Thinking tokens (Gemini 2.5+/3) are billed as output; leaving them out under-bills.
+    let out_tokens =
+        u("/usageMetadata/candidatesTokenCount") + u("/usageMetadata/thoughtsTokenCount");
+    Ok(GeminiParsed {
+        text,
+        in_tokens,
+        cache_read_tokens,
+        out_tokens,
+        tool_calls,
+    })
+}
+
+/// The Gemini wire response plus, when it called tools, an OpenAI-shaped `choices[0].message`
+/// beside `candidates`. Gates ([`crate::gate`]), [`ModelResponse::has_tool_calls`], and the
+/// response renderers read tool calls from Anthropic or OpenAI shape only; adding the OpenAI view
+/// lets all of them see Gemini calls (with their signatures) without a third reader each, while
+/// `candidates` stays intact for [`hit_output_limit`] and audit.
+fn gemini_raw_with_choices(mut json: Value, parsed: &GeminiParsed) -> Value {
+    if !parsed.tool_calls.is_empty()
+        && let Some(map) = json.as_object_mut()
+    {
+        let content = if parsed.text.is_empty() {
+            Value::Null
+        } else {
+            Value::String(parsed.text.clone())
+        };
+        // A call cut off at the output cap must still read as truncated in this view.
+        let finish_reason = if map
+            .get("candidates")
+            .and_then(|c| c.pointer("/0/finishReason"))
+            == Some(&Value::String("MAX_TOKENS".to_owned()))
+        {
+            "length"
+        } else {
+            "tool_calls"
+        };
+        map.insert(
+            "choices".to_owned(),
+            serde_json::json!([{
+                "index": 0,
+                "message": { "role": "assistant", "content": content, "tool_calls": parsed.tool_calls },
+                "finish_reason": finish_reason,
+            }]),
+        );
+    }
+    json
+}
+
+/// Speaks `POST {base}/v1beta/models/{model}:generateContent` (Google Gemini Generative Language
+/// API). The API key goes in the `x-goog-api-key` header — never the URL query string, so it stays
+/// out of logs and proxies.
+///
+// LIVE-VERIFIED (2026-08-03): served `google/gemini-3.5-flash-lite` end to end through the real
+// proxy against the real endpoint, with a receipt, in the `provider-smoke` matrix. Note the
+// timestamp — that is a claim about a commit, not a standing property.
+#[derive(Debug, Clone)]
+pub struct GeminiProvider {
+    /// Ladder prefix / trace label (usually `"gemini"` or `"google"`).
+    pub id: String,
+    /// Base URL, e.g. `https://generativelanguage.googleapis.com`.
+    pub base_url: String,
+    /// Env var the API key is read from, e.g. `"GEMINI_API_KEY"`.
+    pub api_key_env: Option<String>,
+    /// Shared, connection-pooled HTTP client.
+    pub http: reqwest::Client,
+}
+
+#[async_trait]
+impl Provider for GeminiProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn translates_structured(&self) -> bool {
+        true
+    }
+
+    async fn complete(
+        &self,
+        req: &ModelRequest,
+        auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        // A configured api_key_env wins and never falls through (it is *this* provider's key);
+        // otherwise the inbound x-goog-api-key, Gemini dialect only. Never auth.openai_key.
+        let key = resolve_api_key(self.api_key_env.as_deref(), auth.gemini_key.as_deref());
+        let body = gemini_request_body(req);
+        let url = format!(
+            "{}/v1beta/models/{}:generateContent",
+            self.base_url.trim_end_matches('/'),
+            wire_model(&req.model),
+        );
+        let resp = self
+            .http
+            .post(url)
+            .header("x-goog-api-key", key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+
+        let json: Value =
+            serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
+        let parsed = gemini_parse_response(&json)?;
+        Ok(ModelResponse {
+            // Gemini bills no cache write on the generateContent call.
+            cache_write_tokens: 0,
+            cache_read_tokens: parsed.cache_read_tokens,
+            model: req.model.clone(),
+            text: parsed.text.clone(),
+            in_tokens: parsed.in_tokens,
+            out_tokens: parsed.out_tokens,
+            raw: gemini_raw_with_choices(json, &parsed),
+        })
+    }
+}
+
+/// AWS credentials read fresh from the standard env vars at call time — never cached, never
+/// logged (ADR 0006 P2). `AWS_SESSION_TOKEN` is optional (long-lived IAM user keys have none;
+/// STS-issued temporary credentials do).
+struct AwsEnvCredentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+}
+
+impl AwsEnvCredentials {
+    fn from_env() -> Result<Self, ProviderError> {
+        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
+            .map_err(|_| ProviderError::Transport("AWS_ACCESS_KEY_ID is not set".to_owned()))?;
+        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .map_err(|_| ProviderError::Transport("AWS_SECRET_ACCESS_KEY is not set".to_owned()))?;
+        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+        Ok(Self {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        })
+    }
+}
+
+/// Build the Bedrock `invoke` URL for a region + wire model id.
+fn bedrock_url(region: &str, model: &str) -> String {
+    format!("https://bedrock-runtime.{region}.amazonaws.com/model/{model}/invoke")
+}
+
+/// SigV4-sign a Bedrock `InvokeModel` request, returning the fully-built (headers + body) HTTP
+/// request ready to hand to reqwest. Delegates all canonical-request construction and HMAC signing
+/// to `aws-sigv4` (ADR 0006 I3) — this function only wires host/service/region into that crate's
+/// API and applies the resulting signature. Split out from [`BedrockProvider::complete`] so the
+/// signing shape (not its cryptographic validity, which only a real AWS call can prove) is
+/// unit-testable offline with dummy credentials.
+///
+// LIVE-UNVERIFIED: tests assert the produced request carries an `AWS4-HMAC-SHA256` authorization
+// header and the expected host, against dummy credentials. Signature validity is only provable
+// against a real Bedrock endpoint.
+fn sign_bedrock(
+    url: &str,
+    region: &str,
+    body: &[u8],
+    creds: &AwsEnvCredentials,
+) -> Result<http::Request<Vec<u8>>, ProviderError> {
+    let host = url
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(str::to_owned))
+        .ok_or_else(|| ProviderError::Transport(format!("invalid bedrock URL: {url}")))?;
+
+    let identity: aws_smithy_runtime_api::client::identity::Identity =
+        aws_credential_types::Credentials::new(
+            creds.access_key_id.clone(),
+            creds.secret_access_key.clone(),
+            creds.session_token.clone(),
+            None,
+            "firstpass",
+        )
+        .into();
+
+    let signing_params: aws_sigv4::http_request::SigningParams<'_> =
+        aws_sigv4::sign::v4::SigningParams::builder()
+            .identity(&identity)
+            .region(region)
+            .name("bedrock")
+            .time(SystemTime::now())
+            .settings(aws_sigv4::http_request::SigningSettings::default())
+            .build()
+            .map_err(|e| ProviderError::Transport(format!("sigv4 signing params: {e}")))?
+            .into();
+
+    let headers = [
+        ("host", host.as_str()),
+        ("content-type", "application/json"),
+    ];
+    let signable = aws_sigv4::http_request::SignableRequest::new(
+        "POST",
+        url,
+        headers.into_iter(),
+        aws_sigv4::http_request::SignableBody::Bytes(body),
+    )
+    .map_err(|e| ProviderError::Transport(format!("sigv4 signable request: {e}")))?;
+
+    let (instructions, _signature) = aws_sigv4::http_request::sign(signable, &signing_params)
+        .map_err(|e| ProviderError::Transport(format!("sigv4 sign: {e}")))?
+        .into_parts();
+
+    let mut req = http::Request::builder()
+        .method("POST")
+        .uri(url)
+        .header("host", host)
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .map_err(|e| ProviderError::Transport(format!("build bedrock request: {e}")))?;
+    instructions.apply_to_request_http1x(&mut req);
+    Ok(req)
+}
+
+/// Speaks `POST https://bedrock-runtime.{region}.amazonaws.com/model/{model}/invoke` (Claude on AWS
+/// Bedrock) — an Anthropic-shaped body ([`anthropic_messages_body`]) authenticated with AWS SigV4
+/// request signing rather than an API key (ADR 0006 P2). Credentials come from the standard
+/// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` env vars, read fresh per
+/// call — never logged, never put in the URL (I2).
+///
+// LIVE-UNVERIFIED: the request/response translation and signing call shape are unit-tested
+// offline; this has not been exercised against a real Bedrock endpoint. Verify against real AWS
+// credentials before relying on it in production.
+#[derive(Debug, Clone)]
+pub struct BedrockProvider {
+    /// Ladder prefix / trace label (usually `"bedrock"`).
+    pub id: String,
+    /// AWS region Bedrock is called in, e.g. `"us-east-1"`.
+    pub region: Option<String>,
+    /// Shared, connection-pooled HTTP client.
+    pub http: reqwest::Client,
+}
+
+#[async_trait]
+impl Provider for BedrockProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn carries_structured_verbatim(&self, inbound: firstpass_core::Dialect) -> bool {
+        inbound == firstpass_core::Dialect::Anthropic
+    }
+
+    async fn complete(
+        &self,
+        req: &ModelRequest,
+        _auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        let region = self.region.as_deref().ok_or_else(|| {
+            ProviderError::Transport("bedrock provider requires a region".to_owned())
+        })?;
+        let model = wire_model(&req.model);
+        let url = bedrock_url(region, model);
+        let body = anthropic_messages_body(req, "bedrock-2023-05-31");
+        let body_bytes =
+            serde_json::to_vec(&body).map_err(|e| ProviderError::Decode(e.to_string()))?;
+
+        let creds = AwsEnvCredentials::from_env()?;
+        let signed = sign_bedrock(&url, region, &body_bytes, &creds)?;
+        let http_req = reqwest::Request::try_from(signed)
+            .map_err(|e| ProviderError::Transport(format!("build reqwest request: {e}")))?;
+
+        let resp = self
+            .http
+            .execute(http_req)
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+
+        let json: Value =
+            serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
+        let u = anthropic_parse_response(&json)?;
+        let (text, in_tokens, out_tokens) = (u.text, u.in_tokens, u.out_tokens);
+        let (cache_write_tokens, cache_read_tokens) = (u.cache_write_tokens, u.cache_read_tokens);
+        Ok(ModelResponse {
+            cache_write_tokens,
+            cache_read_tokens,
+            model: req.model.clone(),
+            text,
+            in_tokens,
+            out_tokens,
+            raw: json,
+        })
+    }
+}
+
+/// Build the Vertex AI `rawPredict` URL for a region + project + wire model id (Claude on Vertex).
+fn vertex_url(region: &str, project: &str, model: &str) -> String {
+    format!(
+        "https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:rawPredict"
+    )
+}
+
+/// Speaks `POST https://{region}-aiplatform.googleapis.com/.../publishers/anthropic/models/{model}:rawPredict`
+/// (Claude on Google Vertex AI) — an Anthropic-shaped body ([`anthropic_messages_body`])
+/// authenticated with a GCP OAuth2 bearer token rather than an API key (ADR 0006 P3). The token is
+/// minted and cached by `gcp_auth` from `GOOGLE_APPLICATION_CREDENTIALS` or the ambient GCP
+/// environment — this adapter never caches or logs it, and it never goes in the URL (I2).
+///
+// LIVE-UNVERIFIED: the request/response translation is unit-tested offline; this has not been
+// exercised against a real Vertex endpoint. Verify against a real service account before relying
+// on it in production.
+#[derive(Debug, Clone)]
+pub struct VertexProvider {
+    /// Ladder prefix / trace label (usually `"vertex"`).
+    pub id: String,
+    /// GCP region Vertex is called in, e.g. `"us-central1"`.
+    pub region: Option<String>,
+    /// GCP project id.
+    pub project: Option<String>,
+    /// Shared, connection-pooled HTTP client.
+    pub http: reqwest::Client,
+}
+
+#[async_trait]
+impl Provider for VertexProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn carries_structured_verbatim(&self, inbound: firstpass_core::Dialect) -> bool {
+        inbound == firstpass_core::Dialect::Anthropic
+    }
+
+    async fn complete(
+        &self,
+        req: &ModelRequest,
+        _auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        let region = self.region.as_deref().ok_or_else(|| {
+            ProviderError::Transport("vertex provider requires a region".to_owned())
+        })?;
+        let project = self.project.as_deref().ok_or_else(|| {
+            ProviderError::Transport("vertex provider requires a project".to_owned())
+        })?;
+        let model = wire_model(&req.model);
+        let url = vertex_url(region, project, model);
+        let body = anthropic_messages_body(req, "vertex-2023-10-16");
+
+        // ponytail: gcp_auth re-detects the auth method per call (the token itself is cached inside
+        // the provider). Cache the provider in a OnceCell if Vertex ever becomes a hot path.
+        let provider = gcp_auth::provider()
+            .await
+            .map_err(|e| ProviderError::Transport(format!("gcp_auth provider: {e}")))?;
+        let token = provider
+            .token(&["https://www.googleapis.com/auth/cloud-platform"])
+            .await
+            .map_err(|e| ProviderError::Transport(format!("gcp_auth token: {e}")))?;
+
+        let resp = self
+            .http
+            .post(url)
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {}", token.as_str()),
+            )
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+
+        let json: Value =
+            serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
+        let u = anthropic_parse_response(&json)?;
+        let (text, in_tokens, out_tokens) = (u.text, u.in_tokens, u.out_tokens);
+        let (cache_write_tokens, cache_read_tokens) = (u.cache_write_tokens, u.cache_read_tokens);
+        Ok(ModelResponse {
+            cache_write_tokens,
+            cache_read_tokens,
+            model: req.model.clone(),
+            text,
+            in_tokens,
+            out_tokens,
+            raw: json,
+        })
+    }
+}
+
+/// Lookup from provider id (`"anthropic"`, `"openai"`, ...) to the [`Provider`] that serves it.
+#[derive(Clone)]
+pub struct ProviderRegistry {
+    providers: HashMap<String, Arc<dyn Provider>>,
+}
+
+impl std::fmt::Debug for ProviderRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderRegistry")
+            .field("providers", &self.providers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// The env var a built-in OpenAI-compatible provider reads its key from, if `id` is one.
+///
+/// Exposed so `doctor` can report a missing key at setup time rather than letting the first real
+/// request discover it.
+#[must_use]
+pub fn builtin_key_env(id: &str) -> Option<&'static str> {
+    BUILTIN_OPENAI_COMPATIBLE
+        .iter()
+        .find(|(p, _, _)| *p == id)
+        .map(|(_, _, k)| *k)
+}
+
+impl ProviderRegistry {
+    /// One HTTP client shared by every provider. The enforce path is request/response (never
+    /// streamed through the adapter), so it carries a total request timeout as well as a connect
+    /// timeout — a hung or slow upstream can't pin a routing decision indefinitely. The total is
+    /// 600 s, the Anthropic SDK's own default: a long generation (12k output tokens) legitimately
+    /// runs past two minutes, and a shorter cap turns it into a provider error on every rung.
+    /// Falls back to a default client if the builder fails (only on TLS backend init, which is
+    /// fatal anyway).
+    fn build_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
+    /// Build the standard registry: the built-in `anthropic` + `openai` providers.
+    #[must_use]
+    pub fn new(anthropic_base: impl Into<String>, openai_base: impl Into<String>) -> Self {
+        Self::from_config(&[], anthropic_base, openai_base)
+    }
+
+    /// Build the registry with the built-in `anthropic` / `openai` providers plus every configured
+    /// `[[provider]]` entry — so a ladder can route to any OpenAI-compatible or Anthropic-compatible
+    /// endpoint (Groq, Together, Fireworks, DeepSeek, Mistral, xAI, OpenRouter, Ollama, vLLM, Azure,
+    /// …) by id. A `[[provider]]` whose id is `anthropic` or `openai` overrides the built-in default
+    /// (e.g. to point `openai` at Azure). Shares one HTTP client across all of them.
+    #[must_use]
+    pub fn from_config(
+        defs: &[firstpass_core::ProviderDef],
+        anthropic_base: impl Into<String>,
+        openai_base: impl Into<String>,
+    ) -> Self {
+        let http = Self::build_http_client();
+        let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        providers.insert(
+            "anthropic".to_owned(),
+            Arc::new(AnthropicProvider {
+                id: "anthropic".to_owned(),
+                base_url: anthropic_base.into(),
+                api_key_env: None,
+                http: http.clone(),
+            }),
+        );
+        providers.insert(
+            "openai".to_owned(),
+            Arc::new(OpenAiProvider {
+                id: "openai".to_owned(),
+                base_url: openai_base.into(),
+                api_key_env: None,
+                http: http.clone(),
+            }),
+        );
+        // Registered BEFORE user `[[provider]]` blocks so an explicit definition overrides the
+        // built-in — an operator pointing `groq` at a proxy of their own must win over our default.
+        for (id, base, key_env) in BUILTIN_OPENAI_COMPATIBLE {
+            providers.insert(
+                (*id).to_owned(),
+                Arc::new(OpenAiProvider {
+                    id: (*id).to_owned(),
+                    base_url: (*base).to_owned(),
+                    api_key_env: Some((*key_env).to_owned()),
+                    http: http.clone(),
+                }),
+            );
+        }
+        for def in defs {
+            // Auth scheme comes first (ADR 0006): `aws_sigv4`/`gcp_oauth` are bespoke-auth
+            // backends that wrap the Anthropic body shape regardless of `dialect`; `api_key`
+            // (the default) is today's dialect-driven dispatch, unchanged.
+            let provider: Arc<dyn Provider> = match def.auth {
+                firstpass_core::AuthScheme::AwsSigv4 => Arc::new(BedrockProvider {
+                    id: def.id.clone(),
+                    region: def.region.clone(),
+                    http: http.clone(),
+                }),
+                firstpass_core::AuthScheme::GcpOauth => Arc::new(VertexProvider {
+                    id: def.id.clone(),
+                    region: def.region.clone(),
+                    project: def.project.clone(),
+                    http: http.clone(),
+                }),
+                firstpass_core::AuthScheme::ApiKey => match def.dialect {
+                    firstpass_core::Dialect::Anthropic => Arc::new(AnthropicProvider {
+                        id: def.id.clone(),
+                        base_url: def.base_url.clone(),
+                        api_key_env: def.api_key_env.clone(),
+                        http: http.clone(),
+                    }),
+                    firstpass_core::Dialect::Openai => Arc::new(OpenAiProvider {
+                        id: def.id.clone(),
+                        base_url: def.base_url.clone(),
+                        api_key_env: def.api_key_env.clone(),
+                        http: http.clone(),
+                    }),
+                    firstpass_core::Dialect::Gemini => Arc::new(GeminiProvider {
+                        id: def.id.clone(),
+                        base_url: def.base_url.clone(),
+                        api_key_env: def.api_key_env.clone(),
+                        http: http.clone(),
+                    }),
+                },
+            };
+            providers.insert(def.id.clone(), provider);
+        }
+        Self { providers }
+    }
+
+    /// Build a registry from arbitrary providers — used to wire up [`MockProvider`]s in tests.
+    #[must_use]
+    pub fn from_map(providers: HashMap<String, Arc<dyn Provider>>) -> Self {
+        Self { providers }
+    }
+
+    /// Look up a provider by id.
+    #[must_use]
+    pub fn get(&self, provider_id: &str) -> Option<Arc<dyn Provider>> {
+        self.providers.get(provider_id).cloned()
+    }
+}
+
+/// Test-only provider: returns a pre-programmed outcome per model, deterministically.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub struct MockProvider {
+    id: String,
+    outcomes: HashMap<String, Result<ModelResponse, ProviderError>>,
+    /// Every model string `complete()` was called with — lets speculation tests assert which rungs
+    /// were actually fired. Shared (`Arc`) so a clone taken before boxing still observes the calls.
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Simulated per-call latency (0 = respond instantly). Lets a test measure the wall-clock win
+    /// speculation buys by overlapping rung calls that would otherwise run serially.
+    delay_ms: u64,
+}
+
+#[cfg(test)]
+impl MockProvider {
+    /// Build a mock provider that answers `outcomes[model]` for `complete()`.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        outcomes: HashMap<String, Result<ModelResponse, ProviderError>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            outcomes,
+            calls: Arc::default(),
+            delay_ms: 0,
+        }
+    }
+
+    /// Make `complete()` sleep `ms` before responding, to simulate real per-call latency.
+    #[must_use]
+    pub fn with_delay(mut self, ms: u64) -> Self {
+        self.delay_ms = ms;
+        self
+    }
+
+    /// A handle to the shared call log; clone it before boxing the provider into a registry, then
+    /// inspect the models `complete()` saw after the engine runs.
+    #[must_use]
+    pub fn call_log(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+        Arc::clone(&self.calls)
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Provider for MockProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    // ponytail: returns true for all dialects — test-only mock needs to pass the fidelity guard
+    // for both Anthropic and OpenAI inbound tests without a real dialect-split implementation.
+    fn carries_structured_verbatim(&self, _inbound: firstpass_core::Dialect) -> bool {
+        true
+    }
+
+    async fn complete(
+        &self,
+        req: &ModelRequest,
+        _auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        self.calls.lock().unwrap().push(req.model.clone());
+        if self.delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        }
+        self.outcomes.get(&req.model).cloned().unwrap_or_else(|| {
+            Err(ProviderError::Decode(format!(
+                "no mock outcome configured for {}",
+                req.model
+            )))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every provider's way of saying "stopped at the output-token limit" is recognised, and a
+    /// normal stop or an unknown shape is not.
+    #[test]
+    fn output_limit_is_detected_across_providers() {
+        use serde_json::json;
+        for raw in [
+            json!({"stop_reason": "max_tokens"}),
+            json!({"choices": [{"finish_reason": "length"}]}),
+            json!({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}),
+            json!({"candidates": [{"finishReason": "MAX_TOKENS"}]}),
+        ] {
+            assert!(hit_output_limit(&raw), "{raw}");
+        }
+        for raw in [
+            json!({"stop_reason": "end_turn"}),
+            json!({"choices": [{"finish_reason": "stop"}]}),
+            json!({"incomplete_details": {"reason": "content_filter"}}),
+            json!({"candidates": [{"finishReason": "STOP"}]}),
+            serde_json::Value::Null,
+        ] {
+            assert!(!hit_output_limit(&raw), "{raw}");
+        }
+    }
+
+    use super::*;
+
+    fn obj(v: Value) -> serde_json::Map<String, Value> {
+        v.as_object().expect("test literal is an object").clone()
+    }
+
+    #[test]
+    fn openai_reasoning_effort_crosses_onto_an_anthropic_rung() {
+        // The bug this exists for: a ladder is routinely cross-vendor, so an OpenAI client that
+        // set `reasoning_effort` gets escalated onto an Anthropic rung. Forwarded verbatim that
+        // is a 400 on a request the caller wrote correctly.
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 8192, "reasoning_effort": "high",
+        }));
+
+        normalize_reasoning(&mut body, Wire::Anthropic);
+
+        assert!(
+            !body.contains_key("reasoning_effort"),
+            "the foreign spelling must not survive: {body:?}"
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        // Clamped to max_tokens - 1: "high" wants 16384, but Anthropic requires the budget to
+        // leave room for the answer itself.
+        assert_eq!(body["thinking"]["budget_tokens"], 8191);
+    }
+
+    #[test]
+    fn anthropic_thinking_budget_crosses_onto_an_openai_rung_as_a_word() {
+        let mut body = obj(serde_json::json!({
+            "model": "gpt-5.5",
+            "thinking": { "type": "enabled", "budget_tokens": 16384 },
+        }));
+
+        normalize_reasoning(&mut body, Wire::OpenAi);
+
+        assert!(!body.contains_key("thinking"));
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn thinking_is_dropped_rather_than_sent_invalid_when_max_tokens_cannot_fit_it() {
+        // Anthropic requires budget >= 1024 AND max_tokens > budget. A caller asking for high
+        // effort with max_tokens=500 cannot have both; sending it anyway is a 400. Serving
+        // without extended thinking is the answer the caller can actually use.
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 500, "reasoning_effort": "high",
+        }));
+
+        normalize_reasoning(&mut body, Wire::Anthropic);
+
+        assert!(
+            !body.contains_key("thinking"),
+            "must not emit a budget max_tokens cannot satisfy: {body:?}"
+        );
+        assert!(!body.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn enabling_thinking_clears_a_temperature_the_caller_chose_without_knowing() {
+        // Extended thinking rejects any temperature but the default. The caller set it before the
+        // router decided to enable thinking, so keeping it would 400.
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 8192,
+            "reasoning_effort": "medium", "temperature": 0.2, "top_p": 0.9,
+        }));
+
+        normalize_reasoning(&mut body, Wire::Anthropic);
+
+        assert_eq!(body["thinking"]["budget_tokens"], 4096);
+        assert!(!body.contains_key("temperature"), "{body:?}");
+        assert!(!body.contains_key("top_p"), "{body:?}");
+    }
+
+    #[test]
+    fn a_body_that_asked_for_no_reasoning_is_left_alone() {
+        let before = serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 1024, "temperature": 0.7,
+        });
+        let mut body = obj(before.clone());
+
+        normalize_reasoning(&mut body, Wire::Anthropic);
+
+        assert_eq!(
+            Value::Object(body),
+            before,
+            "no reasoning request, no rewrite"
+        );
+    }
+
+    #[test]
+    fn gemini_gets_a_nested_budget_not_a_top_level_one() {
+        let mut body = obj(serde_json::json!({
+            "contents": [], "generationConfig": { "maxOutputTokens": 4096 },
+            "reasoning_effort": "low",
+        }));
+
+        normalize_reasoning(&mut body, Wire::Gemini);
+
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            1024
+        );
+        assert_eq!(
+            body["generationConfig"]["maxOutputTokens"], 4096,
+            "must not clobber the rest of generationConfig"
+        );
+        assert!(
+            !body.contains_key("thinkingConfig"),
+            "top level is wrong for Gemini"
+        );
+    }
+
+    #[test]
+    fn a_same_dialect_body_is_never_rewritten_even_when_the_caller_got_it_wrong() {
+        // budget_tokens(1024) > max_tokens(512) is invalid at Anthropic — and this request is
+        // already Anthropic-spelled, so it is not ours to "fix". Rewriting it would serve a
+        // different request than the caller wrote and hide the error that explains why.
+        let before = serde_json::json!({
+            "max_tokens": 512,
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+        });
+        let mut body = obj(before.clone());
+
+        normalize_reasoning(&mut body, Wire::Anthropic);
+
+        assert_eq!(Value::Object(body), before);
+    }
+
+    #[test]
+    fn disabled_thinking_is_not_read_as_a_request_to_think() {
+        let body = obj(serde_json::json!({
+            "thinking": { "type": "disabled", "budget_tokens": 16384 },
+        }));
+        assert_eq!(read_effort(&body), None);
+    }
+
+    #[test]
+    fn a_cached_response_reports_its_cache_tokens_not_just_the_remainder() {
+        // A real cached Claude Code turn: the prompt is in the cache counters, and `input_tokens`
+        // is the small uncached remainder. Reading only `input_tokens` — which this did — is how a
+        // ~$0.70 call banked a receipt reading a fraction of a cent.
+        let json = serde_json::json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "usage": {
+                "input_tokens": 20,
+                "cache_creation_input_tokens": 190_000,
+                "cache_read_input_tokens": 1_234,
+                "output_tokens": 400,
+            },
+        });
+
+        let u = anthropic_parse_response(&json).expect("parses");
+
+        assert_eq!(u.in_tokens, 20);
+        assert_eq!(u.cache_write_tokens, 190_000);
+        assert_eq!(u.cache_read_tokens, 1_234);
+        assert_eq!(u.out_tokens, 400);
+    }
+
+    #[test]
+    fn an_uncached_response_reports_zero_cache_traffic() {
+        // The overwhelmingly common case must be untouched.
+        let json = serde_json::json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "usage": { "input_tokens": 1000, "output_tokens": 200 },
+        });
+
+        let u = anthropic_parse_response(&json).expect("parses");
+
+        assert_eq!(u.in_tokens, 1000);
+        assert_eq!(u.cache_write_tokens, 0);
+        assert_eq!(u.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn cache_breakpoints_land_on_the_stable_prefix_only() {
+        // System prompt and tool definitions are what repeat byte-for-byte across an agent's
+        // turns. The conversation after them is not cached, and must not be marked.
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "system": "you are a careful assistant. ".repeat(200),
+            "tools": [{ "name": "a" }, { "name": "b" }],
+            "messages": [{ "role": "user", "content": "hi" }],
+        }));
+
+        add_cache_breakpoints(&mut body);
+
+        // A bare string system cannot carry cache_control — it must become the block form.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            body["system"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("you are a careful")
+        );
+        // Only the LAST tool: a breakpoint marks the end of a prefix, and one per tool would
+        // spend the write premium several times over for the same prefix.
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert!(
+            body["messages"][0].get("cache_control").is_none(),
+            "the conversation is not the stable prefix"
+        );
+    }
+
+    #[test]
+    fn a_prefix_too_small_to_qualify_is_not_marked() {
+        // Anthropic refuses to cache below a per-model minimum (1024 tokens, 2048 on Haiku), and
+        // marking a shorter prefix is not merely wasted — it is a request the API can reject.
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "system": "be terse",
+            "messages": [{ "role": "user", "content": "hi" }],
+        }));
+        let before = body.clone();
+
+        add_cache_breakpoints(&mut body);
+
+        assert_eq!(body, before, "a two-word system prompt cannot be cached");
+    }
+
+    #[test]
+    fn a_caller_that_placed_its_own_breakpoints_is_left_alone() {
+        // They have knowledge of their own prefix that this code does not; adding more would
+        // exceed Anthropic's breakpoint limit and re-bill the write premium.
+        let before = serde_json::json!({
+            "system": [{ "type": "text", "text": "s", "cache_control": { "type": "ephemeral" } }],
+            "tools": [{ "name": "a" }],
+        });
+        let mut body = obj(before.clone());
+
+        add_cache_breakpoints(&mut body);
+
+        assert_eq!(Value::Object(body), before);
+    }
+
+    #[test]
+    fn nothing_is_marked_when_there_is_no_stable_prefix() {
+        let mut body = obj(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{ "role": "user", "content": "one shot" }],
+        }));
+        let before = body.clone();
+
+        add_cache_breakpoints(&mut body);
+
+        assert_eq!(body, before, "no system, no tools — nothing to cache");
+    }
+
+    #[test]
+    fn breakpoints_are_off_unless_the_request_asks_for_them() {
+        // The default path must be byte-identical to before this existed.
+        let raw = serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 64,
+            "system": "a long stable system prefix. ".repeat(200),
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let req = ModelRequest {
+            model: "anthropic/claude-sonnet-5".to_owned(),
+            system: Some("a long stable system prefix. ".repeat(200)),
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 64,
+            tools: Value::Null,
+            raw: raw.clone(),
+            cache_prefix: false,
+        };
+
+        let body = anthropic_wire_body(&req);
+        assert!(body["system"].is_string(), "unchanged when opted out");
+
+        let opted = ModelRequest {
+            cache_prefix: true,
+            ..req
+        };
+        let body = anthropic_wire_body(&opted);
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn breakpoints_apply_on_the_normalized_path_too() {
+        // Found in review. The normalized branch is not a rare fallback — it is what every
+        // translated request uses, and every CONDENSED one, since condensing clears `raw` on
+        // purpose. Marking only the raw branch meant `prompt_cache` did nothing for exactly the
+        // long conversations it exists to pay for.
+        let req = ModelRequest {
+            model: "anthropic/claude-sonnet-5".to_owned(),
+            system: Some("stable prefix. ".repeat(300)),
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 64,
+            tools: serde_json::json!([{ "name": "a" }]),
+            raw: Value::Null, // no raw body → normalized build path
+            cache_prefix: true,
+        };
+
+        let body = anthropic_wire_body(&req);
+
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn common_openai_compatible_providers_work_without_a_config_block() {
+        // The breadth gap: a ladder naming `groq/…` previously needed a `[[provider]]` block, so
+        // "bring your own provider" meant boilerplate before the first request.
+        let reg = ProviderRegistry::from_config(
+            &[],
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+        );
+        for id in [
+            "groq",
+            "deepseek",
+            "together",
+            "fireworks",
+            "mistral",
+            "openrouter",
+            "xai",
+            "cerebras",
+        ] {
+            assert!(reg.get(id).is_some(), "{id} should be built in");
+        }
+        // The originals are untouched.
+        assert!(reg.get("anthropic").is_some());
+        assert!(reg.get("openai").is_some());
+        assert!(reg.get("not-a-provider").is_none());
+    }
+
+    #[test]
+    fn an_explicit_provider_block_overrides_the_builtin() {
+        // An operator pointing `groq` at a gateway of their own must win over our default —
+        // otherwise the built-in silently routes their traffic to the public endpoint instead.
+        let defs = vec![firstpass_core::ProviderDef {
+            id: "groq".to_owned(),
+            base_url: "https://internal.example.com/groq".to_owned(),
+            api_key_env: Some("MY_KEY".to_owned()),
+            dialect: firstpass_core::Dialect::Openai,
+            auth: firstpass_core::AuthScheme::ApiKey,
+            region: None,
+            project: None,
+        }];
+
+        let reg = ProviderRegistry::from_config(
+            &defs,
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+        );
+
+        let p = reg.get("groq").expect("groq present");
+        assert!(
+            format!("{p:?}").contains("internal.example.com"),
+            "the explicit block must win: {p:?}"
+        );
+    }
+
+    #[test]
+    fn wire_model_strips_the_provider_prefix() {
+        // Regression: sending "anthropic/claude-haiku-4-5" verbatim 404s at the provider.
+        assert_eq!(wire_model("anthropic/claude-haiku-4-5"), "claude-haiku-4-5");
+        assert_eq!(wire_model("openai/gpt-5.5"), "gpt-5.5");
+        assert_eq!(wire_model("claude-opus-4-8"), "claude-opus-4-8"); // no prefix → unchanged
+    }
+
+    #[test]
+    fn gemini_request_maps_roles_and_system_instruction() {
+        let req = ModelRequest {
+            model: "gemini/gemini-2.0-flash".to_owned(),
+            system: Some("be terse".to_owned()),
+            messages: vec![
+                ChatMessage::text("user", "hi"),
+                ChatMessage::text("assistant", "hello"),
+            ],
+            max_tokens: 256,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let body = gemini_request_body(&req);
+        // System prompt goes in systemInstruction (canonical REST field name), not contents.
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be terse");
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 256);
+        // Anthropic's "assistant" role becomes Gemini's "model"; "user" stays "user".
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "hi");
+        assert_eq!(body["contents"][1]["role"], "model");
+        assert_eq!(body["contents"][1]["parts"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn gemini_response_parses_text_and_usage() {
+        let json = serde_json::json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                { "text": "the answer " }, { "text": "is 42" }
+            ] } }],
+            "usageMetadata": { "promptTokenCount": 11, "candidatesTokenCount": 4 }
+        });
+        let p = gemini_parse_response(&json).unwrap();
+        assert_eq!(p.text, "the answer is 42");
+        assert_eq!(p.in_tokens, 11);
+        assert_eq!(p.out_tokens, 4);
+        // A response with no candidates is a decode error, not a fabricated empty answer.
+        assert!(gemini_parse_response(&serde_json::json!({ "candidates": [] })).is_err());
+        let thinking = serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }],
+            "usageMetadata": { "promptTokenCount": 7, "candidatesTokenCount": 3, "thoughtsTokenCount": 40 }
+        });
+        let p = gemini_parse_response(&thinking).unwrap();
+        assert_eq!(p.out_tokens, 43, "thinking tokens are billed output");
+    }
+
+    #[test]
+    fn gemini_cached_prompt_tokens_are_split_out_as_cache_reads() {
+        let json = serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }],
+            "usageMetadata": { "promptTokenCount": 1000, "cachedContentTokenCount": 800, "candidatesTokenCount": 5 }
+        });
+        let p = gemini_parse_response(&json).unwrap();
+        assert_eq!(
+            p.in_tokens, 200,
+            "promptTokenCount includes the cached part"
+        );
+        assert_eq!(p.cache_read_tokens, 800);
+        // mutant (done): reverting to `in_tokens = promptTokenCount` / `cache_read = 0` fails both.
+        // A malformed count larger than the prompt saturates rather than wrapping.
+        let odd = serde_json::json!({
+            "candidates": [{ "content": { "parts": [] } }],
+            "usageMetadata": { "promptTokenCount": 10, "cachedContentTokenCount": 50 }
+        });
+        assert_eq!(gemini_parse_response(&odd).unwrap().in_tokens, 0);
+    }
+
+    /// A Gemini-inbound tool turn as `crate::gemini::request_to_chat` emits it, through the real
+    /// translation path (`parse_openai_request(_, false)`), into each provider's wire body.
+    fn signed_gemini_tool_turn() -> ModelRequest {
+        let gemini = serde_json::json!({ "contents": [
+            { "role": "user", "parts": [{ "text": "list src" }] },
+            { "role": "model", "parts": [
+                { "functionCall": { "name": "ls", "args": { "p": "src" } }, "thoughtSignature": "SIG_A" },
+                { "functionCall": { "name": "cat", "args": { "f": "x" } } }
+            ] },
+            { "role": "user", "parts": [
+                { "functionResponse": { "name": "ls", "response": { "out": "a.rs" } } },
+                { "functionResponse": { "name": "cat", "response": { "out": "fn" } } }
+            ] }
+        ], "tools": [{ "functionDeclarations": [
+            { "name": "ls", "parametersJsonSchema": { "type": "object" } },
+            { "name": "cat", "parametersJsonSchema": { "type": "object" } }
+        ] }] });
+        assert!(!crate::gemini::has_untranslatable_content(&gemini));
+        let chat = crate::gemini::request_to_chat(&gemini, "gemini-3-flash");
+        let mut req = crate::proxy::parse_openai_request(chat.to_string().as_bytes(), false)
+            .expect("translatable");
+        req.model = "google/gemini-3-flash".to_owned();
+        req
+    }
+
+    #[test]
+    fn gemini_body_replays_the_inbound_thought_signature() {
+        let body = gemini_request_body(&signed_gemini_tool_turn());
+        let c = body["contents"].as_array().unwrap();
+        assert_eq!(
+            c.len(),
+            3,
+            "the two tool results merge into one user turn: {body}"
+        );
+        let model_parts = c[1]["parts"].as_array().unwrap();
+        assert_eq!(c[1]["role"], "model");
+        assert_eq!(model_parts[0]["functionCall"]["name"], "ls");
+        assert_eq!(model_parts[0]["functionCall"]["args"]["p"], "src");
+        assert_eq!(model_parts[0]["thoughtSignature"], "SIG_A");
+        // Only the first call of a turn needs one (gemini-cli's rule); the second stays unsigned.
+        assert!(model_parts[1].get("thoughtSignature").is_none());
+        let resp = c[2]["parts"].as_array().unwrap();
+        assert_eq!(resp[0]["functionResponse"]["name"], "ls");
+        assert_eq!(resp[0]["functionResponse"]["response"]["out"], "a.rs");
+        assert_eq!(resp[1]["functionResponse"]["name"], "cat");
+        let decls = body["tools"][0]["functionDeclarations"].as_array().unwrap();
+        assert_eq!(decls[0]["name"], "ls");
+        assert_eq!(decls[0]["parametersJsonSchema"]["type"], "object");
+        // mutant (done): dropping the `extra_content` copy in `parse_openai_request` or the
+        // `thoughtSignature` restore here makes SIG_A the synthetic value and fails line 3.
+    }
+
+    #[test]
+    fn gemini_body_signs_an_unsigned_first_call_like_gemini_cli() {
+        // A call a non-Gemini rung (or an OpenAI caller) produced carries no signature.
+        let req = ModelRequest {
+            model: "google/gemini-3-flash".to_owned(),
+            system: None,
+            messages: vec![
+                ChatMessage::text("user", "go"),
+                ChatMessage {
+                    role: "assistant".to_owned(),
+                    content: serde_json::json!([
+                        { "type": "tool_use", "id": "t1", "name": "ls", "input": {} },
+                        { "type": "tool_use", "id": "t2", "name": "ls", "input": {} }
+                    ]),
+                },
+                ChatMessage {
+                    role: "user".to_owned(),
+                    content: serde_json::json!([
+                        { "type": "tool_result", "tool_use_id": "t1", "content": "plain text" },
+                        { "type": "tool_result", "tool_use_id": "t2", "content": "x" }
+                    ]),
+                },
+            ],
+            max_tokens: 64,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let body = gemini_request_body(&req);
+        let parts = body["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["thoughtSignature"], SYNTHETIC_THOUGHT_SIGNATURE);
+        assert!(parts[1].get("thoughtSignature").is_none());
+        // A non-JSON tool result is wrapped, because functionResponse.response must be an object.
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"],
+            "plain text"
+        );
+        // mutant (done): deleting the synthetic-signature loop fails the first assert.
+    }
+
+    #[test]
+    fn non_gemini_bodies_never_carry_extra_content() {
+        let req = signed_gemini_tool_turn();
+        // Translation path (raw = Null): Anthropic, Bedrock/Vertex, and OpenAI rebuild bodies.
+        let mut raw_carry = req.clone();
+        raw_carry.raw = serde_json::json!({
+            "model": "x",
+            "messages": [{ "role": "assistant", "content": "hi",
+                "extra_content": { "google": { "thought_signature": "m" } },
+                "tool_calls": [{ "id": "c", "type": "function",
+                    "function": { "name": "ls", "arguments": "{}" },
+                    "extra_content": { "google": { "thought_signature": "SIG_A" } } }] }],
+        });
+        for (label, body) in [
+            ("anthropic", anthropic_wire_body(&req)),
+            ("anthropic raw", anthropic_wire_body(&raw_carry)),
+            (
+                "bedrock",
+                anthropic_messages_body(&req, "bedrock-2023-05-31"),
+            ),
+            (
+                "bedrock raw",
+                anthropic_messages_body(&raw_carry, "bedrock-2023-05-31"),
+            ),
+            ("openai", openai_wire_body(&req)),
+            ("openai raw", openai_wire_body(&raw_carry)),
+        ] {
+            let s = body.to_string();
+            assert!(!s.contains("extra_content"), "{label} leaked: {s}");
+            assert!(!s.contains("SIG_A"), "{label} leaked the signature: {s}");
+        }
+        // The normalized request really did carry it (else the asserts above prove nothing).
+        assert!(
+            serde_json::to_string(&req.messages)
+                .unwrap()
+                .contains("SIG_A")
+        );
+        // mutant (done): removing any one `strip_extra_content` call fails its label.
+    }
+
+    #[test]
+    fn gemini_tool_call_cut_off_at_max_tokens_still_reads_truncated() {
+        let json = serde_json::json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                { "functionCall": { "name": "write", "args": { "body": "partial" } } }
+            ] }, "finishReason": "MAX_TOKENS" }],
+            "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 2 }
+        });
+        let parsed = gemini_parse_response(&json).unwrap();
+        let raw = gemini_raw_with_choices(json, &parsed);
+        assert_eq!(raw["choices"][0]["finish_reason"], "length");
+        assert!(hit_output_limit(&raw));
+    }
+
+    #[test]
+    fn gemini_response_function_calls_surface_with_their_signature() {
+        let json = serde_json::json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                { "text": "Checking." },
+                { "functionCall": { "name": "ls", "args": { "p": "." } }, "thoughtSignature": "OUT_SIG" }
+            ] }, "finishReason": "STOP" }],
+            "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 2 }
+        });
+        let parsed = gemini_parse_response(&json).unwrap();
+        let resp = ModelResponse {
+            model: "google/gemini-3-flash".to_owned(),
+            text: parsed.text.clone(),
+            in_tokens: parsed.in_tokens,
+            cache_write_tokens: 0,
+            cache_read_tokens: parsed.cache_read_tokens,
+            out_tokens: parsed.out_tokens,
+            raw: gemini_raw_with_choices(json, &parsed),
+        };
+        assert!(resp.has_tool_calls(), "gates must see the Gemini call");
+        let call = &resp.raw["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "ls");
+        assert_eq!(call["function"]["arguments"], r#"{"p":"."}"#);
+        assert_eq!(
+            call["extra_content"]["google"]["thought_signature"],
+            "OUT_SIG"
+        );
+        assert!(
+            resp.raw["candidates"].is_array(),
+            "wire response kept for audit"
+        );
+        // And back out to a Gemini caller with the signature on the functionCall part.
+        let out = crate::gemini::response_from_chat(&crate::proxy::openai_response_json(&resp));
+        let parts = out["candidates"][0]["content"]["parts"].as_array().unwrap();
+        assert_eq!(parts[1]["thoughtSignature"], "OUT_SIG");
+        // mutant (done): dropping the `extra_content` insert in `gemini_parse_response` fails
+        // the signature asserts; skipping `gemini_raw_with_choices` fails `has_tool_calls`.
+    }
+
+    #[test]
+    fn from_config_wires_the_gemini_dialect() {
+        let defs = vec![firstpass_core::ProviderDef {
+            id: "gemini".to_owned(),
+            dialect: firstpass_core::Dialect::Gemini,
+            base_url: "https://generativelanguage.googleapis.com".to_owned(),
+            api_key_env: Some("GEMINI_API_KEY".to_owned()),
+            auth: firstpass_core::AuthScheme::ApiKey,
+            region: None,
+            project: None,
+        }];
+        let reg = ProviderRegistry::from_config(
+            &defs,
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+        );
+        assert_eq!(reg.get("gemini").unwrap().id(), "gemini");
+    }
+
+    #[test]
+    fn from_config_registers_custom_providers_alongside_builtins() {
+        let defs = vec![
+            firstpass_core::ProviderDef {
+                id: "groq".to_owned(),
+                dialect: firstpass_core::Dialect::Openai,
+                base_url: "https://api.groq.com/openai".to_owned(),
+                api_key_env: Some("GROQ_API_KEY".to_owned()),
+                auth: firstpass_core::AuthScheme::ApiKey,
+                region: None,
+                project: None,
+            },
+            // A custom provider may override a built-in id (e.g. point `openai` at Azure).
+            firstpass_core::ProviderDef {
+                id: "openai".to_owned(),
+                dialect: firstpass_core::Dialect::Openai,
+                base_url: "https://my-azure.openai.azure.com".to_owned(),
+                api_key_env: Some("AZURE_OPENAI_KEY".to_owned()),
+                auth: firstpass_core::AuthScheme::ApiKey,
+                region: None,
+                project: None,
+            },
+        ];
+        let reg = ProviderRegistry::from_config(
+            &defs,
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+        );
+        // Built-in anthropic is still present; the custom groq resolves and labels itself "groq".
+        assert_eq!(reg.get("anthropic").unwrap().id(), "anthropic");
+        assert_eq!(reg.get("groq").unwrap().id(), "groq");
+        // Unknown provider → None (router fails over rather than guessing).
+        assert!(reg.get("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn anthropic_messages_body_omits_model_and_includes_system_only_when_set() {
+        let req = ModelRequest {
+            model: "bedrock/anthropic.claude-3-5-haiku".to_owned(),
+            system: Some("be terse".to_owned()),
+            messages: vec![
+                ChatMessage::text("user", "hi"),
+                ChatMessage {
+                    role: "assistant".to_owned(),
+                    content: serde_json::json!([{ "type": "text", "text": "hello" }]),
+                },
+            ],
+            max_tokens: 128,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let body = anthropic_messages_body(&req, "bedrock-2023-05-31");
+        // Model goes in the URL for Bedrock/Vertex, never the body.
+        assert!(body.get("model").is_none());
+        assert_eq!(body["anthropic_version"], "bedrock-2023-05-31");
+        assert_eq!(body["max_tokens"], 128);
+        assert_eq!(body["system"], "be terse");
+        assert_eq!(body["messages"][0]["content"], serde_json::json!("hi"));
+        // Content-block arrays forward verbatim, same as the direct Anthropic adapter (ADR 0005).
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([{ "type": "text", "text": "hello" }])
+        );
+
+        // No system prompt => no `system` key at all (not `null`).
+        let req_no_system = ModelRequest {
+            system: None,
+            ..req
+        };
+        let body2 = anthropic_messages_body(&req_no_system, "vertex-2023-10-16");
+        assert!(body2.get("system").is_none());
+    }
+
+    #[test]
+    fn bedrock_url_construction_and_missing_region() {
+        assert_eq!(
+            bedrock_url("us-east-1", "anthropic.claude-3-5-haiku-20241022-v1:0"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-haiku-20241022-v1:0/invoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_complete_errors_without_a_region() {
+        let provider = BedrockProvider {
+            id: "bedrock".to_owned(),
+            region: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "bedrock/anthropic.claude-3-5-haiku".to_owned(),
+            system: None,
+            messages: vec![],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let err = provider.complete(&req, &Auth::default()).await.unwrap_err();
+        assert!(matches!(err, ProviderError::Transport(_)));
+    }
+
+    #[test]
+    fn bedrock_signing_produces_a_sigv4_authorization_header() {
+        // Dummy, non-production credentials — this only proves the *shape* of the signed request
+        // (algorithm header + host), not cryptographic validity against real AWS (LIVE-UNVERIFIED).
+        let creds = AwsEnvCredentials {
+            access_key_id: "AKIDEXAMPLE".to_owned(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            session_token: None,
+        };
+        let url = bedrock_url("us-east-1", "anthropic.claude-3-5-haiku");
+        let body = br#"{"anthropic_version":"bedrock-2023-05-31"}"#;
+        let signed = sign_bedrock(&url, "us-east-1", body, &creds).unwrap();
+
+        let auth_header = signed
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .expect("authorization header present");
+        assert!(auth_header.starts_with("AWS4-HMAC-SHA256"));
+
+        let host_header = signed
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .expect("host header present");
+        assert_eq!(host_header, "bedrock-runtime.us-east-1.amazonaws.com");
+    }
+
+    #[test]
+    fn vertex_url_construction_and_missing_project() {
+        assert_eq!(
+            vertex_url("us-central1", "my-project", "claude-3-5-sonnet"),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/anthropic/models/claude-3-5-sonnet:rawPredict"
+        );
+    }
+
+    #[tokio::test]
+    async fn vertex_complete_errors_without_a_project() {
+        let provider = VertexProvider {
+            id: "vertex".to_owned(),
+            region: Some("us-central1".to_owned()),
+            project: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "vertex/claude-3-5-sonnet".to_owned(),
+            system: None,
+            messages: vec![],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let err = provider.complete(&req, &Auth::default()).await.unwrap_err();
+        assert!(matches!(err, ProviderError::Transport(_)));
+    }
+
+    #[test]
+    fn from_config_wires_bedrock_and_vertex_auth_schemes() {
+        let defs = vec![
+            firstpass_core::ProviderDef {
+                id: "bedrock".to_owned(),
+                dialect: firstpass_core::Dialect::Anthropic,
+                base_url: String::new(),
+                api_key_env: None,
+                auth: firstpass_core::AuthScheme::AwsSigv4,
+                region: Some("us-east-1".to_owned()),
+                project: None,
+            },
+            firstpass_core::ProviderDef {
+                id: "vertex".to_owned(),
+                dialect: firstpass_core::Dialect::Anthropic,
+                base_url: String::new(),
+                api_key_env: None,
+                auth: firstpass_core::AuthScheme::GcpOauth,
+                region: Some("us-central1".to_owned()),
+                project: Some("my-project".to_owned()),
+            },
+        ];
+        let reg = ProviderRegistry::from_config(
+            &defs,
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+        );
+        assert_eq!(reg.get("bedrock").unwrap().id(), "bedrock");
+        assert_eq!(reg.get("vertex").unwrap().id(), "vertex");
+    }
+
+    #[test]
+    fn resolve_api_key_prefers_configured_env_then_byok() {
+        // Use PATH (always present) to exercise the env branch without mutating process env.
+        let path = std::env::var("PATH").expect("PATH is set");
+        // Configured env wins over any BYOK override (the env var is *this* provider's key).
+        assert_eq!(resolve_api_key(Some("PATH"), Some("byok")), path);
+        // Configured env unset → return "" (never fall through to the client's BYOK override).
+        // Sending no credential is safer than leaking a key to the wrong host.
+        assert_eq!(
+            resolve_api_key(Some("FIRSTPASS_DEFINITELY_UNSET_KEY"), Some("byok")),
+            ""
+        );
+        // No configured env → fall back to BYOK.
+        assert_eq!(resolve_api_key(None, Some("byok")), "byok");
+        // Neither → empty (keyless local endpoint).
+        assert_eq!(resolve_api_key(None, None), "");
+    }
+
+    #[test]
+    fn anthropic_wire_forwards_tool_and_image_content_verbatim() {
+        // ADR 0005 I3 (request side): the Anthropic adapter serializes tool_use / tool_result /
+        // image content blocks byte-for-byte into the wire body — enforce forwards them, it does not
+        // flatten them. A plain-string message still serializes as a bare string (I1).
+        let messages = vec![
+            ChatMessage::text("user", "hi"),
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: serde_json::json!([
+                    { "type": "tool_use", "id": "t1", "name": "calc", "input": { "x": 1 } }
+                ]),
+            },
+            ChatMessage {
+                role: "user".to_owned(),
+                content: serde_json::json!([
+                    { "type": "tool_result", "tool_use_id": "t1", "content": "2" },
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AA==" } }
+                ]),
+            },
+        ];
+        let wire = anthropic_wire_body(&ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages,
+            max_tokens: 64,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        });
+        assert_eq!(wire["messages"][0]["content"], serde_json::json!("hi"));
+        assert_eq!(
+            wire["messages"][1]["content"],
+            serde_json::json!([{ "type": "tool_use", "id": "t1", "name": "calc", "input": { "x": 1 } }])
+        );
+        assert_eq!(
+            wire["messages"][2]["content"],
+            serde_json::json!([
+                { "type": "tool_result", "tool_use_id": "t1", "content": "2" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AA==" } }
+            ])
+        );
+    }
+
+    fn resp(model: &str, text: &str) -> ModelResponse {
+        ModelResponse {
+            model: model.to_owned(),
+            text: text.to_owned(),
+            in_tokens: 10,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 5,
+            raw: Value::Null,
+        }
+    }
+
+    #[test]
+    fn transport_and_5xx_are_failover_eligible() {
+        assert!(ProviderError::Transport("boom".into()).is_failover_eligible());
+        assert!(
+            ProviderError::Http {
+                status: 503,
+                body: String::new()
+            }
+            .is_failover_eligible()
+        );
+    }
+
+    #[test]
+    fn client_errors_and_decode_failures_are_hard() {
+        assert!(
+            !ProviderError::Http {
+                status: 400,
+                body: String::new()
+            }
+            .is_failover_eligible()
+        );
+        assert!(!ProviderError::Decode("bad json".into()).is_failover_eligible());
+    }
+
+    #[test]
+    fn auth_debug_never_prints_key_material() {
+        let auth = Auth {
+            anthropic_key: Some("sk-ant-super-secret".to_owned()),
+            openai_key: Some("sk-oai-super-secret".to_owned()),
+            anthropic_bearer: Some("oauth-super-secret".to_owned()),
+            anthropic_beta: None,
+            anthropic_version: None,
+            gemini_key: None,
+            latency: None,
+        };
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn mock_provider_returns_configured_outcome() {
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            "anthropic/claude-haiku-4-5".to_owned(),
+            Ok(resp("anthropic/claude-haiku-4-5", "hello")),
+        );
+        let provider = MockProvider::new("anthropic", outcomes);
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![],
+            max_tokens: 100,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let out = provider.complete(&req, &Auth::default()).await.unwrap();
+        assert_eq!(out.text, "hello");
+    }
+
+    #[test]
+    fn anthropic_wire_body_carries_raw_request_verbatim() {
+        // ADR 0005: with a raw inbound body present, the wire request IS that body — every field
+        // the caller set (tools, tool_choice, temperature, thinking, ...) survives; only `model`
+        // is swapped to the rung's wire id and `stream` is stripped (complete() buffers to gate).
+        let raw = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "stream": true,
+            "max_tokens": 512,
+            "temperature": 0.2,
+            "tool_choice": { "type": "auto" },
+            "tools": [{ "name": "get_weather", "input_schema": { "type": "object" } }],
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 512,
+            tools: raw["tools"].clone(),
+            raw: raw.clone(),
+            cache_prefix: false,
+        };
+        let wire = anthropic_wire_body(&req);
+        assert_eq!(wire["model"], "claude-haiku-4-5", "rung model swapped in");
+        assert!(wire.get("stream").is_none(), "stream stripped");
+        for field in [
+            "temperature",
+            "tool_choice",
+            "tools",
+            "thinking",
+            "max_tokens",
+            "messages",
+        ] {
+            assert_eq!(
+                wire[field], raw[field],
+                "field {field} must survive verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_vertex_body_carries_raw_minus_model_plus_version() {
+        let raw = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "stream": true,
+            "max_tokens": 64,
+            "tools": [{ "name": "t" }],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let req = ModelRequest {
+            model: "bedrock/anthropic.claude-haiku".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 64,
+            tools: raw["tools"].clone(),
+            raw: raw.clone(),
+            cache_prefix: false,
+        };
+        let body = anthropic_messages_body(&req, "bedrock-2023-05-31");
+        assert!(body.get("model").is_none(), "model lives in the URL");
+        assert!(body.get("stream").is_none());
+        assert_eq!(body["anthropic_version"], "bedrock-2023-05-31");
+        assert_eq!(body["tools"], raw["tools"]);
+        assert_eq!(body["messages"], raw["messages"]);
+    }
+
+    #[test]
+    fn verbatim_carriers_are_dialect_aware() {
+        use firstpass_core::Dialect;
+        let reg = ProviderRegistry::new("http://localhost", "http://localhost");
+        // Anthropic provider: verbatim for Anthropic inbound, not for OpenAI
+        assert!(
+            reg.get("anthropic")
+                .unwrap()
+                .carries_structured_verbatim(Dialect::Anthropic)
+        );
+        assert!(
+            !reg.get("anthropic")
+                .unwrap()
+                .carries_structured_verbatim(Dialect::Openai)
+        );
+        // OpenAI provider: verbatim for OpenAI inbound, not for Anthropic
+        assert!(
+            reg.get("openai")
+                .unwrap()
+                .carries_structured_verbatim(Dialect::Openai)
+        );
+        assert!(
+            !reg.get("openai")
+                .unwrap()
+                .carries_structured_verbatim(Dialect::Anthropic)
+        );
+    }
+
+    #[test]
+    fn openai_wire_body_carries_raw_request_verbatim() {
+        // All-OpenAI-ladder raw carry: same semantics as anthropic_wire_body_carries_raw_request_verbatim.
+        let raw = serde_json::json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "max_tokens": 256,
+            "temperature": 0.7,
+            "response_format": { "type": "json_object" },
+            "tool_choice": "auto",
+            "tools": [{ "type": "function", "function": { "name": "get_weather", "parameters": {} } }],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let req = ModelRequest {
+            model: "openai/gpt-4.1-mini".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 256,
+            tools: Value::Null,
+            raw: raw.clone(),
+            cache_prefix: false,
+        };
+        let wire = openai_wire_body(&req);
+        assert_eq!(wire["model"], "gpt-4.1-mini", "rung model swapped in");
+        assert!(wire.get("stream").is_none(), "stream stripped");
+        for field in [
+            "temperature",
+            "tool_choice",
+            "tools",
+            "response_format",
+            "messages",
+            "max_tokens",
+        ] {
+            assert_eq!(
+                wire[field], raw[field],
+                "field {field} must survive verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_wire_body_falls_back_to_normalized_fields() {
+        // Translation path (raw = Null): reconstruct from normalized fields.
+        let req = ModelRequest {
+            model: "openai/gpt-4.1-mini".to_owned(),
+            system: Some("be terse".to_owned()),
+            messages: vec![
+                ChatMessage::text("user", "hello"),
+                ChatMessage::text("assistant", "hi"),
+            ],
+            max_tokens: 128,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let wire = openai_wire_body(&req);
+        assert_eq!(wire["model"], "gpt-4.1-mini");
+        // System → injected as first message with role="system"
+        assert_eq!(wire["messages"][0]["role"], "system");
+        assert_eq!(wire["messages"][0]["content"], "be terse");
+        assert_eq!(wire["messages"][1]["role"], "user");
+        assert_eq!(wire["messages"][2]["role"], "assistant");
+    }
+
+    #[test]
+    fn gemini_dialect_never_populates_anthropic_or_inbound_openai_credentials() {
+        use firstpass_core::Dialect;
+        let mut h = HeaderMap::new();
+        h.insert("x-goog-api-key", "goog-key".parse().unwrap());
+        h.insert("x-api-key", "stray-anthropic-key".parse().unwrap());
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer stray-bearer".parse().unwrap(),
+        );
+        let auth = Auth::from_headers(&h, Dialect::Gemini);
+        assert_eq!(auth.gemini_key.as_deref(), Some("goog-key"));
+        assert!(
+            auth.anthropic_key.is_none(),
+            "x-api-key must not cross to Anthropic"
+        );
+        assert!(auth.anthropic_bearer.is_none());
+        assert_ne!(auth.openai_key.as_deref(), Some("stray-bearer"));
+    }
+
+    #[test]
+    fn auth_from_headers_captures_beta_and_version() {
+        use firstpass_core::Dialect;
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "sk-ant-key".parse().unwrap());
+        h.insert(
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14".parse().unwrap(),
+        );
+        h.insert("anthropic-version", "2024-01-01".parse().unwrap());
+        let auth = Auth::from_headers(&h, Dialect::Anthropic);
+        assert_eq!(auth.anthropic_key.as_deref(), Some("sk-ant-key"));
+        assert_eq!(
+            auth.anthropic_beta.as_deref(),
+            Some("interleaved-thinking-2025-05-14")
+        );
+        assert_eq!(auth.anthropic_version.as_deref(), Some("2024-01-01"));
+        assert!(auth.openai_key.is_none());
+        assert!(auth.anthropic_bearer.is_none());
+    }
+
+    #[test]
+    fn auth_from_headers_anthropic_dialect_bearer_goes_to_anthropic_bearer_not_openai_key() {
+        // A Claude account subscription client: Bearer arrives on /v1/messages (Anthropic dialect).
+        // It must populate `anthropic_bearer` only — never `openai_key`.
+        use firstpass_core::Dialect;
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer claude-oauth-token".parse().unwrap(),
+        );
+        let auth = Auth::from_headers(&h, Dialect::Anthropic);
+        assert!(auth.anthropic_key.is_none(), "no x-api-key header");
+        assert!(
+            auth.openai_key.is_none(),
+            "Bearer on Anthropic path must NOT populate openai_key"
+        );
+        assert_eq!(
+            auth.anthropic_bearer.as_deref(),
+            Some("claude-oauth-token"),
+            "Bearer on Anthropic path goes to anthropic_bearer"
+        );
+    }
+
+    #[test]
+    fn auth_from_headers_openai_dialect_bearer_goes_to_openai_key_not_anthropic_bearer() {
+        // An OpenAI client: Bearer arrives on /v1/chat/completions (OpenAI dialect).
+        // It must populate `openai_key` only — never `anthropic_bearer`.
+        use firstpass_core::Dialect;
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer sk-openai-key".parse().unwrap(),
+        );
+        let auth = Auth::from_headers(&h, Dialect::Openai);
+        assert!(auth.anthropic_key.is_none());
+        assert!(
+            auth.anthropic_bearer.is_none(),
+            "Bearer on OpenAI path must NOT populate anthropic_bearer"
+        );
+        assert_eq!(
+            auth.openai_key.as_deref(),
+            Some("sk-openai-key"),
+            "Bearer on OpenAI path goes to openai_key"
+        );
+    }
+
+    /// Verifies that `AnthropicProvider` sends `anthropic-beta`, uses the inbound
+    /// `anthropic-version`, and falls back to `Authorization: Bearer` when no `x-api-key` is
+    /// present — all three changes required for OAuth/subscription clients (e.g. Claude Code).
+    #[tokio::test]
+    async fn anthropic_provider_forwards_beta_version_and_bearer_fallback() {
+        use std::sync::{Arc, Mutex};
+        // Spin up a local axum server that records the incoming request headers.
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap| {
+                *captured_clone.lock().unwrap() = Some(headers);
+                async {
+                    axum::Json(serde_json::json!({
+                        "id": "msg_test", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            api_key_env: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: serde_json::json!({"messages": [{"role":"user","content":"hi"}], "max_tokens": 16}),
+            cache_prefix: false,
+        };
+        let auth = Auth {
+            anthropic_key: None, // no API key — use Bearer fallback
+            openai_key: None,    // OpenAI key must NOT be forwarded to Anthropic
+            anthropic_bearer: Some("oauth-bearer-token".to_owned()),
+            anthropic_beta: Some("interleaved-thinking-2025-05-14".to_owned()),
+            anthropic_version: Some("2024-01-01".to_owned()),
+            gemini_key: None,
+            latency: None,
+        };
+        provider.complete(&req, &auth).await.expect("must succeed");
+
+        let hdrs = captured.lock().unwrap().take().expect("headers captured");
+        assert!(
+            hdrs.get("x-api-key").is_none(),
+            "x-api-key must be absent when no API key is configured"
+        );
+        assert_eq!(
+            hdrs.get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer oauth-bearer-token"),
+            "OAuth Bearer from anthropic_bearer must be forwarded when x-api-key is absent"
+        );
+        assert_eq!(
+            hdrs.get("anthropic-version").and_then(|v| v.to_str().ok()),
+            Some("2024-01-01"),
+            "inbound anthropic-version must override the default"
+        );
+        assert_eq!(
+            hdrs.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+            Some("interleaved-thinking-2025-05-14"),
+            "anthropic-beta must be forwarded verbatim"
+        );
+    }
+
+    /// An `@effort` rung strips its suffix from the wire model and overrides the caller's own
+    /// reasoning request, in each dialect (#283).
+    #[test]
+    fn effort_rung_pins_reasoning_and_strips_the_suffix() {
+        let mut req = ModelRequest {
+            model: "anthropic/claude-sonnet-5@high".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 32_000,
+            tools: Value::Null,
+            raw: serde_json::json!({"messages": [], "max_tokens": 32_000,
+                "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+            cache_prefix: false,
+        };
+        let a = anthropic_wire_body(&req);
+        assert_eq!(a["model"], "claude-sonnet-5");
+        assert_eq!(a["thinking"]["budget_tokens"], 16384, "rung effort wins");
+        assert!(a.get("reasoning_effort").is_none());
+
+        req.model = "openai/gpt-5.5@low".to_owned();
+        req.raw = serde_json::json!({"messages": [], "reasoning_effort": "high"});
+        let o = openai_wire_body(&req);
+        assert_eq!((&o["model"], &o["reasoning_effort"]), (&"gpt-5.5".into(), &"low".into()));
+
+        // Fallback (translated/condensed) path, no raw body.
+        req.raw = Value::Null;
+        assert_eq!(openai_wire_body(&req)["reasoning_effort"], "low");
+        // No suffix: byte-identical to before.
+        req.model = "openai/gpt-5.5".to_owned();
+        assert!(openai_wire_body(&req).get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn latency_header_parses_and_absent_or_bad_means_none() {
+        let mut h = HeaderMap::new();
+        let d = |h: &HeaderMap| Auth::from_headers(h, firstpass_core::Dialect::Anthropic).latency;
+        assert_eq!(d(&h), None);
+        h.insert("x-firstpass-latency", "24h".parse().unwrap());
+        assert_eq!(d(&h), Some(std::time::Duration::from_secs(86_400)));
+        for bad in ["soon", "0s"] {
+            h.insert("x-firstpass-latency", bad.parse().unwrap());
+            assert_eq!(d(&h), None, "{bad}");
+        }
+    }
+
+    /// `@batch` goes through the Message Batches API: submit, poll, read results from our own base
+    /// URL, normalize the message; an errored result is a hard (non-escalating) error.
+    #[tokio::test]
+    async fn anthropic_batch_round_trip() {
+        use axum::routing::{get, post};
+        use std::sync::{Arc, Mutex};
+        let submitted: Arc<Mutex<Option<Value>>> = Arc::default();
+        let sub = Arc::clone(&submitted);
+        let result: Arc<Mutex<Value>> = Arc::new(Mutex::new(serde_json::json!({
+            "type": "succeeded", "message": {
+                "content": [{"type": "text", "text": "batched"}],
+                "usage": {"input_tokens": 7, "output_tokens": 3}}
+        })));
+        let res = Arc::clone(&result);
+        let app = axum::Router::new()
+            .route(
+                "/v1/messages/batches",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    *sub.lock().unwrap() = Some(b);
+                    async { axum::Json(serde_json::json!({"id": "b1"})) }
+                }),
+            )
+            .route(
+                "/v1/messages/batches/b1",
+                get(|| async {
+                    axum::Json(serde_json::json!({"processing_status": "ended",
+                        "results_url": "https://elsewhere.invalid/steal"}))
+                }),
+            )
+            .route(
+                "/v1/messages/batches/b1/results",
+                get(move || {
+                    let r = res.lock().unwrap().clone();
+                    async move { serde_json::json!({"custom_id": "firstpass", "result": r}).to_string() }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            api_key_env: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5@low@batch".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let auth = Auth {
+            anthropic_key: Some("k".to_owned()),
+            latency: Some(std::time::Duration::from_secs(3600)),
+            ..Auth::default()
+        };
+        let r = provider.complete_batch(&req, &auth).await.expect("batch ok");
+        assert_eq!((r.text.as_str(), r.in_tokens, r.out_tokens), ("batched", 7, 3));
+        assert_eq!(r.model, req.model, "receipt keeps the full rung");
+        let body = submitted.lock().unwrap().take().unwrap();
+        assert_eq!(body["requests"][0]["params"]["model"], "claude-haiku-4-5");
+
+        *result.lock().unwrap() = serde_json::json!({"type": "errored", "error": {}});
+        let err = provider.complete_batch(&req, &auth).await.unwrap_err();
+        assert!(!err.is_failover_eligible(), "{err}");
+    }
+
+    #[test]
+    fn response_has_tool_calls_anthropic_format() {
+        let with_tool = ModelResponse {
+            model: "m".to_owned(),
+            text: String::new(),
+            in_tokens: 0,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 0,
+            raw: serde_json::json!({
+                "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}]
+            }),
+        };
+        assert!(with_tool.has_tool_calls());
+
+        let text_only = ModelResponse {
+            raw: serde_json::json!({"content": [{"type": "text", "text": "hi"}]}),
+            ..with_tool.clone()
+        };
+        assert!(!text_only.has_tool_calls());
+
+        let no_content = ModelResponse {
+            raw: serde_json::Value::Null,
+            ..with_tool.clone()
+        };
+        assert!(!no_content.has_tool_calls());
+    }
+
+    #[test]
+    fn response_has_tool_calls_openai_format() {
+        let with_tc = ModelResponse {
+            model: "m".to_owned(),
+            text: String::new(),
+            in_tokens: 0,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 0,
+            raw: serde_json::json!({
+                "choices": [{"message": {"role": "assistant",
+                    "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "f", "arguments": "{}"}}]
+                }}]
+            }),
+        };
+        assert!(with_tc.has_tool_calls());
+
+        let no_tc = ModelResponse {
+            raw: serde_json::json!({"choices": [{"message": {"content": "hi"}}]}),
+            ..with_tc.clone()
+        };
+        assert!(!no_tc.has_tool_calls());
+    }
+
+    /// SECURITY: OPENAI_API_KEY must never be forwarded to the Anthropic endpoint.
+    /// When `anthropic_key` is absent but `openai_key` is set (e.g. from the env fallback on
+    /// a server that has OPENAI_API_KEY set), the Anthropic provider must send NO auth header
+    /// rather than leaking the OpenAI key.
+    #[tokio::test]
+    async fn anthropic_provider_does_not_forward_openai_key_to_anthropic_endpoint() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap| {
+                *captured_clone.lock().unwrap() = Some(headers);
+                async {
+                    axum::Json(serde_json::json!({
+                        "id": "msg_test", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            api_key_env: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: serde_json::json!({"messages": [{"role":"user","content":"hi"}], "max_tokens": 16}),
+            cache_prefix: false,
+        };
+
+        // Auth with an openai_key set (e.g., from OPENAI_API_KEY env) but no anthropic creds.
+        let auth = Auth {
+            anthropic_key: None,
+            openai_key: Some("sk-openai-from-env".to_owned()),
+            anthropic_bearer: None,
+            anthropic_beta: None,
+            anthropic_version: None,
+            gemini_key: None,
+            latency: None,
+        };
+        provider.complete(&req, &auth).await.expect("must succeed");
+
+        let hdrs = captured.lock().unwrap().take().expect("headers captured");
+        assert!(hdrs.get("x-api-key").is_none(), "x-api-key must be absent");
+        assert!(
+            hdrs.get(axum::http::header::AUTHORIZATION).is_none(),
+            "SECURITY: openai_key must NOT be forwarded to the Anthropic endpoint"
+        );
+    }
+
+    /// A rung with its own configured key (e.g. a custom Anthropic-compatible host) sends that
+    /// key, and neither the client's `x-api-key` nor its OAuth Bearer reaches that host.
+    /// `api_key_env = "PATH"` stands in for a configured key without `unsafe env::set_var`.
+    #[tokio::test]
+    async fn anthropic_provider_sends_the_configured_key_not_the_clients_credentials() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap| {
+                *captured_clone.lock().unwrap() = Some(headers);
+                async {
+                    axum::Json(serde_json::json!({
+                        "id": "msg_test", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            // "PATH" is always set; its value is used as the api key — doesn't matter
+            // for this test, we only care that x-api-key does NOT appear in the request.
+            api_key_env: Some("PATH".to_owned()),
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":16}),
+            cache_prefix: false,
+        };
+        // Client sends Bearer only — no x-api-key.  Bearer must win over the server env key.
+        let auth = Auth {
+            anthropic_key: Some("client-anthropic-key".to_owned()),
+            openai_key: None,
+            anthropic_bearer: Some("client-oauth-token".to_owned()),
+            anthropic_beta: None,
+            anthropic_version: None,
+            gemini_key: None,
+            latency: None,
+        };
+        provider.complete(&req, &auth).await.expect("must succeed");
+
+        let hdrs = captured.lock().unwrap().take().expect("headers captured");
+        let path = std::env::var("PATH").unwrap_or_default();
+        assert_eq!(
+            hdrs.get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some(path.as_str()),
+            "the rung's configured key must be sent"
+        );
+        assert!(
+            hdrs.get(axum::http::header::AUTHORIZATION).is_none(),
+            "a client's OAuth token must not reach a host with its own configured key"
+        );
+    }
+
+    /// The credential order: configured > request key > request Bearer > ambient.
+    ///
+    /// Key security invariant: when `api_key_env` is configured (outer `Some`) but the env var is
+    /// unset (`Some(None)`), the function returns `None` — it never falls through to client creds.
+    #[test]
+    fn anthropic_credential_order() {
+        let auth = |key: Option<&str>, bearer: Option<&str>| Auth {
+            anthropic_key: key.map(str::to_owned),
+            openai_key: Some("openai".to_owned()),
+            anthropic_bearer: bearer.map(str::to_owned),
+            anthropic_beta: None,
+            anthropic_version: None,
+            gemini_key: None,
+            latency: None,
+        };
+        // configured = Option<Option<String>>
+        //   None           → api_key_env not set → use client creds + ambient
+        //   Some(None)     → api_key_env set but env var unset → send nothing
+        //   Some(Some(k))  → api_key_env set and resolved → use k
+        let cfg = |v: &str| Some(Some(v.to_owned())); // Some(Some(k))
+        let no_env: Option<Option<String>> = Some(None); // configured, env var unset
+        let s = |v: &str| Some(v.to_owned()); // ambient / auth helper
+        use AnthropicCredential::{ApiKey, Bearer};
+
+        // Not configured, bearer present — bearer wins over ambient.
+        assert_eq!(
+            anthropic_credential(None, &auth(None, Some("oauth")), s("ambient")),
+            Some(Bearer("oauth".to_owned()))
+        );
+        // Not configured, api-key + bearer — api-key wins.
+        assert_eq!(
+            anthropic_credential(None, &auth(Some("k"), Some("oauth")), s("ambient")),
+            Some(ApiKey("k".to_owned()))
+        );
+        // Configured key wins over every client credential and ambient.
+        assert_eq!(
+            anthropic_credential(cfg("cfgkey"), &auth(Some("k"), Some("oauth")), s("ambient")),
+            Some(ApiKey("cfgkey".to_owned()))
+        );
+        // Not configured, no client creds — ambient fallback.
+        assert_eq!(
+            anthropic_credential(None, &auth(None, None), s("ambient")),
+            Some(ApiKey("ambient".to_owned()))
+        );
+        // Configured but env var unset → None (never leak client creds to the wrong host).
+        assert_eq!(
+            anthropic_credential(no_env, &auth(Some("k"), Some("oauth")), s("ambient")),
+            None,
+            "configured-but-unset must not fall through to client credentials"
+        );
+        // Configured but resolved to empty string → also None.
+        assert_eq!(
+            anthropic_credential(cfg(""), &auth(Some("k"), None), None),
+            None,
+            "empty configured value must not fall through to client key"
+        );
+        // OpenAI key is never used (different provider).
+        assert_eq!(
+            anthropic_credential(None, &auth(None, None), None),
+            None,
+            "the OpenAI key is never used for Anthropic requests"
+        );
+    }
+
+    /// When a request x-api-key is present it must be used even when a Bearer is also present.
+    #[tokio::test]
+    async fn anthropic_provider_prefers_x_api_key_over_bearer() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap| {
+                *captured_clone.lock().unwrap() = Some(headers);
+                async {
+                    axum::Json(serde_json::json!({
+                        "id": "msg_t", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            api_key_env: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":16}),
+            cache_prefix: false,
+        };
+        // Both x-api-key and Bearer present: x-api-key must win.
+        let auth = Auth {
+            anthropic_key: Some("sk-real-api-key".to_owned()),
+            openai_key: None,
+            anthropic_bearer: Some("oauth-bearer-ignored".to_owned()),
+            anthropic_beta: None,
+            anthropic_version: None,
+            gemini_key: None,
+            latency: None,
+        };
+        provider.complete(&req, &auth).await.expect("must succeed");
+
+        let hdrs = captured.lock().unwrap().take().expect("headers captured");
+        assert_eq!(
+            hdrs.get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some("sk-real-api-key"),
+            "x-api-key must be sent when present"
+        );
+        assert!(
+            hdrs.get(axum::http::header::AUTHORIZATION).is_none(),
+            "Bearer must not be sent when x-api-key is present"
+        );
+    }
+
+    #[test]
+    fn blank_anthropic_version_header_is_absent() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "anthropic-version",
+            "  ".parse().unwrap_or_else(|_| unreachable!()),
+        );
+        assert_eq!(
+            Auth::from_headers(&h, firstpass_core::Dialect::Anthropic).anthropic_version,
+            None
+        );
+    }
+
+    #[test]
+    fn auth_from_headers_multiple_anthropic_beta_values_are_joined() {
+        use firstpass_core::Dialect;
+        let mut h = HeaderMap::new();
+        h.append(
+            "anthropic-beta",
+            "extended-thinking-2025-02-19".parse().unwrap(),
+        );
+        h.append(
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14".parse().unwrap(),
+        );
+        let auth = Auth::from_headers(&h, Dialect::Anthropic);
+        // Both values must appear joined — order preserved, separated by ", ".
+        let beta = auth.anthropic_beta.expect("anthropic_beta must be Some");
+        assert!(
+            beta.contains("extended-thinking-2025-02-19"),
+            "first beta value missing: {beta}"
+        );
+        assert!(
+            beta.contains("interleaved-thinking-2025-05-14"),
+            "second beta value missing: {beta}"
+        );
+        assert!(
+            beta.contains(", "),
+            "values must be comma-separated: {beta}"
+        );
+    }
+}

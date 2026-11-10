@@ -1142,7 +1142,10 @@ impl SessionPromotion {
 }
 
 /// Parse a compact duration like `30m`, `2h`, `90s`, `1d`.
-fn parse_window(s: &str) -> Result<Duration> {
+///
+/// # Errors
+/// Returns [`Error::BadDuration`] if `s` is not `<int><unit>` with unit in `s`/`m`/`h`/`d`.
+pub fn parse_window(s: &str) -> Result<Duration> {
     let s = s.trim();
     let split = s
         .find(|c: char| c.is_ascii_alphabetic())

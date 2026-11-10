@@ -343,6 +343,9 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
     let rung_end = start + (ctx.max_rungs as usize).min(rungs_available);
     for (i, model_str) in ctx.ladder[start..rung_end].iter().enumerate() {
         let idx = (start + i) as u32;
+        if batch_ineligible(ctx, model_str) {
+            continue;
+        }
         let start = Instant::now();
 
         // Resolve provider from `provider/model`. A missing provider/malformed ref is treated as
@@ -366,7 +369,7 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
         let mut req = ctx.base_request.clone();
         req.model = model_str.clone();
 
-        match provider.complete(&req, ctx.auth).await {
+        match call_rung(provider.as_ref(), &req, ctx.auth).await {
             Err(err) if err.is_failover_eligible() => {
                 // Transport / 5xx: abstain and fail over to the next rung.
                 let ms = elapsed_ms(start);
@@ -566,6 +569,10 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
         }
 
         let model_str = &ctx.ladder[idx];
+        if batch_ineligible(ctx, model_str) {
+            idx += 1;
+            continue;
+        }
         let provider = match ModelRef::parse(model_str) {
             Ok(m) => ctx.providers.get(&m.provider),
             Err(_) => None,
@@ -759,6 +766,9 @@ fn spawn_rung(
     j: usize,
 ) -> Option<JoinHandle<Result<ModelResponse, ProviderError>>> {
     let model_str = ctx.ladder.get(j)?;
+    if batch_ineligible(ctx, model_str) {
+        return None;
+    }
     let provider = match ModelRef::parse(model_str) {
         Ok(m) => ctx.providers.get(&m.provider)?,
         Err(_) => return None,
@@ -766,9 +776,29 @@ fn spawn_rung(
     let mut req = ctx.base_request.clone();
     req.model = model_str.clone();
     let auth = ctx.auth.clone();
-    Some(tokio::spawn(
-        async move { provider.complete(&req, &auth).await },
-    ))
+    Some(tokio::spawn(async move {
+        call_rung(provider.as_ref(), &req, &auth).await
+    }))
+}
+
+/// An `@batch` rung only runs when the caller declared latency tolerance (`x-firstpass-latency`);
+/// otherwise it is skipped with no attempt recorded, so a ladder without the header behaves as if
+/// the rung were not there.
+fn batch_ineligible(ctx: &EnforceCtx<'_>, rung: &str) -> bool {
+    firstpass_core::cost::split_rung(rung).2 && ctx.auth.latency.is_none()
+}
+
+/// Call a rung on its tier: the provider's Batch API for `@batch` rungs, the sync API otherwise.
+async fn call_rung(
+    provider: &dyn crate::provider::Provider,
+    req: &ModelRequest,
+    auth: &Auth,
+) -> Result<ModelResponse, ProviderError> {
+    if firstpass_core::cost::split_rung(&req.model).2 {
+        provider.complete_batch(req, auth).await
+    } else {
+        provider.complete(req, auth).await
+    }
 }
 
 fn elapsed_ms(start: Instant) -> u64 {
@@ -1036,6 +1066,54 @@ mod tests {
         assert_eq!(trace.attempts[1].verdict, Verdict::Pass);
         assert_eq!(trace.final_.escalations, 1);
         assert_eq!(trace.final_.served_rung, Some(1));
+    }
+
+    /// Effort/tier rungs (#283): `@low` escalates to `@high` on gate failure and the receipt names
+    /// each attempt's effort+tier; an `@batch` rung is skipped without `x-firstpass-latency` and,
+    /// with it, goes through `complete_batch` (the mock has none, so it abstains — a sync call would
+    /// have served the mock's passing answer).
+    #[tokio::test]
+    async fn effort_ladder_escalates_and_batch_rung_needs_latency() {
+        let (low, batch, high) = (
+            format!("{SONNET}@low"),
+            format!("{SONNET}@batch"),
+            format!("{SONNET}@high"),
+        );
+        let ladder = vec![low.clone(), batch.clone(), high.clone()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let providers = registry(vec![
+            ("anthropic", &low, Ok(resp(&low, "   "))),
+            ("anthropic", &batch, Ok(resp(&batch, "sync answer"))),
+            ("anthropic", &high, Ok(resp(&high, "real answer"))),
+        ]);
+        let prices = PriceTable::defaults();
+        let health = GateHealthRegistry::new();
+
+        let auth = Auth::default();
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == high));
+        let models: Vec<&str> = trace.attempts.iter().map(|a| a.model.as_str()).collect();
+        assert_eq!(models, [low.as_str(), high.as_str()], "batch rung skipped");
+        assert_eq!(trace.final_.served_rung, Some(2));
+        // sonnet-5 @ $3/$15: 1000 in + 500 out.
+        assert!((trace.attempts[0].cost_usd - 0.0105).abs() < 1e-9);
+
+        let auth = Auth {
+            latency: Some(std::time::Duration::from_secs(3600)),
+            ..Auth::default()
+        };
+        let (out, trace) = route_enforce(ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        ))
+        .await;
+        assert!(matches!(out, EngineOutcome::Served(r) if r.model == high));
+        assert_eq!(trace.attempts.len(), 3);
+        assert_eq!(trace.attempts[1].model, batch);
+        assert_eq!(trace.attempts[1].verdict, Verdict::Abstain);
     }
 
     /// Fake `/v1/systemone` server: low probability for a candidate containing `NOT_GOOD_ENOUGH`,

@@ -80,6 +80,10 @@ Config surface (the parser is `deny_unknown_fields`, so a wrong key is a hard fa
 - **Every ladder rung must resolve to a price** — built-in or a `[[price]]` block. There is no silent fallback:
   an unpriced rung would record `cost_usd: 0.0` in a tamper-evident receipt and leave `[budget]` caps un-trippable,
   so it is rejected at parse. A model you host yourself is free, but must declare `0.0` explicitly.
+- **A rung can pin effort and tier: `provider/model[@low|@medium|@high][@batch]`** (e.g.
+  `anthropic/claude-sonnet-5@low` → `…@high`). It prices as the base model (`@batch` at 0.5×). An
+  `@batch` rung is skipped unless the request sends `x-firstpass-latency` (e.g. `24h`); only the
+  Anthropic provider has a batch path — on any other provider the rung abstains.
 - **`[budget]` has no `max_escalations`** — it is `per_request_usd` / `per_session_usd` / `per_day_usd` / `on_exhausted`.
   The escalation cap is `[escalation] max_rungs_per_request`.
 - **`firstpass launch gemini` sets `GOOGLE_GEMINI_BASE_URL` (no `/v1` suffix)** — the Gemini SDK
