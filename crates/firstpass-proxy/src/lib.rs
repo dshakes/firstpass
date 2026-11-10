@@ -46,6 +46,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod onboard;
 pub mod ope;
+pub(crate) mod patch_grammar;
 pub mod prior;
 pub mod provider;
 pub mod proxy;
