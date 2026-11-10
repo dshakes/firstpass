@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fetch the APPS test split and write the seeded 300-problem sample the live run used.
 
-Usage: fetch_apps.py OUT_DIR   (writes OUT_DIR/apps300.jsonl and OUT_DIR/tests.json)
+Usage: fetch_apps.py OUT_DIR [N]   (N default 300; writes OUT_DIR/apps300.jsonl and OUT_DIR/tests.json)
 
 Keeps interview/competition problems with stdin/stdout tests (no starter code, no fn_name),
 statements under 6000 chars, and at most 20 test cases each. The live run used the first 150.
@@ -59,8 +59,11 @@ for off in range(0, 5000, 100):
             }
         )
 print("eligible", len(rows))
+N = int(sys.argv[2]) if len(sys.argv) > 2 else 300
+if N > len(rows):
+    sys.exit(f"requested {N} but only {len(rows)} eligible")
 random.seed(20261031)
-sample = random.sample(rows, 300)
+sample = random.sample(rows, N)
 (out / "tests.json").write_text(
     json.dumps(
         {
