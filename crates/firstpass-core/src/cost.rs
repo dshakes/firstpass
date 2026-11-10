@@ -61,6 +61,28 @@ pub const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
 /// Discount on input rate for tokens served from the provider's prompt cache (Anthropic: 0.1×).
 pub const CACHE_READ_MULTIPLIER: f64 = 0.1;
 
+/// Discount on both rates for the provider Batch API tier (Anthropic and OpenAI: 50% off). Stacks with
+/// the cache multipliers, because those scale the already-discounted input rate.
+pub const BATCH_MULTIPLIER: f64 = 0.5;
+
+/// Split a ladder rung `provider/model[@low|@medium|@high][@batch]` into its base model, effort,
+/// and whether it runs on the batch tier.
+///
+/// Only those exact suffixes are recognised, so a model id that itself contains `@` (Vertex's
+/// `claude-…@20250514`) passes through as a plain model.
+#[must_use]
+pub fn split_rung(rung: &str) -> (&str, Option<&'static str>, bool) {
+    let (rest, batch) = rung
+        .strip_suffix("@batch")
+        .map_or((rung, false), |r| (r, true));
+    for effort in ["low", "medium", "high"] {
+        if let Some(base) = rest.strip_suffix(effort).and_then(|r| r.strip_suffix('@')) {
+            return (base, Some(effort), batch);
+        }
+    }
+    (rest, None, batch)
+}
+
 /// A lookup from `provider/model` to [`ModelPrice`].
 ///
 /// ponytail: the embedded [`PriceTable::defaults`] are a calibration knob, not gospel —
@@ -118,10 +140,25 @@ impl PriceTable {
         self
     }
 
-    /// Look up a model's price by its `provider/model` key.
+    /// Look up a model's price by its `provider/model` key, or by a ladder rung
+    /// `provider/model[@effort][@batch]` (see [`split_rung`]). An exact entry always wins; otherwise a
+    /// rung prices as its base model — effort bills through output tokens, not the rate — scaled by
+    /// [`BATCH_MULTIPLIER`] on the batch tier.
     #[must_use]
     pub fn get(&self, model: &str) -> Option<ModelPrice> {
-        self.prices.get(model).copied()
+        if let Some(p) = self.prices.get(model) {
+            return Some(*p);
+        }
+        let (base, effort, batch) = split_rung(model);
+        if effort.is_none() && !batch {
+            return None;
+        }
+        let p = self.prices.get(base)?;
+        let m = if batch { BATCH_MULTIPLIER } else { 1.0 };
+        Some(ModelPrice {
+            input_per_mtok: p.input_per_mtok * m,
+            output_per_mtok: p.output_per_mtok * m,
+        })
     }
 
     /// Cost in USD of a call to `model` with the given token counts.
@@ -196,6 +233,35 @@ mod tests {
         );
         // 20 in + 400 out + 190k written at 1.25x: 0.00006 + 0.006 + 0.7125
         assert!((real - 0.71856).abs() < 1e-5, "got {real}");
+    }
+
+    /// Effort/tier rungs price as their base model; the batch tier is half price; an unknown base
+    /// or an unrecognised `@` suffix stays unpriced (so config parse still rejects it).
+    #[test]
+    fn effort_and_batch_rungs_resolve_to_a_price() {
+        use super::split_rung;
+        assert_eq!(
+            split_rung("anthropic/claude-sonnet-5@low@batch"),
+            ("anthropic/claude-sonnet-5", Some("low"), true)
+        );
+        assert_eq!(
+            split_rung("vertex/claude-sonnet-4@20250514"),
+            ("vertex/claude-sonnet-4@20250514", None, false)
+        );
+
+        let t = super::PriceTable::defaults();
+        let base = t.get("anthropic/claude-sonnet-5").unwrap();
+        assert_eq!(t.get("anthropic/claude-sonnet-5@high"), Some(base));
+        let batch = t.get("anthropic/claude-opus-4-8@high@batch").unwrap();
+        assert!((batch.input_per_mtok - 7.5).abs() < 1e-9);
+        assert!((batch.output_per_mtok - 37.5).abs() < 1e-9);
+        // Baseline math reads the same table, so a batch top rung's counterfactual is discounted.
+        let b = t
+            .baseline_usd("anthropic/claude-opus-4-8@high@batch", 1_000_000, 0)
+            .unwrap();
+        assert!((b - 7.5).abs() < 1e-9, "got {b}");
+        assert!(t.get("anthropic/no-such-model@low").is_none());
+        assert!(t.get("anthropic/claude-sonnet-5@turbo").is_none());
     }
 
     #[test]

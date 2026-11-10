@@ -205,6 +205,10 @@ pub struct Auth {
     /// Never set on Anthropic/OpenAI paths — scoping prevents the Google key from reaching
     /// other providers.
     pub gemini_key: Option<String>,
+    /// How long the caller will wait, from `x-firstpass-latency` (e.g. `24h`). `Some` makes the
+    /// ladder's `@batch` rungs eligible and bounds how long a batch call may poll; `None` (the
+    /// default, header absent or unparsable) skips batch rungs entirely.
+    pub latency: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for Auth {
@@ -219,6 +223,7 @@ impl std::fmt::Debug for Auth {
             .field("anthropic_beta", &self.anthropic_beta)
             .field("anthropic_version", &self.anthropic_version)
             .field("gemini_key", &self.gemini_key.as_ref().map(|_| "***"))
+            .field("latency", &self.latency)
             .finish()
     }
 }
@@ -309,6 +314,12 @@ impl Auth {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_owned);
+        let latency = headers
+            .get("x-firstpass-latency")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| firstpass_core::config::parse_window(v).ok())
+            .filter(|d| !d.is_zero())
+            .map(|d| d.min(MAX_BATCH_WINDOW));
         Self {
             anthropic_key,
             openai_key,
@@ -316,6 +327,7 @@ impl Auth {
             anthropic_beta,
             anthropic_version,
             gemini_key,
+            latency,
         }
     }
 }
@@ -334,6 +346,23 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
         req: &ModelRequest,
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError>;
+
+    /// Call the model through the provider's Batch API (an `@batch` rung), waiting at most
+    /// `auth.latency` for the result. Default: unsupported — a failover-eligible error, so the
+    /// rung abstains with nothing billed rather than silently running at full price.
+    ///
+    /// # Errors
+    /// As [`Provider::complete`], plus a transport error when the batch does not end in time.
+    async fn complete_batch(
+        &self,
+        _req: &ModelRequest,
+        _auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        Err(ProviderError::Transport(format!(
+            "provider {} has no batch tier",
+            self.id()
+        )))
+    }
 
     /// Provider identity, e.g. `"anthropic"`.
     fn id(&self) -> &str;
@@ -393,7 +422,41 @@ fn strip_extra_content(messages: Option<&mut Value>) {
 /// OpenAI expect the bare model (`claude-haiku-4-5`), not `anthropic/claude-haiku-4-5`. The full
 /// prefixed id is still what the ladder/trace use; only the wire call is stripped.
 fn wire_model(model: &str) -> &str {
+    let model = firstpass_core::cost::split_rung(model).0;
     model.split_once('/').map_or(model, |(_, m)| m)
+}
+
+/// Longest `x-firstpass-latency` honoured: the Message Batches API's own processing window. The
+/// header is caller input, so it is clamped before it can size a deadline.
+pub const MAX_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// After cancelling a batch that overran its window, how long to keep polling for it to reach
+/// `ended`. A cancel is not instant (`canceling`), and a request that completed meanwhile is billed,
+/// so the result must be read to keep the receipt honest.
+const BATCH_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The effort an `@low|@medium|@high` ladder rung pins.
+fn rung_effort(model: &str) -> Option<Effort> {
+    match firstpass_core::cost::split_rung(model).1? {
+        "low" => Some(Effort::Low),
+        "medium" => Some(Effort::Medium),
+        _ => Some(Effort::High),
+    }
+}
+
+/// Apply a rung's pinned effort to a wire body, replacing whatever reasoning the caller asked
+/// for and spelling it the way `wire` expects. No-op for a rung without an effort suffix.
+fn pin_effort(body: &mut serde_json::Map<String, Value>, model: &str, wire: Wire) {
+    let Some(effort) = rung_effort(model) else {
+        return;
+    };
+    body.remove("thinking");
+    body.remove("thinkingConfig");
+    body.insert(
+        "reasoning_effort".to_owned(),
+        Value::String(effort.as_str().to_owned()),
+    );
+    normalize_reasoning(body, wire);
 }
 
 /// Resolve the API key for a provider call.
@@ -472,6 +535,7 @@ pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
         );
         body.remove("stream");
         strip_extra_content(body.get_mut("messages"));
+        pin_effort(&mut body, &req.model, Wire::Anthropic);
         normalize_reasoning(&mut body, Wire::Anthropic);
         if req.cache_prefix {
             add_cache_breakpoints(&mut body);
@@ -494,6 +558,9 @@ pub fn anthropic_wire_body(req: &ModelRequest) -> Value {
     }
     if !req.tools.is_null() {
         body["tools"] = req.tools.clone();
+    }
+    if let Some(map) = body.as_object_mut() {
+        pin_effort(map, &req.model, Wire::Anthropic);
     }
     // This branch is not a rare fallback: it is the path every translated request takes, and
     // every CONDENSED one — condensing clears `raw` precisely so the smaller message list is what
@@ -541,10 +608,116 @@ impl Provider for AnthropicProvider {
         auth: &Auth,
     ) -> Result<ModelResponse, ProviderError> {
         let body = anthropic_wire_body(req);
+        let json = self
+            .send(self.http.post(self.url("")).json(&body), auth)
+            .await?;
+        anthropic_response(req, json)
+    }
 
-        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let mut builder = self.http.post(url);
+    /// Message Batches API: submit one request, poll until it ends (or `auth.latency` runs out,
+    /// which cancels it), then read its result.
+    async fn complete_batch(
+        &self,
+        req: &ModelRequest,
+        auth: &Auth,
+    ) -> Result<ModelResponse, ProviderError> {
+        // ponytail: one request per batch and a fixed poll interval; group concurrent requests
+        // into one batch if submission overhead ever shows up.
+        const POLL: std::time::Duration = std::time::Duration::from_secs(30);
+        let window = auth.latency.unwrap_or_default().min(MAX_BATCH_WINDOW);
+        let now = tokio::time::Instant::now();
+        let overflow = || ProviderError::Transport("batch: deadline overflow".to_owned());
+        let deadline = now.checked_add(window).ok_or_else(overflow)?;
+        let grace_end = deadline
+            .checked_add(BATCH_CANCEL_GRACE)
+            .ok_or_else(overflow)?;
+        let submit = serde_json::json!({
+            "requests": [{ "custom_id": "firstpass", "params": anthropic_wire_body(req) }]
+        });
+        let batch = self
+            .send(self.http.post(self.url("/batches")).json(&submit), auth)
+            .await?;
+        let id = batch
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Decode("batch: missing id".to_owned()))?
+            .to_owned();
+        let mut cancelled = false;
+        loop {
+            let status = self
+                .send(self.http.get(self.url(&format!("/batches/{id}"))), auth)
+                .await?;
+            if status.get("processing_status").and_then(Value::as_str) == Some("ended") {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline && !cancelled {
+                // Out of window: cancel, but keep polling — the request may already have
+                // completed (and billed) before the cancel lands, and its usage must be recorded.
+                let cancel = self.http.post(self.url(&format!("/batches/{id}/cancel")));
+                let _ = self.send(cancel, auth).await;
+                cancelled = true;
+            }
+            if now >= grace_end {
+                tracing::warn!(batch = %id, "batch never ended after cancel; its spend is unknown");
+                return Err(ProviderError::Transport(format!(
+                    "batch {id} cancelled but not ended; spend unknown, not zero"
+                )));
+            }
+            let until = if cancelled { grace_end } else { deadline };
+            tokio::time::sleep(POLL.min(until.saturating_duration_since(now))).await;
+        }
+        // The documented results path on our own base URL — never the `results_url` the status
+        // body names, so credentials only ever go to the configured host.
+        let lines = self
+            .send_raw(
+                self.http.get(self.url(&format!("/batches/{id}/results"))),
+                auth,
+            )
+            .await?;
+        let line = String::from_utf8_lossy(&lines)
+            .lines()
+            .find_map(|l| serde_json::from_str::<Value>(l).ok())
+            .ok_or_else(|| ProviderError::Decode("batch: empty results".to_owned()))?;
+        match line.pointer("/result/type").and_then(Value::as_str) {
+            Some("succeeded") => anthropic_response(req, line["result"]["message"].clone()),
+            // A per-request error is the request's fault, like a sync 4xx: don't escalate it.
+            Some("errored") => Err(ProviderError::Http {
+                status: 400,
+                body: line["result"].to_string(),
+            }),
+            // expired / canceled: nothing was billed; let the next rung try.
+            _ => Err(ProviderError::Transport(format!(
+                "batch {id} result: {}",
+                line["result"]
+            ))),
+        }
+    }
+}
 
+impl AnthropicProvider {
+    fn url(&self, suffix: &str) -> String {
+        format!(
+            "{}/v1/messages{suffix}",
+            self.base_url.trim_end_matches('/')
+        )
+    }
+
+    async fn send(
+        &self,
+        builder: reqwest::RequestBuilder,
+        auth: &Auth,
+    ) -> Result<Value, ProviderError> {
+        let bytes = self.send_raw(builder, auth).await?;
+        serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))
+    }
+
+    /// Attach credentials + version headers, send, and return the body of a 2xx response.
+    async fn send_raw(
+        &self,
+        mut builder: reqwest::RequestBuilder,
+        auth: &Auth,
+    ) -> Result<bytes::Bytes, ProviderError> {
         match anthropic_credential(
             self.api_key_env.as_deref().map(|e| std::env::var(e).ok()),
             auth,
@@ -568,7 +741,6 @@ impl Provider for AnthropicProvider {
         }
 
         let resp = builder
-            .json(&body)
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -585,23 +757,22 @@ impl Provider for AnthropicProvider {
                 body: String::from_utf8_lossy(&bytes).into_owned(),
             });
         }
-
-        let json: Value =
-            serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
-        let u = anthropic_parse_response(&json)?;
-        let (text, in_tokens, out_tokens) = (u.text, u.in_tokens, u.out_tokens);
-        let (cache_write_tokens, cache_read_tokens) = (u.cache_write_tokens, u.cache_read_tokens);
-
-        Ok(ModelResponse {
-            cache_write_tokens,
-            cache_read_tokens,
-            model: req.model.clone(),
-            text,
-            in_tokens,
-            out_tokens,
-            raw: json,
-        })
+        Ok(bytes)
     }
+}
+
+/// Normalize an Anthropic Messages response (sync, or one batch result's `message`).
+fn anthropic_response(req: &ModelRequest, json: Value) -> Result<ModelResponse, ProviderError> {
+    let u = anthropic_parse_response(&json)?;
+    Ok(ModelResponse {
+        cache_write_tokens: u.cache_write_tokens,
+        cache_read_tokens: u.cache_read_tokens,
+        model: req.model.clone(),
+        text: u.text,
+        in_tokens: u.in_tokens,
+        out_tokens: u.out_tokens,
+        raw: json,
+    })
 }
 
 /// Extract `(text, in_tokens, out_tokens)` from an Anthropic Messages API response. Shared by
@@ -675,6 +846,7 @@ fn anthropic_messages_body(req: &ModelRequest, anthropic_version: &str) -> Value
             "anthropic_version".to_owned(),
             Value::String(anthropic_version.to_owned()),
         );
+        pin_effort(&mut body, &req.model, Wire::Anthropic);
         return Value::Object(body);
     }
     let messages: Vec<Value> = req
@@ -694,6 +866,9 @@ fn anthropic_messages_body(req: &ModelRequest, anthropic_version: &str) -> Value
     if !req.tools.is_null() {
         body["tools"] = req.tools.clone();
     }
+    if let Some(map) = body.as_object_mut() {
+        pin_effort(map, &req.model, Wire::Anthropic);
+    }
     body
 }
 
@@ -712,6 +887,7 @@ pub fn openai_wire_body(req: &ModelRequest) -> Value {
         );
         body.remove("stream");
         strip_extra_content(body.get_mut("messages"));
+        pin_effort(&mut body, &req.model, Wire::OpenAi);
         normalize_reasoning(&mut body, Wire::OpenAi);
         return Value::Object(body);
     }
@@ -733,6 +909,9 @@ pub fn openai_wire_body(req: &ModelRequest) -> Value {
     strip_extra_content(body.get_mut("messages"));
     if !req.tools.is_null() {
         body["tools"] = req.tools.clone();
+    }
+    if let Some(map) = body.as_object_mut() {
+        pin_effort(map, &req.model, Wire::OpenAi);
     }
     body
 }
@@ -1206,7 +1385,8 @@ fn gemini_request_body(req: &ModelRequest) -> Value {
     }
     // This builder reconstructs from normalized fields, so the caller's reasoning request is only
     // in `raw` — carry it across rather than dropping it on the Gemini rung.
-    if let (Some(effort), Some(map)) = (effort_of(&req.raw), body.as_object_mut()) {
+    let effort = rung_effort(&req.model).or_else(|| effort_of(&req.raw));
+    if let (Some(effort), Some(map)) = (effort, body.as_object_mut()) {
         let mut carry = serde_json::Map::new();
         carry.insert(
             "reasoning_effort".to_owned(),
@@ -2901,6 +3081,7 @@ mod tests {
             anthropic_beta: None,
             anthropic_version: None,
             gemini_key: None,
+            latency: None,
         };
         let debug = format!("{auth:?}");
         assert!(!debug.contains("super-secret"));
@@ -3225,6 +3406,7 @@ mod tests {
             anthropic_beta: Some("interleaved-thinking-2025-05-14".to_owned()),
             anthropic_version: Some("2024-01-01".to_owned()),
             gemini_key: None,
+            latency: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 
@@ -3249,6 +3431,265 @@ mod tests {
             Some("interleaved-thinking-2025-05-14"),
             "anthropic-beta must be forwarded verbatim"
         );
+    }
+
+    /// An `@effort` rung strips its suffix from the wire model and overrides the caller's own
+    /// reasoning request, in each dialect (#283).
+    #[test]
+    fn effort_rung_pins_reasoning_and_strips_the_suffix() {
+        let mut req = ModelRequest {
+            model: "anthropic/claude-sonnet-5@high".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 32_000,
+            tools: Value::Null,
+            raw: serde_json::json!({"messages": [], "max_tokens": 32_000,
+                "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+            cache_prefix: false,
+        };
+        let a = anthropic_wire_body(&req);
+        assert_eq!(a["model"], "claude-sonnet-5");
+        assert_eq!(a["thinking"]["budget_tokens"], 16384, "rung effort wins");
+        assert!(a.get("reasoning_effort").is_none());
+
+        req.model = "openai/gpt-5.5@low".to_owned();
+        req.raw = serde_json::json!({"messages": [], "reasoning_effort": "high"});
+        let o = openai_wire_body(&req);
+        assert_eq!(
+            (&o["model"], &o["reasoning_effort"]),
+            (&"gpt-5.5".into(), &"low".into())
+        );
+
+        // Fallback (translated/condensed) path, no raw body.
+        req.raw = Value::Null;
+        assert_eq!(openai_wire_body(&req)["reasoning_effort"], "low");
+        // No suffix: byte-identical to before.
+        req.model = "openai/gpt-5.5".to_owned();
+        assert!(openai_wire_body(&req).get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn latency_header_parses_and_absent_or_bad_means_none() {
+        let mut h = HeaderMap::new();
+        let d = |h: &HeaderMap| Auth::from_headers(h, firstpass_core::Dialect::Anthropic).latency;
+        assert_eq!(d(&h), None);
+        h.insert("x-firstpass-latency", "24h".parse().unwrap());
+        assert_eq!(d(&h), Some(std::time::Duration::from_secs(86_400)));
+        for bad in ["soon", "0s"] {
+            h.insert("x-firstpass-latency", bad.parse().unwrap());
+            assert_eq!(d(&h), None, "{bad}");
+        }
+    }
+
+    /// `@batch` goes through the Message Batches API: submit, poll, read results from our own base
+    /// URL, normalize the message; an errored result is a hard (non-escalating) error.
+    #[tokio::test]
+    async fn anthropic_batch_round_trip() {
+        use axum::routing::{get, post};
+        use std::sync::{Arc, Mutex};
+        let submitted: Arc<Mutex<Option<Value>>> = Arc::default();
+        let sub = Arc::clone(&submitted);
+        let result: Arc<Mutex<Value>> = Arc::new(Mutex::new(serde_json::json!({
+            "type": "succeeded", "message": {
+                "content": [{"type": "text", "text": "batched"}],
+                "usage": {"input_tokens": 7, "output_tokens": 3}}
+        })));
+        let res = Arc::clone(&result);
+        let app =
+            axum::Router::new()
+                .route(
+                    "/v1/messages/batches",
+                    post(move |axum::Json(b): axum::Json<Value>| {
+                        *sub.lock().unwrap() = Some(b);
+                        async { axum::Json(serde_json::json!({"id": "b1"})) }
+                    }),
+                )
+                .route(
+                    "/v1/messages/batches/b1",
+                    get(|| async {
+                        axum::Json(serde_json::json!({"processing_status": "ended",
+                        "results_url": "https://elsewhere.invalid/steal"}))
+                    }),
+                )
+                .route(
+                    "/v1/messages/batches/b1/results",
+                    get(move || {
+                        let r = res.lock().unwrap().clone();
+                        async move {
+                            serde_json::json!({"custom_id": "firstpass", "result": r}).to_string()
+                        }
+                    }),
+                );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            api_key_env: None,
+            http: reqwest::Client::new(),
+        };
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5@low@batch".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let auth = Auth {
+            anthropic_key: Some("k".to_owned()),
+            latency: Some(std::time::Duration::from_secs(3600)),
+            ..Auth::default()
+        };
+        let r = provider
+            .complete_batch(&req, &auth)
+            .await
+            .expect("batch ok");
+        assert_eq!(
+            (r.text.as_str(), r.in_tokens, r.out_tokens),
+            ("batched", 7, 3)
+        );
+        assert_eq!(r.model, req.model, "receipt keeps the full rung");
+        let body = submitted.lock().unwrap().take().unwrap();
+        assert_eq!(body["requests"][0]["params"]["model"], "claude-haiku-4-5");
+
+        *result.lock().unwrap() = serde_json::json!({"type": "errored", "error": {}});
+        let err = provider.complete_batch(&req, &auth).await.unwrap_err();
+        assert!(!err.is_failover_eligible(), "{err}");
+    }
+
+    /// A Message Batches server that reports `in_progress` for the first `ended_after` status polls
+    /// (then `ended`); after a cancel it reports `canceling` once, then `ended`. Its one result is
+    /// `succeeded` with usage 7 in / 3 out. Returns the provider and the "cancel was called" flag.
+    async fn batch_server(
+        ended_after: usize,
+    ) -> (AnthropicProvider, Arc<std::sync::atomic::AtomicBool>) {
+        use axum::routing::{get, post};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let polls = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let after_cancel = Arc::new(AtomicUsize::new(0));
+        let (c1, c2) = (Arc::clone(&cancelled), Arc::clone(&cancelled));
+        let app = axum::Router::new()
+            .route(
+                "/v1/messages/batches",
+                post(|| async { axum::Json(serde_json::json!({"id": "b1"})) }),
+            )
+            .route(
+                "/v1/messages/batches/b1",
+                get(move || {
+                    let status = if c1.load(SeqCst) {
+                        if after_cancel.fetch_add(1, SeqCst) == 0 {
+                            "canceling"
+                        } else {
+                            "ended"
+                        }
+                    } else if polls.fetch_add(1, SeqCst) >= ended_after {
+                        "ended"
+                    } else {
+                        "in_progress"
+                    };
+                    async move { axum::Json(serde_json::json!({"processing_status": status})) }
+                }),
+            )
+            .route(
+                "/v1/messages/batches/b1/cancel",
+                post(move || {
+                    c2.store(true, SeqCst);
+                    async { axum::Json(serde_json::json!({"id": "b1"})) }
+                }),
+            )
+            .route(
+                "/v1/messages/batches/b1/results",
+                get(|| async {
+                    serde_json::json!({"custom_id": "firstpass", "result": {
+                        "type": "succeeded", "message": {
+                            "content": [{"type": "text", "text": "batched"}],
+                            "usage": {"input_tokens": 7, "output_tokens": 3}}}})
+                    .to_string()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            api_key_env: None,
+            http: reqwest::Client::new(),
+        };
+        (provider, cancelled)
+    }
+
+    fn batch_req(latency: std::time::Duration) -> (ModelRequest, Auth) {
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5@batch".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let auth = Auth {
+            anthropic_key: Some("k".to_owned()),
+            latency: Some(latency),
+            ..Auth::default()
+        };
+        (req, auth)
+    }
+
+    /// A huge caller latency is clamped, never overflowing the deadline (it used to panic on
+    /// `Instant + Duration`).
+    #[tokio::test]
+    async fn batch_huge_latency_is_clamped_not_a_panic() {
+        let mut h = HeaderMap::new();
+        h.insert("x-firstpass-latency", "99999999999999d".parse().unwrap());
+        let auth = Auth::from_headers(&h, firstpass_core::Dialect::Anthropic);
+        assert_eq!(auth.latency, Some(MAX_BATCH_WINDOW));
+
+        let (provider, _) = batch_server(0).await;
+        let (req, auth) = batch_req(std::time::Duration::MAX);
+        let r = provider
+            .complete_batch(&req, &auth)
+            .await
+            .expect("no panic");
+        assert_eq!(r.text, "batched");
+    }
+
+    /// A window shorter than the poll interval still polls (it used to give up before the first
+    /// sleep because `now + 30s > deadline`).
+    // Real time: a paused clock auto-advances while awaiting socket I/O and would skip the window.
+    #[tokio::test]
+    async fn batch_sub_poll_window_still_waits_for_the_result() {
+        let (provider, cancelled) = batch_server(1).await;
+        let (req, auth) = batch_req(std::time::Duration::from_secs(1));
+        let r = provider
+            .complete_batch(&req, &auth)
+            .await
+            .expect("ended in window");
+        assert_eq!(r.text, "batched");
+        assert!(!cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Out of window: the batch is cancelled, but a request that completed before the cancel landed
+    /// was billed — its result and usage are returned, not recorded as a zero-cost abstain.
+    #[tokio::test(start_paused = true)]
+    async fn batch_cancel_still_reads_and_bills_a_completed_result() {
+        let (provider, cancelled) = batch_server(usize::MAX).await;
+        let (req, auth) = batch_req(std::time::Duration::from_secs(60));
+        let r = provider
+            .complete_batch(&req, &auth)
+            .await
+            .expect("billed result");
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!((r.in_tokens, r.out_tokens), (7, 3));
     }
 
     #[test]
@@ -3357,6 +3798,7 @@ mod tests {
             anthropic_beta: None,
             anthropic_version: None,
             gemini_key: None,
+            latency: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 
@@ -3421,6 +3863,7 @@ mod tests {
             anthropic_beta: None,
             anthropic_version: None,
             gemini_key: None,
+            latency: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 
@@ -3450,6 +3893,7 @@ mod tests {
             anthropic_beta: None,
             anthropic_version: None,
             gemini_key: None,
+            latency: None,
         };
         // configured = Option<Option<String>>
         //   None           → api_key_env not set → use client creds + ambient
@@ -3549,6 +3993,7 @@ mod tests {
             anthropic_beta: None,
             anthropic_version: None,
             gemini_key: None,
+            latency: None,
         };
         provider.complete(&req, &auth).await.expect("must succeed");
 
