@@ -110,6 +110,8 @@ pub struct AppState {
     /// (the default) — behavior is byte-identical to before. When `Some`, `offer_trace` appends
     /// to `<db_path>.spill.jsonl` on channel-full instead of dropping.
     pub spill: Option<store::SpillHandle>,
+    /// Per-BYOK-key daily spend and receipt-chain heads for observe passthrough (#284).
+    pub byok: Arc<crate::byok::ByokMeter>,
 }
 
 /// Build the per-tenant keyed rate limiter from config (ADR 0004 §D6). Returns `None` when
@@ -3951,9 +3953,13 @@ async fn observe_passthrough(
     session_header: Option<String>,
     tenant: String,
 ) -> Response {
+    let key = match byok_gate(&state, &headers) {
+        Ok(k) => k,
+        Err(blocked) => return *blocked,
+    };
     // Streaming requests are relayed chunk-by-chunk rather than buffered (SPEC §7.4).
     if is_stream_request(&body) {
-        return observe_stream(state, headers, body, session_header, tenant).await;
+        return observe_stream(state, headers, body, session_header, tenant, key).await;
     }
     let start = Instant::now();
     let result = forward_anthropic(
@@ -3982,6 +3988,7 @@ async fn observe_passthrough(
                 "anthropic",
                 "anthropic.messages",
                 None,
+                key.clone(),
             );
             (status, resp_headers, resp_body).into_response()
         }
@@ -3996,6 +4003,7 @@ async fn observe_passthrough(
                 "anthropic",
                 "anthropic.messages",
                 None,
+                key.clone(),
             );
             err.into_response()
         }
@@ -4013,6 +4021,7 @@ async fn observe_stream(
     body: Bytes,
     session_header: Option<String>,
     tenant: String,
+    key: Option<String>,
 ) -> Response {
     let start = Instant::now();
     let result = forward_anthropic_streaming(
@@ -4036,6 +4045,7 @@ async fn observe_stream(
                 status.is_success(),
                 "anthropic.messages",
                 None,
+                key.clone(),
             );
             let tap = SseTap::new(response.bytes_stream(), on_done);
             let stream_body = Body::from_stream(tap);
@@ -4052,6 +4062,7 @@ async fn observe_stream(
                 "anthropic",
                 "anthropic.messages",
                 None,
+                key.clone(),
             );
             err.into_response()
         }
@@ -4075,10 +4086,12 @@ fn stream_trace_callback(
     upstream_success: bool,
     api: &'static str,
     model_hint: Option<String>,
+    key: Option<String>,
 ) -> impl FnOnce(SseUsage, SseEndReason) + Send + 'static {
     let config = state.config.clone();
     let traces = state.traces.clone();
     let spill = state.spill.clone();
+    let byok = state.byok.clone();
     move |usage: SseUsage, reason: SseEndReason| {
         let mut trace = if !upstream_success {
             // Non-2xx HTTP status: the upstream returned an error response (e.g. 429, 500).
@@ -4162,6 +4175,9 @@ fn stream_trace_callback(
         // Stamp the resolved tenant identity — never the config default nor anything
         // request-borne.
         trace.tenant_id = tenant;
+        if let Some(key) = key {
+            crate::byok::meter(&byok, &key, &trace);
+        }
         offer_trace(&traces, spill.as_ref(), trace);
     }
 }
@@ -4430,10 +4446,12 @@ fn spawn_trace(
     provider: &'static str,
     api: &'static str,
     model_hint: Option<String>,
+    key: Option<String>,
 ) {
     let config = state.config.clone();
     let traces = state.traces.clone();
     let spill = state.spill.clone();
+    let byok = state.byok.clone();
     tokio::spawn(async move {
         let mut trace = match resp_body {
             Some(resp) => build_trace(
@@ -4457,8 +4475,21 @@ fn spawn_trace(
         };
         // Stamp the resolved tenant identity — never the config default nor anything request-borne.
         trace.tenant_id = tenant;
+        if let Some(key) = key {
+            crate::byok::meter(&byok, &key, &trace);
+        }
         offer_trace(&traces, spill.as_ref(), trace);
     });
+}
+
+/// [`crate::byok::gate`] against this deployment's `[budget] per_day_usd`, applied per BYOK key.
+fn byok_gate(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, Box<Response>> {
+    let cap = state
+        .config
+        .routing
+        .as_ref()
+        .and_then(|r| r.budget.per_day_usd);
+    crate::byok::gate(&state.byok, cap, headers)
 }
 
 /// Session id for the trace: the caller-supplied header, or the trace's own id when absent.
@@ -5623,8 +5654,12 @@ async fn observe_passthrough_openai_path(
     tenant: String,
     path: &'static str,
 ) -> Response {
+    let key = match byok_gate(&state, &headers) {
+        Ok(k) => k,
+        Err(blocked) => return *blocked,
+    };
     if is_stream_request(&body) {
-        return observe_stream_openai_path(state, headers, body, session_header, tenant, path)
+        return observe_stream_openai_path(state, headers, body, session_header, tenant, path, key)
             .await;
     }
     let start = Instant::now();
@@ -5650,6 +5685,7 @@ async fn observe_passthrough_openai_path(
                 "openai",
                 "openai.chat_completions",
                 None,
+                key.clone(),
             );
             (status, resp_headers, resp_body).into_response()
         }
@@ -5664,6 +5700,7 @@ async fn observe_passthrough_openai_path(
                 "openai",
                 "openai.chat_completions",
                 None,
+                key.clone(),
             );
             err.into_response()
         }
@@ -5680,6 +5717,7 @@ async fn observe_stream_openai_path(
     session_header: Option<String>,
     tenant: String,
     path: &'static str,
+    key: Option<String>,
 ) -> Response {
     let start = Instant::now();
     let result = crate::upstream::forward_openai_streaming_path(
@@ -5703,6 +5741,7 @@ async fn observe_stream_openai_path(
                 status.is_success(),
                 "openai.chat_completions",
                 None,
+                key.clone(),
             );
             let tap = SseTap::new(response.bytes_stream(), on_done);
             let stream_body = Body::from_stream(tap);
@@ -5719,6 +5758,7 @@ async fn observe_stream_openai_path(
                 "openai",
                 "openai.chat_completions",
                 None,
+                key.clone(),
             );
             err.into_response()
         }
@@ -6294,6 +6334,10 @@ async fn observe_passthrough_gemini(
     scrubbed_query: String,
     model_hint: Option<String>,
 ) -> Response {
+    let key = match byok_gate(&state, &headers) {
+        Ok(k) => k,
+        Err(blocked) => return *blocked,
+    };
     let path = if scrubbed_query.is_empty() {
         format!("/v1beta/models/{model_action}")
     } else {
@@ -6322,6 +6366,7 @@ async fn observe_passthrough_gemini(
                     status.is_success(),
                     "gemini.generate_content",
                     model_hint,
+                    key.clone(),
                 );
                 let tap = SseTap::new(response.bytes_stream(), on_done);
                 let stream_body = Body::from_stream(tap);
@@ -6338,6 +6383,7 @@ async fn observe_passthrough_gemini(
                     "google", // price-table prefix (google/gemini-*)
                     "gemini.generate_content",
                     model_hint,
+                    key.clone(),
                 );
                 return err.into_response();
             }
@@ -6366,6 +6412,7 @@ async fn observe_passthrough_gemini(
                 "google", // price-table prefix (google/gemini-*)
                 "gemini.generate_content",
                 model_hint,
+                key.clone(),
             );
             (status, resp_headers, resp_body).into_response()
         }
@@ -6380,6 +6427,7 @@ async fn observe_passthrough_gemini(
                 "google", // price-table prefix (google/gemini-*)
                 "gemini.generate_content",
                 model_hint,
+                key.clone(),
             );
             err.into_response()
         }
@@ -6648,6 +6696,7 @@ mod tests {
             providers: ProviderRegistry::from_map(HashMap::new()),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -7419,6 +7468,7 @@ mod tests {
             providers,
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -7657,6 +7707,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -8113,6 +8164,7 @@ mod tests {
             providers: ProviderRegistry::from_map(HashMap::new()),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -8172,6 +8224,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -8404,6 +8457,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -8779,6 +8833,7 @@ mod tests {
             providers: ProviderRegistry::from_map(providers),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -9210,6 +9265,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -9604,6 +9660,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -9727,6 +9784,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -10008,6 +10066,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -10103,6 +10162,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -10293,6 +10353,7 @@ mod tests {
             providers: ProviderRegistry::from_map(map),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments,
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -12119,6 +12180,7 @@ mod tests {
             providers: ProviderRegistry::from_map(HashMap::new()),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -12211,6 +12273,7 @@ mod tests {
             providers: ProviderRegistry::from_map(HashMap::new()),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -12229,7 +12292,15 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"model":"claude-haiku-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
         );
-        let resp = observe_stream(state, HeaderMap::new(), body, None, "default".to_owned()).await;
+        let resp = observe_stream(
+            state,
+            HeaderMap::new(),
+            body,
+            None,
+            "default".to_owned(),
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
         // Consuming the body drives the stream to completion, fires `on_done`, which spawns
@@ -12573,6 +12644,7 @@ mod tests {
             providers: ProviderRegistry::from_map(HashMap::new()),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -12617,6 +12689,7 @@ mod tests {
             true,
             "anthropic.messages",
             None,
+            None,
         );
         cb(usage, SseEndReason::UpstreamError);
 
@@ -12656,6 +12729,7 @@ mod tests {
             "anthropic",
             true,
             "anthropic.messages",
+            None,
             None,
         );
         cb(usage, SseEndReason::Dropped);
@@ -12739,6 +12813,7 @@ mod tests {
                 "anthropic",
                 true,
                 "anthropic.messages",
+                None,
                 None,
             );
             cb(
@@ -12877,6 +12952,7 @@ mod tests {
             providers: ProviderRegistry::from_map(HashMap::new()),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -13582,6 +13658,7 @@ mod tests {
             providers: ProviderRegistry::new("http://127.0.0.1:1", "http://127.0.0.1:1"),
             gate_health: Arc::new(GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
@@ -13735,5 +13812,173 @@ mod tests {
             "Gemini response has no top-level model field"
         );
         // mutant: remove usageMetadata branch → in_tokens stays 0
+    }
+
+    /// An Anthropic usage block costing a known non-zero amount on `claude-haiku-4-5`.
+    const BYOK_RESP: &str = r#"{"id":"m","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":500}}"#;
+    const BYOK_REQ: &[u8] =
+        br#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}"#;
+
+    fn byok_trace(config: &ProxyConfig) -> Trace {
+        build_trace(
+            config,
+            &Bytes::from_static(BYOK_REQ),
+            &Bytes::from_static(BYOK_RESP.as_bytes()),
+            1,
+            None,
+            "anthropic",
+            "anthropic.messages",
+            None,
+        )
+    }
+
+    #[test]
+    fn byok_receipts_meter_usage_and_chain_per_key() {
+        let config = ProxyConfig::from_lookup(|_| None).unwrap();
+        let meter = crate::byok::ByokMeter::default();
+        let t = byok_trace(&config);
+        assert!(t.final_.total_cost_usd > 0.0, "fixture must cost something");
+
+        let a: Vec<_> = (0..3).map(|_| meter.record("ka", &t).unwrap()).collect();
+        let b = meter.record("kb", &t).unwrap();
+        assert_eq!(a[0].in_tokens, 1000);
+        assert_eq!(a[0].out_tokens, 500);
+        assert_eq!(a[0].model, "claude-haiku-4-5");
+        assert!((a[2].day_spent_usd - 3.0 * t.final_.total_cost_usd).abs() < 1e-12);
+        // Each key has its own chain: kb starts at genesis even though ka has history.
+        assert_eq!(b.prev_hash, firstpass_core::GENESIS_HASH);
+        assert!((b.day_spent_usd - t.final_.total_cost_usd).abs() < 1e-12);
+        firstpass_core::hashchain::verify_chain(&a, firstpass_core::GENESIS_HASH).unwrap();
+
+        let mut tampered = a.clone();
+        tampered[1].cost_usd = 0.0;
+        assert!(
+            firstpass_core::hashchain::verify_chain(&tampered, firstpass_core::GENESIS_HASH)
+                .is_err(),
+            "editing a receipt must break the chain"
+        );
+    }
+
+    #[test]
+    fn byok_budget_resets_on_a_new_utc_day() {
+        let config = ProxyConfig::from_lookup(|_| None).unwrap();
+        let meter = crate::byok::ByokMeter::default();
+        let mut t = byok_trace(&config);
+        let cap = t.final_.total_cost_usd;
+        meter.record("ka", &t).unwrap();
+        assert!(meter.over_budget("ka", cap, t.ts));
+        assert!(!meter.over_budget("kb", cap, t.ts));
+        let tomorrow = t.ts + jiff::SignedDuration::from_hours(24);
+        assert!(!meter.over_budget("ka", cap, tomorrow));
+        t.ts = tomorrow;
+        let r = meter.record("ka", &t).unwrap();
+        assert!(
+            (r.day_spent_usd - cap).abs() < 1e-12,
+            "spend restarts on a new day"
+        );
+        assert_ne!(
+            r.prev_hash,
+            firstpass_core::GENESIS_HASH,
+            "chain continues across days"
+        );
+    }
+
+    /// End to end through the real passthrough: a key under its `[budget] per_day_usd` is
+    /// forwarded and metered; once its spend reaches the cap it gets a 402 while another key is
+    /// still served.
+    #[tokio::test]
+    async fn byok_daily_budget_blocks_with_402_per_key() {
+        use axum::http::StatusCode;
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    BYOK_RESP,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+        let config = ProxyConfig::from_lookup(|k| match k {
+            "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some(base_url.clone()),
+            "FIRSTPASS_CONFIG_TOML" => Some("[budget]\nper_day_usd = 0.000001\n".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let (traces, mut rx) = mpsc::channel(8);
+        let state = AppState {
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            providers: ProviderRegistry::from_map(HashMap::new()),
+            gate_health: Arc::new(GateHealthRegistry::new()),
+            shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
+            paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            experiments: Arc::default(),
+            guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
+            traces,
+            adaptive: None,
+            eprocess: None,
+            bandit: None,
+            promoter: None,
+            verified_cache: None,
+            predictor: None,
+            prior: None,
+            tenant_rate_limiter: None,
+            spill: None,
+        };
+        let with_key = |k: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-api-key", k.parse().unwrap());
+            h
+        };
+        let send = |k: &str| {
+            observe_passthrough(
+                state.clone(),
+                with_key(k),
+                Bytes::from_static(BYOK_REQ),
+                None,
+                "default".to_owned(),
+            )
+        };
+
+        assert_eq!(send("key-a").await.status(), StatusCode::OK);
+        // Metering runs before the trace is enqueued, so once it arrives key-a is debited.
+        rx.recv().await.expect("trace");
+        let blocked = send("key-a").await;
+        assert_eq!(blocked.status(), StatusCode::PAYMENT_REQUIRED);
+        let body = axum::body::to_bytes(blocked.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "budget_exceeded");
+        assert!(!String::from_utf8_lossy(&body).contains("key-a"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a blocked request is not forwarded or traced"
+        );
+
+        assert_eq!(
+            send("key-b").await.status(),
+            StatusCode::OK,
+            "budgets are per key"
+        );
+        // No key, no attribution: never blocked by a per-key cap.
+        let anon = observe_passthrough(
+            state.clone(),
+            HeaderMap::new(),
+            Bytes::from_static(BYOK_REQ),
+            None,
+            "default".to_owned(),
+        )
+        .await;
+        assert_eq!(anon.status(), StatusCode::OK);
     }
 }
