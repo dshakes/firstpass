@@ -3953,7 +3953,7 @@ async fn observe_passthrough(
     session_header: Option<String>,
     tenant: String,
 ) -> Response {
-    let key = match byok_gate(&state, &headers) {
+    let key = match byok_gate(&state, &headers, crate::byok::ANTHROPIC_CREDS) {
         Ok(k) => k,
         Err(blocked) => return *blocked,
     };
@@ -4021,7 +4021,7 @@ async fn observe_stream(
     body: Bytes,
     session_header: Option<String>,
     tenant: String,
-    key: Option<String>,
+    key: Option<crate::byok::Admit>,
 ) -> Response {
     let start = Instant::now();
     let result = forward_anthropic_streaming(
@@ -4086,7 +4086,7 @@ fn stream_trace_callback(
     upstream_success: bool,
     api: &'static str,
     model_hint: Option<String>,
-    key: Option<String>,
+    key: Option<crate::byok::Admit>,
 ) -> impl FnOnce(SseUsage, SseEndReason) + Send + 'static {
     let config = state.config.clone();
     let traces = state.traces.clone();
@@ -4446,7 +4446,7 @@ fn spawn_trace(
     provider: &'static str,
     api: &'static str,
     model_hint: Option<String>,
-    key: Option<String>,
+    key: Option<crate::byok::Admit>,
 ) {
     let config = state.config.clone();
     let traces = state.traces.clone();
@@ -4483,13 +4483,17 @@ fn spawn_trace(
 }
 
 /// [`crate::byok::gate`] against this deployment's `[budget] per_day_usd`, applied per BYOK key.
-fn byok_gate(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, Box<Response>> {
+fn byok_gate(
+    state: &AppState,
+    headers: &HeaderMap,
+    creds: &[&str],
+) -> Result<Option<crate::byok::Admit>, Box<Response>> {
     let cap = state
         .config
         .routing
         .as_ref()
         .and_then(|r| r.budget.per_day_usd);
-    crate::byok::gate(&state.byok, cap, headers)
+    crate::byok::gate(&state.byok, cap, headers, creds)
 }
 
 /// Session id for the trace: the caller-supplied header, or the trace's own id when absent.
@@ -5654,7 +5658,7 @@ async fn observe_passthrough_openai_path(
     tenant: String,
     path: &'static str,
 ) -> Response {
-    let key = match byok_gate(&state, &headers) {
+    let key = match byok_gate(&state, &headers, crate::byok::OPENAI_CREDS) {
         Ok(k) => k,
         Err(blocked) => return *blocked,
     };
@@ -5717,7 +5721,7 @@ async fn observe_stream_openai_path(
     session_header: Option<String>,
     tenant: String,
     path: &'static str,
-    key: Option<String>,
+    key: Option<crate::byok::Admit>,
 ) -> Response {
     let start = Instant::now();
     let result = crate::upstream::forward_openai_streaming_path(
@@ -6334,7 +6338,7 @@ async fn observe_passthrough_gemini(
     scrubbed_query: String,
     model_hint: Option<String>,
 ) -> Response {
-    let key = match byok_gate(&state, &headers) {
+    let key = match byok_gate(&state, &headers, crate::byok::GEMINI_CREDS) {
         Ok(k) => k,
         Err(blocked) => return *blocked,
     };
@@ -13838,9 +13842,13 @@ mod tests {
         let meter = crate::byok::ByokMeter::default();
         let t = byok_trace(&config);
         assert!(t.final_.total_cost_usd > 0.0, "fixture must cost something");
+        let rec = |k: &str| {
+            let admit = meter.admit(k.to_owned(), None, t.ts).unwrap().unwrap();
+            meter.record(&admit, &t).unwrap()
+        };
 
-        let a: Vec<_> = (0..3).map(|_| meter.record("ka", &t).unwrap()).collect();
-        let b = meter.record("kb", &t).unwrap();
+        let a: Vec<_> = (0..3).map(|_| rec("ka")).collect();
+        let b = rec("kb");
         assert_eq!(a[0].in_tokens, 1000);
         assert_eq!(a[0].out_tokens, 500);
         assert_eq!(a[0].model, "claude-haiku-4-5");
@@ -13860,38 +13868,37 @@ mod tests {
     }
 
     #[test]
-    fn byok_budget_resets_on_a_new_utc_day() {
+    fn byok_budget_and_chain_reset_on_a_new_utc_day() {
         let config = ProxyConfig::from_lookup(|_| None).unwrap();
         let meter = crate::byok::ByokMeter::default();
         let mut t = byok_trace(&config);
-        let cap = t.final_.total_cost_usd;
-        meter.record("ka", &t).unwrap();
-        assert!(meter.over_budget("ka", cap, t.ts));
-        assert!(!meter.over_budget("kb", cap, t.ts));
+        let cap = Some(t.final_.total_cost_usd);
+        let admit = meter.admit("ka".into(), cap, t.ts).unwrap().unwrap();
+        meter.record(&admit, &t).unwrap();
+        assert!(meter.admit("ka".into(), cap, t.ts).is_err(), "cap reached");
+        assert!(meter.admit("kb".into(), cap, t.ts).is_ok(), "per key");
         let tomorrow = t.ts + jiff::SignedDuration::from_hours(24);
-        assert!(!meter.over_budget("ka", cap, tomorrow));
+        let admit = meter.admit("ka".into(), cap, tomorrow).unwrap().unwrap();
         t.ts = tomorrow;
-        let r = meter.record("ka", &t).unwrap();
+        let r = meter.record(&admit, &t).unwrap();
         assert!(
-            (r.day_spent_usd - cap).abs() < 1e-12,
+            (r.day_spent_usd - t.final_.total_cost_usd).abs() < 1e-12,
             "spend restarts on a new day"
         );
-        assert_ne!(
+        assert_eq!(
             r.prev_hash,
             firstpass_core::GENESIS_HASH,
-            "chain continues across days"
+            "the chain is per (key, day)"
         );
     }
 
-    /// End to end through the real passthrough: a key under its `[budget] per_day_usd` is
-    /// forwarded and metered; once its spend reaches the cap it gets a 402 while another key is
-    /// still served.
-    #[tokio::test]
-    async fn byok_daily_budget_blocks_with_402_per_key() {
-        use axum::http::StatusCode;
+    /// A passthrough `AppState` whose Anthropic upstream answers [`BYOK_RESP`] after `delay`,
+    /// with `[budget] per_day_usd = cap`.
+    async fn byok_state(cap: f64, delay: std::time::Duration) -> (AppState, mpsc::Receiver<Trace>) {
         let app = axum::Router::new().route(
             "/v1/messages",
-            axum::routing::post(|| async {
+            axum::routing::post(move || async move {
+                tokio::time::sleep(delay).await;
                 (
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
                     BYOK_RESP,
@@ -13906,13 +13913,14 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         let base_url = format!("http://{addr}");
+        let toml = format!("[budget]\nper_day_usd = {cap}\n");
         let config = ProxyConfig::from_lookup(|k| match k {
             "FIRSTPASS_UPSTREAM_ANTHROPIC" => Some(base_url.clone()),
-            "FIRSTPASS_CONFIG_TOML" => Some("[budget]\nper_day_usd = 0.000001\n".to_owned()),
+            "FIRSTPASS_CONFIG_TOML" => Some(toml.clone()),
             _ => None,
         })
         .unwrap();
-        let (traces, mut rx) = mpsc::channel(8);
+        let (traces, rx) = mpsc::channel(16);
         let state = AppState {
             config: Arc::new(config),
             http: reqwest::Client::new(),
@@ -13934,25 +13942,36 @@ mod tests {
             tenant_rate_limiter: None,
             spill: None,
         };
-        let with_key = |k: &str| {
-            let mut h = HeaderMap::new();
-            h.insert("x-api-key", k.parse().unwrap());
-            h
-        };
-        let send = |k: &str| {
-            observe_passthrough(
-                state.clone(),
-                with_key(k),
-                Bytes::from_static(BYOK_REQ),
-                None,
-                "default".to_owned(),
-            )
-        };
+        (state, rx)
+    }
 
-        assert_eq!(send("key-a").await.status(), StatusCode::OK);
+    fn byok_send(
+        state: &AppState,
+        key: &str,
+    ) -> impl std::future::Future<Output = Response> + use<> {
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", key.parse().unwrap());
+        observe_passthrough(
+            state.clone(),
+            h,
+            Bytes::from_static(BYOK_REQ),
+            None,
+            "default".to_owned(),
+        )
+    }
+
+    /// End to end through the real passthrough: a key under its `[budget] per_day_usd` is
+    /// forwarded and metered; once its spend reaches the cap it gets a 402 while another key is
+    /// still served.
+    #[tokio::test]
+    async fn byok_daily_budget_blocks_with_402_per_key() {
+        use axum::http::StatusCode;
+        let (state, mut rx) = byok_state(0.000_001, std::time::Duration::ZERO).await;
+
+        assert_eq!(byok_send(&state, "key-a").await.status(), StatusCode::OK);
         // Metering runs before the trace is enqueued, so once it arrives key-a is debited.
         rx.recv().await.expect("trace");
-        let blocked = send("key-a").await;
+        let blocked = byok_send(&state, "key-a").await;
         assert_eq!(blocked.status(), StatusCode::PAYMENT_REQUIRED);
         let body = axum::body::to_bytes(blocked.into_body(), 1 << 16)
             .await
@@ -13966,7 +13985,7 @@ mod tests {
         );
 
         assert_eq!(
-            send("key-b").await.status(),
+            byok_send(&state, "key-b").await.status(),
             StatusCode::OK,
             "budgets are per key"
         );
@@ -13980,5 +13999,45 @@ mod tests {
         )
         .await;
         assert_eq!(anon.status(), StatusCode::OK);
+    }
+
+    /// Concurrent requests on one key are admitted against reservations, not just settled spend:
+    /// with one request's cost already spent and room for one more, a burst of five in flight at
+    /// once lets exactly one through, and the day's spend stays within the cap.
+    #[tokio::test]
+    async fn byok_concurrent_requests_cannot_overshoot_the_daily_cap() {
+        use axum::http::StatusCode;
+        let c = byok_trace(&ProxyConfig::from_lookup(|_| None).unwrap())
+            .final_
+            .total_cost_usd;
+        let cap = 2.5 * c;
+        let (state, mut rx) = byok_state(cap, std::time::Duration::from_millis(200)).await;
+        assert_eq!(byok_send(&state, "key-a").await.status(), StatusCode::OK);
+        rx.recv().await.expect("warm-up trace");
+
+        let burst: Vec<_> = (0..5)
+            .map(|_| tokio::spawn(byok_send(&state, "key-a")))
+            .collect();
+        let mut ok = 0;
+        for h in burst {
+            match h.await.unwrap().status() {
+                StatusCode::OK => ok += 1,
+                s => assert_eq!(s, StatusCode::PAYMENT_REQUIRED),
+            }
+        }
+        assert_eq!(
+            ok, 1,
+            "only the request that fits under the cap is admitted"
+        );
+        rx.recv().await.expect("trace of the admitted request");
+        let last = state.byok.admit(
+            firstpass_core::hashchain::sha256_hex(b"key-a"),
+            Some(cap),
+            jiff::Timestamp::now(),
+        );
+        assert!(
+            last.is_err(),
+            "spent 2c of a 2.5c cap: the next request does not fit"
+        );
     }
 }
