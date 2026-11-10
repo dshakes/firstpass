@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// UTC day number, used as the reset boundary. A calendar day is the unit an operator budgets in.
-fn day_of(ts: jiff::Timestamp) -> i64 {
+pub(crate) fn day_of(ts: jiff::Timestamp) -> i64 {
     ts.as_second().div_euclid(86_400)
 }
 

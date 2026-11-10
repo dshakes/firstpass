@@ -25,6 +25,7 @@
 
 pub mod affinity;
 pub mod bandit;
+pub mod byok;
 pub mod calibrate;
 pub mod cli;
 pub mod condense;

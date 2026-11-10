@@ -421,6 +421,7 @@ mod tests {
             providers: crate::provider::ProviderRegistry::from_map(Default::default()),
             gate_health: Arc::new(crate::gate::GateHealthRegistry::new()),
             shadow_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
+            byok: Default::default(),
             paired_ledger: Arc::new(crate::shadow::ShadowLedger::new()),
             experiments: Arc::default(),
             guardrails: Arc::new(crate::guard::GuardrailRegistry::new()),
