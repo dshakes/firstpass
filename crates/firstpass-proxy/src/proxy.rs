@@ -13892,6 +13892,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn byok_late_trace_from_yesterday_does_not_wipe_todays_spend() {
+        let config = ProxyConfig::from_lookup(|_| None).unwrap();
+        let meter = crate::byok::ByokMeter::default();
+        let mut t = byok_trace(&config);
+        let c = t.final_.total_cost_usd;
+        let yesterday = t.ts;
+        let today = yesterday + jiff::SignedDuration::from_hours(24);
+        t.ts = today;
+        let a = meter.admit("ka".into(), None, today).unwrap().unwrap();
+        meter.record(&a, &t).unwrap();
+        // A stream admitted yesterday, recorded after midnight.
+        let late = meter.admit("kb".into(), None, today).unwrap().unwrap();
+        t.ts = yesterday;
+        let r = meter.record(&late, &t).unwrap();
+        assert_eq!(
+            r.day,
+            crate::shadow::day_of(today),
+            "debited to the current day"
+        );
+        let a = meter.admit("ka".into(), None, today).unwrap().unwrap();
+        t.ts = today;
+        let r = meter.record(&a, &t).unwrap();
+        assert!(
+            (r.day_spent_usd - 2.0 * c).abs() < 1e-12,
+            "today's spend survived"
+        );
+    }
+
     /// A passthrough `AppState` whose Anthropic upstream answers [`BYOK_RESP`] after `delay`,
     /// with `[budget] per_day_usd = cap`.
     async fn byok_state(cap: f64, delay: std::time::Duration) -> (AppState, mpsc::Receiver<Trace>) {

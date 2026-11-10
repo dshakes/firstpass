@@ -100,9 +100,11 @@ struct Ledger {
 }
 
 impl Ledger {
-    /// A new UTC day drops every key: spend resets and the map cannot grow across days.
+    /// A new UTC day drops every key: spend resets and the map cannot grow across days. Monotonic:
+    /// a late trace from an earlier day (a stream that ran past 00:00 UTC) is debited to the
+    /// current day rather than rolling the ledger back and wiping it.
     fn roll(&mut self, today: i64) {
-        if today != self.day {
+        if today > self.day {
             self.day = today;
             self.keys.clear();
         }
