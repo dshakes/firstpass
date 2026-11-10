@@ -336,16 +336,10 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
     // is what the trace records. Stays `None` while elastic is off.
     let mut last_elastic: Option<ElasticDecision> = None;
 
-    let start = (ctx.start_rung as usize).min(ctx.ladder.len().saturating_sub(1));
-    // max_rungs caps the NUMBER of rungs attempted from start; rung_end is the exclusive upper
-    // bound on ladder indices. With start=0 this is identical to the original rung_limit logic.
-    let rungs_available = ctx.ladder.len().saturating_sub(start);
-    let rung_end = start + (ctx.max_rungs as usize).min(rungs_available);
-    for (i, model_str) in ctx.ladder[start..rung_end].iter().enumerate() {
-        let idx = (start + i) as u32;
-        if batch_ineligible(ctx, model_str) {
-            continue;
-        }
+    let rungs = eligible_rungs(ctx);
+    for (pos, &j) in rungs.iter().enumerate() {
+        let idx = j as u32;
+        let model_str = &ctx.ladder[j];
         let start = Instant::now();
 
         // Resolve provider from `provider/model`. A missing provider/malformed ref is treated as
@@ -507,7 +501,7 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                 // Gate failed → escalate, unless the budget is already spent and a next rung exists.
                 if let Some(cap) = ctx.budget_per_request_usd
                     && spent >= cap
-                    && (idx as usize) + 1 < rung_end
+                    && pos + 1 < rungs.len()
                 {
                     break;
                 }
@@ -538,22 +532,20 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
     let mut served_rung: Option<u32> = None;
     let mut hard_error: Option<String> = None;
 
-    let start = (ctx.start_rung as usize).min(ctx.ladder.len().saturating_sub(1));
-    // rung_end is the exclusive upper bound on ladder indices (same semantics as serial's rung_end).
-    let rungs_available = ctx.ladder.len().saturating_sub(start);
-    let rung_end = start + (ctx.max_rungs as usize).min(rungs_available);
+    let rungs = eligible_rungs(ctx);
     let speculation = ctx.speculation as usize;
     let mut inflight: HashMap<usize, JoinHandle<Result<ModelResponse, ProviderError>>> =
         HashMap::new();
 
-    let mut idx = start;
+    let mut pos = 0;
     // `done` = a rung passed or hard-errored: stop consuming, then cancel/harvest the rest.
     let mut done = false;
-    while idx < rung_end && !done {
+    while pos < rungs.len() && !done {
+        let idx = rungs[pos];
         // Fire the window [idx ..= idx+speculation] concurrently. The rung we must gate now (idx)
         // always fires; rungs ahead only while under budget, so speculation can't blow the cap.
-        let window_end = (idx + speculation).min(rung_end - 1);
-        for j in idx..=window_end {
+        let window_end = (pos + speculation).min(rungs.len() - 1);
+        for &j in &rungs[pos..=window_end] {
             if inflight.contains_key(&j) {
                 continue;
             }
@@ -569,10 +561,6 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
         }
 
         let model_str = &ctx.ladder[idx];
-        if batch_ineligible(ctx, model_str) {
-            idx += 1;
-            continue;
-        }
         let provider = match ModelRef::parse(model_str) {
             Ok(m) => ctx.providers.get(&m.provider),
             Err(_) => None,
@@ -586,7 +574,7 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                 reason::PROVIDER_ERROR,
                 0,
             ));
-            idx += 1;
+            pos += 1;
             continue;
         };
         // Provider resolved ⇒ we spawned a task for `idx`; await it in strict ladder order.
@@ -598,7 +586,7 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                 reason::PROVIDER_ERROR,
                 0,
             ));
-            idx += 1;
+            pos += 1;
             continue;
         };
         let t0 = Instant::now();
@@ -615,7 +603,7 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                     reason::PROVIDER_ERROR,
                     ms,
                 ));
-                idx += 1;
+                pos += 1;
             }
             Ok(Err(err)) if err.is_failover_eligible() => {
                 attempts.push(abstain_attempt(
@@ -625,7 +613,7 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                     reason::PROVIDER_ERROR,
                     ms,
                 ));
-                idx += 1;
+                pos += 1;
             }
             Ok(Err(err)) => {
                 // Same rule as the serial path: a prompt too large for THIS rung is a capacity
@@ -638,7 +626,7 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                         reason::CONTEXT_OVERFLOW,
                         ms,
                     ));
-                    idx += 1;
+                    pos += 1;
                 } else {
                     // Hard error (4xx / decode): do not escalate — the request is the problem.
                     let (r, msg) = hard_reason(&err);
@@ -709,11 +697,11 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                     done = true;
                 } else if let Some(cap) = ctx.budget_per_request_usd
                     && spent >= cap
-                    && idx + 1 < rung_end
+                    && pos + 1 < rungs.len()
                 {
                     done = true;
                 }
-                idx += 1;
+                pos += 1;
             }
         }
     }
@@ -766,9 +754,6 @@ fn spawn_rung(
     j: usize,
 ) -> Option<JoinHandle<Result<ModelResponse, ProviderError>>> {
     let model_str = ctx.ladder.get(j)?;
-    if batch_ineligible(ctx, model_str) {
-        return None;
-    }
     let provider = match ModelRef::parse(model_str) {
         Ok(m) => ctx.providers.get(&m.provider)?,
         Err(_) => return None,
@@ -779,6 +764,16 @@ fn spawn_rung(
     Some(tokio::spawn(async move {
         call_rung(provider.as_ref(), &req, &auth).await
     }))
+}
+
+/// Ladder indices this request may attempt, in order: from `start_rung`, ineligible `@batch` rungs
+/// dropped, THEN capped at `max_rungs` — so a skipped rung never uses up a slot of the cap.
+fn eligible_rungs(ctx: &EnforceCtx<'_>) -> Vec<usize> {
+    let start = (ctx.start_rung as usize).min(ctx.ladder.len().saturating_sub(1));
+    (start..ctx.ladder.len())
+        .filter(|&j| !batch_ineligible(ctx, &ctx.ladder[j]))
+        .take(ctx.max_rungs as usize)
+        .collect()
 }
 
 /// An `@batch` rung only runs when the caller declared latency tolerance (`x-firstpass-latency`);
@@ -1114,6 +1109,35 @@ mod tests {
         assert_eq!(trace.attempts.len(), 3);
         assert_eq!(trace.attempts[1].model, batch);
         assert_eq!(trace.attempts[1].verdict, Verdict::Abstain);
+    }
+
+    /// A skipped `@batch` rung must not use up a `max_rungs` slot: [cheap, cheap@batch, strong]
+    /// with no latency header and a cap of 2 still reaches `strong`, in both engines.
+    #[tokio::test]
+    async fn skipped_batch_rung_does_not_consume_the_rung_cap() {
+        let batch = format!("{HAIKU}@batch");
+        let ladder = vec![HAIKU.to_owned(), batch.clone(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(NonEmptyGate)];
+        let req = base_request();
+        let providers = registry(vec![
+            ("anthropic", HAIKU, Ok(resp(HAIKU, "   "))),
+            ("anthropic", SONNET, Ok(resp(SONNET, "real answer"))),
+        ]);
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+        for speculation in [0, 1] {
+            let mut c = ctx(
+                &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+            );
+            c.max_rungs = 2;
+            c.speculation = speculation;
+            let (out, trace) = route_enforce(c).await;
+            assert!(
+                matches!(out, EngineOutcome::Served(r) if r.model == SONNET),
+                "speculation={speculation}"
+            );
+            assert_eq!(trace.final_.served_rung, Some(2));
+        }
     }
 
     /// Fake `/v1/systemone` server: low probability for a candidate containing `NOT_GOOD_ENOUGH`,

@@ -318,7 +318,8 @@ impl Auth {
             .get("x-firstpass-latency")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| firstpass_core::config::parse_window(v).ok())
-            .filter(|d| !d.is_zero());
+            .filter(|d| !d.is_zero())
+            .map(|d| d.min(MAX_BATCH_WINDOW));
         Self {
             anthropic_key,
             openai_key,
@@ -424,6 +425,15 @@ fn wire_model(model: &str) -> &str {
     let model = firstpass_core::cost::split_rung(model).0;
     model.split_once('/').map_or(model, |(_, m)| m)
 }
+
+/// Longest `x-firstpass-latency` honoured: the Message Batches API's own processing window. The
+/// header is caller input, so it is clamped before it can size a deadline.
+pub const MAX_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// After cancelling a batch that overran its window, how long to keep polling for it to reach
+/// `ended`. A cancel is not instant (`canceling`), and a request that completed meanwhile is billed,
+/// so the result must be read to keep the receipt honest.
+const BATCH_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The effort an `@low|@medium|@high` ladder rung pins.
 fn rung_effort(model: &str) -> Option<Effort> {
@@ -614,7 +624,13 @@ impl Provider for AnthropicProvider {
         // ponytail: one request per batch and a fixed poll interval; group concurrent requests
         // into one batch if submission overhead ever shows up.
         const POLL: std::time::Duration = std::time::Duration::from_secs(30);
-        let deadline = std::time::Instant::now() + auth.latency.unwrap_or_default();
+        let window = auth.latency.unwrap_or_default().min(MAX_BATCH_WINDOW);
+        let now = tokio::time::Instant::now();
+        let overflow = || ProviderError::Transport("batch: deadline overflow".to_owned());
+        let deadline = now.checked_add(window).ok_or_else(overflow)?;
+        let grace_end = deadline
+            .checked_add(BATCH_CANCEL_GRACE)
+            .ok_or_else(overflow)?;
         let submit = serde_json::json!({
             "requests": [{ "custom_id": "firstpass", "params": anthropic_wire_body(req) }]
         });
@@ -626,6 +642,7 @@ impl Provider for AnthropicProvider {
             .and_then(Value::as_str)
             .ok_or_else(|| ProviderError::Decode("batch: missing id".to_owned()))?
             .to_owned();
+        let mut cancelled = false;
         loop {
             let status = self
                 .send(self.http.get(self.url(&format!("/batches/{id}"))), auth)
@@ -633,14 +650,22 @@ impl Provider for AnthropicProvider {
             if status.get("processing_status").and_then(Value::as_str) == Some("ended") {
                 break;
             }
-            if std::time::Instant::now() + POLL > deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline && !cancelled {
+                // Out of window: cancel, but keep polling — the request may already have
+                // completed (and billed) before the cancel lands, and its usage must be recorded.
                 let cancel = self.http.post(self.url(&format!("/batches/{id}/cancel")));
                 let _ = self.send(cancel, auth).await;
+                cancelled = true;
+            }
+            if now >= grace_end {
+                tracing::warn!(batch = %id, "batch never ended after cancel; its spend is unknown");
                 return Err(ProviderError::Transport(format!(
-                    "batch {id} did not end within the caller's latency window"
+                    "batch {id} cancelled but not ended; spend unknown, not zero"
                 )));
             }
-            tokio::time::sleep(POLL).await;
+            let until = if cancelled { grace_end } else { deadline };
+            tokio::time::sleep(POLL.min(until.saturating_duration_since(now))).await;
         }
         // The documented results path on our own base URL — never the `results_url` the status
         // body names, so credentials only ever go to the configured host.
@@ -3535,6 +3560,136 @@ mod tests {
         *result.lock().unwrap() = serde_json::json!({"type": "errored", "error": {}});
         let err = provider.complete_batch(&req, &auth).await.unwrap_err();
         assert!(!err.is_failover_eligible(), "{err}");
+    }
+
+    /// A Message Batches server that reports `in_progress` for the first `ended_after` status polls
+    /// (then `ended`); after a cancel it reports `canceling` once, then `ended`. Its one result is
+    /// `succeeded` with usage 7 in / 3 out. Returns the provider and the "cancel was called" flag.
+    async fn batch_server(
+        ended_after: usize,
+    ) -> (AnthropicProvider, Arc<std::sync::atomic::AtomicBool>) {
+        use axum::routing::{get, post};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let polls = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let after_cancel = Arc::new(AtomicUsize::new(0));
+        let (c1, c2) = (Arc::clone(&cancelled), Arc::clone(&cancelled));
+        let app = axum::Router::new()
+            .route(
+                "/v1/messages/batches",
+                post(|| async { axum::Json(serde_json::json!({"id": "b1"})) }),
+            )
+            .route(
+                "/v1/messages/batches/b1",
+                get(move || {
+                    let status = if c1.load(SeqCst) {
+                        if after_cancel.fetch_add(1, SeqCst) == 0 {
+                            "canceling"
+                        } else {
+                            "ended"
+                        }
+                    } else if polls.fetch_add(1, SeqCst) >= ended_after {
+                        "ended"
+                    } else {
+                        "in_progress"
+                    };
+                    async move { axum::Json(serde_json::json!({"processing_status": status})) }
+                }),
+            )
+            .route(
+                "/v1/messages/batches/b1/cancel",
+                post(move || {
+                    c2.store(true, SeqCst);
+                    async { axum::Json(serde_json::json!({"id": "b1"})) }
+                }),
+            )
+            .route(
+                "/v1/messages/batches/b1/results",
+                get(|| async {
+                    serde_json::json!({"custom_id": "firstpass", "result": {
+                        "type": "succeeded", "message": {
+                            "content": [{"type": "text", "text": "batched"}],
+                            "usage": {"input_tokens": 7, "output_tokens": 3}}}})
+                    .to_string()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let provider = AnthropicProvider {
+            id: "anthropic".to_owned(),
+            base_url: format!("http://{addr}"),
+            api_key_env: None,
+            http: reqwest::Client::new(),
+        };
+        (provider, cancelled)
+    }
+
+    fn batch_req(latency: std::time::Duration) -> (ModelRequest, Auth) {
+        let req = ModelRequest {
+            model: "anthropic/claude-haiku-4-5@batch".to_owned(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            max_tokens: 16,
+            tools: Value::Null,
+            raw: Value::Null,
+            cache_prefix: false,
+        };
+        let auth = Auth {
+            anthropic_key: Some("k".to_owned()),
+            latency: Some(latency),
+            ..Auth::default()
+        };
+        (req, auth)
+    }
+
+    /// A huge caller latency is clamped, never overflowing the deadline (it used to panic on
+    /// `Instant + Duration`).
+    #[tokio::test]
+    async fn batch_huge_latency_is_clamped_not_a_panic() {
+        let mut h = HeaderMap::new();
+        h.insert("x-firstpass-latency", "99999999999999d".parse().unwrap());
+        let auth = Auth::from_headers(&h, firstpass_core::Dialect::Anthropic);
+        assert_eq!(auth.latency, Some(MAX_BATCH_WINDOW));
+
+        let (provider, _) = batch_server(0).await;
+        let (req, auth) = batch_req(std::time::Duration::MAX);
+        let r = provider
+            .complete_batch(&req, &auth)
+            .await
+            .expect("no panic");
+        assert_eq!(r.text, "batched");
+    }
+
+    /// A window shorter than the poll interval still polls (it used to give up before the first
+    /// sleep because `now + 30s > deadline`).
+    // Real time: a paused clock auto-advances while awaiting socket I/O and would skip the window.
+    #[tokio::test]
+    async fn batch_sub_poll_window_still_waits_for_the_result() {
+        let (provider, cancelled) = batch_server(1).await;
+        let (req, auth) = batch_req(std::time::Duration::from_secs(1));
+        let r = provider
+            .complete_batch(&req, &auth)
+            .await
+            .expect("ended in window");
+        assert_eq!(r.text, "batched");
+        assert!(!cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Out of window: the batch is cancelled, but a request that completed before the cancel landed
+    /// was billed — its result and usage are returned, not recorded as a zero-cost abstain.
+    #[tokio::test(start_paused = true)]
+    async fn batch_cancel_still_reads_and_bills_a_completed_result() {
+        let (provider, cancelled) = batch_server(usize::MAX).await;
+        let (req, auth) = batch_req(std::time::Duration::from_secs(60));
+        let r = provider
+            .complete_batch(&req, &auth)
+            .await
+            .expect("billed result");
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!((r.in_tokens, r.out_tokens), (7, 3));
     }
 
     #[test]
