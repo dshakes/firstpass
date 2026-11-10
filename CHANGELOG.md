@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-04
+
 ### Added
 - Agent routes match Claude Code, Codex and Gemini CLI with no client header: the agent is
   inferred from the User-Agent when `x-firstpass-agent` is absent or blank (#271).
